@@ -9,7 +9,7 @@ This experiment fills it on gemma, measures whether the combination earns its
 parameters, and lands discovered manifolds in a real steering/probe runtime.
 
 Full literature provenance, gap sweep, and the synergy argument live in
-[`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md)
+[`docs/research/block-sparse-crosscoders-2026-07.md`](research/block-sparse-crosscoders-2026-07.md)
 — read it before arguing with anything here. One paragraph of it matters for
 the design: each parent fixes the other's failure. Blocks absorb cross-layer
 within-subspace rotation that fragments scalar crosscoder latents (SASA's

@@ -1,14 +1,24 @@
 # Data + figures are regenerated artifacts; keep them out of git.
-data/
-figures/
+data/**
+!data/.gitkeep
+figures/**
+!figures/.gitkeep
 
 # Python
 __pycache__/
 *.py[cod]
-.venv
+.venv/
 *.egg-info/
+build/
+dist/
 .pytest_cache/
+.ruff_cache/
+.env
 .DS_Store
+.idea/
+.vscode/
+.claude/
 
 # run logs (regeneration helper output)
-logs/
+logs/**
+!logs/.gitkeep

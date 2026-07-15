@@ -10,7 +10,7 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`DESIGN.md`](DESIGN.md): hypotheses H1–H5, the architecture sketch
+- [`docs/design.md`](docs/design.md): hypotheses H1–H5, the architecture sketch
   (BatchTopK block selection in whitened space, per-site nuclear norm), the
   phase ladder 0 → 0.5 → 1 → 2 → 3 with gates, out-of-scope list.
 - [`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md):
@@ -46,7 +46,7 @@ package.
 
 - Workspace rules apply: shared base Python 3.12, plain `python`, no venvs,
   no `uv`. Install the workspace root once, then this package editable.
-- Phase discipline: each phase gates the next (gates in `DESIGN.md`). Don't
+- Phase discipline: each phase gates the next (gates in `docs/design.md`). Don't
   start Phase-1 training before Phase-0/0.5 have verdicts — the whole design
   is built so the expensive step is the *third* thing, not the first.
 - A null result is informative at every gate (no-rings sharpens the
