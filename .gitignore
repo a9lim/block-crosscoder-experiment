@@ -1,0 +1,14 @@
+# Data + figures are regenerated artifacts; keep them out of git.
+data/
+figures/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# run logs (regeneration helper output)
+logs/

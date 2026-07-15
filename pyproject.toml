@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "block-crosscoder-experiment"
+version = "0.0.1"
+description = "Block-sparse crosscoders: unsupervised cross-layer manifold discovery on gemma, feeding the saklas steering runtime."
+requires-python = ">=3.12"
+dependencies = [
+    "transformer-experiments>=0.1,<0.2",
+    "datasets",
+    "numpy",
+    "sae-lens",
+    "saklas>=1.4.6",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    # saklas is also developed locally when needed:
+    #   pip install -e ../../saklas
+    #   pip install -e .
+]
+
+[tool.setuptools.packages.find]
+include = ["block_crosscoder_experiment*"]
