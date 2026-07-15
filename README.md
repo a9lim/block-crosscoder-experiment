@@ -3,7 +3,10 @@
 Do block-sparse crosscoders — subspace-unit dictionary learning with one
 shared code across layers — recover token-level concept manifolds in gemma,
 and can those discovered manifolds feed a real steering/probe runtime
-(saklas)? See [`docs/design.md`](docs/design.md) for hypotheses and the phase ladder;
+(saklas)? See [`docs/design.md`](docs/design.md) for hypotheses, the architecture spec,
+and the phase ladder;
+[`docs/design-review-2026-07-15.md`](docs/design-review-2026-07-15.md) for the
+adversarial review that shaped it;
 [`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md)
 for the research digest this grew from.
 
@@ -20,8 +23,10 @@ python -m pip install -e ../../saklas
 
 ## Status
 
-Pre-Phase-0 scaffold (2026-07-15). No runnable experiments yet; the Phase-0
-blockification script is the next deliverable.
+Design v2.1, frozen after two-round adversarial review (2026-07-15); no
+runnable experiments yet. Next deliverables: the Phase −1 synthetic
+ground-truth harness, then the Phase-0 blockification script (GPT-2
+positive control → gemma-scope-2).
 
 ## Layout
 

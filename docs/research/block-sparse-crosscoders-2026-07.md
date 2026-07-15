@@ -4,7 +4,9 @@
 the 2026-07-12 BSF digest (prompted by Fel et al. 2606.25234, "can we do this
 for LLMs?") with the 2026-07-15 crosscoder extension (prompted by a9: "why
 hasn't anyone combined BSF with crosscoders?"). Verification provenance: Fel
-et al. read at primary source (full HTML, 07-12); SASA (2606.06333) abstract;
+et al. read at primary source (full HTML, 07-12); SASA (2606.06333) abstract,
+**upgraded to full text 07-15 during the adversarial design review** — the
+transfer correction it forced is in `docs/design-review-2026-07-15.md`;
 Engels (2405.14860) prior knowledge + search-verified; SAE-scaling
 (2509.02565) [snippet]; crosscoder gap swept via web + HF paper search
 (07-15); Minder 2504.02922, Gorton 2410.24184, Jiralerspong & Bricken
@@ -13,7 +15,10 @@ Engels (2405.14860) prior knowledge + search-verified; SAE-scaling
 
 **Verdict: a block-sparse crosscoder (BSC) — subspace-unit dictionary
 learning with one shared code across layers (later: across models) — exists
-nowhere in the literature, and the combination is better than the sum of its
+nowhere in the LLM-interpretability literature *(scope amended 07-15: the
+older multi-view / coupled / joint group-sparse dictionary-learning
+literature has not been swept; do that before any external novelty claim)*,
+and the combination is better than the sum of its
 parts: each parent fixes the other's characteristic failure. It is, almost
 term for term, the unsupervised generator of saklas's manifold artifact.
 The unclaimed territory found in the original sweep (unsupervised manifold
@@ -196,13 +201,22 @@ x^s. G blocks of width b:
 - decode: x̂^s = Σ_{g active} z_g D_g^s ; loss Σ_s ‖x^s − x̂^s‖²_whitened
   + λ_* Σ_g Σ_s ‖D_g^s‖_* (SASA's nuclear norm, **per site**, so each layer
   chooses its own effective rank of each block).
+  *[07-15 amendment: this sketch as written is gauge-degenerate (z↦cz,
+  D↦D/c zeroes the penalty without changing reconstruction or selection) and
+  mis-transfers SASA, whose full-text penalty is on the product ‖D_k E_k‖_*.
+  The corrected, Gram-constrained objective — Σ_s D_g^s D_g^sᵀ = I_b, select
+  by exact contribution ‖z_g‖ — is specified in `docs/design.md` v2; the
+  disposition trail is `docs/design-review-2026-07-15.md`.]*
 - diagnostics: block-level Latent Scaling (per-site
   reconstruction-contribution regression) as the artifact flag; per-block
   per-site effective-rank histogram as the headline geometry measurement;
   MDL vs a matched-width scalar crosscoder — the `log₂(G choose k)` vs
   `log₂(Gb choose kb)` argument carries over per token unchanged
-  [synthesis, straightforward], and remains the honest language-viability
-  arbiter it was in the single-layer plan.
+  [synthesis, straightforward]. *[07-15 amendment: "unchanged" was too
+  strong — the support term is one part of a codec; amplitude quantization,
+  variable per-token k under BatchTopK, and parameter-bit scope all needed
+  defining. The pre-registered rate–distortion protocol in `docs/design.md`
+  v2 is the honest version.]*
 
 Honest failure mode of the shared code: a feature whose *position* genuinely
 transforms across depth (Engels' modular arithmetic — the answer-day differs
@@ -267,9 +281,13 @@ directly, and adds the depth axis the single-layer plan lacked:
   comfortable with 8-bit Adam, a tied (Grassmannian) encoder, G=4k, or 6
   sites. The matched-width scalar-crosscoder baseline is the same size.
   Activations stream (~40 KB/token at 8 sites; 200M tokens ≈ 8 TB raw, so
-  storage was never on the table); harvest throughput is unchanged, just
-  wider taps per forward. Cross-model doubles the harvest (two forwards per
-  token), not the per-site decoder scaling.
+  storage was never on the table). *[07-15 amendments: (i) the review's
+  VRAM arithmetic killed streamed-gemma-plus-full-config on 24 GB — the
+  adopted topology is a bounded disk-backed store (~38M tokens on the 4090
+  box's NVMe), which also frees the full-width config; (ii) "cross-model
+  doubles the harvest, not the per-site decoder scaling" is wrong under
+  sites = layers × models — parameters double too; Phase 3 holds the site
+  budget constant instead (4 layers × 2 models). See `docs/design.md` v2.]*
 
 ## Plan (phased; each phase is a go/no-go gate for the next)
 

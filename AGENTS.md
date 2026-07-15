@@ -10,19 +10,28 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`docs/design.md`](docs/design.md): hypotheses H1–H5, the architecture sketch
-  (BatchTopK block selection in whitened space, per-site nuclear norm), the
-  phase ladder 0 → 0.5 → 1 → 2 → 3 with gates, out-of-scope list.
+- [`docs/design.md`](docs/design.md) (v2.1, post-review, frozen): hypotheses H1–H5, the
+  architecture spec (Gram-constrained decoders — Σ_s D_g^s D_g^sᵀ = I_b —
+  BatchTopK block selection by exact whitened contribution ‖z_g‖, per-site
+  nuclear norm on a fixed spectrum budget), the phase ladder
+  −1 → 0 → 0.5 → 0.9 → 1 → 2 → 3 with gates, configs, the rate–distortion
+  protocol, out-of-scope list, decision log.
+- [`docs/design-review-2026-07-15.md`](docs/design-review-2026-07-15.md):
+  the adversarial review disposition (Codex sol-tier + parallel pass, 35
+  findings) that produced v2 — the *why* behind every load-bearing spec
+  choice. Read before re-litigating any of them.
 - [`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md):
   the canonical research digest — parent papers (Fel BSF, SASA, Anthropic
   crosscoders + Minder artifacts), gap sweep, the synergy argument, full
-  source provenance. Migrated from the saklas repo 2026-07-15; it is the
-  literature ground truth for this project.
+  source provenance. Migrated from the saklas repo 2026-07-15; carries
+  bracketed 07-15 review amendments; it is the literature ground truth for
+  this project.
 
-**Status: pre-Phase-0 scaffold.** No experiment code yet. Next action: the
-Phase-0 blockification script (cluster an existing SAELens SAE's decoder
-directions on gemma, PCA within-cluster codes over a token stream, hunt
-weekday/month rings).
+**Status: design v2.1 frozen (round-2 verified); no experiment code yet.**
+Next actions, in order: the Phase −1 synthetic ground-truth harness
+(`tests/` + `scripts/`), then Phase 0 (GPT-2 positive control first, then
+`google/gemma-scope-2-4b-pt` blockification — cluster decoder directions,
+PCA within-cluster codes over a token stream, hunt weekday/month rings).
 
 ## The saklas seam
 
@@ -66,9 +75,14 @@ package.
   the harvest loop especially — needs periodic `torch.mps.synchronize()`
   backpressure plus output validation (zero-row guards). Never trust an
   all-zeros block on MPS; suspect the queue first.
-- Streamed activation harvest only (~40 KB/token at 8 sites on gemma-3-4b —
-  200M tokens ≈ 8 TB raw; storage was never on the table).
-- Phase-1 full config (~1.3B params untied) is tight on the 4090 with
-  mixed-precision AdamW (≈16–21 GB): drop to G=4k / 6 sites / tied
-  (Grassmannian) encoder / 8-bit Adam as needed. The matched scalar baseline
-  is the same size — budget for both runs.
+- **Disk-backed activation store, not streaming** (decision 2026-07-15):
+  harvest once on the 4090 (bf16, 8 sites, ~40 KB/token) into a bounded
+  ~38M-token store on its NVMe (~1.6 TB of the ~1.9 TB free), train from the
+  store with gemma out of VRAM. Interleaved streaming is the documented
+  escalation only if rare-feature starvation shows. **fp16 is banned in the
+  harvest/store path** — gemma-3 late-layer channels overflow it.
+- Phase-1 primary config is G=4096 × b=4 × 8 sites untied (~671M params,
+  ~9 GB train VRAM with 8-bit Adam); G=8192 (~1.34B, ~11 GB) is the stretch
+  config the store makes possible. The matched scalar baseline is the same
+  size — budget for both runs, 2 seeds each. A 1M-token measured pilot
+  precedes the store commit.
