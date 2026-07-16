@@ -56,6 +56,9 @@ def cell_grid() -> dict[str, dict]:
     A = dict(zoo="core6", G=10, k=1.0, optimizer="auto", steps=3000, s_aux=4)
     B = dict(zoo="core5_f25", G=8, k=1.0, optimizer="adamw", steps=2000, s_aux=2)
     return {
+        # Round 1 (2026-07-16): OFAT A->B. Result: budget ratio is the
+        # factor (0.8 -> zero tiling, deaths remain); optimizer/s_aux/steps
+        # are non-factors; B_pinned is seed-lucky.
         "A_base": A,
         "A_adamw": {**A, "optimizer": "adamw"},
         "A_budget08": {**A, "k": 0.8},
@@ -68,6 +71,16 @@ def cell_grid() -> dict[str, dict]:
         "A_saux2": {**A, "s_aux": 2},
         "B_pinned": B,
         "B_8bit": {**B, "optimizer": "auto"},
+        # Round 2: map the budget curve and attack the deaths that tight
+        # budget causes — more revival pressure, more steps, and budget
+        # annealing in both directions (anneal over the first half, hold).
+        "C_b07": {**A, "k": 0.7},
+        "C_b085": {**A, "k": 0.85},
+        "C_b08_10k": {**A, "k": 0.8, "steps": 10000},
+        "C_b08_saux8": {**A, "k": 0.8, "s_aux": 8},
+        "C_anneal_dn": {**A, "k": 0.8, "k_anneal_from": 1.0},
+        "C_anneal_up": {**A, "k": 1.0, "k_anneal_from": 0.8},
+        "C_anneal_up_10k": {**A, "k": 1.0, "k_anneal_from": 0.8, "steps": 10000},
     }
 
 
@@ -86,11 +99,15 @@ def run_cell(name: str, cell: dict, seeds: list[int], bc0: BatteryConfig, device
     runs = []
     for seed in seeds:
         t0 = time.time()
+        anneal_from = cell.get("k_anneal_from")
         rep, _, _ = run_one_full(
             specs, bc,
             n_blocks=cell["G"], k=cell["k"],
             learner_seed=seed, data_seed=seed,
             optimizer=cell["optimizer"], s_aux=cell["s_aux"],
+            # Anneal over the first half of training, hold thereafter.
+            k_anneal_from=anneal_from,
+            k_anneal_steps=cell["steps"] // 2 if anneal_from is not None else None,
             device=device,
         )
         labels = [classify(r) for r in rep.blocks]

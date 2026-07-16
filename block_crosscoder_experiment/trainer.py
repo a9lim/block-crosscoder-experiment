@@ -64,6 +64,12 @@ class TrainConfig:
     dead_threshold: float = 1e-4
     dead_window_batches: int = 100
     dead_horizon_batches: int = 500
+    # BatchTopK budget annealing (capture-sweep finding: budget ratio drives
+    # the capture-vs-tiling basin). When set, k is interpolated linearly from
+    # k_anneal_from to the model config's k over k_anneal_steps (default:
+    # total_steps), then held.
+    k_anneal_from: float | None = None
+    k_anneal_steps: int | None = None
     # Diagnostics
     ema_decay: float = 0.99  # EMA of batch-min selected score (D10: diagnostic only)
     log_every: int = 10
@@ -264,6 +270,7 @@ class Trainer:
             device=model.E.device,
         )
         self.step_idx = 0
+        self._k_final = float(model.cfg.k)  # annealing target
         self.ema_min_score: float | None = None  # diagnostic only (D10)
         self._prev_shares = site_frobenius_shares(self.master.D).detach().clone()
         self.history: list[dict] = []
@@ -275,6 +282,15 @@ class Trainer:
         cfg = self.cfg
         x = x.to(device=self.fwd.E.device, dtype=self.fwd.E.dtype)
         log_step = self.step_idx % cfg.log_every == 0
+
+        k_now = None
+        if cfg.k_anneal_from is not None:
+            span = max(1, cfg.k_anneal_steps or cfg.total_steps)
+            frac = min(1.0, self.step_idx / span)
+            k_now = cfg.k_anneal_from + (self._k_final - cfg.k_anneal_from) * frac
+            self.master.cfg.k = k_now
+            if self.fwd is not self.master:
+                self.fwd.cfg.k = k_now
 
         out = self.fwd(x)
         parts = bsc_loss(out, x, self.fwd)
@@ -360,6 +376,8 @@ class Trainer:
         }
         if "rank" in parts:
             record["rank"] = float(parts["rank"].detach())
+        if k_now is not None:
+            record["k"] = k_now
         if l_aux is not None:
             record["aux"] = float(l_aux.detach())
         if grad_norm_aux is not None:
@@ -412,6 +430,7 @@ class Trainer:
             "scheduler": self.sched.state_dict(),
             "tracker": self.tracker.state_dict(),
             "step_idx": self.step_idx,
+            "k_final": self._k_final,  # cfg.k may be mid-anneal at save time
             "ema_min_score": self.ema_min_score,
             "model_cfg": asdict(self.master.cfg),
             "train_cfg": asdict(self.cfg),
@@ -439,6 +458,7 @@ class Trainer:
         trainer.sched.load_state_dict(payload["scheduler"])
         trainer.tracker.load_state_dict(payload["tracker"])
         trainer.step_idx = payload["step_idx"]
+        trainer._k_final = payload.get("k_final", float(model_cfg.k))
         trainer.ema_min_score = payload["ema_min_score"]
         if trainer.fwd is not trainer.master:
             with torch.no_grad():

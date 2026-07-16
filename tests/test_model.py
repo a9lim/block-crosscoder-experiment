@@ -65,6 +65,10 @@ def test_batchtopk_exact_count_and_variable_per_token(device):
     assert per_token.min() != per_token.max()  # counts vary by design
     # Kept scores dominate dropped scores globally.
     assert scores[mask].min() >= scores[~mask].max()
+    # Fractional budget (the capture-sweep under-provisioned regime):
+    # round(k*B) selections batch-wide.
+    frac = batch_topk_mask(scores, 0.8)
+    assert int(frac.sum().item()) == round(0.8 * B)
 
 
 def test_gradient_only_through_selected(device):

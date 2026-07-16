@@ -67,6 +67,41 @@ def test_bf16_forward_copy_stays_in_sync(device):
     assert trainer.history[-1]["rec"] < 0.7 * trainer.history[0]["rec"]
 
 
+def test_k_anneal_schedule(device):
+    """Budget annealing interpolates cfg.k linearly to the model's k over
+    k_anneal_steps, then holds; a mid-anneal checkpoint restores the true
+    target, not the interpolated value."""
+    model = BlockCrosscoder(CFG).to(device)  # k = 3
+    trainer = Trainer(
+        model,
+        train_cfg(total_steps=40, k_anneal_from=1.0, k_anneal_steps=20, log_every=1),
+    )
+    batches = planted_batches(device)
+    trainer.fit(batches[:10])
+    # After 10 of 20 anneal steps the last-applied k (step_idx 9) is
+    # 1.0 + (3 - 1) * 9/20.
+    assert abs(model.cfg.k - (1.0 + 2.0 * 9 / 20)) < 1e-9
+    assert abs(trainer.history[0]["k"] - 1.0) < 1e-9
+    trainer.fit(batches[10:])
+    assert model.cfg.k == 3.0  # held at target after the anneal span
+    assert trainer._k_final == 3.0
+
+
+def test_k_anneal_checkpoint_restores_target(device, tmp_path):
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(
+        model,
+        train_cfg(total_steps=40, k_anneal_from=1.0, k_anneal_steps=20),
+    )
+    trainer.fit(planted_batches(device)[:10])  # stop mid-anneal
+    path = tmp_path / "mid_anneal.pt"
+    trainer.save_checkpoint(path)
+    resumed = Trainer.load_checkpoint(path, device=device)
+    assert resumed._k_final == 3.0
+    resumed.fit(planted_batches(device)[10:])
+    assert resumed.master.cfg.k == 3.0
+
+
 def test_dead_tracker_criteria(device):
     B = 64
     tracker = DeadTracker(n_blocks=4, capacity=8, device=device)
