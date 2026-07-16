@@ -62,6 +62,17 @@ def cell_grid() -> dict[str, dict]:
         "H_bun_G16_k12_30k": dict(G=16, k=1.2, steps=30000),
         "H_bun_G16_k09": dict(G=16, k=0.9, steps=10000),
         "H_bun_G16_k15": dict(G=16, k=1.5, steps=10000),
+        # Round 8: k=0.9 solved capture (4/4 single-block rings, code-R2
+        # 0.9996, bundle packed 4/4) but budget slack junk-fills the ring
+        # block on 2.3% of off-ring tokens at norm 0.074 vs ring norm 2.000,
+        # inflating all-firings CV 0.010 -> 0.254 (bimodal arithmetic:
+        # CV ~ 0.97*sqrt(junk fraction); < 0.1 needs junk < ~1% of firings).
+        # Prediction: the gate-as-written window is k just above the packed
+        # demand 0.75 - packing forced, slack ~0, junk ~0. Probe the window
+        # and its starvation edge.
+        "I_bun_G16_k070": dict(G=16, k=0.70, steps=10000),
+        "I_bun_G16_k075": dict(G=16, k=0.75, steps=10000),
+        "I_bun_G16_k080": dict(G=16, k=0.80, steps=10000),
     }
 
 
