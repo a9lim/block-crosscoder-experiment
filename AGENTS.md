@@ -34,19 +34,26 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: design v2.2 frozen (round-3: deployment re-plan on measured
-hardware + paper-fidelity amendments); Phase −1 implementation started
-2026-07-16 — core Gram/model primitives (`gram.py`, `model.py`) landed
-with numeric tests; battery runs on jobe (CUDA) per the placement
-amendment in the design decision log.**
-Next actions, in order: the rest of the Phase −1 synthetic ground-truth
-harness — trainer (fp32-master → retract → bf16-recast ordering, 8-bit
-Adam, AuxK variants), the gauge-correct generator, recovery metrics +
-scenario battery (`tests/` + `scripts/`) — then Phase 0 (positive control first — pinned to Bloom's 2024
-GPT-2-small layer-7 SAE, observational only — then
+**Status: Phase −1 harness complete and battery run twice on jobe
+(2026-07-16) — primitives, trainer, gauge-correct generator, recovery
+metrics, seven-scenario battery, all unit-tested (69 tests on CUDA).
+Verdicts in
+[`docs/findings-phase-minus1-battery.md`](docs/findings-phase-minus1-battery.md):
+λ=0-primary confirmed (empty admissible set; the run-1 "share
+concentration" was largely a Frobenius parked-capacity artifact — the
+real λ harm is overlap collapse); rank ≤3 gaussians recover exactly,
+shells tile, spare capacity splits — one capture/tiling/splitting
+lottery behind every red gate. The 8-bit-Adam retraction-ordering
+check (0.9 gate) passed early.**
+Blocking decision (a9's): Phase −1 core gate semantics — capture-only
+vs capture-where-achievable + span-recovery for shells/high-rank
+(findings §3). Then: Phase 0 (positive control first — pinned to
+Bloom's 2024 GPT-2-small layer-7 SAE, observational only — then
 `google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
 plus the activation-dependence branch, PCA within-cluster codes over a
-token stream, hunt weekday/month rings with the full Engels battery).
+token stream, hunt weekday/month rings with the full Engels battery —
+noting the tiled-ring caveat: norm-CV only flags *captured* rings, so
+the ring hunt needs span-level evidence too).
 
 ## The saklas seam
 

@@ -757,3 +757,18 @@ public (P23, round-3 novelty verdict).
   batched linalg; faster λ×scenario×seed battery. Code remains
   device-generic; MPS/CPU stay supported for dev runs and unit tests.
   Hardware placement only — no science change; design remains frozen.
+- **2026-07-16 (λ-veto outcome)** — the Phase −1 λ-veto protocol ran
+  (battery runs 1–2, `docs/findings-phase-minus1-battery.md`): the
+  admissible set is empty at every tested nonzero λ
+  {3e-4, 1e-3, 3e-3} — recovery overlap collapses 0.95→~0.71, far
+  below the 0.85-retention floor — so the design's documented fallback
+  fires: **λ=0 primary, nuclear rank reported diagnostically**.
+  Mechanism note: run-1's apparent share concentration under λ>0 was
+  largely a Frobenius parked-capacity measurement artifact; under
+  contribution-energy shares, λ≤1e-3 passes the share tolerance and
+  the veto is driven by overlap alone. Consequences: recovery/depth
+  readouts (and the Phase-2 `share` export) must use
+  contribution-energy shares, never Frobenius; the Phase-1 grid should
+  bracket smaller λ (3e-5, 1e-4) before ruling out a benign window at
+  production scale. Executes the spec'd protocol — no frozen-surface
+  change.
