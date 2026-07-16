@@ -31,7 +31,6 @@ class BSCConfig:
     d_model: int  # d
     k: int  # average active blocks/token (BatchTopK budget)
     lambda_rank: float = 0.0  # lambda_* on the pinned R_rank reduction
-    alpha_aux: float = 0.0  # alpha on L_aux (AuxK; lands with the trainer)
     eig_floor: float = 1e-6  # retraction eigenvalue floor
     sv_eps: float = 1e-8  # eps inside sqrt(eig + eps)
     seed: int = 0
@@ -127,13 +126,16 @@ class BlockCrosscoder(nn.Module):
             return p > self.theta
         raise ValueError(f"unknown selection mode {mode!r}")
 
-    def decode(self, z_selected: torch.Tensor) -> torch.Tensor:
-        """z_selected: [B, G, b] -> xhat: [B, S, d]."""
+    def decode(self, z_selected: torch.Tensor, *, add_bias: bool = True) -> torch.Tensor:
+        """z_selected: [B, G, b] -> xhat: [B, S, d]. AuxK residual
+        reconstruction decodes without the bias (add_bias=False)."""
         cfg = self.cfg
         Wd = self.D.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)  # view
         flat = z_selected.reshape(-1, cfg.n_latents)
         # [B, G*b] @ [S, G*b, d] broadcasts to [S, B, d].
-        xhat = torch.matmul(flat, Wd) + self.c.unsqueeze(1)
+        xhat = torch.matmul(flat, Wd)
+        if add_bias:
+            xhat = xhat + self.c.unsqueeze(1)
         return xhat.transpose(0, 1)
 
     def forward(self, x: torch.Tensor, *, mode: str = "topk") -> BSCOutput:
@@ -162,6 +164,25 @@ class BlockCrosscoder(nn.Module):
         else:
             self.E.mul_(mean_p.median() / mean_p.mean())
 
+    @torch.no_grad()
+    def fit_threshold_(self, batches, target_avg_blocks: float) -> float:
+        """Fit the frozen inference threshold theta on the calibration
+        split so the average active-block count hits the preregistered
+        target (D10): mean count = G * P(p > theta), so theta is the
+        (1 - target/G) quantile of the pooled score distribution.
+        Uses kthvalue, not torch.quantile (which caps at ~16M elements).
+        """
+        scores = torch.cat(
+            [self.scores(self.encode(x.to(self.E.device, self.E.dtype))).flatten().float()
+             for x in batches]
+        )
+        n = scores.numel()
+        q = 1.0 - target_avg_blocks / self.cfg.n_blocks
+        idx = min(max(int(round(q * n)), 1), n)
+        theta = scores.kthvalue(idx).values
+        self.theta.fill_(theta)
+        return float(theta)
+
 
 def bsc_loss(
     out: BSCOutput, x: torch.Tensor, model: BlockCrosscoder
@@ -170,10 +191,13 @@ def bsc_loss(
 
     L_rec  = mean over tokens, sites, dims of the squared whitened residual.
     R_rank = mean over blocks of (sum_s ||D_g^s||_* - b)/b.
-    L_aux  lands with the trainer (AuxK needs cross-step frequency state).
+    L_aux  lives in the trainer (AuxK needs cross-step frequency state).
+
+    Reductions run in fp32 regardless of forward dtype — a bf16 mean over
+    millions of elements loses the precision the comparisons need.
     """
     cfg = model.cfg
-    l_rec = (out.xhat - x).pow(2).mean()
+    l_rec = (out.xhat.float() - x.float()).pow(2).mean()
     total = l_rec
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
     if cfg.lambda_rank > 0:
