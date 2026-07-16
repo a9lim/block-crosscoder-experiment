@@ -12,7 +12,7 @@ optimizer-step -> retract -> recast ordering are the trainer's job.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
@@ -86,7 +86,9 @@ class BlockCrosscoder(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        self.cfg = cfg
+        # Own copy: k is mutated in place by budget annealing, and an
+        # aliased caller config would leak that mutation.
+        self.cfg = replace(cfg)
         gen = torch.Generator(device="cpu").manual_seed(cfg.seed)
         D = init_decoder_stack(
             cfg.n_sites, cfg.n_blocks, cfg.block_dim, cfg.d_model, generator=gen

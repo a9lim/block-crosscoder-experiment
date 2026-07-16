@@ -85,6 +85,9 @@ def test_k_anneal_schedule(device):
     trainer.fit(batches[10:])
     assert model.cfg.k == 3.0  # held at target after the anneal span
     assert trainer._k_final == 3.0
+    # The model owns a config copy: annealing must not leak into the
+    # caller's (here module-shared) BSCConfig.
+    assert CFG.k == 3
 
 
 def test_k_anneal_checkpoint_restores_target(device, tmp_path):
