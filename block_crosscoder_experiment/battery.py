@@ -52,7 +52,7 @@ class BatteryConfig:
     """Predeclared thresholds and scales — recorded verbatim in the output,
     per the spec's 'set when the harness lands; recorded in its config'."""
 
-    steps: int = 3000
+    steps: int = 10000
     batch_size: int = 1024
     n_eval: int = 32768
     seeds: tuple[int, ...] = (0, 1)
@@ -61,6 +61,11 @@ class BatteryConfig:
     block_dim: int = 4
     lr: float = 3e-3
     lambda_grid: tuple[float, ...] = (0.0, 3e-4, 1e-3, 3e-3)
+    # Selection budget as a fraction of E[active blocks/token]. Calibrated by
+    # the capture sweep (2026-07-16): at ratio 1.0 shells tile into arcs and
+    # spare capacity splits ranks; at 0.8 with 10k steps capture is the
+    # dominant basin (zero tiling). k for every scenario is derived from this.
+    budget_ratio: float = 0.8
     # Gates
     overlap_pass: float = 0.9
     code_r2_pass: float = 0.8
@@ -93,6 +98,11 @@ def rotate_blocks_(model: BlockCrosscoder, seed: int) -> None:
             R = (q * torch.sign(torch.diagonal(r))).to(model.D.device)
             model.D[:, g] = torch.einsum("bc,scd->sbd", R, model.D[:, g])
             model.E[:, g] = torch.einsum("bc,scd->sbd", R, model.E[:, g])
+
+
+def budget_k(specs, bc: "BatteryConfig") -> float:
+    """Scenario selection budget: budget_ratio x E[active blocks/token]."""
+    return bc.budget_ratio * sum(s.frequency for s in specs)
 
 
 def run_one_full(
@@ -173,9 +183,9 @@ def run_one(specs: list[BlockSpec], bc: BatteryConfig, **kwargs) -> RecoveryRepo
 # -- scenario zoos ------------------------------------------------------------
 
 
-def core_zoo() -> tuple[list[BlockSpec], int, int]:
+def core_zoo() -> tuple[list[BlockSpec], int]:
     """Six shared flat-profile blocks, ranks 1..4, hollow + thickened
-    shells, energy-balanced (E||z||^2 = 4), E[active] = 1.0 -> k=1."""
+    shells, energy-balanced (E||z||^2 = 4), E[active] = 1.0."""
     f = 1.0 / 6.0
     specs = [
         BlockSpec(rank=1, frequency=f, scale=2.0),
@@ -185,10 +195,10 @@ def core_zoo() -> tuple[list[BlockSpec], int, int]:
         BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8)),
         BlockSpec(rank=4, frequency=f, spectrum=(1.6, 1.2, 0.8, 0.6)),
     ]
-    return specs, 10, 1  # specs, G_learner, k
+    return specs, 10  # specs, G_learner
 
 
-def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int, int]:
+def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
     f = 1.0 / 6.0
     one_hot = lambda s: tuple(1.0 if i == s else 0.0 for i in range(n_sites))
     specs = [
@@ -199,10 +209,10 @@ def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int, int]:
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(1)),
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(3)),
     ]
-    return specs, 10, 1
+    return specs, 10
 
 
-def bundle_zoo() -> tuple[list[BlockSpec], int, int]:
+def bundle_zoo() -> tuple[list[BlockSpec], int]:
     f = 0.25
     specs = [
         # The weakened null: four perfectly co-active rank-1 scalars.
@@ -214,10 +224,10 @@ def bundle_zoo() -> tuple[list[BlockSpec], int, int]:
         BlockSpec(rank=2, frequency=f, geometry="shell", scale=2.0),
         BlockSpec(rank=1, frequency=f, scale=2.0),
     ]
-    return specs, 8, 1
+    return specs, 8
 
 
-def frequency_zoo() -> tuple[list[BlockSpec], int, int]:
+def frequency_zoo() -> tuple[list[BlockSpec], int]:
     ladder = (0.1, 0.03, 0.01, 0.003, 0.001)
     specs = [
         BlockSpec(rank=2, frequency=fr, spectrum=(2.4, 1.6)) for fr in ladder
@@ -225,10 +235,10 @@ def frequency_zoo() -> tuple[list[BlockSpec], int, int]:
         BlockSpec(rank=1, frequency=0.3, scale=2.0),
         BlockSpec(rank=1, frequency=0.3, scale=2.0),
     ]
-    return specs, 10, 1
+    return specs, 10
 
 
-def auxk_zoo() -> tuple[list[BlockSpec], int, int]:
+def auxk_zoo() -> tuple[list[BlockSpec], int]:
     specs = [
         BlockSpec(rank=2, frequency=0.2, spectrum=(2.4, 1.6)),
         BlockSpec(rank=1, frequency=0.2, scale=2.0),
@@ -237,14 +247,15 @@ def auxk_zoo() -> tuple[list[BlockSpec], int, int]:
         BlockSpec(rank=1, frequency=0.005, scale=2.0),
         BlockSpec(rank=2, frequency=0.005, geometry="shell", scale=2.0),
     ]
-    return specs, 16, 1  # oversized learner: dead-prone by design
+    return specs, 16  # oversized learner: dead-prone by design
 
 
 # -- scenarios ----------------------------------------------------------------
 
 
 def scenario_core(bc: BatteryConfig, device) -> dict:
-    specs, G, k = core_zoo()
+    specs, G = core_zoo()
+    k = budget_k(specs, bc)
     runs = []
     for seed in bc.seeds:
         rep = run_one(
@@ -267,7 +278,8 @@ def scenario_core(bc: BatteryConfig, device) -> dict:
 
 
 def scenario_lambda_veto(bc: BatteryConfig, device) -> dict:
-    specs, G, k = core_zoo()  # all flat-profile by construction
+    specs, G = core_zoo()  # all flat-profile by construction
+    k = budget_k(specs, bc)
     grid: dict[float, list[RecoveryReport]] = {}
     for lam in bc.lambda_grid:
         grid[lam] = [
@@ -313,7 +325,8 @@ def scenario_lambda_veto(bc: BatteryConfig, device) -> dict:
 
 
 def scenario_decoys(bc: BatteryConfig, device) -> dict:
-    specs, G, k = decoy_zoo(bc.n_sites)
+    specs, G = decoy_zoo(bc.n_sites)
+    k = budget_k(specs, bc)
     runs, gates = [], []
     for seed in bc.seeds:
         rep = run_one(
@@ -369,7 +382,8 @@ def _gate_associated_cv(
 
 
 def scenario_bundle_null(bc: BatteryConfig, device) -> dict:
-    specs, G, k = bundle_zoo()
+    specs, G = bundle_zoo()
+    k = budget_k(specs, bc)
     runs, gates = [], []
     for seed in bc.seeds:
         rep, trainer, truth = run_one_full(
@@ -403,7 +417,8 @@ def scenario_bundle_null(bc: BatteryConfig, device) -> dict:
 
 
 def scenario_frequency_ladder(bc: BatteryConfig, device) -> dict:
-    specs, G, k = frequency_zoo()
+    specs, G = frequency_zoo()
+    k = budget_k(specs, bc)
     runs = []
     for seed in bc.seeds:
         rep = run_one(
@@ -476,7 +491,8 @@ def scenario_rotation_equivariance(bc: BatteryConfig, device) -> dict:
     diverges MORE than ordinary seed-to-seed basin variance — raw
     divergence confounds Adam non-equivariance with basin luck (run 1
     failed on exactly that confound)."""
-    specs, G, k = core_zoo()
+    specs, G = core_zoo()
+    k = budget_k(specs, bc)
     runs, gates = [], []
     for seed in bc.seeds:
         base = run_one_full(
@@ -516,7 +532,8 @@ def scenario_rotation_equivariance(bc: BatteryConfig, device) -> dict:
 
 
 def scenario_auxk_comparison(bc: BatteryConfig, device) -> dict:
-    specs, G, k = auxk_zoo()
+    specs, G = auxk_zoo()
+    k = budget_k(specs, bc)
     out = {}
     for variant in ("sasa", "long_horizon", "fel"):
         rows = []
