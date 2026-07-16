@@ -110,6 +110,15 @@ def cell_grid() -> dict[str, dict]:
         "E_dec_G10_b10": {**A, "zoo": "decoy6", "k": 1.0, "steps": 10000},
         "E_dec_G16_b10": {**A, "zoo": "decoy6", "G": 16, "k": 1.0, "steps": 10000},
         "E_core_G16_b10": {**A, "G": 16, "k": 1.0, "steps": 10000},
+        # Round 5: matched budget refuted (round 4: b1.0 tiles the decoy
+        # zoo's gaussians AND still merges the twins; 0.8 is monotonically
+        # best for both zoos). The remaining decoy failure is a per-seed
+        # merge lottery between the identical one-hot twins. Probe: is the
+        # merge a stable attractor, or does AuxK escape it with time (a
+        # dead block learns the missing twin's residual, then outcompetes
+        # the union block — needs spare blocks + steps)?
+        "F_dec_G10_b08_30k": {**A, "zoo": "decoy6", "k": 0.8, "steps": 30000},
+        "F_dec_G16_b08_30k": {**A, "zoo": "decoy6", "G": 16, "k": 0.8, "steps": 30000},
     }
 
 
