@@ -16,6 +16,7 @@ from .gram import (
     site_singular_values,
 )
 from .model import BlockCrosscoder, BSCConfig, BSCOutput, batch_topk_mask, bsc_loss
+from .synthetic import BlockSpec, PlantedModel, SyntheticBatch
 from .trainer import DeadTracker, TrainConfig, Trainer, aux_loss, tensor_batches
 
 __version__ = "0.1.0"
@@ -24,7 +25,10 @@ __all__ = [
     "BSCConfig",
     "BSCOutput",
     "BlockCrosscoder",
+    "BlockSpec",
     "DeadTracker",
+    "PlantedModel",
+    "SyntheticBatch",
     "TrainConfig",
     "Trainer",
     "aux_loss",
