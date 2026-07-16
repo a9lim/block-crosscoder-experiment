@@ -772,3 +772,17 @@ public (P23, round-3 novelty verdict).
   bracket smaller λ (3e-5, 1e-4) before ruling out a benign window at
   production scale. Executes the spec'd protocol — no frozen-surface
   change.
+- **2026-07-16 (λ-veto outcome, superseding amendment)** — the
+  preceding entry's measurement was made at 3k steps (a CLI default
+  silently shadowed the 10k operating point; battery runs 3–4 were
+  also affected — see findings §5.3). Battery run 5, the first honest
+  operating-point run (10k × batch 1024 ≈ 10M tokens, G16, 4 seeds),
+  re-ran the veto: the overlap collapse does not occur at this scale
+  (overlap ≥0.95 through λ=1e-3) and the admissible set is
+  **{3e-4, 1e-3}** — the "benign window opening with more data"
+  anticipated above, at values already in the grid. Per the frozen
+  protocol (largest admissible λ = primary): **Phase-1 primary is
+  λ=1e-3**; λ=0 and 3e-4 remain in the sweep as the lower arm; at
+  λ=3e-3 the binding violation is genuine share concentration (0.046
+  > 0.02 tolerance), not overlap. Numbers: findings §6.1. Executes
+  the spec'd protocol — no frozen-surface change.

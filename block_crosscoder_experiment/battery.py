@@ -404,7 +404,20 @@ def _gate_associated_cv(
 
 def scenario_bundle_null(bc: BatteryConfig, device) -> dict:
     specs, G = bundle_zoo()
-    k = budget_k(specs, bc)
+    # Budget pinned in *block-event* demand, not per-feature sum of
+    # frequencies (capture-campaign rounds 7-8, 2026-07-16). The four
+    # gate-grouped bundle scalars pack into one width-4 block whenever the
+    # budget prices out the unpacked format (the packing economics of
+    # findings 5.2), so their selection demand is one slot, not four:
+    # E[blocks/token] = 0.25 bundle + 0.25 ring + 0.25 scalar = 0.75.
+    # Any slack above that junk-fills through the ring block with
+    # trace-magnitude firings and inflates its all-firings norm-CV past
+    # the detector threshold (CV ~ 0.97*sqrt(junk fraction); k=0.8 gives
+    # CV 0.17-0.20 with the ring *captured perfectly*, k=1.2 - the naive
+    # ratio-0.8 budget - loses capture itself to phase-splits and misses).
+    # Matched block-event demand passes 4/4 seeds with ring CV <= 0.06
+    # (k=0.70 also 4/4 at CV 0.01; the window is real but narrow above).
+    k = 0.75
     runs, gates = [], []
     for seed in bc.seeds:
         rep, trainer, truth = run_one_full(
@@ -419,9 +432,16 @@ def scenario_bundle_null(bc: BatteryConfig, device) -> dict:
         )
         # Bundling is legitimate (D11); the failure would be a hollow-shell
         # signature on the blocks that fire for the bundle. The ring is the
-        # positive contrast — hollow must be detectable when real (arcs of
-        # a hollow shell are still norm-concentrated, so this is robust to
-        # tiling).
+        # positive contrast — hollow must be detectable when real. NB the
+        # original robustness argument here ("arcs of a hollow shell are
+        # still norm-concentrated") is empirically refuted (run 5): ring
+        # splits are *soft* — two blocks co-firing with phase-dependent
+        # amplitude, norm-CV ~0.22 each — and even a perfectly captured
+        # single-block ring fails all-firings CV once budget slack
+        # junk-fills through it (findings 6.2-6.3). Detection as written
+        # works only in the zero-slack budget regime pinned above; the
+        # Phase-0 ring hunt must use span-level + gate-conditional
+        # evidence, never bare norm-CV.
         no_hallucination = all(
             r["norm_cv"] >= bc.norm_cv_shell_max for r in bundle_assoc
         )
