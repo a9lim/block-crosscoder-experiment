@@ -8,6 +8,7 @@ import torch
 
 from block_crosscoder_experiment.metrics import (
     block_site_spans,
+    contribution_shares,
     energy_rank,
     evaluate_recovery,
     norm_cv,
@@ -75,6 +76,20 @@ def test_rank_estimators():
     assert energy_rank(spread) == 4
     assert 2.0 < participation_ratio(spread) < 3.0
     assert energy_rank(torch.tensor([1.0, 1e-8, 1e-8, 1e-8])) == 1
+
+
+def test_contribution_shares_ignore_parked_capacity():
+    """The parked-capacity confound (battery run 1): a block whose USED
+    direction lives at site 0 but whose parked frame direction sits at
+    site 1 satisfies the constraint with Frobenius shares (0.5, 0.5) —
+    the contribution shares are the honest one-hot depth profile."""
+    D = torch.zeros(2, 2, 8)  # [S, b, d]
+    D[0, 0, 0] = 1.0  # used direction, site 0
+    D[1, 1, 1] = 1.0  # parked direction, site 1
+    z = torch.zeros(1000, 2)
+    z[:, 0] = torch.randn(1000)  # code mass only on the used dim
+    shares = contribution_shares(D, z)
+    assert torch.allclose(shares, torch.tensor([1.0, 0.0]), atol=1e-6)
 
 
 def test_norm_cv_separates_geometries():

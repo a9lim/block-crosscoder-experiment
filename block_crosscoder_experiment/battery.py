@@ -245,7 +245,17 @@ def scenario_core(bc: BatteryConfig, device) -> dict:
             specs, bc, n_blocks=G, k=k, learner_seed=seed, data_seed=seed, device=device
         )
         frac = sum(_recovered(r, bc) for r in rep.blocks) / len(rep.blocks)
-        runs.append({"seed": seed, "recovered_fraction": frac, "report": rep.to_dict()})
+        # Span-found is the weaker criterion: the subspace was located even
+        # if the block was tiled (overlap high, code_r2 low). Both are
+        # reported; which one the Phase -1 gate should demand is an open
+        # judgment call (run 1 showed rings tile at harness scale).
+        span_frac = sum(
+            r.matched is not None and r.overlap > bc.overlap_pass for r in rep.blocks
+        ) / len(rep.blocks)
+        runs.append(
+            {"seed": seed, "recovered_fraction": frac,
+             "span_found_fraction": span_frac, "report": rep.to_dict()}
+        )
     gate = all(r["recovered_fraction"] >= bc.recovered_fraction_pass for r in runs)
     return {"runs": runs, "gate_pass": gate}
 
@@ -324,31 +334,64 @@ def scenario_decoys(bc: BatteryConfig, device) -> dict:
     return {"runs": runs, "gate_pass": all(gates)}
 
 
+def _gate_associated_cv(
+    learner, truth, gate: torch.Tensor, device, n_eval: int, seed: int
+) -> list[dict]:
+    """Learned blocks associated with an activation *gate* (conditional-rate
+    lift over off-gate rate), with their norm concentration. Association is
+    gate-level because per-member Hungarian matching is meaningless for a
+    perfectly co-active bundle — the learner may legitimately fuse it."""
+    from .metrics import norm_cv
+
+    batch = truth.sample(n_eval, seed=seed)
+    with torch.no_grad():
+        out = learner(batch.x.to(device, learner.E.dtype))
+    mask = out.mask.cpu()
+    z = out.z_selected.float().cpu()
+    counts = mask.sum(dim=0)
+    cond = mask[gate].float().mean(dim=0)
+    off = mask[~gate].float().mean(dim=0)
+    rows = []
+    for j in range(mask.shape[1]):
+        if counts[j] < 50 or cond[j] < 0.05 or cond[j] < 3.0 * float(off[j]):
+            continue
+        rows.append(
+            {"learned": j, "cond_rate": float(cond[j]),
+             "norm_cv": norm_cv(z[mask[:, j], j])}
+        )
+    return rows
+
+
 def scenario_bundle_null(bc: BatteryConfig, device) -> dict:
     specs, G, k = bundle_zoo()
     runs, gates = [], []
     for seed in bc.seeds:
-        rep = run_one(
+        rep, trainer, truth = run_one_full(
             specs, bc, n_blocks=G, k=k, learner_seed=seed, data_seed=seed, device=device
         )
-        bundle = [r for r, s in zip(rep.blocks, specs) if s.gate_group == 0]
-        ring = rep.blocks[4]
-        # Bundling is legitimate (D11); the failure would be a hollow-shell
-        # signature on bundle-matched blocks. NaN cv (nothing matched) is
-        # not a hallucination.
-        no_hallucination = all(
-            not (r.norm_cv_learned == r.norm_cv_learned  # not NaN
-                 and r.norm_cv_learned < bc.norm_cv_shell_max)
-            for r in bundle
+        batch_gates = truth.sample(bc.n_eval, seed=98).active
+        bundle_assoc = _gate_associated_cv(
+            trainer.master, truth, batch_gates[:, 0], device, bc.n_eval, 98
         )
-        ring_detected = (
-            ring.matched is not None
-            and ring.norm_cv_learned < bc.norm_cv_shell_max
+        ring_assoc = _gate_associated_cv(
+            trainer.master, truth, batch_gates[:, 4], device, bc.n_eval, 98
+        )
+        # Bundling is legitimate (D11); the failure would be a hollow-shell
+        # signature on the blocks that fire for the bundle. The ring is the
+        # positive contrast — hollow must be detectable when real (arcs of
+        # a hollow shell are still norm-concentrated, so this is robust to
+        # tiling).
+        no_hallucination = all(
+            r["norm_cv"] >= bc.norm_cv_shell_max for r in bundle_assoc
+        )
+        ring_detected = any(
+            r["norm_cv"] < bc.norm_cv_shell_max for r in ring_assoc
         )
         gates.append(no_hallucination and ring_detected)
         runs.append(
             {"seed": seed, "no_hallucination": no_hallucination,
-             "ring_detected": ring_detected, "report": rep.to_dict()}
+             "ring_detected": ring_detected, "bundle_associated": bundle_assoc,
+             "ring_associated": ring_assoc, "report": rep.to_dict()}
         )
     return {"runs": runs, "gate_pass": all(gates)}
 
@@ -376,59 +419,93 @@ def scenario_frequency_ladder(bc: BatteryConfig, device) -> dict:
     return {"runs": runs, "gate_pass": None}  # report-only: the R24 calibration
 
 
-def scenario_rotation_equivariance(bc: BatteryConfig, device) -> dict:
+def _pair_divergence(rep_x, tr_x, rep_y, tr_y, truth, bc, device) -> list[dict]:
+    """Per-planted-block divergence between two trained learners: span
+    agreement and relative spectrum difference of the matched blocks."""
     from .metrics import block_site_spans, subspace_overlap
 
+    batch = truth.sample(bc.n_eval, seed=99)
+    xa = batch.x.to(device)
+    with torch.no_grad():
+        out_x = tr_x.master(xa)
+        out_y = tr_y.master(xa)
+    pairs = []
+    for rx, ry in zip(rep_x.blocks, rep_y.blocks):
+        if rx.matched is None or ry.matched is None:
+            continue
+        zx = out_x.z_selected[out_x.mask[:, rx.matched], rx.matched].float().cpu()
+        zy = out_y.z_selected[out_y.mask[:, ry.matched], ry.matched].float().cpu()
+        if zx.shape[0] < 50 or zy.shape[0] < 50:
+            continue
+        spans_x, spec_x = block_site_spans(
+            tr_x.master.D.detach().float().cpu()[:, rx.matched], zx
+        )
+        spans_y, spec_y = block_site_spans(
+            tr_y.master.D.detach().float().cpu()[:, ry.matched], zy
+        )
+        r = rx.rank
+        span_agree = sum(
+            subspace_overlap(spans_x[s, :, :r], spans_y[s, :, :r])[0]
+            for s in range(bc.n_sites)
+        ) / bc.n_sites
+        sx = spec_x.sort(descending=True).values
+        sy = spec_y.sort(descending=True).values
+        rel = float((sx - sy).norm() / sx.norm().clamp_min(1e-12))
+        pairs.append(
+            {"planted": rx.planted, "span_agreement": span_agree,
+             "spectrum_rel_diff": rel}
+        )
+    return pairs
+
+
+def _median(vals: list[float]) -> float:
+    if not vals:
+        return float("nan")
+    s = sorted(vals)
+    return s[len(s) // 2]
+
+
+def scenario_rotation_equivariance(bc: BatteryConfig, device) -> dict:
+    """R8, with a control arm: the question is whether an O(b)-rotated init
+    diverges MORE than ordinary seed-to-seed basin variance — raw
+    divergence confounds Adam non-equivariance with basin luck (run 1
+    failed on exactly that confound)."""
     specs, G, k = core_zoo()
     runs, gates = [], []
     for seed in bc.seeds:
-        rep_a, tr_a, truth = run_one_full(
+        base = run_one_full(
             specs, bc, n_blocks=G, k=k, learner_seed=seed, data_seed=seed,
             device=device,
         )
-        rep_b, tr_b, _ = run_one_full(
+        rotated = run_one_full(
             specs, bc, n_blocks=G, k=k, learner_seed=seed, data_seed=seed,
             device=device, rotate_init_seed=500 + seed,
         )
-        batch = truth.sample(bc.n_eval, seed=99)
-        xa = batch.x.to(device)
-        with torch.no_grad():
-            out_a = tr_a.master(xa)
-            out_b = tr_b.master(xa)
-        pairs = []
-        for ra, rb in zip(rep_a.blocks, rep_b.blocks):
-            if ra.matched is None or rb.matched is None:
-                continue
-            za = out_a.z_selected[out_a.mask[:, ra.matched], ra.matched].cpu()
-            zb = out_b.z_selected[out_b.mask[:, rb.matched], rb.matched].cpu()
-            if za.shape[0] < 50 or zb.shape[0] < 50:
-                continue
-            spans_a, spec_a = block_site_spans(
-                tr_a.master.D.detach().float().cpu()[:, ra.matched], za
-            )
-            spans_b, spec_b = block_site_spans(
-                tr_b.master.D.detach().float().cpu()[:, rb.matched], zb
-            )
-            r = ra.rank
-            span_agree = sum(
-                subspace_overlap(spans_a[s, :, :r], spans_b[s, :, :r])[0]
-                for s in range(bc.n_sites)
-            ) / bc.n_sites
-            sa, sb = spec_a.sort(descending=True).values, spec_b.sort(descending=True).values
-            rel = float((sa - sb).norm() / sa.norm().clamp_min(1e-12))
-            pairs.append(
-                {"planted": ra.planted, "span_agreement": span_agree,
-                 "spectrum_rel_diff": rel}
-            )
-        ok = bool(pairs) and all(
-            p["span_agreement"] > bc.rotation_span_pass
-            and p["spectrum_rel_diff"] < bc.rotation_spectrum_tol
-            for p in pairs
+        control = run_one_full(
+            specs, bc, n_blocks=G, k=k, learner_seed=seed + 1000, data_seed=seed,
+            device=device,
+        )
+        truth = base[2]
+        rot_pairs = _pair_divergence(base[0], base[1], rotated[0], rotated[1], truth, bc, device)
+        ctl_pairs = _pair_divergence(base[0], base[1], control[0], control[1], truth, bc, device)
+        rot_spec = _median([p["spectrum_rel_diff"] for p in rot_pairs])
+        ctl_spec = _median([p["spectrum_rel_diff"] for p in ctl_pairs])
+        rot_span = _median([p["span_agreement"] for p in rot_pairs])
+        ctl_span = _median([p["span_agreement"] for p in ctl_pairs])
+        ok = (
+            bool(rot_pairs)
+            and rot_spec <= max(bc.rotation_spectrum_tol, 1.5 * ctl_spec)
+            and rot_span >= min(bc.rotation_span_pass, ctl_span - 0.05)
         )
         gates.append(ok)
-        runs.append({"seed": seed, "pairs": pairs, "gate": ok})
-    # Material divergence => move decoders off coordinatewise Adam (R8);
-    # the battery flags it rather than silently passing.
+        runs.append(
+            {"seed": seed, "gate": ok,
+             "rotated_median": {"spectrum_rel_diff": rot_spec, "span_agreement": rot_span},
+             "control_median": {"spectrum_rel_diff": ctl_spec, "span_agreement": ctl_span},
+             "rotated_pairs": rot_pairs, "control_pairs": ctl_pairs}
+        )
+    # Rotated divergence materially above the seed-variance baseline =>
+    # move decoders off coordinatewise Adam (R8).
     return {"runs": runs, "gate_pass": all(gates)}
 
 

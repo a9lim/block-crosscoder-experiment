@@ -39,6 +39,7 @@ __all__ = [
     "participation_ratio",
     "energy_rank",
     "block_site_spans",
+    "contribution_shares",
     "evaluate_recovery",
 ]
 
@@ -114,6 +115,15 @@ def norm_cv(z_active: torch.Tensor) -> float:
     return float(n.std() / n.mean().clamp_min(1e-12))
 
 
+def contribution_shares(D_block: torch.Tensor, z_active: torch.Tensor) -> torch.Tensor:
+    """Code-anchored depth profile: per-site fraction of the block's
+    contribution energy, E||D^sT z||^2 = tr(D^s D^sT K). [S]"""
+    K = z_active.float().mT @ z_active.float() / max(1, z_active.shape[0])
+    D = D_block.float()
+    energy = torch.einsum("sbd,scd,bc->s", D, D, K)
+    return energy / energy.sum().clamp_min(1e-12)
+
+
 # -- report structures --------------------------------------------------------
 
 
@@ -127,7 +137,13 @@ class BlockRecovery:
     mean_angle_deg: float = math.nan
     code_r2: float = math.nan  # after the single global Procrustes
     scale_ratio: float = math.nan
-    share_error: float = math.nan  # max_s |share diff| — the lambda-veto metric
+    # Depth-profile error, max_s |share diff| — the lambda-veto metric.
+    # PRIMARY is contribution-energy share (code-anchored): Frobenius
+    # shares count parked frame capacity, which nothing pins at lambda=0
+    # (battery run 1, 2026-07-16: perfect decoy recoveries showed
+    # Frobenius share error ~0.4 from parked directions alone).
+    share_error: float = math.nan  # contribution-energy shares
+    share_error_frobenius: float = math.nan  # what saklas would bake; secondary
     rank_pr: float = math.nan  # participation ratio, mean over carrying sites
     rank_95: float = math.nan  # 95%-energy rank, mean over carrying sites
     detection_iou: float = math.nan
@@ -257,9 +273,13 @@ def evaluate_recovery(
             _, rec.code_r2, rec.scale_ratio = procrustes(
                 z_l[joint, j], batch.z[joint, g]
             )
+        profile = torch.tensor(profiles[g])
         rec.share_error = float(
-            (shares_l[:, j] - torch.tensor(profiles[g])).abs().max()
+            (contribution_shares(learner_D[:, j], z_l[mask_l[:, j], j]) - profile)
+            .abs()
+            .max()
         )
+        rec.share_error_frobenius = float((shares_l[:, j] - profile).abs().max())
         rec.rank_pr = sum(participation_ratio(spectra_l[j][s]) for s in carrying) / len(carrying)
         rec.rank_95 = sum(energy_rank(spectra_l[j][s]) for s in carrying) / len(carrying)
         union = active_p[g] | mask_l[:, j]
