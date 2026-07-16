@@ -117,7 +117,7 @@ def test_auxk_revives_dead_encoders(device):
             ),
         )
         trainer.fit(planted_batches(device))
-        revived_norms[variant] = float(model.E[:, :4].float().norm())
+        revived_norms[variant] = float(model.E.detach()[:, :4].float().norm())
     # Without aux there is no gradient path to a zeroed encoder.
     assert revived_norms["none"] == 0.0
     assert revived_norms["sasa"] > 1e-2

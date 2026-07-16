@@ -373,6 +373,7 @@ class Trainer:
         self.step_idx += 1
         return record
 
+    @torch.no_grad()
     def _diagnostics(self) -> dict:
         d = {
             "gram_residual_master": float(gram_residual(self.master.D).max()),
