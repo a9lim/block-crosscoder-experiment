@@ -209,14 +209,19 @@ def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
         BlockSpec(rank=1, frequency=f, scale=2.0),
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6)),
         BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8)),
-        BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(0)),
-        BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(1)),
-        BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(3)),
+        BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8), depth_profile=one_hot(0)),
+        BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8), depth_profile=one_hot(1)),
+        BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8), depth_profile=one_hot(3)),
     ]
-    # G stays 10: the campaign's open decoy question is the twin-packing
-    # merge (two rank-2 one-hots pack losslessly into one width-4 block;
-    # loss-optimal, so MORE capacity/steps converge to it MORE reliably —
-    # G16/30k merged 4/4). Kept as-is pending the fixture ruling.
+    # Fixture ruling (a9, 2026-07-16): rank-3 decoys. The original rank-2
+    # twins pack losslessly in pairs into one width-4 block (campaign
+    # rounds 3-5: packing is loss- and budget-optimal, so more capacity or
+    # steps converge to the merge MORE reliably — G16/30k merged 4/4).
+    # Pairwise rank 6 > b=4 makes packing lossy, so separation is
+    # objective-aligned and the scenario tests what the design spec'd:
+    # site-exclusive recovery. Residual caveat: one rank-3 decoy + the
+    # shared rank-1 sum to exactly b=4 — if that pack appears it is a
+    # finding, not a fixture bug.
     return specs, 10
 
 
