@@ -352,16 +352,16 @@ class Trainer:
 
         record = {
             "step": self.step_idx,
-            "rec": float(parts["rec"]),
-            "total": float(parts["total"]),
+            "rec": float(parts["rec"].detach()),
+            "total": float(parts["total"].detach()),
             "lr": self.sched.get_last_lr()[0],
             "grad_norm": grad_norm,
             "floor_hits": floor_hits,
         }
         if "rank" in parts:
-            record["rank"] = float(parts["rank"])
+            record["rank"] = float(parts["rank"].detach())
         if l_aux is not None:
-            record["aux"] = float(l_aux)
+            record["aux"] = float(l_aux.detach())
         if grad_norm_aux is not None:
             record["grad_norm_aux"] = grad_norm_aux
         if log_step:
