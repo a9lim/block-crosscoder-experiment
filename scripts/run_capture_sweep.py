@@ -100,6 +100,16 @@ def cell_grid() -> dict[str, dict]:
         "D_dec_G16_b08": {**A, "zoo": "decoy6", "G": 16, "k": 0.8, "steps": 10000},
         "D_dec_G10_b09": {**A, "zoo": "decoy6", "k": 0.9, "steps": 10000},
         "D_dec_G16_b09": {**A, "zoo": "decoy6", "G": 16, "k": 0.9, "steps": 10000},
+        # Round 4: matched budget for the decoy zoo. Round 3 found G16/b08
+        # perfects core but ANY budget shortfall merges the identical one-hot
+        # decoys (merging halves the loss vs dropping under shortfall), while
+        # round 1 showed loose-budget tiling is shell-specific — and the
+        # decoy zoo has no shells. Hypothesis: decoys pass at ratio 1.0;
+        # E_core_G16_b10 completes the map (expect shells to tile: spare
+        # capacity + matched budget re-admits arcs even at G16).
+        "E_dec_G10_b10": {**A, "zoo": "decoy6", "k": 1.0, "steps": 10000},
+        "E_dec_G16_b10": {**A, "zoo": "decoy6", "G": 16, "k": 1.0, "steps": 10000},
+        "E_core_G16_b10": {**A, "G": 16, "k": 1.0, "steps": 10000},
     }
 
 
