@@ -23,7 +23,12 @@ import time
 
 import torch
 
-from block_crosscoder_experiment.battery import BatteryConfig, core_zoo, run_one_full
+from block_crosscoder_experiment.battery import (
+    BatteryConfig,
+    core_zoo,
+    decoy_zoo,
+    run_one_full,
+)
 from block_crosscoder_experiment.synthetic import BlockSpec
 
 OVERLAP_PASS = 0.9
@@ -47,6 +52,7 @@ ZOOS = {
     "core6": core6_specs,  # E[active] = 1.0
     "core5_f20": lambda: core5_specs(0.2),  # E[active] = 1.0
     "core5_f25": lambda: core5_specs(0.25),  # E[active] = 1.25 (pinned zoo)
+    "decoy6": lambda: decoy_zoo(4)[0],  # 3 shared + 3 one-hot, E[active] = 1.0
 }
 
 
@@ -81,6 +87,19 @@ def cell_grid() -> dict[str, dict]:
         "C_anneal_dn": {**A, "k": 0.8, "k_anneal_from": 1.0},
         "C_anneal_up": {**A, "k": 1.0, "k_anneal_from": 0.8},
         "C_anneal_up_10k": {**A, "k": 1.0, "k_anneal_from": 0.8, "steps": 10000},
+        # Round 3: G x budget at the 10k operating point. Battery run 3 left
+        # init-lottery deaths (core) and one-hot decoy merging (decoys);
+        # spare capacity at tight budget is the candidate fix for both, and
+        # G >> F matches production. G10/b08 cells replicate the run-3
+        # battery configs (doubling as a cross-process determinism probe).
+        "D_core_G10_b08": {**A, "k": 0.8, "steps": 10000},
+        "D_core_G16_b08": {**A, "G": 16, "k": 0.8, "steps": 10000},
+        "D_core_G24_b08": {**A, "G": 24, "k": 0.8, "steps": 10000},
+        "D_core_G16_b09": {**A, "G": 16, "k": 0.9, "steps": 10000},
+        "D_dec_G10_b08": {**A, "zoo": "decoy6", "k": 0.8, "steps": 10000},
+        "D_dec_G16_b08": {**A, "zoo": "decoy6", "G": 16, "k": 0.8, "steps": 10000},
+        "D_dec_G10_b09": {**A, "zoo": "decoy6", "k": 0.9, "steps": 10000},
+        "D_dec_G16_b09": {**A, "zoo": "decoy6", "G": 16, "k": 0.9, "steps": 10000},
     }
 
 
@@ -89,7 +108,11 @@ def classify(rec) -> str:
     if rec.matched is None or not math.isfinite(rec.overlap) or rec.overlap < SPAN_FLOOR:
         return "missing"
     if rec.overlap > OVERLAP_PASS:
-        return "captured" if rec.code_r2 > R2_PASS else "tiled"
+        if rec.code_r2 <= R2_PASS:
+            return "tiled"
+        # Merge signature (battery run 3, decoys at tight budget): span and
+        # code fine but the depth profile is split with another feature.
+        return "merged" if rec.share_error > 0.25 else "captured"
     return "partial"
 
 
@@ -117,6 +140,7 @@ def run_cell(name: str, cell: dict, seeds: list[int], bc0: BatteryConfig, device
              "label": lab,
              "overlap": None if not math.isfinite(r.overlap) else round(r.overlap, 4),
              "code_r2": None if not math.isfinite(r.code_r2) else round(r.code_r2, 4),
+             "share_error": None if not math.isfinite(r.share_error) else round(r.share_error, 4),
              "support_size": r.support_size}
             for r, lab in zip(rep.blocks, labels)
         ]
@@ -140,6 +164,7 @@ def run_cell(name: str, cell: dict, seeds: list[int], bc0: BatteryConfig, device
         "n_missing": sum(r["labels"].count("missing") for r in runs),
         "n_tiled": sum(r["labels"].count("tiled") for r in runs),
         "n_partial": sum(r["labels"].count("partial") for r in runs),
+        "n_merged": sum(r["labels"].count("merged") for r in runs),
     }
 
 
@@ -188,13 +213,13 @@ def main() -> None:
     for name, cell in cells.items():
         results[name] = run_cell(name, cell, args.seeds, bc0, device)
 
-    print(f"\n{'cell':<14} {'cap_mean':>8} {'cap_min':>8} "
-          f"{'tiled':>5} {'partial':>7} {'missing':>7}")
+    print(f"\n{'cell':<16} {'cap_mean':>8} {'cap_min':>8} "
+          f"{'tiled':>5} {'partial':>7} {'missing':>7} {'merged':>6}")
     for name, r in results.items():
         if name == "B_replica":
             continue
-        print(f"{name:<14} {r['capture_mean']:>8.2f} {r['capture_min']:>8.2f} "
-              f"{r['n_tiled']:>5} {r['n_partial']:>7} {r['n_missing']:>7}")
+        print(f"{name:<16} {r['capture_mean']:>8.2f} {r['capture_min']:>8.2f} "
+              f"{r['n_tiled']:>5} {r['n_partial']:>7} {r['n_missing']:>7} {r['n_merged']:>6}")
 
     if args.out:
         payload = {"device": str(device), "seeds": args.seeds, "results": results}
