@@ -45,9 +45,12 @@ real λ harm is overlap collapse); rank ≤3 gaussians recover exactly,
 shells tile, spare capacity splits — one capture/tiling/splitting
 lottery behind every red gate. The 8-bit-Adam retraction-ordering
 check (0.9 gate) passed early.**
-Blocking decision (a9's): Phase −1 core gate semantics — capture-only
-vs capture-where-achievable + span-recovery for shells/high-rank
-(findings §3). Then: Phase 0 (positive control first — pinned to
+Gate semantics ruled (a9, 2026-07-16): **strict capture-as-written**
+(findings §3). Next: the capture campaign — factor-isolate the passing
+pinned-test config vs the failing battery config (budget ratio,
+optimizer, zoo, G/F, steps; multi-seed), map the seed-robust capture
+region incl. production-like spare capacity, re-run the battery inside
+it. Phase −1 passes only on full capture. Then: Phase 0 (positive control first — pinned to
 Bloom's 2024 GPT-2-small layer-7 SAE, observational only — then
 `google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
 plus the activation-dependence branch, PCA within-cluster codes over a

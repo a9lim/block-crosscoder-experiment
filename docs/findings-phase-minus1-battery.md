@@ -124,6 +124,18 @@ pipeline finds what was planted and measures it honestly, which it now
 does. Not adopted unilaterally; the gate criterion is frozen design
 surface.
 
+**Ruling (a9, 2026-07-16): option 1 — strict capture-as-written.** The
+gate stands; Phase −1 does not pass on tiled or split recoveries. The
+consequence is a capture campaign (below), not gate surgery: find the
+training conditions under which capture is seed-robust, verify the
+production config sits inside that region, and re-run the battery
+there. An existence proof is already pinned in the repo: the
+`test_end_to_end_recovery` config achieves 5/5 full capture *including
+a hollow shell* — the battery core config differs from it in six
+enumerable factors (zoo composition, feature frequency, budget ratio
+0.8 vs 1.0, G 8 vs 10, AdamW vs 8-bit Adam, step count), which is a
+clean factorial to isolate.
+
 ## 4. Smaller confirmations
 
 - 8-bit-Adam × retraction ordering check (pulled forward from the 0.9
