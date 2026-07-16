@@ -10,7 +10,7 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`docs/design.md`](docs/design.md) (v2.1, post-review, frozen): hypotheses H1–H5, the
+- [`docs/design.md`](docs/design.md) (v2.2, post-round-3, frozen): hypotheses H1–H5, the
   architecture spec (Gram-constrained decoders — Σ_s D_g^s D_g^sᵀ = I_b —
   BatchTopK block selection by exact whitened contribution ‖z_g‖, per-site
   nuclear norm on a fixed spectrum budget), the phase ladder
@@ -20,6 +20,13 @@ experiments with explicit go/no-go gates.
   the adversarial review disposition (Codex sol-tier + parallel pass, 35
   findings) that produced v2 — the *why* behind every load-bearing spec
   choice. Read before re-litigating any of them.
+- [`docs/design-review-2026-07-16.md`](docs/design-review-2026-07-16.md):
+  round 3 — two fresh-context sol passes (deployment/design D1–D14 on
+  measured jobe hardware; paper-fidelity P1–P25 over all 13 reference
+  full texts) + fable parallel pass. Produced v2.2: the deployment
+  re-plan (4 TB NVMe, whitened store, calibration split), the
+  gauge-corrected Phase −1 generator, the SASA-based AuxK respec, and
+  the pinned Phase-0 positive control.
 - [`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md):
   the canonical research digest — parent papers (Fel BSF, SASA, Anthropic
   crosscoders + Minder artifacts), gap sweep, the synergy argument, full
@@ -27,11 +34,15 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: design v2.1 frozen (round-2 verified); no experiment code yet.**
+**Status: design v2.2 frozen (round-3: deployment re-plan on measured
+hardware + paper-fidelity amendments); no experiment code yet.**
 Next actions, in order: the Phase −1 synthetic ground-truth harness
-(`tests/` + `scripts/`), then Phase 0 (GPT-2 positive control first, then
-`google/gemma-scope-2-4b-pt` blockification — cluster decoder directions,
-PCA within-cluster codes over a token stream, hunt weekday/month rings).
+(`tests/` + `scripts/`; generator must follow the gauge-correct v2.2
+spec), then Phase 0 (positive control first — pinned to Bloom's 2024
+GPT-2-small layer-7 SAE, observational only — then
+`google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
+plus the activation-dependence branch, PCA within-cluster codes over a
+token stream, hunt weekday/month rings with the full Engels battery).
 
 ## The saklas seam
 
@@ -75,14 +86,20 @@ package.
   the harvest loop especially — needs periodic `torch.mps.synchronize()`
   backpressure plus output validation (zero-row guards). Never trust an
   all-zeros block on MPS; suspect the queue first.
-- **Disk-backed activation store, not streaming** (decision 2026-07-15):
-  harvest once on the 4090 (bf16, 8 sites, ~40 KB/token) into a bounded
-  ~38M-token store on its NVMe (~1.6 TB of the ~1.9 TB free), train from the
-  store with gemma out of VRAM. Interleaved streaming is the documented
-  escalation only if rare-feature starvation shows. **fp16 is banned in the
-  harvest/store path** — gemma-3 late-layer channels overflow it.
+- **Disk-backed whitened activation store, not streaming** (decision
+  2026-07-15; re-planned 2026-07-16 — jobe's stock disks are 2×1 TB and
+  could not hold the store; a dedicated **4 TB NVMe** is purchased for it):
+  harvest once on the 4090 (whitener slice first, then whitened bf16,
+  8 sites, ~40 KB/token) into a 53M-token store — 38M train + 2M eval +
+  13M calibration ≈ 2.17 TB — and train from the store with gemma out of
+  VRAM. Sequential buffered shuffling only (no token-random mmap); whitener
+  hash in every shard header. Interleaved streaming is the documented
+  escalation/fallback. **fp16 is banned in the harvest/store path** —
+  gemma-3 late-layer channels overflow it.
 - Phase-1 primary config is G=4096 × b=4 × 8 sites untied (~671M params,
   ~9 GB train VRAM with 8-bit Adam); G=8192 (~1.34B, ~11 GB) is the stretch
   config the store makes possible. The matched scalar baseline is the same
-  size — budget for both runs, 2 seeds each. A 1M-token measured pilot
-  precedes the store commit.
+  size — budget for both runs, 2 seeds each. A ≥3M-token exact-config
+  pilot (long enough to exercise AuxK, checkpoint/resume, and threshold
+  calibration — a separate mandatory gate; the 1b rehearsal cannot stand
+  in for it) precedes the store commit.

@@ -33,6 +33,20 @@ folded in — objective normalization conventions, the complete quantizer
 spec, the explicit b=1 Gram-constrained baseline, fp32-master retraction
 ordering, calibrated shared-code evals, and exact store arithmetic.
 Round-2 findings are numbered R1–R26 in the review doc.
+**v2.2, 2026-07-16 (current)**: deployment re-plan + round-3 amendments
+after two fresh-context adversarial passes (deployment/design D1–D14,
+paper-fidelity P1–P25 over all 13 reference full texts; disposition in
+[`docs/design-review-2026-07-16.md`](design-review-2026-07-16.md)). The
+v2.1 store assumed a ~1.9 TB volume that does not exist (jobe measured:
+2×1 TB); resolved by a dedicated 4 TB NVMe (a9, 2026-07-16), preserving
+8 sites / 38M tokens / G=8192. Structural changes: whitened-bf16 store
+with immutable hashed whitener; stored 13M-token calibration split;
+calibration-fit inference threshold (EMA demoted to diagnostic); AuxK
+re-specified from SASA C.1 with a variant comparison; Phase −1 generator
+gauge-corrected (bundle null weakened — perfect co-activation is
+observationally equivalent to a block under linear reconstruction); pilot
+extended to actually exercise AuxK; positive control pinned to Engels'
+actual artifact.
 
 ## Hypotheses
 
@@ -77,13 +91,22 @@ rule that keeps selection, regularization, and the H4 readout commensurable
 (review finding 7), and it designs out massive-activation/rogue-dim bait.
 
 Whitening protocol: per site, fit mean μ_s and covariance Σ_s on a dedicated
-5M-token slice of the harvest corpus (disjoint from train and eval), fp32
-accumulation, ridge per saklas's `LayerWhitener` convention (λ_s =
+5M-token slice of the harvest corpus (disjoint from train and eval),
+harvested *first*; ridge per saklas's `LayerWhitener` convention (λ_s =
 mean-diagonal of Σ̂_s × `DEFAULT_RIDGE_SCALE`); eigendecompose once; freeze
-W_s = (Σ_s + λ_s I)^{-1/2} and export it with the run config. Training-side
-whitening is materialized as a dense d×d matmul (the saklas Woodbury object
-is a CPU one-shot operator, not a hot-path transform). Whitened activations:
-x̃^s = W_s (x^s − μ_s).
+W_s = (Σ_s + λ_s I)^{-1/2} and export it with the run config. Numerics
+(D9): TF32 disabled for covariance GEMMs; batch sufficient statistics
+combined by pairwise/Welford accumulation with fp64 aggregates; the eight
+d×d eigendecompositions run in fp64 offline; whitener stability is checked
+across corpus halves/quarters and the transformed covariance spectrum
+validated on held-out sequences — 5M tokens is a *candidate* size that must
+pass these criteria (sequence correlation shrinks effective N; parameter
+counting alone proves nothing). The store then holds **whitened bf16**
+(D8): the whitener is immutable once fit — the exact μ, W, ridge, layer
+set, and source manifest are hashed into every shard header and mismatches
+rejected at load; a small raw shard is retained to measure whitening
+round-trip error; any refit forces reharvest or an explicit store
+migration. Whitened activations: x̃^s = W_s (x^s − μ_s).
 
 **dtype discipline: fp16 is forbidden everywhere in the harvest and store
 path** — gemma-3's late-layer channels exceed fp16 max (fact preserved in
@@ -137,9 +160,15 @@ G blocks of width b. Per site: encoder E_g^s ∈ ℝ^{b×d}, decoder D_g^s ∈
 - **select** — BatchTopK over blocks by p_g = ‖z_g‖₂ (exact contribution
   energy, comparable across blocks because of the constraint). Training:
   keep the top k·B block-activations across the batch of B tokens (per-token
-  counts vary). Inference: fixed global threshold θ on p_g, estimated during
-  training as an EMA of the batch-minimum selected score (BatchTopK
-  convention). BatchTopK, not L1: Minder et al. (2504.02922) show L1
+  counts vary). Inference: fixed global threshold θ on p_g. The
+  training-time EMA of the batch-minimum selected score is a **diagnostic
+  only** — it inherits optimizer history (drift, decay constant, checkpoint
+  timing), so two equivalent checkpoints could otherwise carry different
+  realized count distributions straight into the codec frontier (D10). The
+  final θ is fit on the calibration split to hit the preregistered average
+  block count, then frozen and serialized with the codec; threshold
+  sensitivity and the resulting count distribution are reported. BatchTopK,
+  not L1: Minder et al. (2504.02922) show L1
   manufactures Complete Shrinkage / Latent Decoupling; the block-level
   analogues would poison exactly the H5 diffing questions.
 - **decode** — x̂̃^s = c^s + Σ_{g active} D_g^sᵀ z_g; raw-space export
@@ -206,7 +235,11 @@ predeclared minimum active-token count (default 10k on the eval set);
 below-threshold blocks are counted and reported separately.
 
 Required controls: λ = 0 run, λ-sensitivity curve, seed stability (2 seeds
-at primary config), and **rank-r truncation ablations** — held-out FVU as a
+at primary config, judged at block level **and** at global
+recovered-subspace level via principal angles — Dooms §4.3: individual
+latents agree 15–50% across seeds while the global subspace agrees >90%,
+so block-identity matching alone understates stability, P20), and
+**rank-r truncation ablations** — held-out FVU as a
 block is truncated to its top-r directions, which is the reconstruction-
 anchored ground truth the spectra summarize and the final arbiter of any
 rank claim. Curvature/ring claims are never made from rank alone; they
@@ -240,23 +273,45 @@ manifolds — the H5 diffing story is only told over blocks that pass.
 
 ### Sparsity hygiene
 
-- **Aux loss (dead blocks)** — AuxK at block level: top-32 blocks dead for
-  ≥ 500 batches reconstruct the residual; α = 1/32. The Gram constraint
-  removes the decoder-shrinkage spiral; the aux loss handles encoder-side
-  starvation. Block resampling kept as a documented option, off by default.
+- **Aux loss (dead blocks)** — starting spec follows SASA App. C.1 (P8): a
+  block is dead when its running activation frequency falls to ≤ 10⁻⁴
+  (SASA's window is 1k tokens; ours is re-expressed at batch 4096 and
+  calibrated); the reconstruction residual is **frozen** (no gradient
+  through it) and re-encoded through dead blocks only; the s_aux dead
+  blocks with largest residual energy reconstruct it. s_aux, λ_aux (SASA:
+  256–512 and 1.0), window, and threshold are calibrated in Phase −1/0.9
+  via a three-way comparison — SASA-style frequency-dead vs long-horizon
+  dead (the former v2.1 rule) vs Fel-style runner-up AuxK — v2.1's
+  top-32 / 500-batch / α=1/32 was an unsupported hybrid of three papers'
+  conventions and is demoted to one arm of that comparison. The Gram
+  constraint removes the decoder-shrinkage spiral; the aux loss handles
+  encoder-side starvation. Block resampling kept as a documented option,
+  off by default.
 - **Latent Scaling, blockwise** (Minder) — per-site
   reconstruction-contribution regression as the shrinkage/decoupling
   diagnostic for Phase 3 diffing.
 - **Init** — D_g^s Gaussian then one retraction (≈ equal site shares at
-  init); E_g^s = D_g^s (transpose-tied at init only).
+  init); E_g^s = D_g^s (transpose-tied at init only), with encoder scale
+  norm-calibrated at init (Fel App. D convention) so initial selection
+  scores are comparable across blocks (P16).
 - **Optimizer** — AdamW, lr 3e-4 (1k-step linear warmup, cosine decay),
   β=(0.9, 0.999), fp32 master weights, 8-bit moments, bf16 params; batch
   4096 tokens. All to be recalibrated in the Phase-0.9 rehearsal.
+  Retraction is per-step initially; lower-frequency retraction (Fel used
+  QR every 20 steps) is a documented throughput ablation (P16). The SASA
+  product-penalty ablation uses **symmetric** encoder/decoder weight decay
+  (its variational form requires it, P9); the primary keeps decoder
+  decay 0.
 
 ### Identifiability caveat (worn openly)
 
 Hard group sparsity rewards packing frequently co-active scalar features
-into one block whether or not they form a manifold (finding 9). Block
+into one block whether or not they form a manifold (finding 9) — and round
+3 sharpened this (D11): perfectly co-active scalars with full-dimensional
+joint support are *observationally equivalent* to a block under a linear
+reconstruction objective, so bundling cannot be penalized away or ruled
+out; what the coherence battery certifies is that *curved / manifold*
+structure is never claimed where none exists. Block
 discovery is *candidate generation*; the manifold claim for any block rests
 on the coherence diagnostics (within-block code topology, ring tests,
 truncation ablations, shared-code evals), synthetic-recovery calibration,
@@ -273,7 +328,7 @@ Pre-registered confirmatory targets: weekday ring, month ring.
 | k (blocks/token avg) | 16 | 32 (128 active coeffs) | 32 |
 | params (untied) | 57M | 671M | 1.34B |
 | train VRAM est. | ~2 GB | ~9 GB | ~11 GB |
-| store | ~8M tok ≈ 110 GB | 38M tok ≈ 1.56 TB | same store |
+| store (whitened bf16) | ~11M tok ≈ 152 GB (8M train + 1M eval + 2M calib) | 53M tok ≈ 2.17 TB (38M train + 2M eval + 13M calib) | same store |
 
 Baseline (every config): matched scalar crosscoder = **the b=1
 Gram-constrained architecture** (round-2 R16): per latent,
@@ -300,20 +355,40 @@ not a hyperparameter search.
 
 ## Data & training topology
 
-**Disk-backed activation store on the 4090 box (~1.9 TB free NVMe;
-decision 2026-07-15).** Harvest once on CUDA: gemma forward in bf16, 8 sites,
-seq len 1024, FineWeb-Edu sample streamed with a pinned manifest (shard ids +
-seed, shared verbatim by BSC and baseline runs); BOS and position-0/1
-activations dropped; bf16 shards, shard-level + in-shard shuffle. Exact
-bytes (round-2 R23): 40,960 B/token × 38M train = 1.557 TB; × 2M eval =
-81.9 GB; **the 5M-token whitener slice is accumulated into fp32 statistics
-and never stored** (only μ_s, Σ_s, W_s persist). Stored total ≈ 1.64 TB
-against ~1.9 TB free — ~260 GB headroom for checkpoints (~1.3 GB each ×
-2 models × snapshots), temporary shard writes, checksums, and filesystem
-reserve; free space verified in bytes before the harvest commits. Training
-then runs **without gemma in VRAM** — which is what re-opens the G=8192
-stretch config — with 2-epoch default (per-epoch reshuffle), held-out FVU
+**Disk-backed whitened activation store on a dedicated 4 TB NVMe (decision
+2026-07-16; jobe's stock disks are 2×1 TB — the v2.1 "~1.9 TB free" volume
+never existed and the v2.1 store was unimplementable on the real machine,
+D1).** Harvest once on CUDA: gemma forward in bf16 with the LM head
+skipped (D7), 8 sites, seq len 1024, FineWeb-Edu sample streamed with a
+pinned manifest (shard ids + seed, shared verbatim by BSC and baseline
+runs); BOS and position-0/1 activations dropped. The 5M-token whitener
+slice is harvested **first** and accumulated into statistics (never
+stored; only μ_s, Σ_s, W_s persist — numerics in *Sites, coordinates,
+whitening*); shards are then written **whitened, in bf16**, whitener hash
+in every header (D8). Exact bytes: 40,960 B/token × 38M train = 1.557 TB;
+× 2M eval = 81.9 GB; × 13M calibration = 532.5 GB (sizing rationale under
+*Rate–distortion protocol*). Stored total ≈ 2.17 TB on the 4 TB volume,
+with a ≥15% free-space floor and byte-exact pre-write abort checks
+enforced regardless of headroom (D14).
+
+Store I/O (D6; measured sequential buffered read on jobe: ~1.94 GB/s — a
+160 MiB training batch has an ~82 ms I/O floor, so **token-random mmap
+access is forbidden**): 2–8 GiB atomic shards, tensor layout
+[token, site, d], sequence-contiguous writes; per-epoch shard-level
+shuffle; contiguous chunk reads into a 32k–128k-token RAM shuffle buffer;
+batches mixed within the buffer; 2–4 pinned prefetched batches; the
+permutation seed recorded and shared by BSC and baseline. Training then
+runs **without gemma in VRAM** — which is what keeps the G=8192 stretch
+config live — with 2-epoch default (per-epoch reshuffle), held-out FVU
 gap monitored for store overfit.
+
+Checkpoints and residency (D14): a *resumable* 8-bit-Adam checkpoint at
+the primary config is ~5.4 GB (bf16 forward copy + fp32 master + two
+8-bit moment tensors), roughly double at G=8192 — v2.1's "~1.3 GB" was
+the inference-only bf16 weights. Keep latest-resumable + best-inference
+per run only; atomic write-then-rename with a free-space check that
+aborts *before* the write. The 81.9 GB eval store exceeds the box's
+61 GB RAM: eval is streamed sequentially, never RAM-resident.
 
 Sample-power discipline (R24): 38M unique tokens is the demonstrated-power
 envelope, not a free pass — Phase 1 reports learning curves at store
@@ -334,18 +409,37 @@ Phase-0/rehearsal harvests on the M5 Max obey the MPS async-OOM discipline
 big store is CUDA-side and additionally verified by content checksums and
 per-shard non-zero/finiteness audits at write time.
 
-Mandatory pre-commitment pilot (finding 31): before writing the full store,
-a 1M-token pilot measures harvest tok/s, train tok/s, dead-block trajectory,
-and VRAM high-water; the token budget and config are re-confirmed against
-measurements, not estimates.
+Mandatory pre-commitment pilot (finding 31, extended in round 3 — D7,
+D12): before the full store is written, a **≥3M-token exact-config pilot**
+(>500 steps at batch 4096, with margin) runs the exact production path —
+same sequence batching, all 8 hooks, dtype conversion, whitening,
+checksums, shard writer — and must actually **exercise** AuxK (v2.1's
+1M-token pilot could not: 244–488 steps never cross the 500-batch dead
+window, so the recovery mechanism would go untested), checkpoint/resume,
+and final-threshold calibration, including a synthetic dead-encoder
+revival test. Logged: model tok/s, writer GB/s, GPU duty cycle,
+**data-wait time** (not just aggregate throughput), VRAM high-water,
+dead-block trajectory, pre/post-retraction Gram eigenvalues, floor hits,
+depth-share jumps, and aux/main gradient norms. The token budget and
+config are re-confirmed against measurements, not estimates. This pilot
+is a **separate, mandatory operational gate** — the 1b rehearsal cannot
+stand in for it (D13).
 
 ## Rate–distortion protocol (H3, made honest)
 
 What is compared is **held-out activation rate–distortion**, not "total
 MDL" — parameter bits are deliberately out of scope and the claim is scoped
-accordingly (finding 15). Three data splits: train, **calibration** (held
-out of training; all codec fitting happens here), eval (untouched until
-scoring). Codec, pre-registered:
+accordingly (finding 15). Three data splits: train, **calibration**, eval
+(untouched until scoring). The calibration split is a stored 13M-token
+split (unbudgeted and underspecified in v2.1 — D4): all codec fitting
+happens here — canonical orientation, clipping quantiles, the count
+model, the final inference threshold θ, and the single-site calibration
+maps — and its power is accounted in **active counts per block**, not
+tokens: at mean activation frequency k/G ≈ 0.78%, 13M tokens give ≈100k
+active samples for an average block, i.e. ~100 observations beyond a
+0.1% clipping quantile. Blocks under a predeclared active-count floor
+are excluded from the codec comparison and reported separately. Codec,
+pre-registered:
 
 - **Canonical block orientation** (round-2 blocker R13): after training,
   each block's code space is rotated to diagonalize its calibration-set
@@ -386,34 +480,73 @@ scoring). Codec, pre-registered:
 ## Phases (gates are decision heuristics with demonstrated power)
 
 **Phase −1 — synthetic ground-truth harness. Offline; first deliverable.**
-Planted dictionaries → synthetic activations → recovery. Must include:
-shared blocks with cross-site frame rotation (the thing the BSC exists
-for); flat-profile shared blocks under the **quantitative λ-veto** (see
-*Rank regularizer* — admissible λ must keep planted flat-profile share
-error under the predeclared tolerance, with the λ=0-primary fallback if
-none passes); site-specific decoys; correlated scalar bundles that do *not*
-form manifolds (the finding-9 test); planted ranks 1..b at controlled depth
-profiles **and controlled feature frequencies** (the recovery-vs-frequency
-calibration that Phase 1's rare-block claims are read against, R24); and
-the **rotation-equivariance test** (R8): paired seeds from randomly
-O(b)-rotated inits must recover matching spectra/subspaces, else decoders
-move off coordinatewise Adam. Recovery metrics: subspace principal angles,
-rank recovery, depth-profile fidelity, code correlation.
+Planted dictionaries → synthetic activations → recovery, with the
+generator built **gauge-correct** (D11): intrinsic coordinates u_g ∈ ℝ^r
+are embedded as block codes z_g = A_g u_g through Gram-constraint-
+satisfying concatenated decoders; planted rank is defined by the spectra
+of the *contribution operators*, never by decoder rows — the constraint
+forces every frame to rank b, so parked capacity is unidentifiable and is
+not scored as failed recovery. Recovery is identifiable only modulo one
+joint O(b) per block: evaluation matches blocks by assignment, then
+applies a single **global** Procrustes alignment across all sites and
+codes — per-site alignment would falsely certify shared coordinates.
+Must include: shared blocks with cross-site frame rotation (the thing the
+BSC exists for); flat-profile shared blocks under the **quantitative
+λ-veto** (see *Rank regularizer* — admissible λ must keep planted
+flat-profile share error under the predeclared tolerance, with the
+λ=0-primary fallback if none passes); site-specific decoys (scored as
+*expected site-exclusive recoveries*, not nothing-recovered nulls);
+correlated scalar bundles under the **weakened null** (D11, correcting
+the round-1 finding-9 disposition: perfect co-activation with
+full-dimensional joint support is observationally equivalent to a block
+under linear reconstruction, so the learner may legitimately bundle — the
+gate is that ring/topology/coherence tests must not hallucinate *curved
+manifold* structure on them); planted manifolds in both **hollow and
+radially-thickened** versions of the same geometry (Michaud's regime
+split, P18 — recovery must not be confounded with the geometry regime);
+planted ranks 1..b at controlled depth profiles **and controlled feature
+frequencies** (the recovery-vs-frequency calibration that Phase 1's
+rare-block claims are read against, R24); Bhalla-style
+capture/shattering/dilution metrics — restricted R², support size,
+receptive-field spread (P19); the **rotation-equivariance test** (R8):
+paired seeds from randomly O(b)-rotated inits must recover matching
+spectra/subspaces, else decoders move off coordinatewise Adam; and the
+**AuxK variant comparison** (P8; see *Sparsity hygiene*), including a
+dead-encoder revival test. Recovery metrics: subspace principal angles,
+rank recovery via contribution spectra, depth-profile fidelity, code
+correlation after global alignment.
 *Gate:* the pipeline recovers what was planted, does not hallucinate
 structure in the nulls, and yields a nonempty admissible λ set (or the
 documented λ=0 fallback). Lives in `tests/` + `scripts/`; runs on MPS.
 
 **Phase 0 — post-hoc blockification. Zero training; days.**
-First, **positive control**: replicate the Engels weekday/month rings on
-GPT-2-small with a public SAELens release through our exact pipeline —
-a gemma null without this is uninterpretable (finding 17/19/35). Then:
+First, **positive control**: replicate the Engels weekday/month rings
+through our exact pipeline on **the artifact Engels actually used —
+Bloom's 2024 GPT-2-small layer-7 residual SAE** (~25k features; SAELens
+registry identity verified at phase start), spectral clustering at their
+n=1000 scale — a gemma null without this is uninterpretable (finding
+17/19/35), and a failed transfer to a *different* SAE would demonstrate
+nothing about pipeline power (P13). If that exact artifact is
+unobtainable, the nearest release runs as a labeled *transfer control*
+and a faithful replication path is added. The control is **observational
+only**: Engels' causal tests were on Mistral/Llama — GPT-2 scores
+near-chance on the modular-arithmetic tasks (P2). Then:
 `google/gemma-scope-2-4b-pt` residual SAE at the saklas-convention analysis
-depth (~65%); cluster decoder directions (cosine + spectral, Engels-style);
+depth (~65%); cluster decoder directions (cosine + spectral, Engels-style)
+**plus an activation-dependence branch** (P15 — Bhalla: decoder-cosine
+correlation alone "need not suffice" and is weakest exactly in
+shattering/dilution regimes; an Ising fit on binarized codes, or a
+documented conditional-dependence approximation, runs beside it);
 within-cluster PCA of code contributions over a token stream (saklas `sae`
-runtime harvest). Ring criteria, quantitative: held-out circular decoding
-of the known cyclic families, Fourier structure of code angle, mixture/
-separability tests, label-permutation and random-cluster nulls; BH
-correction over unknown-cluster search.
+runtime harvest). Ring criteria, quantitative — Engels' own battery in
+full (P14): cluster-restricted reconstruction (out-of-cluster latents
+ablated), discard of samples where no cluster element activates, PC-plane
+scan (1–2 through 4–5) with separability and ε-mixture scores averaged
+across planes, the PC1-as-intensity **cone check** (the ring may live in
+PCs 2–3 of a cone), clustering-stability + Jaccard-overlap analysis —
+plus our additions: held-out circular decoding of the known cyclic
+families, Fourier structure of code angle, label-permutation and
+random-cluster nulls; BH correction over unknown-cluster search.
 *Gate:* rings recoverable → live targets + warm-start candidates for
 exploratory runs. Null **with the control passing** → "no rings recoverable
 from this SAE at these depths at demonstrated power" — downgrades H1,
@@ -438,11 +571,17 @@ stage-blocks.
 
 **Phase 0.9 — 1b dress rehearsal. Days; decision 2026-07-15.**
 The entire ladder end-to-end on gemma-3-1b + `gemma-scope-2-1b-pt` at the
-rehearsal config: harvest → store → whiten → train BSC + scalar baseline →
+rehearsal config: harvest → whiten → store → train BSC + scalar baseline →
 full eval suite → toy export. Plumbing gates only (harvest integrity,
 training stability, eval determinism, hyperparameter sanity) — science
-verdicts wait for 4b. A 4b failure after a green rehearsal is about the
-science, not the code.
+verdicts wait for 4b. Two scope corrections from round 3: the
+rehearsal-narrowed λ set carrying to 4b is a **cross-model transfer
+assumption**, worn openly — the one-seed 4b frontier stage is its
+backstop; and a green rehearsal does *not* clear the principal 4b
+operational risks (late-layer outlier behavior, 160 MiB-batch I/O,
+671M-param optimizer/retraction throughput, full checkpoint mechanics,
+calibration tail power) — those belong to the extended 4b pilot, a
+separate mandatory gate (D13).
 
 **Phase 1 — train the BSC on gemma-3-4b. ≈week part-time + 4090 runs.**
 Primary config from the table; store-backed; cold-start BSC + b=1
@@ -481,7 +620,22 @@ instruct gemma first, **paired forwards on identical raw token sequences**
 the residual caveat, handled by running both models template-free on the
 same stream and treating template tokens as a documented distribution gap —
 finding 24). Manifold-level diffing + persona-fan provenance (H5), gated on
-the same shared-code evals per model. Gemma vs Qwen cross-arch only after
+the same shared-code evals per model. H5's toolkit is **causal, not only
+observational** (P12, from Minder §3.1.2): selected-block base→chat
+patching through per-block decoder differences with output-KL readout,
+None/All/reconstruction-error baselines, full-response *and* early-token
+KL (Minder's early-token gap ran >3× the full-response gap),
+sequence-level confidence intervals, template-token stratification, and
+Sentence-BERT-matched nonactivating controls for any autointerp.
+Blockwise Latent Scaling is spec'd before the phase (P11): leave-one-
+*block*-out and reconstruction targets per model/site, held-out b×b
+(ridge- or Procrustes-constrained) maps rather than a scalar coefficient,
+normalized improvement ratios, all calibrated on planted shared /
+site-specific / shrunk / decoupled blocks in the Phase −1 harness.
+Jiralerspong's Dedicated Feature Crosscoders (scalar shared/exclusive
+partitions) are the architectural comparison point, and their
+model-stitching / cross-model-steering validation of exclusivity is
+adopted (P25). Gemma vs Qwen cross-arch only after
 token alignment is solved; document-level pooling changes the object of
 study (it answers a pooled question, not the token-level ring question) and
 is out of scope for the ring claim.
@@ -493,18 +647,34 @@ is out of scope for the ring claim.
 - Weakly-causal crosscoder variants (reach for them only if stage-splitting
   dominates).
 - Steering-quality tuning of imported manifolds (Phase 2 proves the pipe).
-- fp8 activation storage (quantization noise sits too close to the
-  rate–distortion floor being measured).
+- Quantized activation storage for the primary runs. (v2.1's RD-floor
+  rationale was wrong — distortion is measured on clean bf16 eval data;
+  the real reason is that store quantization acts as an
+  *architecture-dependent regularizer* that can shift support, dead
+  rates, spectra, and bundling differently for BSC vs scalar, and raw
+  fp8 on gemma's outlier channels is unsafe outright — D5.) A whitened,
+  per-channel-scaled int8 codec is the documented store-compression
+  escalation, admissible only after a paired bf16-vs-quantized pilot
+  agrees within preregistered tolerances on the RD frontier, block
+  matching, count/dead distributions, rank spectra, and shared-code
+  diagnostics, across 2 seeds.
 - b-sweeps beyond {1 (baseline), 4}: b ∈ {2, 8} noted as follow-up; a
   rank-4 ceiling is a design choice, not a discovery (finding 33).
 
 ## Risks
 
 Structurally designed out: gauge-vacuous rank penalty, selection-score
-proxy error, decoder death spiral (all via the Gram constraint); L1
-shrinkage artifacts (BatchTopK); rogue dims (whitened everything); fp16
-overflow (banned); pipeline-failure nulls (Phase −1 harness + GPT-2
-positive control + 0.9 rehearsal).
+proxy error, decoder death spiral (all via the Gram constraint); rogue
+dims (whitened everything); fp16 overflow (banned); pipeline-failure
+nulls (Phase −1 harness + pinned GPT-2 positive control + 0.9 rehearsal
++ extended 4b pilot).
+
+Empirically mitigated, monitored (P1 — v2.1 wrongly listed this as
+designed out): L1-style shrinkage/decoupling artifacts. BatchTopK
+*substantially mitigates* them (Minder §2.3.2 "may address"; their own
+BatchTopK run still shows 12.0% dead validation latents), so blockwise
+Latent Scaling and the causal-diffing controls stay mandatory rather
+than precautionary.
 
 Instrumented, not eliminated: per-site penalty's site-concentration
 pressure (synthetic gate + λ=0 control + contribution-covariance readout);
@@ -513,11 +683,19 @@ acausal multi-view leakage (site-dropout eval matrix); block bundling
 (coherence diagnostics + BH correction); store overfit at 38M tokens
 (held-out FVU gap; interleaved escalation path).
 
-Honestly open: the block prior may mismatch language (the Fel hedge) — H3/H4
+Honestly open: the block prior may mismatch language (the Fel hedge, and
+b=4 is a hypothesis, not attribution-backed — Fel's shallow-vision optima
+were ≈1–3 with "trust the direction, not any single value", P5) — H3/H4
 are informative under the null and a flat dictionary corroborates the
-flattening line. The novelty claim is scoped to LLM interpretability; the
-older multi-view / coupled group-sparse dictionary-learning literature has
-not been swept and should be before any external writeup.
+flattening line. The novelty claim is scoped to LLM interpretability and
+**survived a full-text sweep of all 13 reference sources (2026-07-16)**
+in its narrow form: no checked work learns sparse multidimensional blocks
+with one shared vector code and distinct per-site frames across sites.
+Owed reads before any external claim: the older multi-view / coupled /
+joint group-sparse dictionary-learning literature (largest remaining
+risk), Yun 2103.15949, Lawson 2409.04185, SMixAE, Shafran et al.,
+Hindupur/SPADE, Mishra-Sharma, and the Baskaran–Sklar crosscoder work if
+public (P23, round-3 novelty verdict).
 
 ## Decision log
 
@@ -542,3 +720,30 @@ not been swept and should be before any external writeup.
   whitener accumulate-and-discard; sequence-level bootstrap; staged run
   matrix; escalation retrains the baseline. Design frozen for
   implementation from this state.
+- **2026-07-16 (v2.2)** — round-3 amendments after two fresh-context
+  sol passes + a fable parallel pass
+  ([`design-review-2026-07-16.md`](design-review-2026-07-16.md)).
+  Hardware ground truth: jobe is 2×1 TB, not "~1.9 TB free" — the v2.1
+  store was unimplementable as frozen; **a9: dedicated 4 TB NVMe
+  purchased**, preserving 8 sites / 38M tokens / G=8192 (interleaved
+  G=4096 streaming remains the documented no-purchase fallback; disk
+  spanning rejected). Store becomes whitened bf16 with an immutable
+  hashed whitener + raw validation shard; 13M-token stored calibration
+  split added, powered in active counts; final threshold calibration-fit
+  (EMA demoted to diagnostic); shard/I-O layout pinned (sequential
+  buffered shuffle, no token-random mmap; measured 1.94 GB/s); checkpoint
+  arithmetic corrected (~5.4 GB resumable); eval streamed, never
+  RAM-resident. AuxK re-specified from SASA C.1 with a three-variant
+  comparison; Fel norm-calibrated init; SASA-ablation symmetric decay;
+  retraction-frequency ablation noted. Phase −1 generator made
+  gauge-correct (global Procrustes, contribution-spectrum ranks, weakened
+  bundle null — correcting the round-1 finding-9 disposition — hollow +
+  thickened manifolds, Bhalla capture/shatter/dilution metrics). Phase 0:
+  positive control pinned to Bloom's layer-7 GPT-2 SAE (observational
+  only), Engels battery completed, activation-dependence branch added.
+  Pilot extended to ≥3M tokens and made a separate mandatory gate
+  (v2.1's 1M pilot could not exercise AuxK); 0.9 "science, not code"
+  overclaim struck; λ 1b→4b transfer worn openly. H5 inherits Minder's
+  causal diffing + DFC stitching/steering validation; blockwise Latent
+  Scaling spec'd as b×b maps. Digest corrected at six points (P1–P6);
+  owed-reads list expanded. Design re-frozen from this state.

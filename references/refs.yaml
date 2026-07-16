@@ -17,6 +17,9 @@ references:
     note: Minder et al. — overcoming sparsity artifacts in crosscoders (chat-tuning diffing).
   - arxiv: "2602.11729"
     note: Jiralerspong & Bricken — cross-architecture model diffing with crosscoders.
+      NB the local md is abstract-only (no arXiv HTML exists; 75-page PDF only).
+      Full text verified via PDF in the 2026-07-16 review — scalar DFC
+      shared/exclusive partitions; does not occupy the BSC cell.
   - arxiv: "2405.14860"
     note: Engels et al. — not all LM features are one-dimensionally linear.
   - arxiv: "2509.02565"

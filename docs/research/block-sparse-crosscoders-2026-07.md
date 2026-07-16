@@ -3,15 +3,13 @@
 *Research digest, 2026-07-15 — the canonical document for this program. Merges
 the 2026-07-12 BSF digest (prompted by Fel et al. 2606.25234, "can we do this
 for LLMs?") with the 2026-07-15 crosscoder extension (prompted by a9: "why
-hasn't anyone combined BSF with crosscoders?"). Verification provenance: Fel
-et al. read at primary source (full HTML, 07-12); SASA (2606.06333) abstract,
-**upgraded to full text 07-15 during the adversarial design review** — the
-transfer correction it forced is in `docs/design-review-2026-07-15.md`;
-Engels (2405.14860) prior knowledge + search-verified; SAE-scaling
-(2509.02565) [snippet]; crosscoder gap swept via web + HF paper search
-(07-15); Minder 2504.02922, Gorton 2410.24184, Jiralerspong & Bricken
-2602.11729 at abstract level; crosscoder formalism from the Anthropic post
-(fetched, summary-level) + prior knowledge.*
+hasn't anyone combined BSF with crosscoders?"). Verification provenance,
+**upgraded 2026-07-16**: every source below has now been read at full text
+(local copies in `references/`; Jiralerspong via the 75-page arXiv PDF —
+no HTML rendering exists) during the round-3 paper-fidelity review
+(`docs/design-review-2026-07-16.md`, findings P1–P25). Bracketed 07-15
+amendments come from the first review (`docs/design-review-2026-07-15.md`);
+bracketed 07-16 amendments from round 3.*
 
 **Verdict: a block-sparse crosscoder (BSC) — subspace-unit dictionary
 learning with one shared code across layers (later: across models) — exists
@@ -53,12 +51,19 @@ contributions `m_m = z_m D_m` over the token stream, PCA them; the PCA frame
 is the concept's natural basis (their curve-detector block recovers the full
 orientation circle, with Fourier modes ω=1/2/3 at 59/18/12% of variance).
 
-**The MDL argument** is the honest core: framing the code as compression,
-block selection costs `log₂(G choose k)` bits vs an SAE's
-`log₂(Gb choose kb)` — BSFs beat b=1 SAEs on total description length at
-every dictionary width on DINOv3, with optimal b = 2–4. Task-derived
-distortion floors (classification tolerates R²≈0.8, depth needs ≈0.9) anchor
-the comparison so reconstruction alone doesn't decide it.
+**The MDL argument** is the inspiration for our rate–distortion protocol
+*(07-16: "honest core" overstated — Fel's App. C protocol prices support,
+code, residual, AND amortized dictionary bits with Gaussian spectral
+water-filling; the `log₂(G choose k)` vs `log₂(Gb choose kb)` contrast is
+the support-only intuition, and our protocol deliberately excludes
+parameter bits, so it is not a Fel replication — P4)*: BSFs beat b=1 SAEs
+on total description length at every dictionary width on DINOv3, with
+optimal b in the 1–4 range *(07-16: their App. C.3 optima are ≈3
+Grassmannian / 1–3 vanilla, with an explicit "trust the direction of the
+effect, and not any single value" — our b=4 is a hypothesis, not an
+attribution — P5)*. Task-derived distortion floors (classification
+tolerates R²≈0.8, depth needs ≈0.9) anchor the comparison so
+reconstruction alone doesn't decide it.
 
 **Steering** (SDXL): clamp a block's code to waypoints on a Kohonen SOM fit
 to the block's empirical code density — i.e. move only within the subspace's
@@ -95,20 +100,34 @@ layer). The unit of interpretation is still a direction.
 
 Known pathology (Minder, Dumas, Juang, Chugtai, Nanda — 2504.02922): the L1
 loss manufactures **Complete Shrinkage** and **Latent Decoupling** — latents
-that read as "chat-only" when the concept exists in both models. Fixes:
-**BatchTopK** selection instead of L1, plus **Latent Scaling** as the
-diagnostic. Any BSC design must inherit these.
+that read as "chat-only" when the concept exists in both models.
+**BatchTopK** selection *substantially mitigates* the artifacts *(07-16:
+"Fixes" was overstated — their §2.3.2 says BatchTopK "may address" them via
+inductive bias, and their own BatchTopK run still shows 12.0% dead
+validation latents (A.10); empirical mitigation, not a guarantee — P1)*,
+with **Latent Scaling** as the diagnostic, which therefore stays mandatory.
+Any BSC design must inherit both.
 
 ## Supporting landscape
 
 - **Engels et al. (2405.14860)** — ground truth that irreducible multi-dim
-  features exist in LLMs: weekday/month *circles* in GPT-2 and Mistral-7B,
-  found by clustering SAE decoder directions, causally implicated in modular
-  date arithmetic. Token-level, not centroid-level (see the science hook).
-- **SAE scaling under feature manifolds (2509.02565)** [snippet] — SAEs
-  reduce loss by tiling manifolds with many sparsely-activating latents at
-  the expense of rarer features; block sparsity is the natural structural
-  fix.
+  features exist in LLMs: weekday/month *circles* discovered in GPT-2 and
+  Mistral-7B by clustering SAE decoder directions; homologous rings
+  **causally tested in Mistral-7B and Llama-3-8B** *(07-16 correction:
+  the causal claim does not extend to GPT-2, which scores near-chance on
+  the modular tasks — 8/49 weekday, 10/144 month — so GPT-2 is the
+  observational positive control only, P2)*. Token-level, not
+  centroid-level (see the science hook).
+- **SAE scaling under feature manifolds (2509.02565)** — demonstrates a
+  *possible pathological regime* in which SAEs reduce loss by tiling
+  manifolds with many sparsely-activating latents at the expense of rarer
+  features *(07-16: previously over-read as an empirical conclusion —
+  Michaud §4 explicitly "do not resolve" whether real SAEs occupy the
+  regime, and App. A.1 finds radial/intensity variation saturates
+  basis-like near n≈2dᵢ; strongly geometry-dependent — P3; design
+  consequence: Phase −1 plants both hollow and radially-thickened
+  manifolds, P18)*; block sparsity remains the natural structural
+  response if the regime is real.
 - **Hindupur, Lubana, Fel, Ba — "Projecting Assumptions"** — an SAE's
   architectural prior determines which concept geometries it can see at all.
   Single-site theory; reads as the motivation for a BSC.
@@ -128,6 +147,16 @@ The literature is a 2×2 — {scalar, block} × {single-site, cross-site} — wi
 three cells occupied (SAE; BSF/SASA; crosscoder + kin) and the fourth empty.
 Searched: "block sparse crosscoder", "group sparse crosscoder", crosscoder ×
 manifold/multi-dimensional latents, SASA follow-ups, Hindupur. Nothing.
+
+*[07-16 amendment: the full-text sweep of all 13 sources confirms the
+narrow cell stays empty — no checked work learns sparse multidimensional
+blocks with one shared vector code and distinct per-site frames — but
+narrows the surrounding prose: Dooms/SASA/Bhalla cover learned single-site
+multidimensional objects; Gorton covers cross-site geometric structure
+with scalar codes; Group-SAE's related work surfaces Yun (2103.15949) and
+Lawson (2409.04185) as earlier shared/multi-layer scalar-SAE work, both
+now owed reads; Ge/Anthropic/Minder/Jiralerspong are scalar cross-site
+codes. Full owed-reads list in design v2.2 §Risks.]*
 
 **Why the cell is empty** (read: no blocker, just a young intersection):
 blocks-for-LLMs is four weeks old; the crosscoder community's agenda is
@@ -207,8 +236,12 @@ x^s. G blocks of width b:
   The corrected, Gram-constrained objective — Σ_s D_g^s D_g^sᵀ = I_b, select
   by exact contribution ‖z_g‖ — is specified in `docs/design.md` v2; the
   disposition trail is `docs/design-review-2026-07-15.md`.]*
-- diagnostics: block-level Latent Scaling (per-site
-  reconstruction-contribution regression) as the artifact flag; per-block
+- diagnostics: block-level Latent Scaling as the artifact flag *(07-16:
+  "per-site reconstruction-contribution regression" was underspecified —
+  Minder fits four coefficients per latent against reconstruction and
+  leave-one-out error targets; the faithful block analogue is
+  leave-one-block-out targets with held-out b×b maps, spec in design
+  v2.2 Phase 3 — P11)*; per-block
   per-site effective-rank histogram as the headline geometry measurement;
   MDL vs a matched-width scalar crosscoder — the `log₂(G choose k)` vs
   `log₂(Gb choose kb)` argument carries over per token unchanged
@@ -331,32 +364,46 @@ caveat the science hook warns about).
 
 ## Sources
 
+*(All at full text as of 07-16 unless noted; local copies in
+`references/`.)*
+
 - Fel et al., "Structuring Sparsity: Block-Sparse Featurizers Capture Visual
-  Concept Manifolds" — arXiv:2606.25234 (primary, full text, 07-12)
+  Concept Manifolds" — arXiv:2606.25234 (primary, full text 07-12;
+  appendices C–D mined 07-16)
 - Dalili & Mahdavi, "Subspace-Aware Sparse Autoencoders" (SASA) —
-  arXiv:2606.06333 (abstract)
+  arXiv:2606.06333 (full text 07-15; appendices B.3/C.1 — optimizer,
+  dead-group aux loss — read 07-16, now the AuxK starting spec)
 - Anthropic, "Sparse Crosscoders for Cross-Layer Features and Model Diffing"
-  — transformer-circuits.pub/2024/crosscoders (fetched, summary-level)
+  — transformer-circuits.pub/2024/crosscoders
 - Minder, Dumas, Juang, Chugtai, Nanda — "Overcoming Sparsity Artifacts in
-  Crosscoders to Interpret Chat-Tuning" — arXiv:2504.02922 (abstract +
-  search-verified)
+  Crosscoders to Interpret Chat-Tuning" — arXiv:2504.02922 (its §3.1.2
+  causal-diffing protocol adopted for H5)
 - Jiralerspong & Bricken — "Cross-Architecture Model Diffing with
-  Crosscoders" — arXiv:2602.11729 (abstract)
+  Crosscoders" — arXiv:2602.11729 (full PDF 07-16 — no arXiv HTML exists;
+  Dedicated Feature Crosscoders: *scalar* shared/exclusive partitions,
+  BatchTopK, model-stitching + cross-model-steering validation; does not
+  occupy the BSC cell)
 - Engels et al., "Not All Language Model Features Are One-Dimensionally
-  Linear" — arXiv:2405.14860
-- "Understanding sparse autoencoder scaling in the presence of feature
-  manifolds" — arXiv:2509.02565 [snippet]
+  Linear" — arXiv:2405.14860 (App. F.1 battery adopted for Phase 0)
+- Michaud et al., "Understanding sparse autoencoder scaling in the presence
+  of feature manifolds" — arXiv:2509.02565
 - Gorton — "Group Crosscoders for Mechanistic Analysis of Symmetry" —
-  arXiv:2410.24184 (disambiguation + adjacency; abstract)
+  arXiv:2410.24184 (disambiguation + adjacency: cross-site *geometry*,
+  scalar codes — its "blocks" are transformation-indexed decoder slices)
 - Hindupur, Lubana, Fel, Ba — "Projecting Assumptions: The Duality Between
   Sparse Autoencoders and Concept Geometry" (motivation; Semantic Scholar
-  record)
+  record only — still an owed full read)
 - Laptev, Balagansky, Aksenov, Gavrilov — "Analyze Feature Flow to Enhance
-  Interpretation and Steering" — arXiv:2502.03032 (Phase 0.5 tool)
+  Interpretation and Steering" — arXiv:2502.03032 (demoted to Phase-0.5
+  bootstrap; keep its deactivation + random-predecessor controls if used)
 - Ge et al. — "Evolution of Concepts in Language Model Pre-Training" —
-  arXiv:2509.17196 (checkpoint-axis crosscoding; landscape)
-- Group-SAE — arXiv:2410.21508 (disambiguation only); "Do Sparse
-  Autoencoders Capture Concept Manifolds?" — arXiv:2604.28119; "Bilinear
-  autoencoders find interpretable manifolds" — arXiv:2605.08891 (landscape)
+  arXiv:2509.17196 (checkpoint-axis crosscoding; norm-based provenance
+  conclusions read as suggestive — no artifact diagnostics applied)
+- Group-SAE — arXiv:2410.21508 (disambiguation; its related work surfaces
+  Yun 2103.15949 + Lawson 2409.04185 as owed predecessor reads); Bhalla —
+  "Do Sparse Autoencoders Capture Concept Manifolds?" — arXiv:2604.28119
+  (Ising activation-dependence branch + capture/shatter/dilution metrics
+  adopted); Dooms — "Bilinear autoencoders find interpretable manifolds" —
+  arXiv:2605.08891 (global-subspace seed-stability metric adopted)
 - Hindupur et al. 2025 was the "parallel LLM work" flagged unverified in the
   07-12 digest; resolved above.
