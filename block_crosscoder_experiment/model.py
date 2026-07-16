@@ -29,7 +29,7 @@ class BSCConfig:
     block_dim: int  # b
     n_sites: int  # S
     d_model: int  # d
-    k: int  # average active blocks/token (BatchTopK budget)
+    k: float  # average active blocks/token (BatchTopK budget; fractional OK)
     lambda_rank: float = 0.0  # lambda_* on the pinned R_rank reduction
     eig_floor: float = 1e-6  # retraction eigenvalue floor
     sv_eps: float = 1e-8  # eps inside sqrt(eig + eps)
@@ -48,14 +48,16 @@ class BSCOutput(NamedTuple):
     mask: torch.Tensor  # [B, G] bool, selected blocks
 
 
-def batch_topk_mask(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """BatchTopK over blocks: keep the top k*B block-activations batch-wide.
+def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
+    """BatchTopK over blocks: keep the top round(k*B) block-activations
+    batch-wide. Fractional k sets the budget below one block per token —
+    the under-provisioned regime the capture sweep probes.
 
     Per-token counts vary by design; only the batch total is pinned.
     scores: [B, G]  ->  bool mask [B, G]
     """
     B, G = scores.shape
-    n_keep = min(k * B, B * G)
+    n_keep = min(int(round(k * B)), B * G)
     flat = scores.reshape(-1)
     idx = flat.topk(n_keep, sorted=False).indices
     mask = torch.zeros_like(flat, dtype=torch.bool)
