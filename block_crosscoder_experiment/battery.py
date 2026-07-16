@@ -195,7 +195,11 @@ def core_zoo() -> tuple[list[BlockSpec], int]:
         BlockSpec(rank=3, frequency=f, spectrum=(2.0, 1.2, 0.8)),
         BlockSpec(rank=4, frequency=f, spectrum=(1.6, 1.2, 0.8, 0.6)),
     ]
-    return specs, 10  # specs, G_learner
+    # G = 16: capture-campaign round 3 — spare capacity at tight budget
+    # (~2.5x F) removes the init-lottery shell deaths (4/4 seeds at
+    # budget_ratio 0.8 and 0.9; G10 left a per-seed death lottery, G24
+    # regressed slightly). Loose budget still tiles shells at any G.
+    return specs, 16  # specs, G_learner
 
 
 def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
@@ -209,6 +213,10 @@ def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(1)),
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6), depth_profile=one_hot(3)),
     ]
+    # G stays 10: the campaign's open decoy question is the twin-packing
+    # merge (two rank-2 one-hots pack losslessly into one width-4 block;
+    # loss-optimal, so MORE capacity/steps converge to it MORE reliably —
+    # G16/30k merged 4/4). Kept as-is pending the fixture ruling.
     return specs, 10
 
 
@@ -224,7 +232,10 @@ def bundle_zoo() -> tuple[list[BlockSpec], int]:
         BlockSpec(rank=2, frequency=f, geometry="shell", scale=2.0),
         BlockSpec(rank=1, frequency=f, scale=2.0),
     ]
-    return specs, 8
+    # G 8 -> 16: run 3's contrast ring captured only 1/4 seeds — the same
+    # shell-establishment lottery the campaign fixed on core with spare
+    # capacity at tight budget.
+    return specs, 16
 
 
 def frequency_zoo() -> tuple[list[BlockSpec], int]:
@@ -235,7 +246,9 @@ def frequency_zoo() -> tuple[list[BlockSpec], int]:
         BlockSpec(rank=1, frequency=0.3, scale=2.0),
         BlockSpec(rank=1, frequency=0.3, scale=2.0),
     ]
-    return specs, 10
+    # G 10 -> 16: report-only scenario; measure the frequency floor in the
+    # same spare-capacity regime the other scenarios now run in.
+    return specs, 16
 
 
 def auxk_zoo() -> tuple[list[BlockSpec], int]:
