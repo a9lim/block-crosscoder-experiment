@@ -222,7 +222,10 @@ def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
     # site-exclusive recovery. Residual caveat: one rank-3 decoy + the
     # shared rank-1 sum to exactly b=4 — if that pack appears it is a
     # finding, not a fixture bug.
-    return specs, 10
+    # G = 16 (campaign round 6): with packing impossible, spare capacity
+    # helps the decoys exactly as it helps core — 4/4 seeds, zero merges
+    # at b0.8/10k; G10 keeps an ordinary establishment lottery.
+    return specs, 16
 
 
 def bundle_zoo() -> tuple[list[BlockSpec], int]:
