@@ -1,0 +1,35 @@
+# Load-bearing papers for this experiment. Markdown copies live beside this
+# file, gitignored — (re)fetch them with:
+#   python -m transformer_experiments.references
+# ("Projecting Assumptions", Hindupur et al., is cited from a Semantic Scholar
+# record only — add it here once its arXiv id is confirmed.)
+references:
+  - arxiv: "2606.25234"
+    slug: fel2026-block-sparse-featurizers
+    note: Parent 1 — block-sparse featurizers capture visual concept manifolds (primary source).
+  - arxiv: "2606.06333"
+    slug: dalili2026-sasa
+    note: Parent 1' — Subspace-Aware Sparse Autoencoders; the LLM relaxation exists.
+  - url: https://transformer-circuits.pub/2024/crosscoders/index.html
+    slug: anthropic2024-crosscoders
+    note: Parent 2 — original sparse-crosscoder writeup (cross-layer features, model diffing).
+  - arxiv: "2504.02922"
+    note: Minder et al. — overcoming sparsity artifacts in crosscoders (chat-tuning diffing).
+  - arxiv: "2602.11729"
+    note: Jiralerspong & Bricken — cross-architecture model diffing with crosscoders.
+  - arxiv: "2405.14860"
+    note: Engels et al. — not all LM features are one-dimensionally linear.
+  - arxiv: "2509.02565"
+    note: SAE scaling in the presence of feature manifolds.
+  - arxiv: "2410.24184"
+    note: Gorton — group crosscoders for mechanistic analysis of symmetry.
+  - arxiv: "2502.03032"
+    note: Laptev et al. — feature flow for interpretation and steering (Phase 0.5 tool).
+  - arxiv: "2509.17196"
+    note: Ge et al. — evolution of concepts in pre-training (checkpoint-axis crosscoding).
+  - arxiv: "2410.21508"
+    note: Group-SAE (disambiguation from group crosscoders).
+  - arxiv: "2604.28119"
+    note: Do sparse autoencoders capture concept manifolds? (landscape).
+  - arxiv: "2605.08891"
+    note: Bilinear autoencoders find interpretable manifolds (landscape).

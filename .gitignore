@@ -1,4 +1,7 @@
 # Data + figures are regenerated artifacts; keep them out of git.
+references/**
+!references/.gitkeep
+!references/refs.yaml
 data/**
 !data/.gitkeep
 figures/**
