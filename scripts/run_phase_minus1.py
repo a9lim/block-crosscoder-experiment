@@ -17,11 +17,15 @@ from block_crosscoder_experiment.battery import SCENARIOS, BatteryConfig, run_ba
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--scenario", nargs="*", default=None, choices=list(SCENARIOS))
-    p.add_argument("--steps", type=int, default=3000)
-    p.add_argument("--batch-size", type=int, default=1024)
+    # None = BatteryConfig's operating point. A literal script default here
+    # silently overrode the 10k-step operating point for battery runs 3-4
+    # (both actually ran at 3k; caught 2026-07-16 via the reports' embedded
+    # battery_config) — never shadow BatteryConfig defaults in the CLI.
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
     p.add_argument("--device", default="auto")
-    p.add_argument("--out", default=None)
+    p.add_argument("--out", default="data/phase_minus1_report.json")
     args = p.parse_args()
 
     device = (
@@ -29,9 +33,12 @@ def main() -> None:
         if args.device == "auto"
         else args.device
     )
-    bc = BatteryConfig(
-        steps=args.steps, batch_size=args.batch_size, seeds=tuple(args.seeds)
-    )
+    overrides = {
+        k: v
+        for k, v in (("steps", args.steps), ("batch_size", args.batch_size))
+        if v is not None
+    }
+    bc = BatteryConfig(seeds=tuple(args.seeds), **overrides)
     payload = run_battery(bc, device=device, scenarios=args.scenario, out_path=args.out)
     verdict = payload["all_hard_gates_pass"]
     print(f"[battery] hard gates: {'PASS' if verdict else 'FAIL' if verdict is not None else 'n/a'}")
