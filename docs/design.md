@@ -517,7 +517,10 @@ rank recovery via contribution spectra, depth-profile fidelity, code
 correlation after global alignment.
 *Gate:* the pipeline recovers what was planted, does not hallucinate
 structure in the nulls, and yields a nonempty admissible λ set (or the
-documented λ=0 fallback). Lives in `tests/` + `scripts/`; runs on MPS.
+documented λ=0 fallback). Lives in `tests/` + `scripts/`; battery runs on
+jobe (CUDA) with the production optimizer — the retraction-vs-8-bit-Adam
+ordering check thereby lands here rather than waiting for 0.9; code stays
+device-generic and unit tests run anywhere.
 
 **Phase 0 — post-hoc blockification. Zero training; days.**
 First, **positive control**: replicate the Engels weekday/month rings
@@ -747,3 +750,10 @@ public (P23, round-3 novelty verdict).
   causal diffing + DFC stitching/steering validation; blockwise Latent
   Scaling spec'd as b×b maps. Digest corrected at six points (P1–P6);
   owed-reads list expanded. Design re-frozen from this state.
+- **2026-07-16 (placement)** — Phase −1 battery moved from MPS to jobe
+  (CUDA); jobe is idle and the move is strictly de-risking: the harness
+  trains with the production 8-bit-Adam optimizer (CUDA-only), pulling
+  the retraction-ordering verification forward from Phase 0.9; native
+  batched linalg; faster λ×scenario×seed battery. Code remains
+  device-generic; MPS/CPU stay supported for dev runs and unit tests.
+  Hardware placement only — no science change; design remains frozen.

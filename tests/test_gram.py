@@ -1,0 +1,155 @@
+"""Numeric checks that the implementation has the four properties the
+Gram constraint was chosen for (design v2.2, round-2 algebra PASS):
+scale-gauge death, O(b)-invariant spectra, exact selection scores, and
+free per-site Frobenius shares."""
+
+import math
+
+import pytest
+import torch
+
+from block_crosscoder_experiment.gram import (
+    block_gram,
+    gram_residual,
+    init_decoder_stack,
+    rank_penalty,
+    retract_,
+    site_frobenius_shares,
+    site_singular_values,
+)
+
+S, G, B_DIM, D_MODEL = 4, 16, 4, 32
+
+
+def random_stack(device, seed=0, scale=1.0):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    D = torch.randn(S, G, B_DIM, D_MODEL, generator=gen) * scale
+    return D.to(device)
+
+
+def random_orthogonal(n, device, seed=0):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    q, r = torch.linalg.qr(torch.randn(n, n, generator=gen))
+    q = q * torch.sign(torch.diagonal(r)).unsqueeze(0)
+    return q.to(device)
+
+
+def test_retraction_satisfies_constraint(device):
+    D = random_stack(device, scale=3.0)
+    retract_(D)
+    assert gram_residual(D).max().item() < 1e-5
+
+
+def test_retraction_idempotent(device):
+    D = random_stack(device)
+    retract_(D)
+    before = D.clone()
+    retract_(D)
+    assert (D - before).abs().max().item() < 1e-5
+
+
+def test_retraction_kills_scale_gauge(device):
+    """D and c*D retract to the same point — the z->cz gauge is dead."""
+    D1 = random_stack(device)
+    D2 = D1 * 7.3
+    retract_(D1)
+    retract_(D2)
+    assert (D1 - D2).abs().max().item() < 1e-4
+
+
+def test_retraction_requires_fp32(device):
+    D = random_stack(device).to(torch.bfloat16)
+    with pytest.raises(TypeError):
+        retract_(D)
+
+
+def test_retraction_floor_hits_on_deficient_block(device):
+    D = random_stack(device)
+    D[:, 0] = 0.0
+    D[0, 0, 0, 0] = 1.0  # block 0: rank 1 across all sites
+    floor_hits = retract_(D)
+    assert floor_hits >= B_DIM - 1
+    assert torch.isfinite(D).all()
+    # Healthy blocks still land on the constraint.
+    assert gram_residual(D)[1:].max().item() < 1e-5
+
+
+def test_site_shares_sum_to_one_and_start_equal(device):
+    D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
+    shares = site_frobenius_shares(D)  # [S, G]
+    assert torch.allclose(
+        shares.sum(dim=0), torch.ones(G, device=device), atol=1e-5
+    )
+    # Gaussian init + one retraction: approximately equal shares (1/S).
+    assert (shares.mean(dim=1) - 1 / S).abs().max().item() < 0.05
+
+
+def site_exclusive_stack(device):
+    """Constraint-satisfying stack with each code direction on one site:
+    directions 0,1 -> site 0; directions 2,3 -> site 1 (b=4)."""
+    gen = torch.Generator(device="cpu").manual_seed(3)
+    D = torch.zeros(S, G, B_DIM, D_MODEL)
+    for g in range(G):
+        q, _ = torch.linalg.qr(torch.randn(D_MODEL, B_DIM, generator=gen))
+        rows = q.T  # [b, d] orthonormal rows
+        D[0, g, 0] = rows[0]
+        D[0, g, 1] = rows[1]
+        D[1, g, 2] = rows[2]
+        D[1, g, 3] = rows[3]
+    return D.to(device)
+
+
+def test_unequal_shares_preserved(device):
+    """The constraint fixes only the total; the depth profile is free."""
+    D = site_exclusive_stack(device)
+    assert gram_residual(D).max().item() < 1e-5
+    before = D.clone()
+    retract_(D)
+    assert (D - before).abs().max().item() < 1e-5
+    shares = site_frobenius_shares(D)
+    expected = torch.tensor([0.5, 0.5, 0.0, 0.0], device=device)
+    assert torch.allclose(shares[:, 0], expected, atol=1e-5)
+
+
+def test_rank_penalty_endpoints(device):
+    # Site-exclusive: penalty ~ 0 (up to the eps inside sqrt).
+    D = site_exclusive_stack(device)
+    assert rank_penalty(D).item() < 1e-3
+    # Flat: D_g^s = Q_g / sqrt(S) with orthonormal Q_g -> penalty = sqrt(S)-1.
+    gen = torch.Generator(device="cpu").manual_seed(4)
+    q, _ = torch.linalg.qr(torch.randn(D_MODEL, B_DIM, generator=gen))
+    flat = (q.T / math.sqrt(S)).expand(S, G, B_DIM, D_MODEL).contiguous().to(device)
+    assert gram_residual(flat).max().item() < 1e-5
+    assert abs(rank_penalty(flat).item() - (math.sqrt(S) - 1)) < 1e-3
+
+
+def test_rank_penalty_bounds_and_grad(device):
+    D = random_stack(device, seed=5)
+    retract_(D)
+    D.requires_grad_(True)
+    r = rank_penalty(D)
+    assert 0.0 <= r.item() <= math.sqrt(S) - 1 + 1e-4
+    r.backward()
+    assert D.grad is not None and torch.isfinite(D.grad).all()
+
+
+def test_o_b_invariance(device):
+    """A per-block O(b) rotation leaves constraint, spectra, and penalty
+    unchanged — the residual gauge the design exploits for canonical
+    orientation."""
+    D = random_stack(device, seed=6)
+    retract_(D)
+    R = random_orthogonal(B_DIM, device, seed=7)
+    D_rot = torch.einsum("bc,sgcd->sgbd", R, D)
+    assert gram_residual(D_rot).max().item() < 1e-4
+    sv, sv_rot = site_singular_values(D), site_singular_values(D_rot)
+    assert (sv - sv_rot).abs().max().item() < 1e-4
+    assert abs(rank_penalty(D).item() - rank_penalty(D_rot).item()) < 1e-5
+
+
+def test_block_gram_matches_naive(device):
+    D = random_stack(device, seed=8)
+    M = block_gram(D)
+    g = 3
+    naive = torch.stack([D[s, g] @ D[s, g].T for s in range(S)]).sum(dim=0)
+    assert torch.allclose(M[g], naive, atol=1e-5)

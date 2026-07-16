@@ -1,0 +1,142 @@
+"""Gram-constraint primitives for the block-sparse crosscoder.
+
+All functions operate on decoder/encoder stacks of shape ``[S, G, b, d]``
+(sites, blocks, block dim, model dim) in whitened per-site coordinates.
+The layout is chosen so ``reshape(S, G*b, d)`` is a free view for the
+encode/decode batched matmuls.
+
+The load-bearing constraint (design v2.2, *Architecture spec*): per block,
+the concatenated decoder Gram is the identity,
+
+    M_g = sum_s D_g^s D_g^s^T = I_b.
+
+It simultaneously (i) kills the z->cz scale gauge, (ii) reduces the
+within-block GL(b) gauge to O(b), (iii) makes ||z_g||^2 exactly the block's
+contribution energy sum_s ||D_g^s^T z_g||^2, and (iv) blocks the dead-block
+decoder-shrinkage spiral. Enforced by retraction after every optimizer step,
+on the fp32 master weights.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+__all__ = [
+    "block_gram",
+    "gram_residual",
+    "retract_",
+    "site_singular_values",
+    "rank_penalty",
+    "site_frobenius_shares",
+    "init_decoder_stack",
+]
+
+
+def block_gram(D: torch.Tensor) -> torch.Tensor:
+    """Concatenated decoder Gram per block: M_g = sum_s D_g^s D_g^s^T.
+
+    D: [S, G, b, d]  ->  M: [G, b, b]
+    """
+    return torch.einsum("sgbd,sgcd->gbc", D, D)
+
+
+def gram_residual(D: torch.Tensor) -> torch.Tensor:
+    """Per-block Frobenius residual ||M_g - I_b||_F (training-health metric).
+
+    D: [S, G, b, d]  ->  [G]
+    """
+    M = block_gram(D)
+    b = M.shape[-1]
+    eye = torch.eye(b, device=M.device, dtype=M.dtype)
+    return (M - eye).norm(dim=(-2, -1))
+
+
+@torch.no_grad()
+def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
+    """In-place retraction onto the Gram manifold: D_g^s <- M_g^{-1/2} D_g^s.
+
+    Operates on the fp32 master decoders (design: optimizer step on master ->
+    retract master -> regenerate bf16 forward copy -> log post-cast residual).
+    Eigenvalues of M_g are floored at ``eig_floor`` before inversion; the
+    number of floor hits is returned for logging (persistent hits after init
+    indicate a genuinely rank-deficient block the retraction cannot repair).
+
+    D: [S, G, b, d], modified in place. Returns the floor-hit count.
+    """
+    if D.dtype != torch.float32:
+        raise TypeError(f"retraction operates on fp32 master weights, got {D.dtype}")
+    M = block_gram(D)  # [G, b, b]
+    evals, evecs = torch.linalg.eigh(M)
+    floor_hits = int((evals < eig_floor).sum().item())
+    evals = evals.clamp_min(eig_floor)
+    inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
+    D.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, D))
+    return floor_hits
+
+
+def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    """Per-site decoder singular values via batched b x b Gram eigenvalues.
+
+    No d-dimensional SVD anywhere in the loop (design: fp32, sqrt(eig + eps)).
+    eigvalsh (eigenvalues only) keeps the backward well-defined for the
+    symmetric functions of the spectrum we use, including near-degenerate
+    spectra where eigenvector gradients would blow up.
+
+    D: [S, G, b, d]  ->  [S, G, b]
+    """
+    gram_s = torch.einsum("sgbd,sgcd->sgbc", D, D).float()
+    evals = torch.linalg.eigvalsh(gram_s)
+    return (evals.clamp_min(0.0) + eps).sqrt()
+
+
+def rank_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    """Normalized per-site nuclear-norm penalty, pinned reduction (R12).
+
+    R_rank = mean_g (sum_s ||D_g^s||_* - b) / b. Under the Gram constraint
+    the per-block sum ranges over [b, b*sqrt(S)], so this lives in
+    [0, sqrt(S)-1]: 0 = fully site-concentrated, sqrt(S)-1 = flat.
+    """
+    sv = site_singular_values(D, eps=eps)  # [S, G, b]
+    b = D.shape[2]
+    nuc = sv.sum(dim=(0, 2))  # [G]
+    return ((nuc - b) / b).mean()
+
+
+def site_frobenius_shares(D: torch.Tensor) -> torch.Tensor:
+    """Per-site Frobenius shares tr(D_g^s D_g^s^T)/b — the depth profile.
+
+    Free under the constraint; shares sum to 1 per block once retracted.
+
+    D: [S, G, b, d]  ->  [S, G]
+    """
+    b = D.shape[2]
+    return torch.einsum("sgbd,sgbd->sg", D, D) / b
+
+
+def init_decoder_stack(
+    n_sites: int,
+    n_blocks: int,
+    block_dim: int,
+    d_model: int,
+    *,
+    generator: torch.Generator | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Gaussian init followed by one retraction (design: *Sparsity hygiene*).
+
+    Gives approximately equal site shares (1/S) at init. Always fp32.
+    """
+    D = torch.randn(
+        n_sites,
+        n_blocks,
+        block_dim,
+        d_model,
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    D /= math.sqrt(d_model)
+    retract_(D)
+    return D

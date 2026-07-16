@@ -35,10 +35,14 @@ experiments with explicit go/no-go gates.
   this project.
 
 **Status: design v2.2 frozen (round-3: deployment re-plan on measured
-hardware + paper-fidelity amendments); no experiment code yet.**
-Next actions, in order: the Phase −1 synthetic ground-truth harness
-(`tests/` + `scripts/`; generator must follow the gauge-correct v2.2
-spec), then Phase 0 (positive control first — pinned to Bloom's 2024
+hardware + paper-fidelity amendments); Phase −1 implementation started
+2026-07-16 — core Gram/model primitives (`gram.py`, `model.py`) landed
+with numeric tests; battery runs on jobe (CUDA) per the placement
+amendment in the design decision log.**
+Next actions, in order: the rest of the Phase −1 synthetic ground-truth
+harness — trainer (fp32-master → retract → bf16-recast ordering, 8-bit
+Adam, AuxK variants), the gauge-correct generator, recovery metrics +
+scenario battery (`tests/` + `scripts/`) — then Phase 0 (positive control first — pinned to Bloom's 2024
 GPT-2-small layer-7 SAE, observational only — then
 `google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
 plus the activation-dependence branch, PCA within-cluster codes over a
