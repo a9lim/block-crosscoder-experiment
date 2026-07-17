@@ -35,6 +35,13 @@ RUNS = (
      Path("/data/stores/bcc-phase0/gemma3_4b_l22_pile")),
     ("layer_22_width_65k_l0_medium",
      Path("/data/stores/bcc-phase0/gemma3_4b_l22_65k_pile")),
+    # Phase-0.5 depth bracket (2026-07-17): decoder-ring geometry vs depth.
+    ("layer_9_width_65k_l0_medium",
+     Path("/data/stores/bcc-phase0/gemma3_4b_l9_65k_pile")),
+    ("layer_17_width_65k_l0_medium",
+     Path("/data/stores/bcc-phase0/gemma3_4b_l17_65k_pile")),
+    ("layer_29_width_65k_l0_medium",
+     Path("/data/stores/bcc-phase0/gemma3_4b_l29_65k_pile")),
 )
 N_CLASSES = {"weekday": 7, "month": 12}
 
