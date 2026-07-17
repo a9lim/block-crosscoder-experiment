@@ -7,7 +7,13 @@ BOS prepended, monology/pile-uncopyrighted. Model runs bf16 (fp16 is
 banned in the harvest path; f32 doesn't fit beside the codes on 24 GB),
 codes stored f32.
 
+Defaults reproduce the 16k run exactly; the width_65k reroute passes
+--sae-id and --out (the Pile stream is deterministic, so both harvests
+see identical token rows).
+
   python scripts/harvest_phase0_gemma.py --n-tokens 4000000
+  python scripts/harvest_phase0_gemma.py --sae-id layer_22_width_65k_l0_medium \
+      --out /data/stores/bcc-phase0/gemma3_4b_l22_65k_pile
 """
 
 from __future__ import annotations
@@ -29,8 +35,10 @@ def main() -> None:
     parser.add_argument(
         "--out", type=Path, default=Path("/data/stores/bcc-phase0/gemma3_4b_l22_pile")
     )
+    parser.add_argument("--sae-id", default=SAE_ID)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    print(f"config: release={RELEASE} sae_id={args.sae_id} out={args.out}", flush=True)
 
     import torch
     from datasets import load_dataset
@@ -42,7 +50,7 @@ def main() -> None:
         pack_token_rows,
     )
 
-    sae = SAE.from_pretrained(RELEASE, SAE_ID, device=args.device)
+    sae = SAE.from_pretrained(RELEASE, args.sae_id, device=args.device)
     hook_name = sae.cfg.metadata.hook_name
     ctx = int(sae.cfg.metadata.context_size)
     model = HookedSAETransformer.from_pretrained_no_processing(
@@ -74,7 +82,7 @@ def main() -> None:
         batch_size=args.batch_size,
         meta={
             "release": RELEASE,
-            "sae_id": SAE_ID,
+            "sae_id": args.sae_id,
             "model": MODEL,
             "corpus": CORPUS,
             "context_size": ctx,

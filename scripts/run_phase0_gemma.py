@@ -14,7 +14,17 @@ mirrors run_phase0_control.py with three deltas:
 - 16,384 features → the similarity/eigh stages are 2.5× smaller than the
   control's; same code paths.
 
+Defaults reproduce the 16k run exactly. The width_65k reroute passes
+--sae-id/--store and --branches graph: at 65k the spectral branch needs a
+65k×65k dense similarity + eigh (~17 GB in f32, over the 4090 and past the
+box's comfort in RAM) and was already degenerate at 16k's much friendlier
+geometry, so it is scoped out rather than silently truncated. The ranking
+and coact stages depend on spectral labels / an F×F dense co-fire matrix
+respectively and are skipped with a printed line when infeasible.
+
   python scripts/run_phase0_gemma.py --stage all
+  python scripts/run_phase0_gemma.py --sae-id layer_22_width_65k_l0_medium \
+      --store /data/stores/bcc-phase0/gemma3_4b_l22_65k_pile --branches graph
 """
 
 from __future__ import annotations
@@ -51,15 +61,18 @@ def load_decoder(device: str) -> torch.Tensor:
     return sae.W_dec.detach().to(device)
 
 
-def stage_cluster(store, out: Path, device: str) -> dict[str, torch.Tensor]:
-    """Two geometric candidate sources.
+def stage_cluster(
+    store, out: Path, device: str, branches: tuple[str, ...]
+) -> dict[str, torch.Tensor]:
+    """Geometric candidate sources (spectral and/or kNN graph).
 
     Gemma-16k decoders are far more orthogonal than Bloom's GPT-2 SAE
     (median max-neighbor cosine 0.218 vs 0.547 — 6.4× vs 32×
     overcomplete), so Engels-style spectral clustering degenerates toward
     singletons + a background blob. The kNN-graph method (Engels' own
     answer for their 65k Mistral SAEs) handles orthogonal-bulk
-    dictionaries gracefully; both run as candidate sources.
+    dictionaries gracefully; at 16k both run as candidate sources, at 65k
+    only the graph branch is feasible (see module docstring).
     """
     from block_crosscoder_experiment.phase0.clustering import (
         angular_similarity,
@@ -69,20 +82,22 @@ def stage_cluster(store, out: Path, device: str) -> dict[str, torch.Tensor]:
 
     decoder = load_decoder(device)
     labelings: dict[str, torch.Tensor] = {}
-    spath = out / "cluster_labels.pt"
-    if spath.exists():
-        labelings["spectral"] = torch.load(spath, weights_only=True)
-    else:
-        labelings["spectral"] = spectral_clusters(
-            angular_similarity(decoder), N_CLUSTERS, seed=0
-        ).cpu()
-        torch.save(labelings["spectral"], spath)
-    gpath = out / "graph_labels.pt"
-    if gpath.exists():
-        labelings["graph"] = torch.load(gpath, weights_only=True)
-    else:
-        labelings["graph"] = knn_graph_clusters(decoder).cpu()
-        torch.save(labelings["graph"], gpath)
+    if "spectral" in branches:
+        spath = out / "cluster_labels.pt"
+        if spath.exists():
+            labelings["spectral"] = torch.load(spath, weights_only=True)
+        else:
+            labelings["spectral"] = spectral_clusters(
+                angular_similarity(decoder), N_CLUSTERS, seed=0
+            ).cpu()
+            torch.save(labelings["spectral"], spath)
+    if "graph" in branches:
+        gpath = out / "graph_labels.pt"
+        if gpath.exists():
+            labelings["graph"] = torch.load(gpath, weights_only=True)
+        else:
+            labelings["graph"] = knn_graph_clusters(decoder).cpu()
+            torch.save(labelings["graph"], gpath)
     return labelings
 
 
@@ -149,7 +164,7 @@ def stage_battery(
     from block_crosscoder_experiment.phase0.battery import run_cluster_battery
 
     decoder = load_decoder(device)
-    report: dict = {}
+    report: dict = {"_config": {"release": RELEASE, "sae_id": SAE_ID}}
     for family in FAMILIES:
         class_ids = _family_label_vector(store, family)
         fam: dict = {}
@@ -273,6 +288,7 @@ def stage_scan(
     mask = benjamini_hochberg(pvals, alpha=0.05)
     flagged = [c for c, m in zip(sorted(tested), mask.tolist()) if m]
     summary = {
+        "_config": {"release": RELEASE, "sae_id": SAE_ID},
         "n_tested": len(tested),
         "n_gated_out": len(results) - len(tested),
         "bh_flagged": flagged,
@@ -282,7 +298,7 @@ def stage_scan(
     return summary
 
 
-def stage_figures(store, labels: torch.Tensor, report: dict, out: Path, device: str):
+def stage_figures(store, report: dict, out: Path, device: str):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -342,6 +358,7 @@ def _jsonable(obj):
 
 
 def main() -> None:
+    global SAE_ID
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--store", type=Path,
@@ -352,14 +369,25 @@ def main() -> None:
         default="all",
         choices=["all", "cluster", "battery", "ranking", "coact", "figures", "scan"],
     )
+    parser.add_argument("--sae-id", default=SAE_ID)
+    parser.add_argument(
+        "--branches", nargs="+", default=["spectral", "graph"],
+        choices=["spectral", "graph"],
+    )
     args = parser.parse_args()
+    SAE_ID = args.sae_id
+    print(
+        f"config: release={RELEASE} sae_id={SAE_ID} store={args.store} "
+        f"branches={args.branches} stage={args.stage}",
+        flush=True,
+    )
     device = _device()
     store = load_store(args.store)
     store.load_csc()
     out = args.store / "target_run"
     out.mkdir(exist_ok=True)
 
-    labelings = stage_cluster(store, out, device)
+    labelings = stage_cluster(store, out, device, tuple(args.branches))
     for branch, labels in labelings.items():
         sizes = torch.bincount(labels)
         print(
@@ -367,7 +395,7 @@ def main() -> None:
             f"median size {float(sizes[sizes > 0].median()):.0f}, "
             f"max {int(sizes.max())}"
         )
-    spectral = labelings["spectral"]
+    spectral = labelings.get("spectral")
     if args.stage in ("all", "battery", "figures"):
         report = stage_battery(store, labelings, out, device)
         for family in FAMILIES:
@@ -390,15 +418,23 @@ def main() -> None:
                         f"{entry['top_affinity']}"
                     )
     if args.stage in ("all", "ranking"):
-        ranking = stage_ranking(store, spectral, out, device)
-        order = ranking["ranking"]
-        report = json.loads((out / "family_battery.json").read_text())
-        for family in FAMILIES:
-            for b in report[family].get("spectral", {}).get("batteries", []):
-                cid = b["cluster"]
-                rank = order.index(cid) + 1 if cid in order else None
-                print(f"{family} cluster {cid}: Engels rank {rank}/{len(order)}")
-    if args.stage in ("all", "coact"):
+        if spectral is None:
+            print("ranking: skipped (needs the spectral branch)")
+        else:
+            ranking = stage_ranking(store, spectral, out, device)
+            order = ranking["ranking"]
+            report = json.loads((out / "family_battery.json").read_text())
+            for family in FAMILIES:
+                for b in report[family].get("spectral", {}).get("batteries", []):
+                    cid = b["cluster"]
+                    rank = order.index(cid) + 1 if cid in order else None
+                    print(f"{family} cluster {cid}: Engels rank {rank}/{len(order)}")
+    if args.stage in ("all", "coact") and store.n_features > 32768:
+        print(
+            f"coact: skipped ({store.n_features}^2 dense co-fire matrix is "
+            f"infeasible at this width; P15 diagnostic, 16k-only)"
+        )
+    elif args.stage in ("all", "coact"):
         coact = stage_coactivation(store, out, device)
         report = json.loads((out / "family_battery.json").read_text())
         for family in FAMILIES:
@@ -416,7 +452,7 @@ def main() -> None:
                     )
     if args.stage in ("all", "figures"):
         report = json.loads((out / "family_battery.json").read_text())
-        stage_figures(store, spectral, report, out, device)
+        stage_figures(store, report, out, device)
         print(f"figures -> {out / 'figures'}")
     if args.stage in ("all", "scan"):
         summary = stage_scan(store, labelings, out, device)

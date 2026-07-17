@@ -14,7 +14,14 @@ supervised union has no ring plane, the null covers representation, not
 just discovery. Verification-only use of labels — no discovery role
 (2026-07-15 corpus decision).
 
+Defaults reproduce the 16k probe; the width_65k reroute passes --store
+and --sae-id. The per-class selectivity table this prints is the direct
+readout of the splitting prediction (findings §Interpretation).
+
   python scripts/check_gemma_supervised_ring.py
+  python scripts/check_gemma_supervised_ring.py \
+      --store /data/stores/bcc-phase0/gemma3_4b_l22_65k_pile \
+      --sae-id layer_22_width_65k_l0_medium
 """
 
 from __future__ import annotations
@@ -35,6 +42,8 @@ TOP_PER_CLASS = 2
 
 
 def main() -> None:
+    import argparse
+
     from sae_lens import SAE
     from transformers import AutoTokenizer
 
@@ -45,14 +54,20 @@ def main() -> None:
         label_tokens,
     )
 
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--store", type=Path, default=STORE)
+    parser.add_argument("--sae-id", default=SAE_ID)
+    args = parser.parse_args()
+    print(f"config: release={RELEASE} sae_id={args.sae_id} store={args.store}", flush=True)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    store = CodeStore(STORE)
+    store = CodeStore(args.store)
     store.load_csc()
     ccol, row, _ = store._csc
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
     token_ids = store.token_ids().to(torch.long)
     decoder = (
-        SAE.from_pretrained(RELEASE, SAE_ID, device="cpu").W_dec.detach().to(device)
+        SAE.from_pretrained(RELEASE, args.sae_id, device="cpu").W_dec.detach().to(device)
     )
 
     # feature id per nnz entry (feature-major CSC order)
@@ -125,7 +140,7 @@ def main() -> None:
             return obj.tolist()
         return obj
 
-    out = STORE / "target_run" / "supervised_ring.json"
+    out = args.store / "target_run" / "supervised_ring.json"
     out.write_text(json.dumps(jsonable(results), indent=2) + "\n")
     print(f"-> {out}", flush=True)
 
