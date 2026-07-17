@@ -57,12 +57,13 @@ encoder-wd is a no-op; seed noise ~5× below the winner gap; λ=1e-3
 still ~free at the optimum; dead dynamics engaged at G=4096 (0.098%
 mortality, k=16 stress arm skipped per the conditional); the renorm arm
 reverses the per-site FVU allocation (deep→shallow) at wash pooled FVU.
-**Awaiting a9: (1) ratify Phase-1 optimizer defaults (recommended
-lr 1.2e-3 cosine, enc-wd 0, λ=1e-3; 6e-4 the documented fallback —
-cliff and lr×G caveats in the findings §recommendation), (2) the F7
-site-renorm decision, pre-4b-store.** The θ-calibration OOM at G=4096
-was fixed in `9bb4133` (CPU-side score accumulation; estimator
-unchanged); the Phase-1 streaming-quantile carry item stands.
+**Phase-1 optimizer defaults ratified by a9 2026-07-17: lr 1.2e-3
+cosine, enc-wd 0, λ=1e-3** (6e-4 the documented fallback; the 4b pilot
+carries lr-point confirmation). **F7 site-renorm: a9 leans renorm** —
+pinned at 4b store build. Phase 1 now waits only on the 4 TB NVMe.
+The θ-calibration OOM at G=4096 was fixed in `9bb4133` (CPU-side score
+accumulation; estimator unchanged); the Phase-1 streaming-quantile
+carry item stands.
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

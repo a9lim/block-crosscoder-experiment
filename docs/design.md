@@ -1052,3 +1052,20 @@ public (P23, round-3 novelty verdict).
   addendum's unconditional arms are scripted in
   `scripts/run_phase095_matrix.sh` (separate out-root; 0.9 artifacts
   untouched).
+- **2026-07-17 (0.9.5 executed; Phase-1 optimizer pinned)** — the
+  calibration campaign ran same-day on jobe (31 runs;
+  [`findings-phase095-calibration.md`](findings-phase095-calibration.md)).
+  The {1,2,3,6}e-4 grid did not bracket: two extension rungs added
+  mid-campaign found the cosine optimum at 1.2e-3 with a cliff at
+  2.4e-3, on both arms independently; linear_fifth turns over past
+  6e-4; encoder-wd is a no-op; seed noise ~5× below the winner gap;
+  λ=1e-3 re-confirmed ~free at the optimum. **Phase-1 optimizer
+  defaults ratified by a9 2026-07-17: lr 1.2e-3, cosine, encoder-wd 0,
+  λ=1e-3** — the 4b pilot carries lr-point confirmation (the optimum
+  sits one doubling under the cliff; lr×G unmeasured at the winner);
+  6e-4 cosine is the documented fallback on pilot instability. The
+  k=16 stress arm is skipped per its condition (dead dynamics engaged:
+  0.098% mortality at G=4096/k=32). **F7 site-renorm: a9 leans renorm
+  (2026-07-17)** — the arm shows wash pooled FVU with the per-site
+  allocation reversed (deep→shallow); the lean is pinned (or revisited)
+  at 4b store build, before the first store byte is written.
