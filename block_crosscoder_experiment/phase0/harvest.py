@@ -165,27 +165,53 @@ class _CodeStoreWriter:
         self.nnz = 0
 
     def add_shard(self, codes: torch.Tensor, token_ids: torch.Tensor) -> None:
-        """codes: dense (T_s, F) nonneg; token_ids: (T_s,)."""
+        """codes: dense (T_s, F) nonneg; token_ids: (T_s,). Small inputs only
+        — production harvests must use add_shard_coo (a dense shard at
+        store scale is ~100 GB; that OOM has been paid for once already)."""
         if codes.shape[1] != self.n_features:
             raise ValueError(f"expected F={self.n_features}, got {codes.shape[1]}")
-        csc = codes.to_sparse_csc()
-        csr = codes.to_sparse_csr()
+        nz = codes.nonzero(as_tuple=False)
+        self.add_shard_coo(
+            nz[:, 0], nz[:, 1], codes[nz[:, 0], nz[:, 1]], token_ids
+        )
+
+    def add_shard_coo(
+        self,
+        rows: torch.Tensor,
+        cols: torch.Tensor,
+        vals: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> None:
+        """Assemble one shard from COO triplets — never densifies."""
+        t_s = int(token_ids.shape[0])
+        rows = rows.to(torch.int64).cpu()
+        cols = cols.to(torch.int64).cpu()
+        vals = vals.to(torch.float32).cpu()
+
+        by_row = torch.argsort(rows, stable=True)
+        crow = torch.zeros(t_s + 1, dtype=torch.int64)
+        crow[1:] = torch.bincount(rows, minlength=t_s).cumsum(0)
+
+        by_col = torch.argsort(cols, stable=True)
+        ccol = torch.zeros(self.n_features + 1, dtype=torch.int64)
+        ccol[1:] = torch.bincount(cols, minlength=self.n_features).cumsum(0)
+
         name = f"shard_{len(self.shards):04d}.pt"
         torch.save(
             {
-                "ccol": csc.ccol_indices().to(torch.int64).cpu(),
-                "row": csc.row_indices().to(torch.int32).cpu(),
-                "val": csc.values().to(torch.float32).cpu(),
-                "crow": csr.crow_indices().to(torch.int64).cpu(),
-                "col": csr.col_indices().to(torch.int32).cpu(),
-                "val_csr": csr.values().to(torch.float32).cpu(),
+                "ccol": ccol,
+                "row": rows[by_col].to(torch.int32),
+                "val": vals[by_col],
+                "crow": crow,
+                "col": cols[by_row].to(torch.int32),
+                "val_csr": vals[by_row],
                 "token_ids": token_ids.to(torch.int32).cpu(),
             },
             self.root / name,
         )
         self.shards.append(name)
-        self.n_tokens += int(codes.shape[0])
-        self.nnz += int(csc.values().shape[0])
+        self.n_tokens += t_s
+        self.nnz += int(vals.shape[0])
 
     def finalize(self) -> CodeStore:
         manifest = {
@@ -244,17 +270,25 @@ def harvest_codes(
     ~none; a spike means the hook or encode path silently broke).
     """
     writer = CodeStore.open_writer(out_root, int(sae.cfg.d_sae), meta)
-    pending_codes: list[torch.Tensor] = []
+    pending_rows: list[torch.Tensor] = []
+    pending_cols: list[torch.Tensor] = []
+    pending_vals: list[torch.Tensor] = []
     pending_ids: list[torch.Tensor] = []
     pending = 0
     zero_rows = 0
     total = 0
 
     def flush() -> None:
-        nonlocal pending, pending_codes, pending_ids
-        if pending_codes:
-            writer.add_shard(torch.cat(pending_codes), torch.cat(pending_ids))
-            pending_codes, pending_ids, pending = [], [], 0
+        nonlocal pending, pending_rows, pending_cols, pending_vals, pending_ids
+        if pending_ids:
+            writer.add_shard_coo(
+                torch.cat(pending_rows),
+                torch.cat(pending_cols),
+                torch.cat(pending_vals),
+                torch.cat(pending_ids),
+            )
+            pending_rows, pending_cols, pending_vals, pending_ids = [], [], [], []
+            pending = 0
 
     batch: list[torch.Tensor] = []
 
@@ -269,7 +303,12 @@ def harvest_codes(
         zero = (codes.gt(0).sum(dim=1) == 0).sum()
         zero_rows += int(zero)
         total += codes.shape[0]
-        pending_codes.append(codes.float().cpu())
+        # Sparsify on-device per batch: a dense shard at store scale is
+        # ~100 GB of RAM (the OOM that killed harvest run 1).
+        nz = codes.nonzero(as_tuple=False)
+        pending_rows.append((nz[:, 0] + pending).cpu())
+        pending_cols.append(nz[:, 1].cpu())
+        pending_vals.append(codes[nz[:, 0], nz[:, 1]].float().cpu())
         pending_ids.append(toks[:, 1:].reshape(-1).cpu())
         pending += codes.shape[0]
         if pending >= shard_tokens:
