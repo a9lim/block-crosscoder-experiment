@@ -34,29 +34,51 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: Phase −1 harness complete and battery run twice on jobe
-(2026-07-16) — primitives, trainer, gauge-correct generator, recovery
-metrics, seven-scenario battery, all unit-tested (69 tests on CUDA).
-Verdicts in
-[`docs/findings-phase-minus1-battery.md`](docs/findings-phase-minus1-battery.md):
-λ=0-primary confirmed (empty admissible set; the run-1 "share
-concentration" was largely a Frobenius parked-capacity artifact — the
-real λ harm is overlap collapse); rank ≤3 gaussians recover exactly,
-shells tile, spare capacity splits — one capture/tiling/splitting
-lottery behind every red gate. The 8-bit-Adam retraction-ordering
-check (0.9 gate) passed early.**
-Gate semantics ruled (a9, 2026-07-16): **strict capture-as-written**
-(findings §3). Next: the capture campaign — factor-isolate the passing
-pinned-test config vs the failing battery config (budget ratio,
-optimizer, zoo, G/F, steps; multi-seed), map the seed-robust capture
-region incl. production-like spare capacity, re-run the battery inside
-it. Phase −1 passes only on full capture. Then: Phase 0 (positive control first — pinned to
-Bloom's 2024 GPT-2-small layer-7 SAE, observational only — then
+**Status: Phase −1 PASSED (2026-07-16) — battery run 6 on jobe, all
+hard gates green under a9's strict capture-as-written ruling.** The
+harness (primitives, trainer, gauge-correct generator, recovery
+metrics, seven-scenario battery; 69 tests on CUDA) plus the capture
+campaign (sweep rounds 1–8, battery runs 3–6) are documented in
+[`docs/findings-phase-minus1-battery.md`](docs/findings-phase-minus1-battery.md).
+Load-bearing outcomes:
+
+- **Operating point** (§5.4): budget ratio 0.8, 10k steps × batch 1024
+  (≈10M tokens), spare capacity G ≈ 2.5×F (all zoos G16). Budget is
+  the driving factor and monotone: loose budgets junk-fill/tile, 0.7
+  starves. The 8-bit-Adam retraction-ordering check (0.9 gate) passed
+  early. Battery runs 1–4 were silently 3k-step runs (CLI shadowing,
+  fixed) — always verify the report's embedded `battery_config`.
+- **λ-verdict reversed at the honest operating point** (§6.1): the
+  admissible set opens at 10M tokens — **Phase-1 primary is λ=1e-3**
+  (largest admissible, per protocol; design decision log amended). The
+  earlier λ=0 fallback was a 3k-scale overlap-collapse artifact.
+- **Block width is a packing budget** (§5.2): sub-width co-active or
+  low-rank features pack losslessly into one block; merging is the
+  *converged optimum*, and better convergence merges more. Decoys
+  re-fixtured to rank-3 twins (a9's ruling); expect packed blocks in
+  production — signature: full overlap, ≈50/50 split shares, degraded
+  code-R². Phase-2 `share` export must treat that signature as a
+  packing flag.
+- **Ring detection needs zero budget slack** (§6.2–6.3): the bundle
+  scenario budget is pinned to block-event demand k=0.75 — per-feature
+  accounting double-counts co-active features, and any slack
+  junk-fills through captured rings (junk tolerance <1% of firings),
+  hiding them from all-firings norm-CV.
+- **AuxK separates at 10k**: SASA keeps 12/12 rare features (1–4 dead
+  of 16) vs 9–12 dead for Fel/long-horizon — the C.1 default is now
+  positively justified. Frequency floor: clean to f=0.01 at 10M
+  tokens; below is a per-seed lottery.
+
+Next: Phase 0 (positive control first — pinned to Bloom's 2024
+GPT-2-small layer-7 SAE, observational only — then
 `google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
 plus the activation-dependence branch, PCA within-cluster codes over a
-token stream, hunt weekday/month rings with the full Engels battery —
-noting the tiled-ring caveat: norm-CV only flags *captured* rings, so
-the ring hunt needs span-level evidence too).
+token stream, hunt weekday/month rings with the full Engels battery).
+Ring-hunt caveat, now quantified in vivo: bare norm-CV misses real
+rings both ways — soft phase-splits score CV ≈ 0.22, and *perfectly
+captured* rings under production budget slack score 0.17–0.43 — so
+ring claims need span-level plus gate-conditional evidence (circular
+decoding / Fourier structure per design §Phase-0), never bare norm-CV.
 
 ## The saklas seam
 

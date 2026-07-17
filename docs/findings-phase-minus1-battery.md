@@ -1,4 +1,12 @@
-# Phase −1 battery findings (runs 1–5 + capture campaign, 2026-07-16)
+# Phase −1 battery findings (runs 1–6 + capture campaign, 2026-07-16)
+
+**Phase −1 verdict: PASSED.** Battery run 6 (10k steps × batch 1024,
+seeds {0,1,2,3}, G16 zoos, rank-3 decoy fixture, bundle budget pinned
+to block-event demand) passes **all hard gates** under a9's strict
+capture-as-written ruling — core, λ-veto, decoys, bundle-null,
+rotation-equivariance 4/4 each; bundle ring CVs 0.047–0.060,
+bit-identical to sweep round 8's k=0.75 cell. The route there is
+§§5–6; Phase-1 primary is λ=1e-3 (§6.1).
 
 Scenario battery per design v2.2 Phase −1, run on jobe (RTX 4090, CUDA,
 8-bit Adam — the production optimizer, per the placement amendment).
@@ -391,8 +399,9 @@ packs to one block, so 0.25 + 0.25 + 0.25), not a tuned number; 4/4
 with 2× CV margin. The naive `budget_k` accounting (ratio 0.8 ×
 per-feature ΣF = 1.2) double-counts the co-active bundle relative to
 the packed format the learner correctly adopts — the packing economics
-of §5.2, closing the loop. Battery run 6 re-runs the full battery at
-this pin.
+of §5.2, closing the loop. **Battery run 6 at this pin: all hard gates
+pass** (bundle 4/4, ring CVs 0.047–0.060 bit-identical to the round-8
+cell; every other scenario reproduces run 5). Phase −1 is green.
 
 Phase-0 consequence, sharpened: production runs always have budget
 slack, so **bare norm-CV will miss real, perfectly captured rings**
