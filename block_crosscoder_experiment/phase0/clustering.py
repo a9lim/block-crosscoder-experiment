@@ -177,14 +177,26 @@ def knn_graph_clusters(
     *,
     k: int = 2,
     tau: float = 0.5,
+    chunk: int = 8192,
 ) -> torch.Tensor:
-    """Engels App. F.2 graph clustering: kNN edges, prune cos < τ, components."""
-    u = _unit_rows(decoder.to(torch.float32))
-    cos = u @ u.T
-    cos.fill_diagonal_(-2.0)
-    _, nbrs = cos.topk(k, dim=1)  # (F, k)
+    """Engels App. F.2 graph clustering: kNN edges, prune cos < τ, components.
 
+    Row-chunked so the dense F×F cosine matrix is never materialized
+    (17 GB at width_65k); per-row topk over the full row is unchanged,
+    so results are identical to the dense form at any chunk size.
+    """
+    u = _unit_rows(decoder.to(torch.float32))
     n = u.shape[0]
+    nbrs = torch.empty(n, k, dtype=torch.long, device=u.device)
+    vals = torch.empty(n, k, dtype=torch.float32, device=u.device)
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        cos = u[lo:hi] @ u.T
+        idx = torch.arange(hi - lo, device=u.device)
+        cos[idx, idx + lo] = -2.0
+        vals[lo:hi], nbrs[lo:hi] = cos.topk(k, dim=1)
+        del cos
+
     parent = list(range(n))
 
     def find(a: int) -> int:
@@ -193,9 +205,9 @@ def knn_graph_clusters(
             a = parent[a]
         return a
 
-    rows = torch.arange(n, device=cos.device).repeat_interleave(k)
+    rows = torch.arange(n, device=u.device).repeat_interleave(k)
     cols = nbrs.reshape(-1)
-    keep = (cos[rows, cols] >= tau).cpu()
+    keep = (vals.reshape(-1) >= tau).cpu()
     rows, cols = rows.cpu(), cols.cpu()
     for i, j in zip(rows[keep].tolist(), cols[keep].tolist()):
         ri, rj = find(i), find(j)
