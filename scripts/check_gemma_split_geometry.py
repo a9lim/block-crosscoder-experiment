@@ -186,9 +186,11 @@ def main() -> None:
                     )
                     fig_dir = Path("figures/phase0-gemma")
                     fig_dir.mkdir(parents=True, exist_ok=True)
+                    layer = sae_id.split("layer_")[1].split("_")[0]
                     width = sae_id.split("width_")[1].split("_")[0]
                     fig.savefig(
-                        fig_dir / f"{family}_decoder_ring_{width}.png", dpi=150
+                        fig_dir / f"{family}_decoder_ring_l{layer}_{width}.png",
+                        dpi=150,
                     )
                     plt.close(fig)
         del dec

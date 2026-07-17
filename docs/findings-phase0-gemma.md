@@ -275,7 +275,7 @@ null).
 **The 65k month dictionary contains a decoder-space ring**: adjacent
 months are systematically more similar (max pair cosine 0.32), and the
 12 decoder directions' PC1/2 angles wind in calendar order
-(`figures/phase0-gemma/month_decoder_ring_65k.png` — months 1–3 and
+(`figures/phase0-gemma/month_decoder_ring_l22_65k.png` — months 1–3 and
 5–11 trace a clean cycle; the two off-ring points are interpretable:
 May, whose dominant feature carries the "may"-modal ambiguity, and
 Jan, pulled toward the center). PC1/2 hold only 29% of the 12-vector
