@@ -34,8 +34,40 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: Phase −1 PASSED (2026-07-16) — battery run 6 on jobe, all
-hard gates green under a9's strict capture-as-written ruling.** The
+**Status: Phases −1, 0, and 0.5 PASSED (2026-07-16/17). Next: Phase
+0.9 (1b dress rehearsal).**
+
+- **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
+  control in `findings-phase0-control.md`): positive control recovered
+  Engels' weekday ring on GPT-2; on gemma layer 22 the discovery
+  verdict is the scoped null at 16k *and* 65k (BH-flagged: none; the
+  supervised skeleton features are τ=0.5 graph singletons — max family
+  cosine 0.32 structurally excludes rings from the candidate set). But
+  the **month ring exists in the 65k dictionary decoder-side**
+  (adjacency p 1.5e-4, Fisher–Lee angle order p 3.5e-4): splitting
+  completes at 25.6× and the ring rides at cosines below every
+  clustering threshold. H1's artifact statement is positive even
+  though post-hoc blockification can't reach it.
+- **Phase 0.5** ([`docs/findings-phase05-cross-layer.md`](docs/findings-phase05-cross-layer.md),
+  layers 9/17/22/29 @ 65k, paired 4M-token stream): **gate passed in
+  the BSC-native form** — month codes correspond linearly across
+  depths (held-out code-map R² 0.83–0.90 for 9↔22↔29, all CCA ≥ 0.96
+  for 9↔22) while raw-basis decoder spans sit at chance alignment;
+  22→29 also span-matches. Frames rotate, the code persists — the
+  architecture's premise observed pre-training. Depth rewrite:
+  activation-space rings live *early* (layer-9 weekday: circ 0.981 on
+  the top plane AND decoder |r| 0.886 — both spaces, still max
+  adjacent cos 0.27 < τ); layer 22 is the ring-visibility minimum,
+  not a representative depth. Layer 17's 65k SAE undersplits both
+  families — never judge structure through a single site's
+  dictionary. Phase-1 site selection must bracket depth including an
+  early (layer-9-like) site. A bonus layer-9 discovery run nulls
+  identically (BH none; 15/17 skeleton feats τ=0.5 singletons): the
+  discovery gap is depth-general, which sharpens H1 at every probed
+  depth.
+
+Phase −1 detail (battery run 6 on jobe, all hard gates green under
+a9's strict capture-as-written ruling): the
 harness (primitives, trainer, gauge-correct generator, recovery
 metrics, seven-scenario battery; 69 tests on CUDA) plus the capture
 campaign (sweep rounds 1–8, battery runs 3–6) are documented in
@@ -69,12 +101,7 @@ Load-bearing outcomes:
   positively justified. Frequency floor: clean to f=0.01 at 10M
   tokens; below is a per-seed lottery.
 
-Next: Phase 0 (positive control first — pinned to Bloom's 2024
-GPT-2-small layer-7 SAE, observational only — then
-`google/gemma-scope-2-4b-pt` blockification: cosine+spectral clustering
-plus the activation-dependence branch, PCA within-cluster codes over a
-token stream, hunt weekday/month rings with the full Engels battery).
-Ring-hunt caveat, now quantified in vivo: bare norm-CV misses real
+Ring-hunt caveat, quantified in vivo at Phase −1: bare norm-CV misses real
 rings both ways — soft phase-splits score CV ≈ 0.22, and *perfectly
 captured* rings under production budget slack score 0.17–0.43 — so
 ring claims need span-level plus gate-conditional evidence (circular
