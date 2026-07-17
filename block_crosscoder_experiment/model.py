@@ -176,17 +176,24 @@ class BlockCrosscoder(nn.Module):
         target (D10): mean count = G * P(p > theta), so theta is the
         (1 - target/G) quantile of the pooled score distribution.
         Uses kthvalue, not torch.quantile (which caps at ~16M elements).
+        Scores accumulate on CPU: at G=4096 the pooled score matrix is
+        ~8.6 GB for the 0.9 calibration split and cannot sit next to the
+        model on a 24 GB card (0.9.5 dead-arm OOM). The estimator is
+        unchanged — exact pooled quantile, just host-side. The Phase-1
+        13M-token calibration needs the streaming quantile regardless
+        (carry item; ~213 GB at G=4096 exceeds host RAM too).
         """
         scores = torch.cat(
-            [self.scores(self.encode(x.to(self.E.device, self.E.dtype))).flatten().float()
+            [self.scores(self.encode(x.to(self.E.device, self.E.dtype)))
+             .flatten().float().cpu()
              for x in batches]
         )
         n = scores.numel()
         q = 1.0 - target_avg_blocks / self.cfg.n_blocks
         idx = min(max(int(round(q * n)), 1), n)
-        theta = scores.kthvalue(idx).values
+        theta = float(scores.kthvalue(idx).values)
         self.theta.fill_(theta)
-        return float(theta)
+        return theta
 
 
 def bsc_loss(
