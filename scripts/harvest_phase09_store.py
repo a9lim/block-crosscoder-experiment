@@ -218,23 +218,30 @@ def main() -> None:
     raw_manifest = raw_writer.close()
     print(f"  raw_validation: {raw_manifest['n_tokens']:,} tokens", flush=True)
 
-    # Held-out whitened covariance ≈ I (D9): fit tokens never enter this.
+    # Held-out transformed-covariance validation (D9). The pinned ridge
+    # (λ = mean eigenvalue) makes W a *shrinkage* whitener — the fit-side
+    # prediction for the whitened spectrum is σ_j/(σ_j+λ), not 1 — so
+    # stability is measured as held-out spectrum vs that prediction;
+    # the vs-identity numbers are reported as ridge-softness context.
     cov = (heldout_cov / max(heldout_n, 1)).cpu()
-    eye = torch.eye(d_model, dtype=torch.float64)
-    dev = [float((cov[s] - eye).abs().max()) for s in range(len(SITES))]
-    mean_dev = [
-        float(torch.linalg.eigvalsh(cov[s]).sub(1).abs().mean())
-        for s in range(len(SITES))
-    ]
-    print(f"held-out whitened cov, max |entry - I| per site: "
-          f"{[round(v, 3) for v in dev]}", flush=True)
-    print(f"held-out whitened cov, mean |eig - 1| per site: "
-          f"{[round(v, 3) for v in mean_dev]}", flush=True)
+    dev_vs_pred, mean_dev_vs_one = [], []
+    for s in range(len(SITES)):
+        held = torch.linalg.eigvalsh(cov[s]).flip(0)  # descending
+        reg = whitener.eigenvalues[s].double().flip(0)  # eigs of Σ+λI, desc
+        lam = float(whitener.ridge[s])
+        predicted = (reg - lam) / reg
+        dev_vs_pred.append(float((held - predicted).abs().mean()))
+        mean_dev_vs_one.append(float(held.sub(1).abs().mean()))
+    print(f"held-out whitened spectrum, mean |eig - predicted| per site: "
+          f"{[round(v, 4) for v in dev_vs_pred]}", flush=True)
+    print(f"held-out whitened spectrum, mean |eig - 1| per site "
+          f"(ridge softness): {[round(v, 3) for v in mean_dev_vs_one]}",
+          flush=True)
 
     report = {
         "whitener_hash": whitener.hash,
-        "heldout_cov_max_dev": dev,
-        "heldout_cov_mean_eig_dev": mean_dev,
+        "heldout_eig_dev_vs_predicted": dev_vs_pred,
+        "heldout_eig_dev_vs_identity": mean_dev_vs_one,
         "heldout_tokens": heldout_n,
         "meta": corpus_meta,
     }
