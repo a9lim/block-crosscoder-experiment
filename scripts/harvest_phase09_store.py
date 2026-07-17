@@ -78,7 +78,10 @@ def main() -> None:
     total_tokens = (
         args.whitener_tokens + args.calib_tokens + args.eval_tokens + args.train_tokens
     )
-    n_rows = -(-total_tokens // tokens_per_row) + args.batch_rows  # margin rows
+    # Margin: each of the 4 stage boundaries discards the tail of its
+    # boundary batch (< batch_rows rows), and act_batches drops a final
+    # partial buffer (< batch_rows rows) — so 5 batches of rows covers it.
+    n_rows = -(-total_tokens // tokens_per_row) + 5 * args.batch_rows + 2
     rows = pack_token_rows(token_docs(), ctx=CTX, bos_id=bos, n_rows=n_rows)
 
     corpus_meta = {

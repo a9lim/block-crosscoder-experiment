@@ -1,0 +1,224 @@
+"""Phase-0.9 rehearsal: train + eval one model from the whitened store.
+
+One invocation = one run of the rehearsal matrix (BSC λ ∈ {0, 3e-4, 1e-3}
+plus the matched b=1 scalar baseline — same G·b latents, k matched by
+training-average L0, same store, same shuffle seed). Plumbing gates
+exercised here: training stability (the trainer's stability diagnostics
+land in the step log), checkpoint/resume (--max-steps then --resume
+continues bit-compatibly from the saved state, fast-forwarding the
+deterministic stream), threshold calibration on the calibration split,
+eval determinism (the eval pass runs twice and must agree exactly), and
+per-site whitened FVU on the held-out eval split.
+
+  python -u scripts/run_phase09_rehearsal.py --arm bsc --lam 1e-3
+  python -u scripts/run_phase09_rehearsal.py --arm scalar
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import time
+from pathlib import Path
+
+STORE = Path("/data/stores/bcc-phase09/gemma3_1b_6site_fineweb")
+G, B_DIM, K = 1024, 4, 16.0
+BATCH = 4096
+EPOCHS = 2
+SHUFFLE_SEED = 0  # recorded; shared verbatim by BSC and baseline (design)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arm", choices=("bsc", "scalar"), required=True)
+    parser.add_argument("--lam", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--store", type=Path, default=STORE)
+    parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument(
+        "--max-steps", type=int, default=None,
+        help="stop early after N steps (resume gate: run with --max-steps, "
+        "then again with --resume)",
+    )
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+
+    import torch
+
+    from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
+    from block_crosscoder_experiment.store import StoreReader, Whitener
+    from block_crosscoder_experiment.trainer import TrainConfig, Trainer
+
+    whitener = Whitener.load(args.store / "whitener.pt")
+    train_reader = StoreReader(args.store, "train", expected_whitener_hash=whitener.hash)
+    n_sites = train_reader.n_sites
+    d_model = train_reader.d_model
+
+    if args.arm == "bsc":
+        model_cfg = BSCConfig(
+            n_blocks=G, block_dim=B_DIM, n_sites=n_sites, d_model=d_model,
+            k=K, lambda_rank=args.lam, seed=args.seed,
+        )
+    else:
+        if args.lam != 0.0:
+            raise SystemExit("scalar baseline runs at lambda=0 (design: at b=1 "
+                             "the nuclear term is not a rank penalty)")
+        model_cfg = BSCConfig(
+            n_blocks=G * B_DIM, block_dim=1, n_sites=n_sites, d_model=d_model,
+            k=K * B_DIM,  # matched training-average L0: E[l] = b*E[k]
+            lambda_rank=0.0, seed=args.seed,
+        )
+
+    steps_per_epoch = train_reader.n_tokens // BATCH
+    total_steps = steps_per_epoch * EPOCHS
+    run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}"
+    run_dir = args.out_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = run_dir / "latest.pt"
+    print(
+        f"config: arm={args.arm} lam={args.lam:g} seed={args.seed} "
+        f"G={model_cfg.n_blocks} b={model_cfg.block_dim} k={model_cfg.k} "
+        f"sites={n_sites} d={d_model} steps={total_steps} batch={BATCH} "
+        f"epochs={EPOCHS} store={args.store} whitener={whitener.hash[:12]}… "
+        f"run_dir={run_dir}",
+        flush=True,
+    )
+
+    train_cfg = TrainConfig(total_steps=total_steps, log_every=10)
+
+    if args.resume:
+        if not ckpt.exists():
+            raise SystemExit(f"--resume but no checkpoint at {ckpt}")
+        trainer = Trainer.load_checkpoint(ckpt, device=args.device)
+        trainer._log_file = (run_dir / "steps.jsonl").open("a")
+        print(f"resumed at step {trainer.step_idx}", flush=True)
+    else:
+        model = BlockCrosscoder(model_cfg, device=args.device)
+        # Encoder scale calibration on the first training batch (Fel App. D).
+        first = next(iter(train_reader.shuffled_batches(BATCH, seed=SHUFFLE_SEED)))
+        model.calibrate_encoder_scale_(first.to(args.device, torch.float32))
+        trainer = Trainer(model, train_cfg, log_path=run_dir / "steps.jsonl")
+
+    batches = train_reader.shuffled_batches(
+        BATCH, seed=SHUFFLE_SEED, epochs=EPOCHS + 1  # +1: margin for skips
+    )
+    if trainer.step_idx:
+        batches = itertools.islice(batches, trainer.step_idx, None)
+        # islice is lazy; the skip cost lands on the first next() below.
+        print(f"fast-forwarding stream by {trainer.step_idx} batches", flush=True)
+
+    stop_at = min(total_steps, args.max_steps or total_steps)
+    t0 = time.time()
+    data_wait = 0.0
+    while trainer.step_idx < stop_at:
+        t_io = time.time()
+        x = next(batches)
+        data_wait += time.time() - t_io
+        rec = trainer.step(x)
+        if trainer.step_idx % args.checkpoint_every == 0 or trainer.step_idx == stop_at:
+            trainer.save_checkpoint(ckpt)
+        if trainer.step_idx % 200 == 0:
+            dt = time.time() - t0
+            print(
+                f"  step {trainer.step_idx}/{total_steps} rec {rec['rec']:.4f} "
+                f"total {rec['total']:.4f} "
+                f"({trainer.step_idx * BATCH / max(dt, 1e-9):,.0f} tok/s, "
+                f"data-wait {data_wait / max(dt, 1e-9):.0%})",
+                flush=True,
+            )
+    trainer.save_checkpoint(ckpt)
+    train_minutes = (time.time() - t0) / 60
+    print(f"training done at step {trainer.step_idx} ({train_minutes:.1f} min)",
+          flush=True)
+    if trainer.step_idx < total_steps:
+        print("stopped at --max-steps; rerun with --resume to finish", flush=True)
+        return
+
+    model = trainer.master.to(args.device)
+
+    # ---- threshold calibration on the calibration split ------------------
+    # fit_threshold_ holds the pooled score matrix in VRAM; cap the token
+    # count so the scalar arm (G·b latents) stays within budget. Streaming
+    # quantiles are a Phase-1 item — 13M calib tokens will need them.
+    calib_reader = StoreReader(
+        args.store, "calibration", expected_whitener_hash=whitener.hash
+    )
+    n_calib_batches = min(128, calib_reader.n_tokens // BATCH)
+    theta = model.fit_threshold_(
+        itertools.islice(calib_reader.sequential_batches(BATCH), n_calib_batches),
+        target_avg_blocks=model.cfg.k,
+    )
+    print(f"calibrated theta {theta:.5f} (target avg blocks {model.cfg.k}, "
+          f"{n_calib_batches * BATCH:,} calib tokens)", flush=True)
+
+    # ---- eval: per-site whitened FVU, run twice (determinism gate) -------
+    eval_reader = StoreReader(args.store, "eval", expected_whitener_hash=whitener.hash)
+
+    @torch.no_grad()
+    def eval_pass(mode: str) -> dict:
+        sq_err = torch.zeros(n_sites, dtype=torch.float64)
+        sq_tot = torch.zeros(n_sites, dtype=torch.float64)
+        mean_acc = torch.zeros(n_sites, d_model, dtype=torch.float64)
+        n = 0
+        active = 0.0
+        for x in eval_reader.sequential_batches(BATCH):
+            x = x.to(args.device, torch.float32)
+            out = model(x, mode=mode)
+            sq_err += (x - out.xhat).double().pow(2).sum(dim=(0, 2)).cpu()
+            mean_acc += x.double().sum(dim=0).cpu()
+            sq_tot += x.double().pow(2).sum(dim=(0, 2)).cpu()
+            active += float(out.mask.sum())
+            n += x.shape[0]
+        mu = mean_acc / n
+        centered_tot = sq_tot - n * mu.pow(2).sum(dim=1)
+        fvu = (sq_err / centered_tot).tolist()
+        return {
+            "mode": mode,
+            "fvu_per_site": [round(v, 6) for v in fvu],
+            "fvu_pooled": round(float(sq_err.sum() / centered_tot.sum()), 6),
+            "avg_active_blocks": round(active / n, 3),
+            "n_tokens": n,
+        }
+
+    results = {}
+    for mode in ("topk", "threshold"):
+        first = eval_pass(mode)
+        second = eval_pass(mode)
+        deterministic = first == second
+        results[mode] = first
+        results[mode]["deterministic"] = deterministic
+        print(f"  eval[{mode}]: pooled FVU {first['fvu_pooled']} "
+              f"per-site {first['fvu_per_site']} "
+              f"avg blocks {first['avg_active_blocks']} "
+              f"deterministic {deterministic}", flush=True)
+
+    dead_frac = float(
+        (trainer.tracker.frequency(train_cfg.dead_window_batches)
+         <= train_cfg.dead_threshold).float().mean()
+    )
+    report = {
+        "arm": args.arm,
+        "lam": args.lam,
+        "seed": args.seed,
+        "model_cfg": {
+            "n_blocks": model_cfg.n_blocks, "block_dim": model_cfg.block_dim,
+            "k": model_cfg.k, "n_sites": n_sites, "d_model": d_model,
+        },
+        "total_steps": total_steps,
+        "shuffle_seed": SHUFFLE_SEED,
+        "whitener_hash": whitener.hash,
+        "theta": theta,
+        "eval": results,
+        "dead_frac_final_window": dead_frac,
+        "train_minutes": round(train_minutes, 2),
+        "optimizer": trainer.optimizer_kind,
+    }
+    (run_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"-> {run_dir / 'report.json'}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
