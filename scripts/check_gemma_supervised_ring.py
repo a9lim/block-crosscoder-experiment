@@ -57,6 +57,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--sae-id", default=SAE_ID)
+    parser.add_argument(
+        "--figures", action="store_true",
+        help="render the union scatter per family into <store>/target_run/figures",
+    )
     args = parser.parse_args()
     print(f"config: release={RELEASE} sae_id={args.sae_id} store={args.store}", flush=True)
 
@@ -117,6 +121,40 @@ def main() -> None:
             seed=0,
         )
         battery["members"] = members_t.tolist()
+        if args.figures and battery.get("circular") is not None:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            from block_crosscoder_experiment.phase0.battery import (
+                cluster_restricted_reconstruction,
+            )
+            from block_crosscoder_experiment.phase0.rings import pca_projections
+
+            recon, kept = cluster_restricted_reconstruction(
+                store, decoder, members_t
+            )
+            proj, _ = pca_projections(recon, k=5)
+            best = tuple(battery["circular_plane"])
+            ids = class_ids[kept.cpu()]
+            labeled = ids >= 0
+            pts = proj[:, list(best)].cpu()[labeled]
+            fig, ax = plt.subplots(figsize=(6, 6))
+            sc = ax.scatter(
+                pts[:, 0], pts[:, 1], c=ids[labeled], cmap="hsv", s=8, alpha=0.7,
+                vmin=0, vmax=N_CLASSES[family],
+            )
+            ax.set_title(
+                f"{args.sae_id} {family} supervised union "
+                f"({members_t.numel()} feats) — PCs {best[0]+1}/{best[1]+1}, "
+                f"circ {battery['circular']:.2f} (p={battery['circular_p']:.3f})"
+            )
+            fig.colorbar(sc, ax=ax, label="class")
+            fig_dir = args.store / "target_run" / "figures"
+            fig_dir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(fig_dir / f"{family}_supervised_union.png", dpi=150)
+            plt.close(fig)
         circ = battery.get("circular")
         print(
             f"  battery: "
