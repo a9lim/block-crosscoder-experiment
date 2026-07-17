@@ -1,6 +1,6 @@
 #!/bin/bash
 # Phase 0.9.6 tier B: the D13 4b pilot on the existing /data disk.
-# (a9 2026-07-17: tiers bundled as 0.9.6; pilot runs pre-NVMe — ~290 GB
+# (a9 2026-07-17: tiers bundled as 0.9.6; pilot runs pre-NVMe — ~370 GB
 # stored vs ~600 GB usable above the ShardWriter floor.)
 #
 # Sequence: harvest (the long pole, hours) -> store verify -> BSC primary
@@ -9,11 +9,24 @@
 # k=32, lr 1.2e-3 cosine, lambda=1e-3, SASA AuxK (trainer default),
 # theta calibrated on the calibration split.
 #
+# Tier-A -> tier-B knobs (set from the tier-A read; see the runbook's
+# decision map — defaults reproduce the plain pilot):
+#   PILOT_EPOCHS=2       epochs for every pilot run (A2: raise if the 1b
+#                        epoch ladder consolidates seed 1 / merges splits)
+#   PILOT_EXTRA_SEED=0   1 -> also run the BSC primary at seed 1 (A1: if
+#                        1b consolidation is seed-dependent)
+#   PILOT_G8192=0        1 -> add the Phase-1 stretch config G=8192 k=32
+#                        (A4: if the 1b G-ladder looks healthy)
+#
 #   nohup bash scripts/run_phase096_pilot4b.sh > /data/runs/bcc-pilot4b/pilot.log 2>&1 &
 cd "$(dirname "$0")/.." || exit 1
 STORE=/data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb
 OUT=/data/runs/bcc-pilot4b
+PILOT_EPOCHS="${PILOT_EPOCHS:-2}"
+PILOT_EXTRA_SEED="${PILOT_EXTRA_SEED:-0}"
+PILOT_G8192="${PILOT_G8192:-0}"
 mkdir -p "$OUT"
+echo "[pilot] knobs: epochs=$PILOT_EPOCHS extra_seed=$PILOT_EXTRA_SEED g8192=$PILOT_G8192"
 
 run() {
   local name=$1; shift
@@ -37,10 +50,10 @@ fi
 # 2. Store verification (checksums + whitening round trip).
 run verify python -u scripts/verify_phase09_store.py --store "$STORE"
 
-REHEARSE="python -u scripts/run_phase09_rehearsal.py --store $STORE --out-root $OUT --blocks 4096 --k 32 --lam 1e-3 --lr 1.2e-3"
+REHEARSE="python -u scripts/run_phase09_rehearsal.py --store $STORE --out-root $OUT --blocks 4096 --k 32 --lam 1e-3 --lr 1.2e-3 --epochs $PILOT_EPOCHS"
 
-# 3. BSC primary, split across the checkpoint/resume gate (D13): stop at
-#    step 900 of 1953, then resume to completion bit-compatibly.
+# 3. BSC primary, split across the checkpoint/resume gate (D13): stop
+#    mid-run, then resume to completion bit-compatibly.
 run bsc_primary_part1 $REHEARSE --arm bsc --max-steps 900
 run bsc_primary_resume $REHEARSE --arm bsc --resume
 
@@ -51,7 +64,17 @@ run bsc_renorm $REHEARSE --arm bsc --site-renorm
 #    the pooled score matrix at 128 batches would be ~34 GB host-side).
 run scalar python -u scripts/run_phase09_rehearsal.py \
   --store "$STORE" --out-root "$OUT" --blocks 4096 --k 32 --lr 1.2e-3 \
-  --arm scalar --calib-batches 64
+  --epochs "$PILOT_EPOCHS" --arm scalar --calib-batches 64
+
+# 6. Optional tier-A-informed arms.
+if [ "$PILOT_EXTRA_SEED" = "1" ]; then
+  run bsc_seed1 $REHEARSE --arm bsc --seed 1
+fi
+if [ "$PILOT_G8192" = "1" ]; then
+  run bsc_G8192 python -u scripts/run_phase09_rehearsal.py \
+    --store "$STORE" --out-root "$OUT" --blocks 8192 --k 32 --lam 1e-3 \
+    --lr 1.2e-3 --epochs "$PILOT_EPOCHS" --arm bsc --calib-batches 64
+fi
 
 echo "PILOT DONE — reports under $OUT/*/report.json"
 echo "Next: calendar probe + planarity screen against these checkpoints"

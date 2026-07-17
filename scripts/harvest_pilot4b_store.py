@@ -1,7 +1,7 @@
 """Harvest the D13 4b pilot store: gemma-3-4b, 8 sites, FineWeb-Edu.
 
 The design-mandated >=3M-token exact-config pilot (design v2.3.2, D13)
-fits on jobe's existing /data disk (~290 GB stored vs ~600 GB usable
+fits on jobe's existing /data disk (~370 GB stored vs ~600 GB usable
 above the ShardWriter floor) — only the 53M-token production store needs
 the 4 TB NVMe. Same machinery as the 0.9 harvest, production model and
 site band:
@@ -16,8 +16,8 @@ site band:
 
 Defaults: 2M whitener slice (accumulated, never stored; halves/quarters
 stability printed — if 4b needs the production 5M slice, this run is the
-evidence), 2M calibration + 1M eval + 4M train stored whitened bf16
-(4 x 8 x 2560 x 2B ~ 287 GB), first 100k calibration tokens also raw.
+evidence), 2M calibration + 1M eval + 6M train stored whitened bf16
+(9.1M x 8 x 2560 x 2B ~ 373 GB), first 100k calibration tokens also raw.
 fp16 forbidden throughout; free-space abort before every shard write.
 
   nohup python -u scripts/harvest_pilot4b_store.py \
@@ -44,7 +44,13 @@ def main() -> None:
     parser.add_argument("--whitener-tokens", type=int, default=2_000_000)
     parser.add_argument("--calib-tokens", type=int, default=2_000_000)
     parser.add_argument("--eval-tokens", type=int, default=1_000_000)
-    parser.add_argument("--train-tokens", type=int, default=4_000_000)
+    parser.add_argument(
+        "--train-tokens", type=int, default=6_000_000,
+        help="6M unique-token default (2026-07-17, tier-A sequencing "
+        "discussion): the 1b epoch ladder can't distinguish more-passes "
+        "from more-unique-tokens, so the store carries the unique-token "
+        "insurance — ~370 GB total, comfortably above the floor",
+    )
     parser.add_argument("--batch-rows", type=int, default=8)
     parser.add_argument(
         "--out", type=Path,

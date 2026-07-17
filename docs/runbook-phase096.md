@@ -18,26 +18,43 @@ it carries everything needed to launch, monitor, and measure.
 Both scripts are `nohup`-able and idempotent-ish (tier B skips a completed
 harvest; a failed run exits the script — relaunch after diagnosis,
 completed runs are skipped only by deleting/renaming their `run()` line).
-**One 4090: run the tiers sequentially, not concurrently.** Suggested
-order — tier B first (a9 priority; harvest is the long pole), tier A
-after:
+**One 4090: run the tiers sequentially, not concurrently.**
+
+**Recommended order (a9 + fable, 2026-07-17): tier A first.** Tier A is
+~2 h and its results set tier-B training knobs (decision map below); the
+pilot *store* doesn't depend on tier A at all, so the only cost is ~2 h
+of pilot latency:
 
 ```bash
 ssh jobe
 cd ~/Work/transformer-experiments/block-crosscoder-experiment
 mkdir -p /data/runs/bcc-pilot4b /data/runs/bcc-phase096
-nohup bash scripts/run_phase096_pilot4b.sh > /data/runs/bcc-pilot4b/pilot.log 2>&1 &
-# ... after PILOT DONE:
 nohup bash scripts/run_phase096_tier_a.sh > /data/runs/bcc-phase096/matrix.log 2>&1 &
+# ... read tier A (consolidation ring tests), set the knobs, then:
+PILOT_EPOCHS=2 PILOT_EXTRA_SEED=0 PILOT_G8192=0 \
+  nohup bash scripts/run_phase096_pilot4b.sh > /data/runs/bcc-pilot4b/pilot.log 2>&1 &
 ```
+
+## Tier-A → tier-B decision map
+
+Read tier A's ring tests (calendar-probe encode + the adjacency-hit
+statistic on each new checkpoint), then set the pilot knobs:
+
+| tier-A observation | knob |
+|---|---|
+| A2: ep4/ep8 consolidates seed 1 or merges the lr-3e-4 two-block split | `PILOT_EPOCHS=4` (or 8); the cosine schedule stretches automatically |
+| A2: epochs don't help (unique tokens were the binding factor) | leave `PILOT_EPOCHS=2` — the store already carries 6M unique train tokens as insurance |
+| A1: consolidation is seed-dependent (fewer than ~3/5 new seeds at 12/12) | `PILOT_EXTRA_SEED=1` (second seed of the BSC primary) |
+| A3: renorm @ 1.2e-3 consolidates as well as baseline | treat the renorm arm as the *analysis* primary for the F7 pin (both arms always run; no script change) |
+| A4: G=8192 at 1b healthy (dead dynamics tame, no packing bloom) | `PILOT_G8192=1` (adds the Phase-1 stretch config) |
 
 ## Tier B — the D13 4b pilot (`scripts/run_phase096_pilot4b.sh`)
 
 | stage | what | expected |
 |---|---|---|
-| harvest | `harvest_pilot4b_store.py`: gemma-3-4b, **sites (9,12,15,18,21,24,27,30)**, 2M whitener + 2M calib + 1M eval + 4M train, whitened bf16 → `/data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb` | hours (4b forward, ~290 GB written); watch tok/s + io-wait lines |
+| harvest | `harvest_pilot4b_store.py`: gemma-3-4b, **sites (9,12,15,18,21,24,27,30)**, 2M whitener + 2M calib + 1M eval + 6M train, whitened bf16 → `/data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb` | hours (4b forward, ~373 GB written); watch tok/s + io-wait lines |
 | verify | `verify_phase09_store.py --store …` | checksums + whitening round trip green |
-| bsc_primary | G=4096×b=4, k=32, lr 1.2e-3 cosine, λ=1e-3, SASA AuxK; split `--max-steps 900` → `--resume` (checkpoint/resume gate at production config) | 1953 steps total; resume must continue bit-compatibly |
+| bsc_primary | G=4096×b=4, k=32, lr 1.2e-3 cosine, λ=1e-3, SASA AuxK; split `--max-steps 900` → `--resume` (checkpoint/resume gate at production config) | 2929 steps at ep2 (1464/epoch over 6M); resume must continue bit-compatibly |
 | bsc_renorm | same + `--site-renorm` (F7 arm) | — |
 | scalar | matched baseline, 16384 latents, k=128, `--calib-batches 64` (θ score matrix ≈17 GB host RAM; 128 would be ~34 GB of jobe's 61) | — |
 
@@ -118,6 +135,21 @@ either turns the paper's consolidation row into a distribution. **What
 block at 4b (ring order a bonus at 8M optimizer tokens — the 4b stream's
 ring band sits early per Phase 0.5, and the pilot's site list covers it).
 
+## Site density (asked and answered, 2026-07-17)
+
+a9 asked whether the pilot should sample **all layers** instead of the
+spaced 8. Decision: no for tier B — (i) D13's purpose is rehearsing the
+*exact* Phase-1 config, and 8 sites is part of that config; (ii) the
+bytes fail twice: all-34 at 4b is 174 KB/token (~1.6 TB pilot store; the
+production 53M store would be ~6 TB, exceeding even the new NVMe), and
+34-site parameter stacks push past the 4090; (iii) adjacent-layer frames
+are already ~0.93-aligned at gap 2 in the trained 1b dictionary — gap-1
+sites mostly buy near-duplicate frames while thinning the Gram budget.
+The underlying question (is the L13→L17 shear zone a wall or a
+gradient?) is worth answering as a **1b all-26-layer side-study**:
+60 KB/token, so a 2–3M-token store is 120–180 GB — fits on /data even
+after the pilot, trivial post-NVMe. Parked behind 0.9.6.
+
 ## Parked (a9, 2026-07-17)
 
 - **Color-word hue-circle probe** — parked until a proper 4b run exists;
@@ -125,6 +157,7 @@ ring band sits early per Phase 0.5, and the pilot's site list covers it).
   words, abbreviations, compass, seasons, ordinals, alphabet, geography —
   also waits; the label-map machinery in `phase0/labels.py` +
   `calendar_probe.py` generalizes directly when wanted.)
+- **1b all-layer depth-resolution store** (above) — behind 0.9.6.
 - Publication path (discussed 2026-07-17): 0.9.6 results → zoo breadth +
   planarity screen → block-23 real export + saklas steering demo → draft.
   The 0.9.6 outcome decides whether the consolidation row is ready.
