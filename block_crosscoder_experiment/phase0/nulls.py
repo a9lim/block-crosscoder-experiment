@@ -82,24 +82,48 @@ def random_member_sets(
     n_draws: int = 100,
     seed: int = 0,
     exclude: torch.Tensor | None = None,
+    frequencies: torch.Tensor | None = None,
+    match_to: torch.Tensor | None = None,
+    n_buckets: int = 10,
 ) -> list[torch.Tensor]:
-    """Matched-size random feature subsets — the random-cluster null.
+    """Matched random feature subsets — the random-cluster null.
 
     `exclude` masks features (e.g. the candidate cluster itself) out of the
-    draw pool.
+    draw pool. With `frequencies` (per-feature firing counts) and
+    `match_to` (the candidate's members), each null member is drawn from
+    the same log-frequency quantile bucket as the member it replaces —
+    without this, random draws over a production-sparse dictionary almost
+    never co-fire and the null starves.
     """
-    pool = torch.arange(n_features)
+    pool_mask = torch.ones(n_features, dtype=torch.bool)
     if exclude is not None:
-        keep = torch.ones(n_features, dtype=torch.bool)
-        keep[exclude] = False
-        pool = pool[keep]
+        pool_mask[exclude] = False
+    pool = torch.arange(n_features)[pool_mask]
     if size > pool.shape[0]:
         raise ValueError(f"size {size} exceeds null pool {pool.shape[0]}")
     gen = torch.Generator().manual_seed(seed)
-    return [
-        pool[torch.randperm(pool.shape[0], generator=gen)[:size]]
-        for _ in range(n_draws)
-    ]
+
+    if frequencies is None or match_to is None:
+        return [
+            pool[torch.randperm(pool.shape[0], generator=gen)[:size]]
+            for _ in range(n_draws)
+        ]
+
+    logf = torch.log10(frequencies.to(torch.float64) + 1.0)
+    edges = torch.quantile(logf, torch.linspace(0, 1, n_buckets + 1, dtype=torch.float64))
+    bucket = torch.bucketize(logf, edges[1:-1])
+    pools = [pool[bucket[pool] == b] for b in range(n_buckets)]
+    member_buckets = bucket[match_to]
+    draws = []
+    for _ in range(n_draws):
+        picks = []
+        for b in member_buckets.tolist():
+            candidates = pools[b] if pools[b].numel() else pool
+            picks.append(
+                int(candidates[torch.randint(candidates.shape[0], (1,), generator=gen)])
+            )
+        draws.append(torch.tensor(picks, dtype=torch.long))
+    return draws
 
 
 def benjamini_hochberg(

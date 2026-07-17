@@ -70,9 +70,14 @@ def _fixture(device: torch.device):
 def test_discard_rule(device):
     codes, decoder, _, _ = _fixture(device)
     recon, kept = cluster_restricted_reconstruction(codes, decoder, RING.to(device))
-    assert int(kept.sum()) == T_RING  # every ring token fires >= 1 member
-    assert not bool(kept[T_RING:].any())
+    assert kept.shape[0] == T_RING  # every ring token fires >= 1 member
+    assert int(kept.max()) < T_RING
     assert recon.shape == (T_RING, D)
+
+    _, capped = cluster_restricted_reconstruction(
+        codes, decoder, RING.to(device), max_tokens=500
+    )
+    assert capped.shape[0] == 500
 
 
 def test_battery_confirms_planted_ring(device):

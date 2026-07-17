@@ -37,25 +37,60 @@ __all__ = [
 ]
 
 
+_DENSE_BYTES_CAP = 4 * 1024**3
+
+
+def _member_codes(codes, members: torch.Tensor, device) -> torch.Tensor:
+    """Dense (T, |members|) submatrix from a tensor or a CodeStore.
+
+    Oversized selections (huge clusters × production stores) fall back to
+    CPU RAM; downstream matmuls follow the codes' device.
+    """
+    if hasattr(codes, "select_members"):
+        est = codes.n_tokens * int(members.shape[0]) * 4
+        if est > _DENSE_BYTES_CAP:
+            device = "cpu"
+        return codes.select_members(members, device=device)
+    return codes[:, members]
+
+
+def _subsample(idx: torch.Tensor, max_tokens: int, seed: int) -> torch.Tensor:
+    if idx.shape[0] <= max_tokens:
+        return idx
+    gen = torch.Generator().manual_seed(seed)
+    pick = torch.randperm(idx.shape[0], generator=gen)[:max_tokens]
+    return idx[pick.to(idx.device)]
+
+
 def cluster_restricted_reconstruction(
-    codes: torch.Tensor,
+    codes,
     decoder: torch.Tensor,
     members: torch.Tensor,
+    *,
+    max_tokens: int | None = None,
+    seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Engels step 2: reconstruct with only the cluster's latents.
 
-    Returns (recon (T', d), kept (T,) bool): tokens where no member latent
-    fires are discarded, surviving tokens are decoded through member rows
-    only.
+    Returns (recon (T', d), kept_idx (T',)): tokens where no member latent
+    fires are discarded, survivors are decoded through member rows only.
+    `codes` is a dense (T, F) tensor or a harvest.CodeStore; `max_tokens`
+    caps T' by seeded subsampling (production stores are millions of
+    tokens; the indices don't need them all).
     """
-    member_codes = codes[:, members]  # (T, |C|)
-    kept = member_codes.gt(0).any(dim=1)
-    recon = member_codes[kept] @ decoder[members].to(member_codes.dtype)
-    return recon, kept
+    member_codes = _member_codes(codes, members, decoder.device)  # (T, |C|)
+    kept_idx = member_codes.gt(0).any(dim=1).nonzero(as_tuple=True)[0]
+    if max_tokens is not None:
+        kept_idx = _subsample(kept_idx, max_tokens, seed)
+    dec = decoder[members.to(decoder.device)].to(
+        device=member_codes.device, dtype=member_codes.dtype
+    )
+    recon = member_codes[kept_idx] @ dec
+    return recon, kept_idx
 
 
 def run_cluster_battery(
-    codes: torch.Tensor,
+    codes,
     decoder: torch.Tensor,
     members: torch.Tensor,
     *,
@@ -64,6 +99,7 @@ def run_cluster_battery(
     mixture_steps: int = 10_000,
     n_perm: int = 200,
     min_tokens: int = 200,
+    max_tokens: int = 100_000,
     seed: int = 0,
 ) -> dict:
     """Full battery for one candidate cluster.
@@ -71,8 +107,10 @@ def run_cluster_battery(
     class_ids (per token, −1 = unlabeled) unlocks the labeled tests; without
     them the battery reports geometry + label-free harmonics only.
     """
-    recon, kept = cluster_restricted_reconstruction(codes, decoder, members)
-    out: dict = {"n_tokens": int(kept.sum()), "n_members": int(members.shape[0])}
+    recon, kept = cluster_restricted_reconstruction(
+        codes, decoder, members, max_tokens=max_tokens, seed=seed
+    )
+    out: dict = {"n_tokens": int(kept.shape[0]), "n_members": int(members.shape[0])}
     if out["n_tokens"] < min_tokens:
         out["verdict"] = "insufficient_tokens"
         return out
@@ -94,7 +132,7 @@ def run_cluster_battery(
         )
 
     if class_ids is not None and n_classes is not None:
-        ids = class_ids[kept]
+        ids = class_ids[kept.to(class_ids.device)].to(recon.device)
         labeled = ids >= 0
         out["n_labeled"] = int(labeled.sum())
         if out["n_labeled"] >= min_tokens:
@@ -114,7 +152,7 @@ def run_cluster_battery(
 
 
 def unknown_cluster_scan(
-    codes: torch.Tensor,
+    codes,
     decoder: torch.Tensor,
     clusters: dict[int, torch.Tensor],
     *,
@@ -122,6 +160,8 @@ def unknown_cluster_scan(
     n_null_draws: int = 100,
     mixture_steps: int = 1000,
     min_tokens: int = 200,
+    max_tokens: int = 100_000,
+    firing_counts: torch.Tensor | None = None,
     seed: int = 0,
 ) -> dict[int, dict]:
     """Label-free ring SURFACING over many clusters, null-calibrated.
@@ -150,11 +190,15 @@ def unknown_cluster_scan(
     def gated_stats(
         members: torch.Tensor, stat_seed: int
     ) -> tuple[float, float, dict[int, float]] | None:
-        member_codes = codes[:, members]
-        cofire = member_codes.gt(0).sum(dim=1) >= 2
-        if int(cofire.sum()) < min_tokens:
+        member_codes = _member_codes(codes, members, decoder.device)
+        cofire_idx = (member_codes.gt(0).sum(dim=1) >= 2).nonzero(as_tuple=True)[0]
+        if cofire_idx.shape[0] < min_tokens:
             return None
-        recon = member_codes[cofire] @ decoder[members].to(member_codes.dtype)
+        cofire_idx = _subsample(cofire_idx, max_tokens, stat_seed)
+        dec = decoder[members.to(decoder.device)].to(
+            device=member_codes.device, dtype=member_codes.dtype
+        )
+        recon = member_codes[cofire_idx] @ dec
         proj, explained = pca_projections(recon, k=5)
         scan = plane_scan(
             proj, explained=explained, mixture_steps=mixture_steps, seed=stat_seed
@@ -181,6 +225,8 @@ def unknown_cluster_scan(
                 n_draws=n_null_draws,
                 seed=seed,
                 exclude=members.cpu(),
+                frequencies=firing_counts,
+                match_to=members.cpu() if firing_counts is not None else None,
             )
             null_cache[size] = [
                 s[0]
