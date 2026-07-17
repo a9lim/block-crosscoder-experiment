@@ -131,15 +131,28 @@ def ckpt_cfg_json(model: BlockCrosscoder) -> dict:
 
 
 def main() -> None:
+    global STORE
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batch", type=int, default=8192)
     ap.add_argument("--out", type=Path, default=Path("/data/runs/bcc-analysis"))
+    ap.add_argument(
+        "--store", type=Path, default=STORE,
+        help="whitened store root (0.9.6: pass the pilot-4b store)",
+    )
+    ap.add_argument(
+        "--runs", nargs="*", default=None, metavar="NAME=PATH",
+        help="override the default run map (0.9.6: name=path pairs)",
+    )
     args = ap.parse_args()
+    STORE = args.store
+    runs = RUNS
+    if args.runs:
+        runs = dict(pair.split("=", 1) for pair in args.runs)
     args.out.mkdir(parents=True, exist_ok=True)
     whitener = Whitener.load(STORE / "whitener.pt")
     renorm = whitener.site_rms_scalars()
-    for name, root in RUNS.items():
+    for name, root in runs.items():
         root = Path(root)
         if not (root / "latest.pt").exists():
             print(f"{name}: missing {root}, skipped")

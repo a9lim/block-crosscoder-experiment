@@ -1,7 +1,7 @@
 """Exploratory calendar probe through the trained 0.9/0.9.5 crosscoders.
 
 NOT a phase gate — an opportunistic H1 preview on the 1b rehearsal
-artifacts (4M-token training, G=1024/4096; read soft). Question: do the
+artifacts (16M-token training, G=1024/4096; read soft). Question: do the
 trained BSC blocks carry weekday/month structure at gemma-3-1b, and does
 any block's b-dim code look ring-like?
 
@@ -57,23 +57,43 @@ def main() -> None:
     ap.add_argument("--skip-docs", type=int, default=20_000)
     ap.add_argument("--batch-rows", type=int, default=16)
     ap.add_argument("--out", type=Path, default=Path("/data/runs/bcc-analysis"))
+    ap.add_argument(
+        "--model", default=MODEL,
+        help="0.9.6: google/gemma-3-4b-pt for the pilot store",
+    )
+    ap.add_argument("--store", type=Path, default=STORE)
+    ap.add_argument(
+        "--runs", nargs="*", default=None, metavar="NAME=PATH",
+        help="override the default run map (name=path pairs)",
+    )
+    ap.add_argument(
+        "--tag", default="",
+        help="suffix for output filenames (e.g. _pilot4b) so 1b artifacts "
+        "are never clobbered",
+    )
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    runs = RUNS if args.runs is None else dict(
+        pair.split("=", 1) for pair in args.runs
+    )
 
     from datasets import load_dataset
     from huggingface_hub import HfApi
     from sae_lens import HookedSAETransformer
 
-    whitener = Whitener.load(STORE / "whitener.pt")
+    whitener = Whitener.load(args.store / "whitener.pt")
+    sites = whitener.sites  # site list rides with the store, not the script
     renorm_scalars = whitener.site_rms_scalars()
 
     model = HookedSAETransformer.from_pretrained_no_processing(
-        MODEL, dtype=torch.bfloat16
+        args.model, dtype=torch.bfloat16
     ).to(args.device)
     model.eval()
     d_model = int(model.cfg.d_model)
-    hook_names = [f"blocks.{L}.hook_resid_post" for L in SITES]
-    stop_at = max(SITES) + 1
+    if whitener.mean.shape != (len(sites), d_model):
+        raise SystemExit("whitener shape does not match the model")
+    hook_names = [f"blocks.{L}.hook_resid_post" for L in sites]
+    stop_at = max(sites) + 1
     bos = model.tokenizer.bos_token_id
 
     label_maps = {
@@ -112,7 +132,7 @@ def main() -> None:
             return_type=None,
         )
         acts = torch.stack([cache[h] for h in hook_names], dim=2)  # [B,ctx,S,d]
-        acts = acts[:, DROP:].reshape(-1, len(SITES), d_model)
+        acts = acts[:, DROP:].reshape(-1, len(sites), d_model)
         ids = toks[:, DROP:].reshape(-1)
         xw = torch.einsum("sde,nse->nsd", w_gpu, acts.float() - mu_gpu)
 
@@ -149,7 +169,7 @@ def main() -> None:
             n_lab = sum(a.shape[0] for a in lab_acts)
             print(f"  scanned {scanned:,} tokens, {n_lab:,} labeled", flush=True)
 
-    acts = torch.cat(lab_acts) if lab_acts else torch.zeros(0, len(SITES), d_model)
+    acts = torch.cat(lab_acts) if lab_acts else torch.zeros(0, len(sites), d_model)
     cls = torch.cat(lab_cls)
     fam = torch.cat(lab_fam)
     tok_ids = torch.cat(lab_tok)
@@ -164,7 +184,7 @@ def main() -> None:
     means = {}
     for fi, family in enumerate(("weekday", "month")):
         n_cls = 7 if family == "weekday" else 12
-        m = torch.zeros(n_cls, len(SITES), d_model)
+        m = torch.zeros(n_cls, len(sites), d_model)
         for cix in range(n_cls):
             sel = (fam == fi) & (cls == cix)
             if int(sel.sum()):
@@ -172,7 +192,7 @@ def main() -> None:
         means[family] = m
 
     np.savez_compressed(
-        args.out / "calendar_probe_acts.npz",
+        args.out / f"calendar_probe_acts{args.tag}.npz",
         acts=acts.numpy().astype(np.float32),
         cls=cls.numpy(),
         fam=fam.numpy(),
@@ -183,9 +203,9 @@ def main() -> None:
         bg_var=bg.var(0).numpy(),
         meta=json.dumps(
             {
-                "model": MODEL, "corpus": CORPUS, "corpus_revision": corpus_sha,
+                "model": args.model, "corpus": CORPUS, "corpus_revision": corpus_sha,
                 "skip_docs": args.skip_docs, "scanned_tokens": scanned,
-                "sites": list(SITES), "whitener_hash": whitener.hash,
+                "sites": list(sites), "whitener_hash": whitener.hash,
                 "label_maps": {
                     f: {str(k): v for k, v in m.items()}
                     for f, m in label_maps.items()
@@ -195,7 +215,7 @@ def main() -> None:
     )
 
     # Encode through each trained checkpoint.
-    for name, root in RUNS.items():
+    for name, root in runs.items():
         root = Path(root)
         if not (root / "latest.pt").exists():
             print(f"{name}: missing, skipped")
@@ -226,7 +246,7 @@ def main() -> None:
         z_lab, p_lab = encode_all(acts)
         _, p_bg = encode_all(bg)
         np.savez_compressed(
-            args.out / f"calendar_probe_codes_{name}.npz",
+            args.out / f"calendar_probe_codes_{name}{args.tag}.npz",
             z_lab=z_lab.numpy(),
             p_lab=p_lab.numpy(),
             p_bg=p_bg.numpy(),

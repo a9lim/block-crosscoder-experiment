@@ -5,8 +5,8 @@
 *measurement* (the calendar probe: a fresh 8M-token labeled harvest encoded
 through existing checkpoints). Exploratory throughout — nothing here is gate
 evidence, and every trained-model claim inherits the rehearsal caveats
-(gemma-3-1b, 6 sites, G=1024/4096, **4M training tokens**; Phase-1 scale is
-~10× that on a 4b stream). Statistics quoted at their measured values;
+(gemma-3-1b, 6 sites, G=1024/4096, **16M training tokens** — 2 epochs over
+the 8M train split; Phase-1 is ~5× that on a 4b stream). Statistics quoted at their measured values;
 permutation p-values floor at 1/20001.
 
 Figures in `figures/interim/` (regeneration: `scripts/analysis/fig_*.py`;
@@ -74,7 +74,7 @@ well-defined eval probe worth carrying into Phase 1.
 **Weekday: capture without ring geometry.** Block 640 fires on **100%** of
 weekday tokens vs 0.3% background (z = 35) — a dedicated weekday block —
 but its code does not order the week (3/7 adjacent, p ≈ 0.43;
-`probe_weekday_null.png`). With 923 probe tokens and 4M training tokens,
+`probe_weekday_null.png`). With 923 probe tokens and 16M training tokens,
 absence of the ring is not evidence of absence in the stream; the honest
 statement is family capture, no ring, at this scale.
 

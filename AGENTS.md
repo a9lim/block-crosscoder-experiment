@@ -82,6 +82,16 @@ instability (loss-spike guard for Phase 1); a 4-block packing clique
 exists at G=4096 (Jaccard >0.9). Single-block ring consolidation varies
 with lr/seed — carry a known-ring-consolidation probe into Phase-1 eval.
 
+**Phase 0.9.6 is staged, not launched**
+([`docs/runbook-phase096.md`](docs/runbook-phase096.md), a9-directed
+2026-07-17): tier A = 1b consolidation/robustness matrix (seeds, epoch
+ladder, renorm@winner-lr F7 deconfound, G ladder); tier B = **the D13 4b
+exact-config pilot on the existing /data disk** (~290 GB store — the
+pilot never needed the 4 TB NVMe; only the production store does). Site
+list (9,12,15,18,21,24,27,30) resolved from the 25–90% band, flagged for
+a9 ratification. Color-word probe and the rest of the manifold zoo:
+parked until a proper 4b run (a9 2026-07-17).
+
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
   Engels' weekday ring on GPT-2; on gemma layer 22 the discovery

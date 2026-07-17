@@ -104,7 +104,7 @@ def fig_block23_ring(za, is_cap) -> None:
     ax2.set_ylabel("angle in code plane (deg)")
     ax2.set_title("class angle vs calendar index — one clean cycle")
     fig.suptitle(
-        "The trained BSC's month block (winner, G=1024, 4M tokens): "
+        "The trained BSC's month block (winner, G=1024, 16M tokens): "
         "one block = the month manifold", y=1.0,
     )
     fig.tight_layout()

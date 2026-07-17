@@ -101,7 +101,7 @@ def fig_training_curves() -> None:
     ax.annotate("2.4e-3 spike, step ~1.5k", xy=(1500, 4), xytext=(24, 6),
                 textcoords="offset points", fontsize=9, color=st.CAT[7])
     ax.set_yscale("log")
-    ax.set_xlabel("step (batch 1024 tokens)")
+    ax.set_xlabel("step (batch 4096 tokens)")
     ax.set_ylabel("reconstruction loss (whitened MSE)")
     ax.set_title("BSC cosine lr ladder — 2.4e-3 destabilizes mid-run and never fully recovers")
     ax.set_xlim(0, 4100)

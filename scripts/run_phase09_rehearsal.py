@@ -54,6 +54,17 @@ def main() -> None:
         "whitening, applied at batch load (train, calib, and eval alike). "
         "Not stored in the checkpoint — pass again on --resume.",
     )
+    parser.add_argument(
+        "--epochs", type=int, default=EPOCHS,
+        help="passes over the train split (0.9.6 consolidation ladder); "
+        "default reproduces the 0.9/0.9.5 two-epoch runs exactly",
+    )
+    parser.add_argument(
+        "--calib-batches", type=int, default=128,
+        help="cap on calibration batches for fit_threshold_ (host-RAM "
+        "guard: the pooled score matrix is n_tokens x G*b fp32 on CPU — "
+        "at 16k latents, 128x4096 tokens is ~34 GB; use 64 there)",
+    )
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
     parser.add_argument("--device", default="cuda")
@@ -110,7 +121,7 @@ def main() -> None:
         )
 
     steps_per_epoch = train_reader.n_tokens // BATCH
-    total_steps = steps_per_epoch * EPOCHS
+    total_steps = steps_per_epoch * args.epochs
     tag = ""
     if args.lr != 3e-4:
         tag += f"_lr{args.lr:g}"
@@ -124,6 +135,8 @@ def main() -> None:
         tag += f"_k{args.k:g}"
     if args.site_renorm:
         tag += "_renorm"
+    if args.epochs != EPOCHS:
+        tag += f"_ep{args.epochs}"
     run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}{tag}"
     run_dir = args.out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +145,7 @@ def main() -> None:
         f"config: arm={args.arm} lam={args.lam:g} seed={args.seed} "
         f"G={model_cfg.n_blocks} b={model_cfg.block_dim} k={model_cfg.k} "
         f"sites={n_sites} d={d_model} steps={total_steps} batch={BATCH} "
-        f"epochs={EPOCHS} store={args.store} whitener={whitener.hash[:12]}… "
+        f"epochs={args.epochs} store={args.store} whitener={whitener.hash[:12]}… "
         f"run_dir={run_dir}",
         flush=True,
     )
@@ -156,7 +169,7 @@ def main() -> None:
         trainer = Trainer(model, train_cfg, log_path=run_dir / "steps.jsonl")
 
     batches = renormed(train_reader.shuffled_batches(
-        BATCH, seed=SHUFFLE_SEED, epochs=EPOCHS + 1  # +1: margin for skips
+        BATCH, seed=SHUFFLE_SEED, epochs=args.epochs + 1  # +1: margin for skips
     ))
     if trainer.step_idx:
         batches = itertools.islice(batches, trainer.step_idx, None)
@@ -199,7 +212,7 @@ def main() -> None:
     calib_reader = StoreReader(
         args.store, "calibration", expected_whitener_hash=whitener.hash
     )
-    n_calib_batches = min(128, calib_reader.n_tokens // BATCH)
+    n_calib_batches = min(args.calib_batches, calib_reader.n_tokens // BATCH)
     theta = model.fit_threshold_(
         renormed(itertools.islice(calib_reader.sequential_batches(BATCH), n_calib_batches)),
         target_avg_blocks=model.cfg.k,
@@ -278,6 +291,8 @@ def main() -> None:
             "k": model_cfg.k, "n_sites": n_sites, "d_model": d_model,
         },
         "total_steps": total_steps,
+        "epochs": args.epochs,
+        "calib_batches": n_calib_batches,
         "lr": args.lr,
         "schedule": args.schedule,
         "encoder_wd": args.encoder_wd,
