@@ -40,23 +40,29 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: Phases −1, 0, 0.5, and 0.9 PASSED (2026-07-16/17). Next:
-Phase 1 (4b) — blocked on the 4 TB NVMe install; the ≥3M-token 4b
-pilot (D13) precedes the store commit.** A paper-fidelity audit
-(2026-07-17, fable + sol counter-review;
+**Status: Phases −1, 0, 0.5, 0.9, and 0.9.5 PASSED/COMPLETE
+(2026-07-16/17). Next: Phase 1 (4b) — blocked on the 4 TB NVMe install
+and two a9 decisions; the ≥3M-token 4b pilot (D13) precedes the store
+commit.** A paper-fidelity audit (2026-07-17, fable + sol
+counter-review;
 [`docs/design-review-2026-07-17-fidelity.md`](docs/design-review-2026-07-17-fidelity.md))
-produced the v2.3.2 amendment set, **ratified by a9 2026-07-17**:
-the **0.9.5 calibration addendum** (lr×schedule ladder on both arms +
-dead-dynamics arm + site-renorm arm on the existing 1b store — the 4b
-pilot at ~732 steps sits inside warmup and cannot select schedules), a
-**pre-4b-store decision** on per-site RMS renormalization after the
-shrinkage whitener (deep sites currently carry ~5× the whitened power
-in L_rec; the renorm arm supplies the decision data), and code fixes
-(θ serialization, bf16 shadow eval, corpus-revision pinning,
-checkpoint free-space floor). **Immediate next action: run
-`scripts/run_phase095_matrix.sh` on jobe** (unconditional arms;
-conditional follow-ups printed at completion), then pick Phase-1
-optimizer defaults from the reports.
+produced the v2.3.2 amendment set, **ratified by a9 2026-07-17**,
+including the **0.9.5 calibration addendum** — run same day, 31 runs on
+the 1b store
+([`docs/findings-phase095-calibration.md`](docs/findings-phase095-calibration.md)):
+**cosine schedule, lr optimum 1.2e-3 with a cliff at 2.4e-3 on both
+arms** (the {1,2,3,6}e-4 grid didn't bracket; extension rungs added
+mid-campaign); linear_fifth wins below 3e-4 but turns over past 6e-4;
+encoder-wd is a no-op; seed noise ~5× below the winner gap; λ=1e-3
+still ~free at the optimum; dead dynamics engaged at G=4096 (0.098%
+mortality, k=16 stress arm skipped per the conditional); the renorm arm
+reverses the per-site FVU allocation (deep→shallow) at wash pooled FVU.
+**Awaiting a9: (1) ratify Phase-1 optimizer defaults (recommended
+lr 1.2e-3 cosine, enc-wd 0, λ=1e-3; 6e-4 the documented fallback —
+cliff and lr×G caveats in the findings §recommendation), (2) the F7
+site-renorm decision, pre-4b-store.** The θ-calibration OOM at G=4096
+was fixed in `9bb4133` (CPU-side score accumulation; estimator
+unchanged); the Phase-1 streaming-quantile carry item stands.
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
