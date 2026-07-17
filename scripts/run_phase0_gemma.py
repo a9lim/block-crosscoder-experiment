@@ -218,8 +218,16 @@ def stage_ranking(store, labels: torch.Tensor, out: Path, device: str) -> dict:
     return result
 
 
-def stage_scan(store, labels: torch.Tensor, out: Path, device: str) -> dict:
-    """Unknown-cluster surfacing scan + BH over the search width."""
+def stage_scan(
+    store, labelings: dict[str, torch.Tensor], out: Path, device: str
+) -> dict:
+    """Unknown-cluster surfacing scan + BH over the search width.
+
+    Runs over BOTH candidate branches (spectral + kNN graph) — in gemma's
+    near-orthogonal geometry the multi-member graph components are the
+    natural co-fire candidates. Exact duplicate member sets across branches
+    are scanned once; BH runs over the deduplicated combined width.
+    """
     from block_crosscoder_experiment.phase0.battery import unknown_cluster_scan
     from block_crosscoder_experiment.phase0.nulls import benjamini_hochberg
 
@@ -227,11 +235,29 @@ def stage_scan(store, labels: torch.Tensor, out: Path, device: str) -> dict:
     if path.exists():
         return json.loads(path.read_text())
     decoder = load_decoder(device)
-    clusters = {
-        cid: (labels == cid).nonzero(as_tuple=True)[0]
-        for cid in range(N_CLUSTERS)
-        if int((labels == cid).sum()) >= 2
+    clusters: dict[str, torch.Tensor] = {}
+    seen: dict[tuple, str] = {}
+    duplicates = 0
+    for branch, labels in labelings.items():
+        uniq, cnt = labels.unique(return_counts=True)
+        for cid, c in zip(uniq.tolist(), cnt.tolist()):
+            if cid < 0 or c < 2:
+                continue
+            members = (labels == cid).nonzero(as_tuple=True)[0]
+            key = tuple(members.tolist())
+            if key in seen:
+                duplicates += 1
+                continue
+            seen[key] = f"{branch}:{cid}"
+            clusters[f"{branch}:{cid}"] = members
+    per_branch = {
+        b: sum(k.startswith(f"{b}:") for k in clusters) for b in labelings
     }
+    print(
+        f"scan width: {len(clusters)} clusters {per_branch} "
+        f"({duplicates} cross-branch duplicates scanned once)",
+        flush=True,
+    )
     results = unknown_cluster_scan(
         store,
         decoder,
@@ -240,6 +266,7 @@ def stage_scan(store, labels: torch.Tensor, out: Path, device: str) -> dict:
         mixture_steps=400,
         firing_counts=store.firing_counts(),
         seed=0,
+        progress=lambda msg: print(msg, flush=True),
     )
     tested = {c: r for c, r in results.items() if "contrast" in r}
     pvals = [tested[c]["p"] for c in sorted(tested)]
@@ -392,7 +419,7 @@ def main() -> None:
         stage_figures(store, spectral, report, out, device)
         print(f"figures -> {out / 'figures'}")
     if args.stage in ("all", "scan"):
-        summary = stage_scan(store, spectral, out, device)
+        summary = stage_scan(store, labelings, out, device)
         print(
             f"scan: {summary['n_tested']} tested, "
             f"{summary['n_gated_out']} gated out, "

@@ -40,26 +40,46 @@ __all__ = [
 _DENSE_BYTES_CAP = 4 * 1024**3
 
 
-def _member_codes(codes, members: torch.Tensor, device) -> torch.Tensor:
-    """Dense (T, |members|) submatrix from a tensor or a CodeStore.
-
-    Oversized selections (huge clusters × production stores) fall back to
-    CPU RAM; downstream matmuls follow the codes' device.
-    """
-    if hasattr(codes, "select_members"):
-        est = codes.n_tokens * int(members.shape[0]) * 4
-        if est > _DENSE_BYTES_CAP:
-            device = "cpu"
-        return codes.select_members(members, device=device)
-    return codes[:, members]
-
-
 def _subsample(idx: torch.Tensor, max_tokens: int, seed: int) -> torch.Tensor:
     if idx.shape[0] <= max_tokens:
         return idx
     gen = torch.Generator().manual_seed(seed)
     pick = torch.randperm(idx.shape[0], generator=gen)[:max_tokens]
     return idx[pick.to(idx.device)]
+
+
+def _gated_member_codes(
+    codes,
+    members: torch.Tensor,
+    *,
+    min_active: int,
+    max_tokens: int | None,
+    seed: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(member_codes (T', |C|), kept_idx (T',)) gated on ≥min_active firing
+    members, subsampled to max_tokens BEFORE densifying.
+
+    On a CodeStore the gate runs on sparse counts, so peak memory is
+    max_tokens × |members|, never n_tokens × |members| — densify-first cost
+    35 GB per call on the production 2192-member blob, and the scan's null
+    draws repeat the allocation per draw (the 2026-07-16 scan OOM).
+    Oversized results still fall back to CPU RAM; downstream matmuls follow
+    the codes' device.
+    """
+    if hasattr(codes, "member_firing_counts"):
+        counts = codes.member_firing_counts(members)
+        kept_idx = (counts >= min_active).nonzero(as_tuple=True)[0]
+        if max_tokens is not None:
+            kept_idx = _subsample(kept_idx, max_tokens, seed)
+        if kept_idx.shape[0] * int(members.shape[0]) * 4 > _DENSE_BYTES_CAP:
+            device = "cpu"
+        return codes.select_member_rows(members, kept_idx, device=device), kept_idx
+    dense = codes[:, members]
+    kept_idx = (dense.gt(0).sum(dim=1) >= min_active).nonzero(as_tuple=True)[0]
+    if max_tokens is not None:
+        kept_idx = _subsample(kept_idx, max_tokens, seed)
+    return dense[kept_idx], kept_idx
 
 
 def cluster_restricted_reconstruction(
@@ -78,14 +98,14 @@ def cluster_restricted_reconstruction(
     caps T' by seeded subsampling (production stores are millions of
     tokens; the indices don't need them all).
     """
-    member_codes = _member_codes(codes, members, decoder.device)  # (T, |C|)
-    kept_idx = member_codes.gt(0).any(dim=1).nonzero(as_tuple=True)[0]
-    if max_tokens is not None:
-        kept_idx = _subsample(kept_idx, max_tokens, seed)
+    member_codes, kept_idx = _gated_member_codes(
+        codes, members, min_active=1, max_tokens=max_tokens, seed=seed,
+        device=decoder.device,
+    )
     dec = decoder[members.to(decoder.device)].to(
         device=member_codes.device, dtype=member_codes.dtype
     )
-    recon = member_codes[kept_idx] @ dec
+    recon = member_codes @ dec
     return recon, kept_idx
 
 
@@ -182,6 +202,7 @@ def unknown_cluster_scan(
     max_tokens: int = 100_000,
     firing_counts: torch.Tensor | None = None,
     seed: int = 0,
+    progress=None,
 ) -> dict[int, dict]:
     """Label-free ring SURFACING over many clusters, null-calibrated.
 
@@ -209,15 +230,16 @@ def unknown_cluster_scan(
     def gated_stats(
         members: torch.Tensor, stat_seed: int
     ) -> tuple[float, float, dict[int, float]] | None:
-        member_codes = _member_codes(codes, members, decoder.device)
-        cofire_idx = (member_codes.gt(0).sum(dim=1) >= 2).nonzero(as_tuple=True)[0]
+        member_codes, cofire_idx = _gated_member_codes(
+            codes, members, min_active=2, max_tokens=max_tokens,
+            seed=stat_seed, device=decoder.device,
+        )
         if cofire_idx.shape[0] < min_tokens:
             return None
-        cofire_idx = _subsample(cofire_idx, max_tokens, stat_seed)
         dec = decoder[members.to(decoder.device)].to(
             device=member_codes.device, dtype=member_codes.dtype
         )
-        recon = member_codes[cofire_idx] @ dec
+        recon = member_codes @ dec
         proj, explained = pca_projections(recon, k=5)
         scan = plane_scan(
             proj, explained=explained, mixture_steps=mixture_steps, seed=stat_seed
@@ -234,6 +256,8 @@ def unknown_cluster_scan(
         observed = gated_stats(members, seed)
         if observed is None:
             results[cid] = {"verdict": "insufficient_cofire_tokens", "p": 1.0}
+            if progress:
+                progress(f"[scan] {cid} (size {int(members.shape[0])}): gated out")
             continue
         contrast, irr, power = observed
         size = int(members.shape[0])
@@ -253,6 +277,11 @@ def unknown_cluster_scan(
                 if (s := gated_stats(d.to(members.device), seed + 1 + i))
                 is not None
             ]
+            if progress:
+                progress(
+                    f"[scan] null cache size {size}: "
+                    f"{len(null_cache[size])}/{n_null_draws} draws co-fired"
+                )
         null = null_cache[size]
         results[cid] = {
             "contrast": contrast,
@@ -261,4 +290,9 @@ def unknown_cluster_scan(
             "n_null": len(null),
             "harmonics": power,
         }
+        if progress:
+            progress(
+                f"[scan] {cid} (size {size}): contrast {contrast:.3f} "
+                f"p {results[cid]['p']:.4f} (n_null {len(null)})"
+            )
     return results

@@ -132,6 +132,58 @@ class CodeStore:
             return row.new_empty(0)
         return torch.cat(slices).unique()
 
+    def member_firing_counts(self, members: torch.Tensor) -> torch.Tensor:
+        """(n_tokens,) count of firing members per token. Consolidates on
+        first use if load_csc() hasn't run."""
+        if self._csc is None:
+            self.load_csc()
+        ccol, row, _ = self._csc
+        slices = [row[int(ccol[f]) : int(ccol[f + 1])] for f in members.tolist()]
+        if not slices:
+            return torch.zeros(self.n_tokens, dtype=torch.long, device=row.device)
+        return torch.bincount(
+            torch.cat(slices).to(torch.int64), minlength=self.n_tokens
+        )
+
+    def select_member_rows(
+        self,
+        members: torch.Tensor,
+        rows: torch.Tensor,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
+        """Dense (|rows|, |members|) submatrix restricted to the given token
+        rows, in their order. Needs load_csc().
+
+        The gate-then-densify path: full-width select_members on a
+        production store is n_tokens × |members| (35 GB for the 2192-member
+        spectral blob — the scan OOM of 2026-07-16, repeated per null
+        draw); gating and subsampling on sparse counts first bounds this
+        at max_tokens × |members|.
+        """
+        if self._csc is None:
+            self.load_csc()
+        ccol, row, val = self._csc
+        out = torch.zeros(rows.shape[0], members.shape[0], device=device)
+        if rows.numel() == 0 or members.numel() == 0:
+            return out
+        rows = rows.to(device=row.device, dtype=torch.int64)
+        order = torch.argsort(rows)
+        sorted_rows = rows[order]
+        for j, f in enumerate(members.tolist()):
+            lo, hi = int(ccol[f]), int(ccol[f + 1])
+            if hi == lo:
+                continue
+            r = row[lo:hi].to(torch.int64)
+            pos = torch.searchsorted(sorted_rows, r).clamp_(
+                max=sorted_rows.shape[0] - 1
+            )
+            hit = sorted_rows[pos] == r
+            if hit.any():
+                out[order[pos[hit]].to(device=device, dtype=torch.long), j] = val[
+                    lo:hi
+                ][hit].to(device=device, dtype=out.dtype)
+        return out
+
     def iter_dense_chunks(
         self, chunk: int = 65536, device: torch.device | str = "cpu"
     ) -> Iterator[torch.Tensor]:
