@@ -136,18 +136,37 @@ def run_cluster_battery(
         labeled = ids >= 0
         out["n_labeled"] = int(labeled.sum())
         if out["n_labeled"] >= min_tokens:
-            pts = best_points[labeled]
             ids_l = ids[labeled]
-            # Class-identity permutation: the null must keep class clumps
-            # intact and randomize only their cyclic placement.
+            # The ring can live on any scanned plane (Engels chose planes by
+            # eye; the irreducibility-best plane is often the cone, not the
+            # ring — weekday cluster 937 taught us this in vivo). Statistic:
+            # max over planes of held-out circular decoding, with the SAME
+            # max-over-planes statistic under the class-identity permutation
+            # null, so plane selection cannot inflate significance.
+            plane_pts = {
+                p: proj[:, list(p)][labeled]
+                for p in out["plane_scan"]["planes"]
+            }
+
+            def circ_stat(lab: torch.Tensor) -> float:
+                return max(
+                    circular_decoding(pts, lab, n_classes, seed=seed)
+                    for pts in plane_pts.values()
+                )
+
             out["circular"], out["circular_p"] = class_permutation_pvalue(
-                lambda lab: circular_decoding(pts, lab, n_classes, seed=seed),
-                ids_l,
-                n_classes,
-                n_perm=n_perm,
-                seed=seed,
+                circ_stat, ids_l, n_classes, n_perm=n_perm, seed=seed
             )
-            out["ngon"] = ngon_alignment(pts, ids_l, n_classes)
+            by_plane = {
+                p: circular_decoding(pts, ids_l, n_classes, seed=seed)
+                for p, pts in plane_pts.items()
+            }
+            circ_plane = max(by_plane, key=lambda p: by_plane[p])
+            out["circular_plane"] = circ_plane
+            out["circular_by_plane"] = by_plane
+            ring_pts = plane_pts[circ_plane]
+            out["ngon"] = ngon_alignment(ring_pts, ids_l, n_classes)
+            out["harmonics_circ_plane"] = angle_harmonic_power(ring_pts)
     return out
 
 
