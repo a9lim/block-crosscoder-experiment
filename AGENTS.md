@@ -10,7 +10,7 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`docs/design.md`](docs/design.md) (v2.3, post-Phase−1 consolidation, frozen): hypotheses H1–H5, the
+- [`docs/design.md`](docs/design.md) (v2.3.1, site band 25–90% post-Phase-0.5, frozen): hypotheses H1–H5, the
   architecture spec (Gram-constrained decoders — Σ_s D_g^s D_g^sᵀ = I_b —
   BatchTopK block selection by exact whitened contribution ‖z_g‖, per-site
   nuclear norm on a fixed spectrum budget), the phase ladder

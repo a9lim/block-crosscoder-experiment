@@ -363,7 +363,7 @@ weekday ring, month ring.
 | | rehearsal (0.9) | primary (Phase 1) | stretch |
 |---|---|---|---|
 | model | gemma-3-1b (d=1152, 26L) | gemma-3-4b (d=2560, 34L) | gemma-3-4b |
-| sites | 6 in 40–90% band | 8 in 40–90% band (≈ layers 14–30, resolved at harvest, frozen in config) | 8 |
+| sites | 6 in 25–90% band | 8 in 25–90% band (≈ layers 9–30, resolved at harvest, frozen in config) | 8 |
 | G × b | 1024 × 4 | 4096 × 4 (16,384 latents) | 8192 × 4 |
 | k (blocks/token avg) | 16 | 32 (128 active coeffs) | 32 |
 | params (untied) | 57M | 671M | 1.34B |
@@ -884,3 +884,15 @@ public (P23, round-3 novelty verdict).
   pinned to contribution-energy shares with the packed-block flag.
   Older log entries remain as provenance; where body and log
   disagree, the body is current. **Design re-frozen as v2.3.**
+- **2026-07-17 (v2.3.1, site-band amendment)** — Phase 0.5 executed
+  and **passed** (findings in
+  `findings-phase05-cross-layer.md`): month codes correspond linearly
+  across depths while raw-basis frames rotate to chance alignment —
+  and the depth bracket showed activation-space calendar rings live
+  *early* (layer 9 of 34 ≈ 26% depth: weekday circ 0.981 + decoder
+  |r| 0.886), with early↔late frame rotation exactly where the BSC's
+  advantage over single-frame methods lives. The harvest site band
+  predates that evidence; amended **40–90% → 25–90%** for both the
+  rehearsal and Phase-1 configs (a9 ratified 2026-07-17) so the site
+  bracket includes the early stream. Single-number change; all other
+  frozen surfaces untouched.
