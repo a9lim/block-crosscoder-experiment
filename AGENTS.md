@@ -34,8 +34,9 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: Phases −1, 0, and 0.5 PASSED (2026-07-16/17). Next: Phase
-0.9 (1b dress rehearsal).**
+**Status: Phases −1, 0, 0.5, and 0.9 PASSED (2026-07-16/17). Next:
+Phase 1 (4b) — blocked on the 4 TB NVMe install; the ≥3M-token 4b
+pilot (D13) precedes the store commit.**
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
@@ -65,6 +66,19 @@ experiments with explicit go/no-go gates.
   identically (BH none; 15/17 skeleton feats τ=0.5 singletons): the
   discovery gap is depth-general, which sharpens H1 at every probed
   depth.
+- **Phase 0.9** ([`docs/findings-phase09-rehearsal.md`](docs/findings-phase09-rehearsal.md),
+  gemma-3-1b, 6 sites {7,10,13,17,20,22}, 13M-token whitened store on
+  jobe): **all plumbing gates green** — store checksums + bit-exact
+  whitening round trip, whitener stability ≤0.025 (halves) at 2M fit
+  tokens, held-out spectrum within 0.047 of the shrinkage prediction,
+  production-scale checkpoint/resume, θ transfer within 0.13% of
+  target k, 8/8 bit-deterministic eval passes, zero dead blocks, toy
+  manifold export with exact Gram-invariant energy accounting. λ
+  ladder ~free at 16M tokens (FVU spread 0.07%); scalar beats BSC at
+  matched latent-L0 (0.353 vs 0.422 pooled FVU) — the H3 question,
+  deferred to 4b. Carried to Phase 1: streaming quantile for
+  `fit_threshold_` (13M calib tokens), store-reader prefetch
+  (55–70% data-wait). D13 risks explicitly not cleared.
 
 Phase −1 detail (battery run 6 on jobe, all hard gates green under
 a9's strict capture-as-written ruling): the
