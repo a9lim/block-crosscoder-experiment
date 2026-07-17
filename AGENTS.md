@@ -65,6 +65,23 @@ The θ-calibration OOM at G=4096 was fixed in `9bb4133` (CPU-side score
 accumulation; estimator unchanged); the Phase-1 streaming-quantile
 carry item stands.
 
+An **interim artifact-analysis sweep (2026-07-17, analysis-only,
+exploratory — not gate evidence)** over everything on disk is written up in
+[`docs/findings-interim-artifact-analysis.md`](docs/findings-interim-artifact-analysis.md)
+(figures in `figures/interim/`, regeneration scripts in
+`scripts/analysis/`). Headlines: a calendar probe through the 0.9.5
+checkpoints found **the month manifold captured as a single block** of the
+ratified winner (block 23: 12/12 calendar order, 97% class-mean variance in
+its code plane, ring held at all 6 sites by the block's rotating frames
+while the raw stream's top plane loses it after L17); the matched scalar
+arm carries the same information without unit-level individuation (top-1
+month features collapse to 4); the late-heavy depth allocation of baseline
+dictionaries is mechanistically traced to shrinkage-whitener retained power
+(supports the F7 renorm lean); the 2.4e-3 lr cliff is a mid-run
+instability (loss-spike guard for Phase 1); a 4-block packing clique
+exists at G=4096 (Jaccard >0.9). Single-block ring consolidation varies
+with lr/seed — carry a known-ring-consolidation probe into Phase-1 eval.
+
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
   Engels' weekday ring on GPT-2; on gemma layer 22 the discovery
