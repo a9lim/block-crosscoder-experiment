@@ -24,11 +24,16 @@ python -m pip install -e ../../saklas
 
 ## Status
 
-Design v2.2, frozen after three review rounds (two-round adversarial
-review 2026-07-15; round-3 deployment + paper-fidelity pass 2026-07-16);
-no runnable experiments yet. Next deliverables: the Phase −1 synthetic
-ground-truth harness, then the Phase-0 blockification script (pinned
-Bloom GPT-2 layer-7 positive control → gemma-scope-2).
+Design v2.3, frozen (two-round adversarial review 2026-07-15; round-3
+deployment + paper-fidelity pass 2026-07-16; post-Phase−1 consolidation
+2026-07-16). **Phase −1 passed** — the synthetic ground-truth harness
+and its seven-scenario battery run green on all hard gates, 4 seeds, at
+the 10M-token operating point; verdict, operating point, and the
+capture-campaign findings (packing economics, budget-regime map,
+ring-detection limits, λ=1e-3 primary) in
+[`docs/findings-phase-minus1-battery.md`](docs/findings-phase-minus1-battery.md).
+Next: Phase 0 blockification (pinned Bloom GPT-2 layer-7 positive
+control → gemma-scope-2).
 
 ## Layout
 

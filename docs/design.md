@@ -33,7 +33,7 @@ folded in — objective normalization conventions, the complete quantizer
 spec, the explicit b=1 Gram-constrained baseline, fp32-master retraction
 ordering, calibrated shared-code evals, and exact store arithmetic.
 Round-2 findings are numbered R1–R26 in the review doc.
-**v2.2, 2026-07-16 (current)**: deployment re-plan + round-3 amendments
+**v2.2, 2026-07-16**: deployment re-plan + round-3 amendments
 after two fresh-context adversarial passes (deployment/design D1–D14,
 paper-fidelity P1–P25 over all 13 reference full texts; disposition in
 [`docs/design-review-2026-07-16.md`](design-review-2026-07-16.md)). The
@@ -47,6 +47,21 @@ gauge-corrected (bundle null weakened — perfect co-activation is
 observationally equivalent to a block under linear reconstruction); pilot
 extended to actually exercise AuxK; positive control pinned to Engels'
 actual artifact.
+**v2.3, 2026-07-16 (current)**: post-Phase−1 consolidation. Phase −1
+executed and **passed** (battery runs 1–6 + capture-campaign sweep
+rounds 1–8 on jobe; gate semantics ruled by a9: strict
+capture-as-written; full record in
+[`docs/findings-phase-minus1-battery.md`](findings-phase-minus1-battery.md)).
+Everything the harness taught is folded into the body: the λ-veto
+outcome (admissible {3e-4, 1e-3}; **Phase-1 primary λ=1e-3**), the
+selection-budget regime map and battery operating point, the packing
+economics (block width is a packing budget; merging is a converged
+optimum), the zero-slack ring-detection lesson (norm-concentration
+alone cannot detect rings under budget slack), the AuxK verdict (SASA
+C.1 positively separated), and the recovery-vs-frequency calibration
+(clean to f=0.01 at 10M tokens). Design re-frozen from this state; the
+decision log remains as provenance, and the body supersedes older log
+entries wherever both speak.
 
 ## Hypotheses
 
@@ -199,13 +214,19 @@ the maximum (√S−1). Reconstruction must overpower that preference for
 genuinely shared structure to survive nonzero λ. Mitigations are therefore
 gates, not notes: (i) the Phase −1 harness plants *shared, flat-profile*
 blocks and imposes a **quantitative veto** — λ is admissible only where the
-planted flat blocks' depth-profile share error stays under a predeclared
-tolerance (set when the harness lands; recorded in its config) and planted
-subspace recovery holds; **if every nonzero λ fails the veto, λ = 0 becomes
-primary and decoder nuclear regularization is demoted to a failed
-ablation** — the veto cannot be passed trivially by λ=0 alone; (ii) headline
-H4 numbers are reported across the λ sweep including λ = 0; (iii) H4's
-primary readouts are code-anchored (below), not the raw decoder spectrum.
+planted flat blocks' depth-profile share error (contribution-energy
+shares, never Frobenius — parked frame capacity poisons the latter)
+stays under max(0.02, 2× the λ=0 baseline) and subspace recovery
+retains ≥0.85× the λ=0 overlap; if every nonzero λ fails, λ = 0
+becomes primary and the penalty is demoted to a failed ablation — the
+veto cannot be passed trivially by λ=0 alone. **Veto outcome (battery
+run 6, 10M-token operating point, 4 seeds): admissible = {3e-4, 1e-3},
+so Phase-1 primary is λ=1e-3**; at 3e-3 the binding violation is
+genuine share concentration (0.046 > 0.02). An earlier empty-set
+verdict was a 3k-step measurement artifact (decision log). (ii)
+headline H4 numbers are reported across the λ sweep including λ = 0;
+(iii) H4's primary readouts are code-anchored (below), not the raw
+decoder spectrum.
 
 SASA's actual formulation (full-text read 2026-07-15) — penalty on the
 end-to-end product ‖D_k E_k‖_*, gauge-invariant by construction, weight-decay
@@ -283,7 +304,12 @@ manifolds — the H5 diffing story is only told over blocks that pass.
   via a three-way comparison — SASA-style frequency-dead vs long-horizon
   dead (the former v2.1 rule) vs Fel-style runner-up AuxK — v2.1's
   top-32 / 500-batch / α=1/32 was an unsupported hybrid of three papers'
-  conventions and is demoted to one arm of that comparison. The Gram
+  conventions and is demoted to one arm of that comparison. **Phase −1
+  outcome: the comparison separates decisively at the 10M-token
+  operating point — SASA C.1 recovers 12/12 planted rare features with
+  1–4 dead blocks of 16, vs 9–12 dead and lost rare features for the
+  Fel and long-horizon arms — so SASA C.1 is the confirmed default**;
+  0.9 recalibrates window/threshold at production batch size. The Gram
   constraint removes the decoder-shrinkage spiral; the aux loss handles
   encoder-side starvation. Block resampling kept as a documented option,
   off by default.
@@ -311,12 +337,26 @@ into one block whether or not they form a manifold (finding 9) — and round
 joint support are *observationally equivalent* to a block under a linear
 reconstruction objective, so bundling cannot be penalized away or ruled
 out; what the coherence battery certifies is that *curved / manifold*
-structure is never claimed where none exists. Block
-discovery is *candidate generation*; the manifold claim for any block rests
-on the coherence diagnostics (within-block code topology, ring tests,
-truncation ablations, shared-code evals), synthetic-recovery calibration,
-and BH multiple-comparison correction over the unknown-block search.
-Pre-registered confirmatory targets: weekday ring, month ring.
+structure is never claimed where none exists.
+
+Phase −1 sharpened it once more, empirically (findings §2.2): **block
+width is a packing budget**. Independent sub-width features whose
+ranks sum to ≤ b pack losslessly into one block — the union code
+carries both features' coordinates and the per-site frames route
+them — freeing a block plus selection budget, so merging is loss- *and*
+budget-optimal and *better convergence merges more* (30k-step runs
+merged strictly more than 10k). Production dictionaries will contain
+packed blocks as converged optima, not as noise. The signature — full
+span overlap, near-50/50 contribution-share split, degraded code-R² —
+is the diagnostic; the Phase-2 `share` export treats it as a packing
+flag.
+
+Block discovery is *candidate generation*; the manifold claim for any
+block rests on the coherence diagnostics (within-block code topology,
+ring tests, truncation ablations, shared-code evals),
+synthetic-recovery calibration, and BH multiple-comparison correction
+over the unknown-block search. Pre-registered confirmatory targets:
+weekday ring, month ring.
 
 ## Configurations
 
@@ -346,10 +386,12 @@ per-site nuclear term is a pure site-concentration penalty, not a rank
 penalty, so nonzero λ is not architecture-fair); nonzero-λ BSC frontiers
 are secondary.
 
-λ_* initial grid {0, 3e-4, 1e-3, 3e-3} under the pinned reductions
-(narrowed by the Phase −1 veto and the 0.9 rehearsal); k frontier
-{16, 32, 64}. Staged run matrix (R26): rehearsal narrows λ to the
-admissible set → one-seed frontier exploration at 4b → both confirmatory
+λ_* grid {0, 3e-4, 1e-3} under the pinned reductions — the Phase −1
+veto passed {3e-4, 1e-3} and failed 3e-3 (share concentration), making
+**λ=1e-3 the Phase-1 primary** with 0 and 3e-4 as the lower arm; the
+0.9 rehearsal re-checks the battery→production transfer. k frontier
+{16, 32, 64}. Staged run matrix (R26): rehearsal confirms λ →
+one-seed frontier exploration at 4b → both confirmatory
 seeds only at the preselected operating points. The 4b headline runs are
 not a hyperparameter search.
 
@@ -522,6 +564,30 @@ jobe (CUDA) with the production optimizer — the retraction-vs-8-bit-Adam
 ordering check thereby lands here rather than waiting for 0.9; code stays
 device-generic and unit tests run anywhere.
 
+**Executed and PASSED, 2026-07-16** (battery runs 1–6 +
+capture-campaign sweep rounds 1–8;
+[`docs/findings-phase-minus1-battery.md`](findings-phase-minus1-battery.md)).
+Gate semantics ruled by a9: **strict capture-as-written** — tiled or
+split recoveries do not pass; the sanctioned fix space is training
+conditions, never gate criteria. The operating point that passes every
+hard gate on 4 seeds: 10k steps × batch 1024 (≈10M tokens), selection
+budget ratio 0.8 of E[active blocks/token] (budget is the driving
+factor and monotone over the tested range — matched budget junk-fills
+and tiles, 0.7 starves), spare capacity G ≈ 2.5×F (removes the
+init-lottery establishment deaths), site decoys at rank 3 (pairwise
+rank > b, so packing is lossy and separation objective-aligned), and
+the bundle scenario's budget in **block-event demand** (per-feature
+ΣF double-counts co-active features relative to the packed format the
+learner correctly adopts; any post-packing budget slack junk-fills
+through captured rings — tolerance <1% of a block's firings — and
+hides them from all-firings norm-concentration). Training is
+bit-deterministic per (seed, config, device). Also verified here:
+retraction ordering under 8-bit Adam; rotation-equivariance on a
+4-seed control arm (spans rotation-stable; spectra are basin-variant
+— decoders stay on Adam); the recovery-vs-frequency calibration
+(clean to f=0.01 at 10M tokens, per-seed lottery at 0.003 and below —
+the curve Phase 1's rare-block claims are read against).
+
 **Phase 0 — post-hoc blockification. Zero training; days.**
 First, **positive control**: replicate the Engels weekday/month rings
 through our exact pipeline on **the artifact Engels actually used —
@@ -550,6 +616,17 @@ PCs 2–3 of a cone), clustering-stability + Jaccard-overlap analysis —
 plus our additions: held-out circular decoding of the known cyclic
 families, Fourier structure of code angle, label-permutation and
 random-cluster nulls; BH correction over unknown-cluster search.
+Phase −1 instrument lesson, binding here (findings §2.3):
+norm-concentration (CV of code norms) is **never a ring detector by
+itself** — it misses real rings both ways. Soft phase-splits (two
+blocks co-firing with phase-dependent amplitude) score CV ≈ 0.22, and
+*perfectly captured* rings score 0.17–0.43 whenever selection-budget
+slack junk-fills trace-magnitude firings through the ring's block
+(CV ≈ 0.97·√(junk fraction); production runs always have slack). Ring
+evidence is therefore span-level and *gate-conditional* — the battery
+above, evaluated on the tokens where the candidate feature is active.
+Expect packed blocks (see *Identifiability caveat*) as ordinary
+converged structure, not anomalies.
 *Gate:* rings recoverable → live targets + warm-start candidates for
 exploratory runs. Null **with the control passing** → "no rings recoverable
 from this SAE at these depths at demonstrated power" — downgrades H1,
@@ -603,10 +680,13 @@ Export a block as a multi-layer manifold artifact. The export must preserve
 the per-site coordinate map, not just the span (finding 10): per site,
 truncated SVD of whitened D_g^s (keep U_r, σ, and the b×r right-factor);
 node positions embedded per site through the *full* map, never re-derived
-from a bare basis. share = per-site whitened decoder norms **re-expressed in
+from a bare basis. share = per-site **contribution-energy** shares —
+never Frobenius decoder norms, which count parked frame capacity
+(Phase −1, findings §2.5) — **re-expressed in
 saklas's consumer-side whitener** (the two whiteners — training-side
 harvest-fit vs consumer-side neutral-fit — are not interchangeable; the
-seam is explicit). Origin (neutral-mean projection), σ (per-site code-density
+seam is explicit). Near-50/50 share splits are flagged as probable
+packed blocks (see *Identifiability caveat*) before any manifold claim. Origin (neutral-mean projection), σ (per-site code-density
 residual), and node labeling (clustered code-density modes + max-activating
 contexts) are *additional estimators with their own validation burden*
 (finding 22) — `experiment naturalness` validates the intervention path, not
@@ -669,8 +749,8 @@ is out of scope for the ring claim.
 Structurally designed out: gauge-vacuous rank penalty, selection-score
 proxy error, decoder death spiral (all via the Gram constraint); rogue
 dims (whitened everything); fp16 overflow (banned); pipeline-failure
-nulls (Phase −1 harness + pinned GPT-2 positive control + 0.9 rehearsal
-+ extended 4b pilot).
+nulls (Phase −1 harness — **passed 2026-07-16** — plus pinned GPT-2
+positive control, 0.9 rehearsal, extended 4b pilot).
 
 Empirically mitigated, monitored (P1 — v2.1 wrongly listed this as
 designed out): L1-style shrinkage/decoupling artifacts. BatchTopK
@@ -682,8 +762,9 @@ than precautionary.
 Instrumented, not eliminated: per-site penalty's site-concentration
 pressure (synthetic gate + λ=0 control + contribution-covariance readout);
 rank-histogram circularity (λ sweep, truncation ablations, seed stability);
-acausal multi-view leakage (site-dropout eval matrix); block bundling
-(coherence diagnostics + BH correction); store overfit at 38M tokens
+acausal multi-view leakage (site-dropout eval matrix); block
+bundling/packing (coherence diagnostics + BH correction + the
+packed-block share signature); store overfit at 38M tokens
 (held-out FVU gap; interleaved escalation path).
 
 Honestly open: the block prior may mismatch language (the Fel hedge, and
@@ -775,7 +856,7 @@ public (P23, round-3 novelty verdict).
 - **2026-07-16 (λ-veto outcome, superseding amendment)** — the
   preceding entry's measurement was made at 3k steps (a CLI default
   silently shadowed the 10k operating point; battery runs 3–4 were
-  also affected — see findings §5.3). Battery run 5, the first honest
+  also affected — see findings §6.2). Battery run 5, the first honest
   operating-point run (10k × batch 1024 ≈ 10M tokens, G16, 4 seeds),
   re-ran the veto: the overlap collapse does not occur at this scale
   (overlap ≥0.95 through λ=1e-3) and the admissible set is
@@ -784,5 +865,22 @@ public (P23, round-3 novelty verdict).
   protocol (largest admissible λ = primary): **Phase-1 primary is
   λ=1e-3**; λ=0 and 3e-4 remain in the sweep as the lower arm; at
   λ=3e-3 the binding violation is genuine share concentration (0.046
-  > 0.02 tolerance), not overlap. Numbers: findings §6.1. Executes
+  > 0.02 tolerance), not overlap. Numbers: findings §2.4. Executes
   the spec'd protocol — no frozen-surface change.
+- **2026-07-16 (v2.3, post-Phase−1 consolidation)** — Phase −1
+  executed and **passed in full** (battery runs 1–6, capture-campaign
+  sweep rounds 1–8; gate semantics ruled strict capture-as-written by
+  a9; complete record in the findings doc). Consolidation sweep folds
+  every Phase −1 learning into the body so the design reads as one
+  document again: λ-veto outcome under *Rank regularizer* and
+  *Configurations* (primary λ=1e-3, grid {0, 3e-4, 1e-3}, tolerances
+  as run); battery operating point and verdict under *Phases /
+  Phase −1* (10k × 1024, budget ratio 0.8, G ≈ 2.5×F, rank-3 decoys,
+  block-event bundle budget, bit-determinism, rotation and retraction
+  checks); packing economics under *Identifiability caveat*; the
+  zero-slack ring-detection lesson under *Phase 0*; AuxK verdict
+  (SASA C.1 confirmed) under *Sparsity hygiene*; frequency
+  calibration (clean to f=0.01 at 10M tokens); Phase-2 `share` export
+  pinned to contribution-energy shares with the packed-block flag.
+  Older log entries remain as provenance; where body and log
+  disagree, the body is current. **Design re-frozen as v2.3.**

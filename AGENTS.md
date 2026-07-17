@@ -10,7 +10,7 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`docs/design.md`](docs/design.md) (v2.2, post-round-3, frozen): hypotheses H1–H5, the
+- [`docs/design.md`](docs/design.md) (v2.3, post-Phase−1 consolidation, frozen): hypotheses H1–H5, the
   architecture spec (Gram-constrained decoders — Σ_s D_g^s D_g^sᵀ = I_b —
   BatchTopK block selection by exact whitened contribution ‖z_g‖, per-site
   nuclear norm on a fixed spectrum budget), the phase ladder
@@ -42,24 +42,24 @@ campaign (sweep rounds 1–8, battery runs 3–6) are documented in
 [`docs/findings-phase-minus1-battery.md`](docs/findings-phase-minus1-battery.md).
 Load-bearing outcomes:
 
-- **Operating point** (§5.4): budget ratio 0.8, 10k steps × batch 1024
+- **Operating point** (findings §1): budget ratio 0.8, 10k steps × batch 1024
   (≈10M tokens), spare capacity G ≈ 2.5×F (all zoos G16). Budget is
   the driving factor and monotone: loose budgets junk-fill/tile, 0.7
   starves. The 8-bit-Adam retraction-ordering check (0.9 gate) passed
-  early. Battery runs 1–4 were silently 3k-step runs (CLI shadowing,
+  early. Battery runs 3–4 silently ran at 3k steps (CLI shadowing,
   fixed) — always verify the report's embedded `battery_config`.
-- **λ-verdict reversed at the honest operating point** (§6.1): the
+- **λ-verdict reversed at the honest operating point** (findings §2.4): the
   admissible set opens at 10M tokens — **Phase-1 primary is λ=1e-3**
   (largest admissible, per protocol; design decision log amended). The
   earlier λ=0 fallback was a 3k-scale overlap-collapse artifact.
-- **Block width is a packing budget** (§5.2): sub-width co-active or
+- **Block width is a packing budget** (findings §2.2): sub-width co-active or
   low-rank features pack losslessly into one block; merging is the
   *converged optimum*, and better convergence merges more. Decoys
   re-fixtured to rank-3 twins (a9's ruling); expect packed blocks in
   production — signature: full overlap, ≈50/50 split shares, degraded
   code-R². Phase-2 `share` export must treat that signature as a
   packing flag.
-- **Ring detection needs zero budget slack** (§6.2–6.3): the bundle
+- **Ring detection needs zero budget slack** (findings §2.3): the bundle
   scenario budget is pinned to block-event demand k=0.75 — per-feature
   accounting double-counts co-active features, and any slack
   junk-fills through captured rings (junk tolerance <1% of firings),
