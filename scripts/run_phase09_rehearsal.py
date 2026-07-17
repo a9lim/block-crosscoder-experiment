@@ -17,6 +17,7 @@ per-site whitened FVU on the held-out eval split.
 from __future__ import annotations
 
 import argparse
+import copy
 import itertools
 import json
 import time
@@ -34,6 +35,25 @@ def main() -> None:
     parser.add_argument("--arm", choices=("bsc", "scalar"), required=True)
     parser.add_argument("--lam", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
+    # 0.9.5 calibration-addendum knobs (F2/F3); defaults reproduce the
+    # 0.9 rehearsal exactly.
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--schedule", choices=("cosine", "linear_fifth"), default="cosine",
+        help="lr decay: cosine-to-zero (default) or SASA B.3 linear-last-fifth",
+    )
+    parser.add_argument("--encoder-wd", type=float, default=0.0)
+    parser.add_argument(
+        "--blocks", type=int, default=G,
+        help="override G (dead-prone arm: 4096 at the same k)",
+    )
+    parser.add_argument("--k", type=float, default=K)
+    parser.add_argument(
+        "--site-renorm", action="store_true",
+        help="F7 decision arm: per-site scalar RMS renorm after shrinkage "
+        "whitening, applied at batch load (train, calib, and eval alike). "
+        "Not stored in the checkpoint — pass again on --resume.",
+    )
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
     parser.add_argument("--device", default="cuda")
@@ -57,24 +77,54 @@ def main() -> None:
     n_sites = train_reader.n_sites
     d_model = train_reader.d_model
 
+    # F7 renorm arm (design v2.3.2): dtype-preserving per-site scalar
+    # multiply at batch load — equivalent to a renormed store up to one
+    # bf16 rounding. Every data path below flows through renormed().
+    renorm_scale = None
+    if args.site_renorm:
+        renorm_scale = whitener.site_rms_scalars().view(1, -1, 1)
+        print(
+            "site-renorm scalars (F7 arm): "
+            f"{[round(float(v), 3) for v in renorm_scale.flatten()]}",
+            flush=True,
+        )
+
+    def renormed(it):
+        if renorm_scale is None:
+            return it
+        return (x * renorm_scale.to(x.dtype) for x in it)
+
     if args.arm == "bsc":
         model_cfg = BSCConfig(
-            n_blocks=G, block_dim=B_DIM, n_sites=n_sites, d_model=d_model,
-            k=K, lambda_rank=args.lam, seed=args.seed,
+            n_blocks=args.blocks, block_dim=B_DIM, n_sites=n_sites, d_model=d_model,
+            k=args.k, lambda_rank=args.lam, seed=args.seed,
         )
     else:
         if args.lam != 0.0:
             raise SystemExit("scalar baseline runs at lambda=0 (design: at b=1 "
                              "the nuclear term is not a rank penalty)")
         model_cfg = BSCConfig(
-            n_blocks=G * B_DIM, block_dim=1, n_sites=n_sites, d_model=d_model,
-            k=K * B_DIM,  # matched training-average L0: E[l] = b*E[k]
+            n_blocks=args.blocks * B_DIM, block_dim=1, n_sites=n_sites, d_model=d_model,
+            k=args.k * B_DIM,  # matched training-average L0: E[l] = b*E[k]
             lambda_rank=0.0, seed=args.seed,
         )
 
     steps_per_epoch = train_reader.n_tokens // BATCH
     total_steps = steps_per_epoch * EPOCHS
-    run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}"
+    tag = ""
+    if args.lr != 3e-4:
+        tag += f"_lr{args.lr:g}"
+    if args.schedule != "cosine":
+        tag += f"_{args.schedule}"
+    if args.encoder_wd:
+        tag += f"_wd{args.encoder_wd:g}"
+    if args.blocks != G:
+        tag += f"_G{args.blocks}"
+    if args.k != K:
+        tag += f"_k{args.k:g}"
+    if args.site_renorm:
+        tag += "_renorm"
+    run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}{tag}"
     run_dir = args.out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt = run_dir / "latest.pt"
@@ -87,7 +137,10 @@ def main() -> None:
         flush=True,
     )
 
-    train_cfg = TrainConfig(total_steps=total_steps, log_every=10)
+    train_cfg = TrainConfig(
+        total_steps=total_steps, lr=args.lr, schedule=args.schedule,
+        encoder_weight_decay=args.encoder_wd, log_every=10,
+    )
 
     if args.resume:
         if not ckpt.exists():
@@ -97,14 +150,14 @@ def main() -> None:
         print(f"resumed at step {trainer.step_idx}", flush=True)
     else:
         model = BlockCrosscoder(model_cfg, device=args.device)
-        # Encoder scale calibration on the first training batch (Fel App. D).
-        first = next(iter(train_reader.shuffled_batches(BATCH, seed=SHUFFLE_SEED)))
+        # Encoder scale calibration on the first training batch (Fel-inspired).
+        first = next(iter(renormed(train_reader.shuffled_batches(BATCH, seed=SHUFFLE_SEED))))
         model.calibrate_encoder_scale_(first.to(args.device, torch.float32))
         trainer = Trainer(model, train_cfg, log_path=run_dir / "steps.jsonl")
 
-    batches = train_reader.shuffled_batches(
+    batches = renormed(train_reader.shuffled_batches(
         BATCH, seed=SHUFFLE_SEED, epochs=EPOCHS + 1  # +1: margin for skips
-    )
+    ))
     if trainer.step_idx:
         batches = itertools.islice(batches, trainer.step_idx, None)
         # islice is lazy; the skip cost lands on the first next() below.
@@ -148,25 +201,29 @@ def main() -> None:
     )
     n_calib_batches = min(128, calib_reader.n_tokens // BATCH)
     theta = model.fit_threshold_(
-        itertools.islice(calib_reader.sequential_batches(BATCH), n_calib_batches),
+        renormed(itertools.islice(calib_reader.sequential_batches(BATCH), n_calib_batches)),
         target_avg_blocks=model.cfg.k,
     )
     print(f"calibrated theta {theta:.5f} (target avg blocks {model.cfg.k}, "
           f"{n_calib_batches * BATCH:,} calib tokens)", flush=True)
+    # Re-save so the calibrated theta is serialized with the checkpoint
+    # (design: theta frozen and serialized with the codec — sol S1; the
+    # pre-calibration save above holds theta = NaN).
+    trainer.save_checkpoint(ckpt)
 
     # ---- eval: per-site whitened FVU, run twice (determinism gate) -------
     eval_reader = StoreReader(args.store, "eval", expected_whitener_hash=whitener.hash)
 
     @torch.no_grad()
-    def eval_pass(mode: str) -> dict:
+    def eval_pass(mode: str, m=model, dtype=torch.float32) -> dict:
         sq_err = torch.zeros(n_sites, dtype=torch.float64)
         sq_tot = torch.zeros(n_sites, dtype=torch.float64)
         mean_acc = torch.zeros(n_sites, d_model, dtype=torch.float64)
         n = 0
         active = 0.0
-        for x in eval_reader.sequential_batches(BATCH):
-            x = x.to(args.device, torch.float32)
-            out = model(x, mode=mode)
+        for x in renormed(eval_reader.sequential_batches(BATCH)):
+            x = x.to(args.device, dtype)
+            out = m(x, mode=mode)
             sq_err += (x - out.xhat).double().pow(2).sum(dim=(0, 2)).cpu()
             mean_acc += x.double().sum(dim=0).cpu()
             sq_tot += x.double().pow(2).sum(dim=(0, 2)).cpu()
@@ -195,6 +252,19 @@ def main() -> None:
               f"avg blocks {first['avg_active_blocks']} "
               f"deterministic {deterministic}", flush=True)
 
+    # bf16 shadow eval (sol S2): the passes above run the fp32 master — the
+    # declared codec primary; this single diagnostic pass per mode runs the
+    # training/deployment precision (theta coarsens to bf16 with the buffer,
+    # which is part of what the shadow measures).
+    shadow = copy.deepcopy(model).to(torch.bfloat16)
+    for mode in ("topk", "threshold"):
+        s = eval_pass(mode, m=shadow, dtype=torch.bfloat16)
+        results[mode]["bf16_shadow"] = {
+            k: s[k] for k in ("fvu_per_site", "fvu_pooled", "avg_active_blocks")
+        }
+        print(f"  eval[{mode}] bf16 shadow: pooled FVU {s['fvu_pooled']} "
+              f"avg blocks {s['avg_active_blocks']}", flush=True)
+
     dead_frac = float(
         (trainer.tracker.frequency(train_cfg.dead_window_batches)
          <= train_cfg.dead_threshold).float().mean()
@@ -208,6 +278,14 @@ def main() -> None:
             "k": model_cfg.k, "n_sites": n_sites, "d_model": d_model,
         },
         "total_steps": total_steps,
+        "lr": args.lr,
+        "schedule": args.schedule,
+        "encoder_wd": args.encoder_wd,
+        "site_renorm": args.site_renorm,
+        "site_renorm_scalars": (
+            [round(float(v), 6) for v in renorm_scale.flatten()]
+            if renorm_scale is not None else None
+        ),
         "shuffle_seed": SHUFFLE_SEED,
         "whitener_hash": whitener.hash,
         "theta": theta,

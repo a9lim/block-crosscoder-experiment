@@ -156,9 +156,10 @@ class BlockCrosscoder(nn.Module):
         self, x: torch.Tensor, *, per_block: bool = True, eps: float = 1e-12
     ) -> None:
         """Scale the encoder so initial selection scores are comparable
-        across blocks (Fel App. D via P16): per-block mean pre-selection
-        score is brought to the cross-block median, preserving the global
-        scale the tied Gram-constrained init already gives.
+        across blocks. Fel-inspired (P16, sol S6): Fel App. D prescribes
+        transpose-tied init with encoder scale calibration in broad terms;
+        the per-block median equalization here is BSC-specific. Preserves
+        the global scale the tied Gram-constrained init already gives.
         """
         p = self.scores(self.encode(x))  # [B, G]
         mean_p = p.mean(dim=0).clamp_min(eps)  # [G]

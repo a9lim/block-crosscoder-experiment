@@ -126,3 +126,19 @@ boundary row margin; bf16-exact token-id test encoding). The
 `gemma-scope-2-1b-pt-res` validation dictionaries (65k at layers
 {7, 13, 17, 22}) remain available for eval-side comparisons if Phase-1
 wants a 1b sanity anchor.
+
+## Errata (2026-07-17, fidelity audit + sol counter-review S1–S4)
+
+- The saved `latest.pt` checkpoints of these runs hold **θ = NaN** — θ
+  was fit after the final checkpoint save; the calibrated values live
+  only in each `report.json`. Driver fixed (re-save after calibration);
+  reloading a 0.9 checkpoint requires re-running `fit_threshold_` (S1).
+- Calibration and eval ran the **fp32 master** (now the declared codec
+  primary); the training/deployment bf16 precision was not evaluated. A
+  bf16 shadow eval is added to the driver for 0.9.5 onward (S2).
+- The harvest recorded dataset/config/split but **no HF revision** —
+  short of the design's pinned-manifest requirement; revision pinning
+  added to the harvest script for all future harvests (S3).
+- §1's "held-out transformed-covariance validation" is an uncentered
+  **second moment** about the fit mean (difference negligible on
+  fit-mean-centered whitened data); script renamed accordingly (S4).

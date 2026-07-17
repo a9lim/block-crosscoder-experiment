@@ -15,9 +15,12 @@ dead-block machinery in its three comparison variants (P8):
                     residual energy re-encode the frozen residual.
     "long_horizon"  the former v2.1 rule — dead = zero activations over a
                     long batch horizon; same selection mechanics.
-    "fel"           Fel App. D — no dead set; the next s_aux runner-up
-                    blocks (by main-code norm, unselected) explain the
-                    residual with the *main* code; alpha = 1/s_aux.
+    "fel"           Fel-style runner-up AuxK — no dead set; the next
+                    s_aux runner-up blocks (by main-code norm, unselected)
+                    explain the residual with the *main* code;
+                    alpha = 1/s_aux. NB a hybrid (F5): Fel App. D uses the
+                    next-l runner-ups with alpha = 1/l where l is the MAIN
+                    block sparsity — faithful only when s_aux = k.
 
 The data interface is any iterable of whitened [B, S, d] batches —
 synthetic tensors in Phase -1, the disk store in Phase 1. The trainer owns
@@ -31,6 +34,7 @@ import copy
 import importlib.util
 import json
 import math
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -44,6 +48,19 @@ from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
 __all__ = ["TrainConfig", "DeadTracker", "Trainer", "aux_loss", "tensor_batches"]
 
 AUX_VARIANTS = ("none", "sasa", "long_horizon", "fel")
+CHECKPOINT_FREE_FLOOR_FRAC = 0.15  # same D14 floor as store.ShardWriter
+
+
+def _payload_nbytes(obj) -> int:
+    """Tensor bytes in a (nested) checkpoint payload, for the pre-write
+    free-space check. Non-tensor leaves are negligible and counted as 0."""
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(_payload_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_payload_nbytes(v) for v in obj)
+    return 0
 
 
 @dataclass
@@ -51,8 +68,13 @@ class TrainConfig:
     total_steps: int
     lr: float = 3e-4
     warmup_steps: int = 1000
+    # "cosine" = linear warmup + cosine decay to 0 (current default);
+    # "linear_fifth" = SASA B.3 — warmup, constant, then linear decay to 0
+    # (our final-fifth reading of SASA's "over one-fifth of the training").
+    # Both arms of the 0.9.5 lr ladder (F2).
+    schedule: str = "cosine"
     betas: tuple[float, float] = (0.9, 0.999)
-    encoder_weight_decay: float = 0.0  # value is a Phase-0.9 calibration item
+    encoder_weight_decay: float = 0.0  # value is an open calibration item (F2)
     retract_every: int = 1  # >1 is the documented throughput ablation (P16)
     optimizer: str = "auto"  # "adamw8bit" (CUDA) | "adamw" | "auto"
     forward_dtype: str = "bf16"  # "bf16" (production) | "fp32" (exact/dev)
@@ -79,6 +101,8 @@ class TrainConfig:
             raise ValueError(f"aux_variant must be one of {AUX_VARIANTS}")
         if self.forward_dtype not in ("bf16", "fp32"):
             raise ValueError("forward_dtype must be 'bf16' or 'fp32'")
+        if self.schedule not in ("cosine", "linear_fifth"):
+            raise ValueError("schedule must be 'cosine' or 'linear_fifth'")
 
 
 class DeadTracker:
@@ -214,10 +238,18 @@ def build_optimizer(model: BlockCrosscoder, cfg: TrainConfig) -> tuple[torch.opt
     raise ValueError(f"unknown optimizer {kind!r}")
 
 
-def _warmup_cosine(cfg: TrainConfig):
+def _lr_factor(cfg: TrainConfig):
     def factor(step: int) -> float:
         if step < cfg.warmup_steps:
             return (step + 1) / cfg.warmup_steps
+        if cfg.schedule == "linear_fifth":
+            # SASA B.3: constant after warmup, linear decay over the
+            # final fifth of training.
+            decay_start = cfg.total_steps * 4 // 5
+            if step < decay_start:
+                return 1.0
+            span = max(1, cfg.total_steps - decay_start)
+            return max(0.0, 1.0 - (step - decay_start) / span)
         span = max(1, cfg.total_steps - cfg.warmup_steps)
         progress = min(1.0, (step - cfg.warmup_steps) / span)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -263,7 +295,7 @@ class Trainer:
         else:
             self.fwd = model
         self.opt, self.optimizer_kind = build_optimizer(self.master, cfg)
-        self.sched = LambdaLR(self.opt, _warmup_cosine(cfg))
+        self.sched = LambdaLR(self.opt, _lr_factor(cfg))
         self.tracker = DeadTracker(
             model.cfg.n_blocks,
             max(cfg.dead_window_batches, cfg.dead_horizon_batches),
@@ -437,6 +469,17 @@ class Trainer:
             "optimizer_kind": self.optimizer_kind,
         }
         path = Path(path)
+        # Free-space check that aborts *before* the write (D14) — the atomic
+        # replace transiently doubles the footprint, and the freed space of
+        # an overwritten checkpoint is deliberately not credited.
+        nbytes = _payload_nbytes(payload)
+        usage = shutil.disk_usage(path.parent if path.parent.name else ".")
+        if usage.free - nbytes < CHECKPOINT_FREE_FLOOR_FRAC * usage.total:
+            raise RuntimeError(
+                f"checkpoint write would breach the "
+                f"{CHECKPOINT_FREE_FLOOR_FRAC:.0%} free-space floor "
+                f"({usage.free / 1e9:.1f} GB free, payload {nbytes / 1e9:.2f} GB)"
+            )
         tmp = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, tmp)  # atomic write-then-rename (D14)
         tmp.rename(path)

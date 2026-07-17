@@ -187,6 +187,45 @@ def test_checkpoint_resume_matches(device, tmp_path):
         assert torch.allclose(a, b, atol=1e-5)
 
 
+def test_lr_schedule_linear_fifth():
+    """SASA B.3 schedule: warmup, constant, linear decay over the final
+    fifth. Cosine remains the default and is untouched."""
+    from block_crosscoder_experiment.trainer import _lr_factor
+
+    f = _lr_factor(train_cfg(total_steps=100, warmup_steps=10, schedule="linear_fifth"))
+    assert f(0) == pytest.approx(0.1)
+    assert f(9) == pytest.approx(1.0)
+    assert f(50) == 1.0
+    assert f(79) == 1.0
+    assert f(90) == pytest.approx(0.5)
+    assert f(100) == 0.0
+
+    g = _lr_factor(train_cfg(total_steps=100, warmup_steps=10))  # cosine default
+    assert g(55) == pytest.approx(0.5)  # midpoint of the decay span
+    with pytest.raises(ValueError, match="schedule"):
+        train_cfg(schedule="nonsense")
+
+
+def test_checkpoint_free_space_floor(device, tmp_path, monkeypatch):
+    """save_checkpoint aborts before writing when the D14 floor would be
+    breached, and leaves no partial files behind."""
+    from types import SimpleNamespace
+
+    import block_crosscoder_experiment.trainer as trainer_mod
+
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(model, train_cfg(total_steps=10))
+    trainer.step(planted_batches(device, n_batches=1)[0])
+
+    total = 1_000_000_000
+    tight = SimpleNamespace(total=total, used=total, free=int(0.15 * total))
+    monkeypatch.setattr(trainer_mod.shutil, "disk_usage", lambda _: tight)
+    with pytest.raises(RuntimeError, match="free-space floor"):
+        trainer.save_checkpoint(tmp_path / "ckpt.pt")
+    assert not (tmp_path / "ckpt.pt").exists()
+    assert not (tmp_path / "ckpt.pt.tmp").exists()
+
+
 def test_threshold_calibration(device):
     model = BlockCrosscoder(CFG).to(device)
     trainer = Trainer(model, train_cfg(total_steps=40))

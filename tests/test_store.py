@@ -50,6 +50,26 @@ def test_whitener_whitens():
         assert (cov - torch.eye(D)).abs().max() < 0.1
 
 
+def test_site_rms_scalars_restore_unit_power():
+    """F7 renorm arm: at production shrinkage (ridge_scale 1.0), sites
+    with different anisotropy retain different whitened power; the RMS
+    scalars restore ~unit mean per-dim power at every site."""
+    gen = torch.Generator().manual_seed(7)
+    x = torch.randn(20_000, S, D, generator=gen)
+    decay = torch.stack(
+        [torch.arange(1, D + 1).float() ** (-(s + 1) / 2) for s in range(S)]
+    )
+    x = x * decay.view(1, S, D)
+    acc = WhitenerAccumulator(S, D)
+    acc.update(x)
+    w = acc.finalize(sites=list(range(S)), meta={}, ridge_scale=1.0)
+    xw = w.apply(x)
+    raw = xw.pow(2).mean(dim=(0, 2))
+    assert (raw.max() - raw.min()) > 0.05  # shrinkage leaves unequal site power
+    power = (xw * w.site_rms_scalars().view(1, S, 1)).pow(2).mean(dim=(0, 2))
+    assert torch.allclose(power, torch.ones(S), atol=0.02)
+
+
 def test_whitener_roundtrip_and_hash(tmp_path):
     batches, _ = gaussian_batches(n_batches=5)
     w = fit_whitener(batches)

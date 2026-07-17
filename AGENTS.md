@@ -10,7 +10,7 @@ experiments with explicit go/no-go gates.
 
 ## Read first
 
-- [`docs/design.md`](docs/design.md) (v2.3.1, site band 25–90% post-Phase-0.5, frozen): hypotheses H1–H5, the
+- [`docs/design.md`](docs/design.md) (v2.3.2, post-fidelity-audit, frozen): hypotheses H1–H5, the
   architecture spec (Gram-constrained decoders — Σ_s D_g^s D_g^sᵀ = I_b —
   BatchTopK block selection by exact whitened contribution ‖z_g‖, per-site
   nuclear norm on a fixed spectrum budget), the phase ladder
@@ -27,6 +27,12 @@ experiments with explicit go/no-go gates.
   re-plan (4 TB NVMe, whitened store, calibration split), the
   gauge-corrected Phase −1 generator, the SASA-based AuxK respec, and
   the pinned Phase-0 positive control.
+- [`docs/design-review-2026-07-17-fidelity.md`](docs/design-review-2026-07-17-fidelity.md):
+  round 4 — the paper-fidelity audit (fable three-way paper→spec→code
+  pass + sol counter-review; F1–F11, S1–S7) that produced v2.3.2: the
+  0.9.5 calibration addendum, the pre-4b-store site-renorm decision,
+  and the S-series code fixes. The verified paper ground truth
+  (hyperparameters of all four parents) lives here.
 - [`docs/research/block-sparse-crosscoders-2026-07.md`](docs/research/block-sparse-crosscoders-2026-07.md):
   the canonical research digest — parent papers (Fel BSF, SASA, Anthropic
   crosscoders + Minder artifacts), gap sweep, the synergy argument, full
@@ -36,7 +42,21 @@ experiments with explicit go/no-go gates.
 
 **Status: Phases −1, 0, 0.5, and 0.9 PASSED (2026-07-16/17). Next:
 Phase 1 (4b) — blocked on the 4 TB NVMe install; the ≥3M-token 4b
-pilot (D13) precedes the store commit.**
+pilot (D13) precedes the store commit.** A paper-fidelity audit
+(2026-07-17, fable + sol counter-review;
+[`docs/design-review-2026-07-17-fidelity.md`](docs/design-review-2026-07-17-fidelity.md))
+produced the v2.3.2 amendment set, **ratified by a9 2026-07-17**:
+the **0.9.5 calibration addendum** (lr×schedule ladder on both arms +
+dead-dynamics arm + site-renorm arm on the existing 1b store — the 4b
+pilot at ~732 steps sits inside warmup and cannot select schedules), a
+**pre-4b-store decision** on per-site RMS renormalization after the
+shrinkage whitener (deep sites currently carry ~5× the whitened power
+in L_rec; the renorm arm supplies the decision data), and code fixes
+(θ serialization, bf16 shadow eval, corpus-revision pinning,
+checkpoint free-space floor). **Immediate next action: run
+`scripts/run_phase095_matrix.sh` on jobe** (unconditional arms;
+conditional follow-ups printed at completion), then pick Phase-1
+optimizer defaults from the reports.
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

@@ -32,6 +32,14 @@ E[active blocks/token] (bundle scenario: block-event demand k=0.75,
 | frequency_ladder | report | Clean through f=0.01 on all seeds (overlap ≥0.998); per-seed lottery below (1/4 clean at 0.003 and at 0.001). The R24 calibration curve. |
 | auxk_comparison | report | Variants separate at 10k: **SASA C.1** 1–4 dead of 16, 12/12 rare features at overlap ≥0.998; long-horizon 11–12 dead (7/12 rare lost); Fel 9–11 dead. Spec default confirmed. |
 
+Fidelity note (F5, audit 2026-07-17): the "Fel" arm is a **hybrid**, not
+a faithful Fel App. D replication — Fel uses the next-**ℓ** runner-up
+blocks with α = 1/ℓ, ℓ being the *main* block sparsity; our arm
+parameterizes both as s_aux (α = 1/s_aux), and s_aux ≠ k in the runs
+made. Read its loss here as "runner-up-style AuxK", not "Fel's exact
+recipe". The comparison verdict is unaffected (the SASA arm won on
+mechanism, and §2.1 found s_aux a non-factor over 2/4/8).
+
 ## 2. What the harness taught
 
 ### 2.1 The budget-regime map (campaign rounds 1–4)

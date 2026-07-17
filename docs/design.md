@@ -47,7 +47,7 @@ gauge-corrected (bundle null weakened — perfect co-activation is
 observationally equivalent to a block under linear reconstruction); pilot
 extended to actually exercise AuxK; positive control pinned to Engels'
 actual artifact.
-**v2.3, 2026-07-16 (current)**: post-Phase−1 consolidation. Phase −1
+**v2.3, 2026-07-16**: post-Phase−1 consolidation. Phase −1
 executed and **passed** (battery runs 1–6 + capture-campaign sweep
 rounds 1–8 on jobe; gate semantics ruled by a9: strict
 capture-as-written; full record in
@@ -62,6 +62,17 @@ C.1 positively separated), and the recovery-vs-frequency calibration
 (clean to f=0.01 at 10M tokens). Design re-frozen from this state; the
 decision log remains as provenance, and the body supersedes older log
 entries wherever both speak.
+**v2.3.2, 2026-07-17 (current)**: fidelity amendments after the
+paper-fidelity audit + sol counter-review (F1–F11, S1–S7; disposition
+in [`docs/design-review-2026-07-17-fidelity.md`](design-review-2026-07-17-fidelity.md)).
+Adds the **0.9.5 calibration addendum** (lr × schedule ladder on both
+arms, dead-dynamics arm at the Phase-1 k/G ratio, site-renorm arm —
+greenlit, `scripts/run_phase095_matrix.sh`), the **pre-4b-store
+decision item** on per-site RMS renormalization after the shrinkage
+whitener, the Phase-3 freeze items (web+chat corpus mix, per-model
+init pairing), and the S-series code fixes (θ serialization, bf16
+shadow eval, corpus-revision pinning, checkpoint free-space floor).
+Ratified by a9 2026-07-17; design frozen as v2.3.2.
 
 ## Hypotheses
 
@@ -110,8 +121,12 @@ Whitening protocol: per site, fit mean μ_s and covariance Σ_s on a dedicated
 harvested *first*; ridge per saklas's `LayerWhitener` convention (λ_s =
 mean-diagonal of Σ̂_s × `DEFAULT_RIDGE_SCALE`); eigendecompose once; freeze
 W_s = (Σ_s + λ_s I)^{-1/2} and export it with the run config. Numerics
-(D9): TF32 disabled for covariance GEMMs; batch sufficient statistics
-combined by pairwise/Welford accumulation with fp64 aggregates; the eight
+(D9): TF32 disabled for covariance GEMMs (the implementation accumulates
+in fp64, which sidesteps TF32 entirely); batch-granular sufficient
+statistics accumulated linearly in fp64 within quarter-accumulators and
+tree-merged (sol S5 — this, not literal Welford/pairwise, is what the
+code does; fp64 linear accumulation over ≤5M tokens carries relative
+error ~5e-10 and is accepted as equivalent); the eight
 d×d eigendecompositions run in fp64 offline; whitener stability is checked
 across corpus halves/quarters and the transformed covariance spectrum
 validated on held-out sequences — 5M tokens is a *candidate* size that must
@@ -121,7 +136,27 @@ counting alone proves nothing). The store then holds **whitened bf16**
 set, and source manifest are hashed into every shard header and mismatches
 rejected at load; a small raw shard is retained to measure whitening
 round-trip error; any refit forces reharvest or an explicit store
-migration. Whitened activations: x̃^s = W_s (x^s − μ_s).
+migration. Whitened activations: x̃^s = W_s (x^s − μ_s). Honest label
+(F7, fidelity audit 2026-07-17; upgraded by sol counter-review): at
+`DEFAULT_RIDGE_SCALE` = 1.0 the ridge equals the mean eigenvalue, so W
+is a **shrinkage** whitener — deep-site whitened spectra sit well below
+identity (0.9 harvest: mean |eig−1| 0.71–0.94) and held-out validation
+correctly targets the prediction σ/(σ+λ), not identity. External prose
+should say "shrinkage whitening"; massive-activation suppression is
+proportional, not total. The sharper consequence (sol): mean retained
+variance per dimension runs ≈ 0.06 (shallow) to 0.29 (deep) across the
+0.9 sites, so the equal-per-dimension L_rec weights deep sites several
+times more heavily than shallow ones — the store does **not** fully
+deliver the cross-site commensurability this section claims, nor
+Anthropic's "each layer contributes comparably" intent. **Pre-4b-store
+decision item (a9)**: whether to apply a per-site scalar RMS
+renormalization *after* shrinkage whitening — preserving directional
+rogue-dim suppression while restoring equal total site power — folded
+into W_s and the whitener hash. Default proposal: adopt; the
+read-time renorm arm in the 0.9.5 addendum (greenlit, a9 2026-07-17;
+`--site-renorm`, scalars via `Whitener.site_rms_scalars` — exact on
+the existing 1b store) supplies the decision data before any 4b bytes
+are written.
 
 **dtype discipline: fp16 is forbidden everywhere in the harvest and store
 path** — gemma-3's late-layer channels exceed fp16 max (fact preserved in
@@ -186,6 +221,17 @@ G blocks of width b. Per site: encoder E_g^s ∈ ℝ^{b×d}, decoder D_g^s ∈
   not L1: Minder et al. (2504.02922) show L1
   manufactures Complete Shrinkage / Latent Decoupling; the block-level
   analogues would poison exactly the H5 diffing questions.
+  Statistic provenance (F6, fidelity audit 2026-07-17): the score itself
+  departs from Minder's v = f_j · (Σ_s ‖d_j^s‖) — an L1-of-norms
+  geometry — because under the Gram constraint ‖z_g‖² *is* the exact
+  total contribution energy and the score ‖z_g‖ is its square root
+  (identical ranking; the L2-of-norms member of the pair), and it is
+  site-profile-neutral. Anthropic's L1-vs-L2-of-norms discussion is
+  about the *penalty*, so it transfers to selection as analogy, not
+  procedural equivalence (their L1-of-norms choice "surfaces
+  layer-specific features"); on the penalty side our R_rank, a per-site
+  sum, is the L1-of-norms member and wears its site-concentration bias
+  through the R7 veto.
 - **decode** — x̂̃^s = c^s + Σ_{g active} D_g^sᵀ z_g; raw-space export
   un-whitens (x̂^s = W_s^{-1} x̂̃^s + μ_s).
 - **loss** — L = L_rec + λ_* R_rank + α L_aux, with reductions pinned so λ
@@ -196,6 +242,16 @@ G blocks of width b. Per site: encoder E_g^s ∈ ℝ^{b×d}, decoder D_g^s ∈
   direction site-exclusive, b√S = flat across sites), so the normalized
   penalty lives in [0, √S−1] with 0 = fully site-concentrated; L_aux = the
   AuxK residual reconstruction under the same reduction as L_rec.
+  Squared error is a deliberate pick between conflicting sources (F1,
+  fidelity audit 2026-07-17): Anthropic, SASA, and Fel all train on
+  squared L2, while Minder's written objective (their Eqs. 4/8) uses
+  **unsquared** per-site L2 norms — a different gradient geometry that
+  downweights high-error tokens. Sol caveat: that is Minder
+  *as written* — the same paper derives Latent Scaling from a squared
+  objective and later speaks in MSE terms, so the source is internally
+  inconsistent and their released trainer is unchecked. We inherit
+  Minder's BatchTopK/AuxK/θ machinery but follow the squared-majority
+  reconstruction convention.
 
 ### Rank regularizer
 
@@ -308,8 +364,24 @@ manifolds — the H5 diffing story is only told over blocks that pass.
   outcome: the comparison separates decisively at the 10M-token
   operating point — SASA C.1 recovers 12/12 planted rare features with
   1–4 dead blocks of 16, vs 9–12 dead and lost rare features for the
-  Fel and long-horizon arms — so SASA C.1 is the confirmed default**;
-  0.9 recalibrates window/threshold at production batch size. The Gram
+  Fel and long-horizon arms — so SASA C.1 is the confirmed default**.
+  Window fidelity, worn openly (F3, fidelity audit 2026-07-17): SASA's
+  literal criterion (ν = 10⁻⁴ over a 1000-token window) is arithmetically
+  "zero firings in the last 1k tokens" — 0.1 expected events — while our
+  re-expression (≤ 10⁻⁴ over 100 batches × 4096 = 409,600 tokens = "≤ 40
+  firings") is a materially stickier criterion, not a unit conversion —
+  a recent-zero detector became a rare-frequency classifier. The
+  batch-granular ring buffer also cannot reproduce a literal
+  token-granular 1k window, so the "SASA arm" is an approximation by
+  construction and is labeled as such.
+  The production-batch recalibration this bullet assigned to 0.9 **did
+  not happen** — the rehearsal had zero dead blocks, so no calibration
+  data exists; the item moves to the ratified 0.9.5 dead-dynamics arm
+  (oversized G at production batch, to observe real dead dynamics) with
+  the 4b pilot's AuxK exercise + synthetic revival test (D12) as
+  backstop, plus a pre-registered in-run escalation: dead-fraction
+  trajectory monitored during Phase 1 against the Phase −1
+  recovery-vs-frequency calibration. The Gram
   constraint removes the decoder-shrinkage spiral; the aux loss handles
   encoder-side starvation. Block resampling kept as a documented option,
   off by default.
@@ -322,12 +394,32 @@ manifolds — the H5 diffing story is only told over blocks that pass.
   scores are comparable across blocks (P16).
 - **Optimizer** — AdamW, lr 3e-4 (1k-step linear warmup, cosine decay),
   β=(0.9, 0.999), fp32 master weights, 8-bit moments, bf16 params; batch
-  4096 tokens. All to be recalibrated in the Phase-0.9 rehearsal.
+  4096 tokens. β and batch are SASA B.3 verbatim; lr and schedule are a
+  synthesis matching no parent exactly (SASA: 2e-4, linear decay "over
+  one-fifth of the training" — final-fifth is our reading; Fel: cosine
+  1e-4→1e-5, 2k warmup; Minder: 1e-4), and the
+  fixed 1k-step warmup is a varying *fraction* of training across scales
+  (25% of the 0.9 run, ~5% at 4b — F10). **The recalibration this bullet
+  once promised at 0.9 was not performed there** (the rehearsal ran these
+  defaults green: smooth loss, zero dead blocks — sanity, not
+  calibration); it is an open item (F2, fidelity audit 2026-07-17)
+  assigned to the ratified 0.9.5 calibration addendum (lr × schedule
+  ladder on the existing 1b store), with the mandatory 4b pilot
+  (D12/D13) as backstop. The encoder weight-decay *value* is likewise
+  open (spec says decay applies to encoders only; the code default is
+  0.0 — currently no decay anywhere).
   Retraction is per-step initially; lower-frequency retraction (Fel used
   QR every 20 steps) is a documented throughput ablation (P16). The SASA
   product-penalty ablation uses **symmetric** encoder/decoder weight decay
   (its variational form requires it, P9); the primary keeps decoder
-  decay 0.
+  decay 0. The ablation is spec-only as of 2026-07-17 (F9): its in/out
+  status in the Phase-1 run matrix is decided before the 4b freeze —
+  default: **out** of both the confirmatory matrix and the 0.9.5
+  addendum. Sol's sharpening stands: a faithful product-penalty run
+  changes the constraint, gauge handling, decay symmetry, and the
+  validity of the selection statistic at once — it is a separately
+  designed method ablation, not a cheap arm, and a hasty version would
+  not isolate "the SASA penalty".
 
 ### Identifiability caveat (worn openly)
 
@@ -379,7 +471,12 @@ L0 (E[ℓ_t] = b·E[k_t]; each model uses its own realized counts at eval),
 identical sites/whitening/data/order/precision/init scheme/tuning budget,
 cold start both (finding 16). Same parameter count by construction. Warm
 starts (from Phase-0 clusters) are exploratory runs only, never the
-headline comparison.
+headline comparison. Scope note (F6, fidelity audit 2026-07-17): this
+baseline is the b=1 special case of *our* architecture — signed latents,
+no ReLU, energy selection — not a literature ReLU crosscoder (a signed
+latent can carry feature + anti-feature in one unit). That is exactly
+what R16's internal comparability requires; external comparisons to
+published crosscoder numbers should note the convention gap.
 
 **The primary H3 comparison runs both models at λ = 0** (at b=1 the
 per-site nuclear term is a pure site-concentration penalty, not a rank
@@ -455,11 +552,20 @@ Mandatory pre-commitment pilot (finding 31, extended in round 3 — D7,
 D12): before the full store is written, a **≥3M-token exact-config pilot**
 (>500 steps at batch 4096, with margin) runs the exact production path —
 same sequence batching, all 8 hooks, dtype conversion, whitening,
-checksums, shard writer — and must actually **exercise** AuxK (v2.1's
-1M-token pilot could not: 244–488 steps never cross the 500-batch dead
-window, so the recovery mechanism would go untested), checkpoint/resume,
+checksums, shard writer — and must actually **exercise** AuxK
+(rationale refreshed post-AuxK-respec, sol S7: the original "cannot
+cross the 500-batch dead window" argument referenced the long-horizon
+arm; the SASA default window is 100 batches, which a ≥3M pilot crosses
+with margin — the pilot stays mandatory on operational-coverage
+grounds), checkpoint/resume,
 and final-threshold calibration, including a synthetic dead-encoder
-revival test. Logged: model tok/s, writer GB/s, GPU duty cycle,
+revival test. Scope limit, worn openly (sol, F2/F10): at ~732 steps the
+pilot sits entirely inside the 1k-step warmup — it validates the
+warmup/early-training regime and operational mechanics, and can
+*confirm* a previously selected lr/schedule point only in that regime;
+it cannot choose between schedules or observe decay-tail behavior.
+Schedule selection belongs to the 0.9.5 addendum at full rehearsal
+horizon. Logged: model tok/s, writer GB/s, GPU duty cycle,
 **data-wait time** (not just aggregate throughput), VRAM high-water,
 dead-block trajectory, pre/post-retraction Gram eigenvalues, floor hits,
 depth-share jumps, and aux/main gradient norms. The token budget and
@@ -702,8 +808,23 @@ instruct gemma first, **paired forwards on identical raw token sequences**
 (shared tokenizer removes vocabulary alignment; chat-template asymmetry is
 the residual caveat, handled by running both models template-free on the
 same stream and treating template tokens as a documented distribution gap —
-finding 24). Manifold-level diffing + persona-fan provenance (H5), gated on
-the same shared-code evals per model. H5's toolkit is **causal, not only
+finding 24). Two config-freeze items from the fidelity audit (F4,
+2026-07-17), both Minder-anchored: (i) **corpus mix** — Minder trained
+the diffing crosscoder on FineWeb *plus lmsys-chat* (mixture
+proportions not stated in the paper — ours must be chosen and pinned
+explicitly, not "matched"); chat-specific latents need
+chat-distribution data to fire, so H5's chat-specific manifolds (the
+persona fan) are likely underpowered or distributionally missed on
+FineWeb-Edu alone — the Phase-3 harvest adopts a web+chat blend (chat
+rendered template-free per the paired-forwards rule), proportions
+pinned at the freeze; (ii)
+**per-model init pairing** — Minder initializes base/chat encoder and
+decoder pairs *identically* (a deliberate start-shared prior for
+diffing); our default independent per-site Gaussian+retraction does not
+— paired vs independent init is decided at the freeze, default proposal:
+paired (matching the diffing parent), with the independent init kept as
+the documented ablation. Manifold-level diffing + persona-fan provenance
+(H5), gated on the same shared-code evals per model. H5's toolkit is **causal, not only
 observational** (P12, from Minder §3.1.2): selected-block base→chat
 patching through per-block decoder differences with output-KL readout,
 None/All/reconstruction-error baselines, full-response *and* early-token
@@ -896,3 +1017,38 @@ public (P23, round-3 novelty verdict).
   rehearsal and Phase-1 configs (a9 ratified 2026-07-17) so the site
   bracket includes the early stream. Single-number change; all other
   frozen surfaces untouched.
+- **2026-07-17 (v2.3.2 pending, fidelity amendments)** — paper-fidelity
+  audit (fable pass, F1–F11;
+  [`design-review-2026-07-17-fidelity.md`](design-review-2026-07-17-fidelity.md))
+  at a9's direction "fix all findings"; sol counter-review in flight
+  (thread `bsc-fidelity-audit-review`). Folded now: F1 (squared
+  reconstruction is a deliberate pick against Minder's unsquared form),
+  F6 (selection-statistic provenance vs Minder's v; b=1 baseline scope
+  note), F7 (shrinkage-whitening label), F10 (warmup-fraction note), F4
+  (Phase-3 freeze items: web+chat corpus mix, per-model init pairing),
+  F9 (SASA-ablation default: out of the confirmatory matrix). Code: F8
+  checkpoint free-space floor (trainer + test). Reassigned open items:
+  F2 (optimizer recalibration) and F3 (AuxK window calibration) move
+  from the discharged-at-0.9 claim to the **0.9.5 calibration
+  addendum** on the existing 1b store, 4b pilot as backstop. No
+  architecture or protocol surface changed. **Sol counter-review
+  returned same day** (job `cx-20260717-110930-e764`): every finding
+  sustained, several sharpened — F7 upgraded to moderate (shrinkage
+  whitening leaves ~5× unequal residual site power in L_rec; per-site
+  RMS renorm is now a pre-4b-store decision item), F3 arithmetic
+  corrected (≤40), F6 energy/√energy wording fixed, F9 hardened (no
+  cheap product-penalty arm), the 4b pilot's warmup-bound scope stated
+  (732 steps < 1k warmup — it cannot select schedules), and seven
+  code-sweep findings S1–S7 added (θ not serialized into the
+  checkpoint; fp32-master vs bf16-forward eval ambiguity; HF corpus
+  revision unpinned; held-out validation is an uncentered second
+  moment; Welford wording vs linear-fp64 reality; Fel-init attribution
+  softened to Fel-inspired; stale pilot-AuxK rationale) — all fixed or
+  worn in this amendment set. Sol endorses 0.9.5 with a corrected
+  matrix (dead-dynamics arm at k=32 preserving the Phase-1 k/G ratio;
+  k=16 as labeled stress only; second seed for winner + runner-up;
+  λ=0 confirmation of the winner). **Ratified by a9 2026-07-17,
+  including the site-renorm arm; design frozen as v2.3.2.** The
+  addendum's unconditional arms are scripted in
+  `scripts/run_phase095_matrix.sh` (separate out-root; 0.9 artifacts
+  untouched).

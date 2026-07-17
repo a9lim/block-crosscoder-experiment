@@ -68,7 +68,16 @@ def main() -> None:
     stop_at = max(SITES) + 1
     bos = model.tokenizer.bos_token_id
 
-    stream = load_dataset(CORPUS[0], name=CORPUS[1], split="train", streaming=True)
+    # Pin the corpus to an exact HF revision (sol S3 — the design's "pinned
+    # manifest" requires more than dataset/config/split; resolve the current
+    # sha and record it, so a re-harvest reads identical bytes).
+    from huggingface_hub import HfApi
+
+    corpus_sha = HfApi().dataset_info(CORPUS[0]).sha
+    stream = load_dataset(
+        CORPUS[0], name=CORPUS[1], split="train", streaming=True,
+        revision=corpus_sha,
+    )
 
     def token_docs():
         for doc in stream:
@@ -88,6 +97,7 @@ def main() -> None:
         "model": MODEL,
         "corpus": CORPUS[0],
         "corpus_config": CORPUS[1],
+        "corpus_revision": corpus_sha,
         "corpus_split": "train",
         "context_size": CTX,
         "prepend_bos": True,
@@ -176,7 +186,10 @@ def main() -> None:
     raw_writer = writer_for("raw_validation")
     raw_writer.whitener_hash = "raw:" + whitener.hash
     raw_remaining = RAW_VALIDATION_TOKENS
-    heldout_cov = torch.zeros(
+    # Uncentered second moment about the *fit* mean (sol S4): whitened data
+    # is fit-mean-subtracted, so the held-out-mean correction is negligible;
+    # it is reported as a second moment, not a covariance.
+    heldout_m2 = torch.zeros(
         len(SITES), d_model, d_model, dtype=torch.float64, device=args.device
     )
     heldout_n = 0
@@ -197,7 +210,7 @@ def main() -> None:
                     raw_writer.add(raw[:n_raw].cpu())
                     raw_remaining -= n_raw
                 if heldout_n < 200_000:  # held-out whitener validation
-                    heldout_cov += torch.einsum(
+                    heldout_m2 += torch.einsum(
                         "nsd,nse->sde", xw.double(), xw.double()
                     )
                     heldout_n += take
@@ -218,15 +231,15 @@ def main() -> None:
     raw_manifest = raw_writer.close()
     print(f"  raw_validation: {raw_manifest['n_tokens']:,} tokens", flush=True)
 
-    # Held-out transformed-covariance validation (D9). The pinned ridge
-    # (λ = mean eigenvalue) makes W a *shrinkage* whitener — the fit-side
-    # prediction for the whitened spectrum is σ_j/(σ_j+λ), not 1 — so
-    # stability is measured as held-out spectrum vs that prediction;
+    # Held-out transformed-second-moment validation (D9, S4). The pinned
+    # ridge (λ = mean eigenvalue) makes W a *shrinkage* whitener — the
+    # fit-side prediction for the whitened spectrum is σ_j/(σ_j+λ), not 1 —
+    # so stability is measured as held-out spectrum vs that prediction;
     # the vs-identity numbers are reported as ridge-softness context.
-    cov = (heldout_cov / max(heldout_n, 1)).cpu()
+    m2 = (heldout_m2 / max(heldout_n, 1)).cpu()
     dev_vs_pred, mean_dev_vs_one = [], []
     for s in range(len(SITES)):
-        held = torch.linalg.eigvalsh(cov[s]).flip(0)  # descending
+        held = torch.linalg.eigvalsh(m2[s]).flip(0)  # descending
         reg = whitener.eigenvalues[s].double().flip(0)  # eigs of Σ+λI, desc
         lam = float(whitener.ridge[s])
         predicted = (reg - lam) / reg

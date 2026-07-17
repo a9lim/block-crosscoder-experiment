@@ -131,6 +131,19 @@ class Whitener:
         h.update(json.dumps([self.sites, self.meta], sort_keys=True).encode())
         return h.hexdigest()
 
+    def site_rms_scalars(self) -> torch.Tensor:
+        """Per-site scalar RMS renormalization after shrinkage whitening
+        (F7 decision arm, design v2.3.2): the whitened per-dim variance
+        prediction is (e_j − λ_s)/e_j for e = eig(Σ+λI), so scaling site s
+        by 1/sqrt(mean_j retained_j) restores ~unit mean per-dim power —
+        directional rogue-dim suppression kept, equal total site power
+        restored. Returns [S] fp32.
+        """
+        e = self.eigenvalues.double()
+        lam = self.ridge.double().unsqueeze(1)
+        retained = ((e - lam) / e).clamp_min(0.0).mean(dim=1)
+        return retained.clamp_min(1e-12).rsqrt().float()
+
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         """x: [n, S, d] raw -> whitened, computed in fp32."""
         if x.dtype in FORBIDDEN_DTYPES:
