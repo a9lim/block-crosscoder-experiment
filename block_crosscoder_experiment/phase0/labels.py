@@ -38,7 +38,9 @@ def build_label_map(tokenizer, family: str) -> dict[int, int]:
     mapping: dict[int, int] = {}
     for k, word in enumerate(words):
         for form in dict.fromkeys(_surface_forms(word)):
-            ids = tokenizer.encode(form)
+            # add_special_tokens=False: gemma-style tokenizers prepend BOS
+            # on bare encode, which made every form look multi-token.
+            ids = tokenizer.encode(form, add_special_tokens=False)
             if len(ids) == 1:
                 existing = mapping.get(ids[0])
                 if existing is not None and existing != k:

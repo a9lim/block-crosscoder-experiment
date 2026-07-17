@@ -51,19 +51,39 @@ def load_decoder(device: str) -> torch.Tensor:
     return sae.W_dec.detach().to(device)
 
 
-def stage_cluster(store, out: Path, device: str) -> torch.Tensor:
+def stage_cluster(store, out: Path, device: str) -> dict[str, torch.Tensor]:
+    """Two geometric candidate sources.
+
+    Gemma-16k decoders are far more orthogonal than Bloom's GPT-2 SAE
+    (median max-neighbor cosine 0.218 vs 0.547 — 6.4× vs 32×
+    overcomplete), so Engels-style spectral clustering degenerates toward
+    singletons + a background blob. The kNN-graph method (Engels' own
+    answer for their 65k Mistral SAEs) handles orthogonal-bulk
+    dictionaries gracefully; both run as candidate sources.
+    """
     from block_crosscoder_experiment.phase0.clustering import (
         angular_similarity,
+        knn_graph_clusters,
         spectral_clusters,
     )
 
-    path = out / "cluster_labels.pt"
-    if path.exists():
-        return torch.load(path, weights_only=True)
     decoder = load_decoder(device)
-    labels = spectral_clusters(angular_similarity(decoder), N_CLUSTERS, seed=0).cpu()
-    torch.save(labels, path)
-    return labels
+    labelings: dict[str, torch.Tensor] = {}
+    spath = out / "cluster_labels.pt"
+    if spath.exists():
+        labelings["spectral"] = torch.load(spath, weights_only=True)
+    else:
+        labelings["spectral"] = spectral_clusters(
+            angular_similarity(decoder), N_CLUSTERS, seed=0
+        ).cpu()
+        torch.save(labelings["spectral"], spath)
+    gpath = out / "graph_labels.pt"
+    if gpath.exists():
+        labelings["graph"] = torch.load(gpath, weights_only=True)
+    else:
+        labelings["graph"] = knn_graph_clusters(decoder).cpu()
+        torch.save(labelings["graph"], gpath)
+    return labelings
 
 
 def stage_coactivation(store, out: Path, device: str) -> torch.Tensor:
@@ -106,7 +126,7 @@ def _family_affinity(
 ) -> list[tuple[int, float, int, int]]:
     class_ids = class_ids.cpu()
     scores = []
-    for cid in range(N_CLUSTERS):
+    for cid in range(int(labels.max()) + 1):
         members = (labels == cid).nonzero(as_tuple=True)[0]
         if members.numel() == 0:
             continue
@@ -123,36 +143,44 @@ def _family_affinity(
     return scores
 
 
-def stage_battery(store, labels: torch.Tensor, out: Path, device: str) -> dict:
+def stage_battery(
+    store, labelings: dict[str, torch.Tensor], out: Path, device: str
+) -> dict:
     from block_crosscoder_experiment.phase0.battery import run_cluster_battery
 
     decoder = load_decoder(device)
     report: dict = {}
     for family in FAMILIES:
         class_ids = _family_label_vector(store, family)
-        affinity = _family_affinity(store, labels, class_ids, N_CLASSES[family])
-        top = affinity[:3]
-        fam: dict = {"top_affinity": [
-            {"cluster": c, "affinity": round(a, 4), "n_fired": n, "coverage": cov}
-            for c, a, n, cov in top
-        ], "batteries": []}
-        for cid, aff, _, _ in top:
-            members = (labels == cid).nonzero(as_tuple=True)[0]
-            battery = run_cluster_battery(
-                store,
-                decoder,
-                members,
-                class_ids=class_ids,
-                n_classes=N_CLASSES[family],
-                n_perm=200,
-                seed=0,
+        fam: dict = {}
+        for branch, labels in labelings.items():
+            affinity = _family_affinity(
+                store, labels, class_ids, N_CLASSES[family]
             )
-            battery["cluster"] = cid
-            battery["affinity"] = aff
-            battery["members"] = members.tolist()
-            fam["batteries"].append(_jsonable(battery))
-        if fam["batteries"]:
-            fam["battery"] = fam["batteries"][0]
+            top = affinity[:3]
+            entry: dict = {"top_affinity": [
+                {"cluster": c, "affinity": round(a, 4), "n_fired": n,
+                 "coverage": cov}
+                for c, a, n, cov in top
+            ], "batteries": []}
+            for cid, aff, _, _ in top:
+                members = (labels == cid).nonzero(as_tuple=True)[0]
+                battery = run_cluster_battery(
+                    store,
+                    decoder,
+                    members,
+                    class_ids=class_ids,
+                    n_classes=N_CLASSES[family],
+                    n_perm=200,
+                    seed=0,
+                )
+                battery["cluster"] = cid
+                battery["affinity"] = aff
+                battery["members"] = members.tolist()
+                entry["batteries"].append(_jsonable(battery))
+            if entry["batteries"]:
+                entry["battery"] = entry["batteries"][0]
+            fam[branch] = entry
         report[family] = fam
     (out / "family_battery.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
@@ -238,7 +266,9 @@ def stage_figures(store, labels: torch.Tensor, report: dict, out: Path, device: 
     )
     from block_crosscoder_experiment.phase0.rings import pca_projections
 
-    def plot_battery(family: str, battery: dict, class_ids: torch.Tensor) -> None:
+    def plot_battery(
+        family: str, branch: str, battery: dict, class_ids: torch.Tensor
+    ) -> None:
         cid = battery["cluster"]
         members = torch.tensor(battery["members"])
         recon, kept = cluster_restricted_reconstruction(store, decoder, members)
@@ -253,11 +283,12 @@ def stage_figures(store, labels: torch.Tensor, report: dict, out: Path, device: 
             vmin=0, vmax=N_CLASSES[family],
         )
         ax.set_title(
-            f"gemma {family} cluster {cid} — PCs {best[0]+1}/{best[1]+1}, "
+            f"gemma {family} {branch} cluster {cid} — "
+            f"PCs {best[0]+1}/{best[1]+1}, "
             f"circ {battery['circular']:.2f} (p={battery['circular_p']:.3f})"
         )
         fig.colorbar(sc, ax=ax, label="class")
-        fig.savefig(fig_dir / f"{family}_cluster{cid}.png", dpi=150)
+        fig.savefig(fig_dir / f"{family}_{branch}_cluster{cid}.png", dpi=150)
         plt.close(fig)
 
     decoder = load_decoder(device)
@@ -265,9 +296,10 @@ def stage_figures(store, labels: torch.Tensor, report: dict, out: Path, device: 
     fig_dir.mkdir(exist_ok=True)
     for family in FAMILIES:
         class_ids = _family_label_vector(store, family)
-        for battery in report.get(family, {}).get("batteries", []):
-            if "circular" in battery:
-                plot_battery(family, battery, class_ids)
+        for branch, entry in report.get(family, {}).items():
+            for battery in entry.get("batteries", []):
+                if "circular" in battery:
+                    plot_battery(family, branch, battery, class_ids)
 
 
 def _jsonable(obj):
@@ -300,35 +332,42 @@ def main() -> None:
     out = args.store / "target_run"
     out.mkdir(exist_ok=True)
 
-    labels = stage_cluster(store, out, device)
-    sizes = torch.bincount(labels, minlength=N_CLUSTERS)
-    print(
-        f"clusters: {int((sizes > 0).sum())}/{N_CLUSTERS} nonempty, "
-        f"median size {float(sizes[sizes > 0].median()):.0f}, max {int(sizes.max())}"
-    )
+    labelings = stage_cluster(store, out, device)
+    for branch, labels in labelings.items():
+        sizes = torch.bincount(labels)
+        print(
+            f"{branch} clusters: {int((sizes > 0).sum())} nonempty, "
+            f"median size {float(sizes[sizes > 0].median()):.0f}, "
+            f"max {int(sizes.max())}"
+        )
+    spectral = labelings["spectral"]
     if args.stage in ("all", "battery", "figures"):
-        report = stage_battery(store, labels, out, device)
+        report = stage_battery(store, labelings, out, device)
         for family in FAMILIES:
-            fam = report[family]
-            printed = False
-            for b in fam.get("batteries", []):
-                if "circular" in b:
+            for branch, entry in report[family].items():
+                printed = False
+                for b in entry.get("batteries", []):
+                    if "circular" in b:
+                        print(
+                            f"{family}/{branch}: cluster {b['cluster']} "
+                            f"affinity {b['affinity']:.2f} "
+                            f"n_members {b['n_members']} "
+                            f"circ {b['circular']:.3f} (p={b['circular_p']:.4f}) "
+                            f"plane {b['circular_plane']} "
+                            f"ngon {b['ngon']['alignment']:.2f}"
+                        )
+                        printed = True
+                if not printed:
                     print(
-                        f"{family}: cluster {b['cluster']} affinity {b['affinity']:.2f} "
-                        f"n_members {b['n_members']} "
-                        f"circ {b['circular']:.3f} (p={b['circular_p']:.4f}) "
-                        f"plane {b['circular_plane']} "
-                        f"ngon {b['ngon']['alignment']:.2f}"
+                        f"{family}/{branch}: no battery-eligible cluster — "
+                        f"{entry['top_affinity']}"
                     )
-                    printed = True
-            if not printed:
-                print(f"{family}: no battery-eligible cluster — {fam['top_affinity']}")
     if args.stage in ("all", "ranking"):
-        ranking = stage_ranking(store, labels, out, device)
+        ranking = stage_ranking(store, spectral, out, device)
         order = ranking["ranking"]
         report = json.loads((out / "family_battery.json").read_text())
         for family in FAMILIES:
-            for b in report[family].get("batteries", []):
+            for b in report[family].get("spectral", {}).get("batteries", []):
                 cid = b["cluster"]
                 rank = order.index(cid) + 1 if cid in order else None
                 print(f"{family} cluster {cid}: Engels rank {rank}/{len(order)}")
@@ -336,23 +375,24 @@ def main() -> None:
         coact = stage_coactivation(store, out, device)
         report = json.loads((out / "family_battery.json").read_text())
         for family in FAMILIES:
-            for b in report[family].get("batteries", []):
-                members = torch.tensor(b["members"])
-                geo = set(members.tolist())
-                ids, cnts = coact[members].unique(return_counts=True)
-                best = int(ids[cnts.argmax()])
-                co = set((coact == best).nonzero(as_tuple=True)[0].tolist())
-                jac = len(geo & co) / len(geo | co)
-                print(
-                    f"{family} cluster {b['cluster']}: "
-                    f"co-activation best-match Jaccard {jac:.2f}"
-                )
+            for branch, entry in report[family].items():
+                for b in entry.get("batteries", []):
+                    members = torch.tensor(b["members"])
+                    geo = set(members.tolist())
+                    ids, cnts = coact[members].unique(return_counts=True)
+                    best = int(ids[cnts.argmax()])
+                    co = set((coact == best).nonzero(as_tuple=True)[0].tolist())
+                    jac = len(geo & co) / len(geo | co)
+                    print(
+                        f"{family}/{branch} cluster {b['cluster']}: "
+                        f"co-activation best-match Jaccard {jac:.2f}"
+                    )
     if args.stage in ("all", "figures"):
         report = json.loads((out / "family_battery.json").read_text())
-        stage_figures(store, labels, report, out, device)
+        stage_figures(store, spectral, report, out, device)
         print(f"figures -> {out / 'figures'}")
     if args.stage in ("all", "scan"):
-        summary = stage_scan(store, labels, out, device)
+        summary = stage_scan(store, spectral, out, device)
         print(
             f"scan: {summary['n_tested']} tested, "
             f"{summary['n_gated_out']} gated out, "
