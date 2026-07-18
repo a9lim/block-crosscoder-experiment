@@ -31,7 +31,7 @@ import torch
 
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.phase0.harvest import pack_token_rows
-from block_crosscoder_experiment.phase0.labels import build_label_map, label_tokens
+from block_crosscoder_experiment.phase0.labels import (FAMILIES, build_label_map, label_tokens)
 from block_crosscoder_experiment.store import Whitener
 
 MODEL = "google/gemma-3-1b-pt"
@@ -67,6 +67,11 @@ def main() -> None:
         help="override the default run map (name=path pairs)",
     )
     ap.add_argument(
+        "--families", nargs="+", default=["weekday", "month"],
+        help="label families from phase0.labels.FAMILIES; fam index in the "
+        "saved npz follows this order",
+    )
+    ap.add_argument(
         "--tag", default="",
         help="suffix for output filenames (e.g. _pilot4b) so 1b artifacts "
         "are never clobbered",
@@ -97,7 +102,7 @@ def main() -> None:
     bos = model.tokenizer.bos_token_id
 
     label_maps = {
-        fam: build_label_map(model.tokenizer, fam) for fam in ("weekday", "month")
+        fam: build_label_map(model.tokenizer, fam) for fam in args.families
     }
     corpus_sha = HfApi().dataset_info(CORPUS[0]).sha
     stream = load_dataset(
@@ -138,7 +143,7 @@ def main() -> None:
 
         cls = torch.full_like(ids, -1)
         fam = torch.full_like(ids, -1)
-        for fi, family in enumerate(("weekday", "month")):
+        for fi, family in enumerate(args.families):
             c = label_tokens(ids.long(), label_maps[family])
             hit = c >= 0
             cls[hit] = c[hit]
@@ -174,16 +179,17 @@ def main() -> None:
     fam = torch.cat(lab_fam)
     tok_ids = torch.cat(lab_tok)
     bg = torch.cat(bg_acts)[:BACKGROUND_CAP]
-    print(
-        f"scan done: {scanned:,} tokens, weekday {int((fam == 0).sum()):,}, "
-        f"month {int((fam == 1).sum()):,}, background {bg.shape[0]:,}",
-        flush=True,
+    per_fam = ", ".join(
+        f"{family} {int((fam == fi).sum()):,}"
+        for fi, family in enumerate(args.families)
     )
+    print(f"scan done: {scanned:,} tokens, {per_fam}, "
+          f"background {bg.shape[0]:,}", flush=True)
 
     # Per-site class means (activation space, whitened coords).
     means = {}
-    for fi, family in enumerate(("weekday", "month")):
-        n_cls = 7 if family == "weekday" else 12
+    for fi, family in enumerate(args.families):
+        n_cls = len(FAMILIES[family])
         m = torch.zeros(n_cls, len(sites), d_model)
         for cix in range(n_cls):
             sel = (fam == fi) & (cls == cix)
@@ -197,8 +203,7 @@ def main() -> None:
         cls=cls.numpy(),
         fam=fam.numpy(),
         token_ids=tok_ids.numpy(),
-        weekday_means=means["weekday"].numpy(),
-        month_means=means["month"].numpy(),
+        **{f"{family}_means": m.numpy() for family, m in means.items()},
         bg_mean=bg.mean(0).numpy(),
         bg_var=bg.var(0).numpy(),
         meta=json.dumps(
@@ -206,6 +211,7 @@ def main() -> None:
                 "model": args.model, "corpus": CORPUS, "corpus_revision": corpus_sha,
                 "skip_docs": args.skip_docs, "scanned_tokens": scanned,
                 "sites": list(sites), "whitener_hash": whitener.hash,
+                "families": list(args.families),
                 "label_maps": {
                     f: {str(k): v for k, v in m.items()}
                     for f, m in label_maps.items()

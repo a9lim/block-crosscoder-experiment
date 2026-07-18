@@ -43,7 +43,7 @@ no arm at 3e-4 spiked at all:
 |---|---|---|---|---|
 | BSC primary | 1.2e-3 | 2.38+ (~800) | **1.134** (destroyed) | 3.4 % |
 | BSC renorm | 1.2e-3 | 7.5 (~700) | killed mid-run | 6 %+ |
-| BSC primary | 6e-4 | 0.45 (1050) | 0.553 (recovered, damaged) | 3.1 % |
+| BSC primary | 6e-4 | 0.45 (1050); re-spike 0.98 (1600) | 0.553 (recovered, damaged) | 3.1 % |
 | BSC renorm | 6e-4 | 94.5 (1180) | 1.105 (destroyed) | 7.1 % |
 | scalar | 6e-4 | 12.3 (1020) | 0.545 (recovered, damaged) | 0.5 % |
 | BSC primary | 3e-4 | 0.132 (=init floor) | **0.430** | 0.10 % |
@@ -72,6 +72,15 @@ Mechanism, from the full step logs (`steps.jsonl` carries per-step
    + SASA-C.1 AuxK at λ_aux=1.0) at 4b scale. λ_aux=1.0 is
    SASA-paper-faithful and was validated at Phase −1/0.9 — this is an
    emergent-at-scale interaction, not a config bug.
+4. **There is a data-driven trigger component** (seen in the figure
+   pass): both 6e-4 arms re-spike at exactly step 1600 — BSC to rec
+   0.98 (its *largest* excursion, above the warmup-peak 0.45) and
+   scalar to 2.84 — on the shared store order, at cosine-decayed
+   lr ≈ 4.6e-4, while the 3e-4 arms sail through the same batch.
+   A specific batch blows up damaged dictionaries when lr is high
+   enough. This favors the batch-skip form of the spike guard over
+   pure clipping, and puts a measured re-spike threshold (~4.6e-4,
+   damaged-dictionary) right beside the unexplored 4.5e-4 rung.
 
 **Phase-1 consequences (for a9 ratification):**
 - **4b optimizer point: lr 3e-4 cosine** (λ=1e-3, enc-wd 0 unchanged).
@@ -198,6 +207,34 @@ Readings:
    dictionary carries diffusely — caveat: the BSC baseline has its own
    seed lottery (3/12 vs 7/12), so the clean contrast is
    renorm-vs-scalar at this budget.
+
+### Rings inside the captured frames (block-23-style test at 4b)
+
+Projecting the labeled acts into the captured blocks' per-site decoder
+frames (`fig_pilot4b.py`, stats in `fig_pilot4b_summary.json`): b595's
+rotating frames hold the month ring at **6 of 8 sites** (10–12 hits at
+L9–L15/L21/L24, 12/12 at L21; weakest 7/12 at L18/L27/L30, still
+p ≈ 2e-3) vs block 23 holding it at all 6 sites at 1b — partially
+block-23-style at pilot budget. b862's frames carry the weekday ring
+**early only** (7/7 at L9–L15, decaying to 4/7 by L21+) even though the
+raw stream holds 7/7 everywhere. Depth detail from the per-site planes:
+the late-site month ring collapses *asymmetrically* — the autumn arc
+(Sep–Nov) crushes into a knot at L27/L30 while spring stays extended —
+and the two months b595 fails to claim (Sep→b3593, Oct→b2705) are
+exactly in that knot: where the stream's ring degenerates, capture
+splits.
+
+### Figures (`figures/pilot4b/`, regenerate with `scripts/analysis/fig_pilot4b.py`)
+
+| figure | shows |
+|---|---|
+| `p4b_b595_ring.png` | the 4b month manifold: labeled tokens + class means in b595's code plane |
+| `p4b_weekday_ring.png` | b862's weekday ring |
+| `p4b_capture_maps.png` | per-arm month claim maps — the lottery, renorm's near-sweep, the mega-block, scalar smear |
+| `p4b_ring_depth.png`, `p4b_depth_planes.png` | raw-stream ring availability by depth; per-site planes with the autumn-knot collapse |
+| `p4b_ring_in_frames.png` | raw vs in-frame ring by depth for b595/b862 |
+| `p4b_instability.png` | the warmup-peak cascade + the step-1600 data-driven re-spike |
+| `p4b_allocation.png` | per-site FVU: the renorm allocation reversal at 4b |
 
 Honesty box: weekday classes are small after the capitalization filter
 (~10² tokens/class); month ring p floors at 5.0e-5 (1/20001); six arms

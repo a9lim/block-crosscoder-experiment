@@ -21,10 +21,34 @@ MONTHS = [
 ]
 YEARS = [str(y) for y in range(1900, 2000)]
 
+# Zoo tranche (0.9.6 analysis pass): linear families for the number-line
+# question, small cyclic families for completeness. Known polysemy is
+# accepted and noted at analysis time (ordinal "second" = time unit,
+# season "spring" = verb/coil, digits ride years and list markers).
+ORDINALS = [
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth",
+    "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
+    "nineteenth", "twentieth",
+]
+CARDINALS = [
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+]
+DIGITS = [str(d) for d in range(10)]
+SEASONS = ["winter", "spring", "summer", "autumn"]
+COMPASS = ["north", "east", "south", "west"]
+
 FAMILIES: dict[str, list[str]] = {
     "weekday": WEEKDAYS,
     "month": MONTHS,
     "year": YEARS,
+    "ordinal": ORDINALS,
+    "cardinal": CARDINALS,
+    "digit": DIGITS,
+    "season": SEASONS,
+    "compass": COMPASS,
 }
 
 
