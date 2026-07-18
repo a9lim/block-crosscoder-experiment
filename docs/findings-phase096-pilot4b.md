@@ -243,11 +243,25 @@ multiple-comparisons correction, the 1.2e-2 ones do not.
 
 ## Remaining
 
-1. **a9 ratification items**: 4b lr 3e-4 (amended optimizer point;
-   tension: order tracks lr, ~4.5e-4 unexplored), site list
-   (9,12,15,18,21,24,27,30 — depth-availability now measured, above),
-   **F7 renorm designation** (4b evidence: FVU win + allocation
-   reversal + only-arm-with-both-rings; cost: lower stability edge),
-   spike guard / AuxK cap for Phase 1.
-2. Parked analysis: eval_activation_stats + planarity screen on the
-   3e-4 checkpoints (runbook, Analysis pass).
+1. ~~a9 ratification items~~ **Ratified 2026-07-18** (design decision
+   log): 4b lr 3e-4 cosine, site list, F7 renorm designated, AuxK cap +
+   spike guard (batch-skip form favored by the step-1600 evidence).
+2. ~~Parked analysis~~ **Run 2026-07-18**: evalstats (4 runs),
+   planarity screen both arms (nameable families incl. ordinal block
+   b3227, digit b1219, duration b2324, magnitude b2987), 8 PNG figures
+   + 4 interactive 3D stacks (`figures/pilot4b/`, scripts
+   `fig_pilot4b.py` / `fig_pilot4b_3d.py`).
+3. **Zoo probe in flight (2026-07-18)**: 7-family scan
+   (weekday/month/ordinal/cardinal/digit/season/compass,
+   `--per-class-cap 4000` after an uncapped-scan host-RAM OOM) chained
+   into `zoo_block_tests.py` on jobe — `zoo_rerun.log`, marker
+   `ZOO_ALL_DONE`. On completion: pull `zoo_means_pilot4b.npz` +
+   `zoo_block_tests_zoo4b.json` + `zoo_codes_*_zoo4b.npz` to Mac
+   `data/analysis/`, rerun `fig_pilot4b_3d.py` (zoo 3D views
+   auto-generate from the means npz), read the order stats (does
+   b3227 own an ordered ordinal line the way b595 owns the month
+   ring?), add the zoo section here.
+4. Still open beyond that: cross-arm correspondence
+   (b1270/b705/b595 span alignment), 4b packing-clique check
+   (evalstats coact), code-anisotropy at 4b, deeper decode of oddball
+   planar blocks (b510 Latin, b1623 astonishment-intensity).
