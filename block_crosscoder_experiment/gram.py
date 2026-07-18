@@ -23,6 +23,10 @@ import math
 
 import torch
 
+# Safe batch count for cusolver's batched symmetric eigensolvers
+# (empirical ceiling sits between 24576 and 32768 on CUDA 12.8).
+_EIGH_MAX_BATCH = 16384
+
 __all__ = [
     "block_gram",
     "gram_residual",
@@ -87,7 +91,20 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     D: [S, G, b, d]  ->  [S, G, b]
     """
     gram_s = torch.einsum("sgbd,sgcd->sgbc", D, D).float()
-    evals = torch.linalg.eigvalsh(gram_s)
+    # cusolver's batched syev rejects large batch counts (measured on
+    # CUDA 12.8 / 4090: S*G = 24576 passes, 32768 fails with
+    # CUSOLVER_STATUS_INVALID_VALUE on finite input), so chunk the flat
+    # batch; hit at G=8192, S=6.
+    flat = gram_s.reshape(-1, gram_s.shape[-2], gram_s.shape[-1])
+    if flat.shape[0] > _EIGH_MAX_BATCH:
+        evals = torch.cat(
+            [
+                torch.linalg.eigvalsh(flat[i : i + _EIGH_MAX_BATCH])
+                for i in range(0, flat.shape[0], _EIGH_MAX_BATCH)
+            ]
+        ).reshape(gram_s.shape[:-1])
+    else:
+        evals = torch.linalg.eigvalsh(gram_s)
     return (evals.clamp_min(0.0) + eps).sqrt()
 
 
