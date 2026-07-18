@@ -1069,3 +1069,27 @@ public (P23, round-3 novelty verdict).
   (2026-07-17)** — the arm shows wash pooled FVU with the per-site
   allocation reversed (deep→shallow); the lean is pinned (or revisited)
   at 4b store build, before the first store byte is written.
+- **2026-07-18 (0.9.6 executed; 4b optimizer + F7 + AuxK ratified)** —
+  tier A ([`findings-phase096-tier-a.md`](findings-phase096-tier-a.md)):
+  capture consolidation universal at 1b/16M tokens, calendar *order* a
+  seed lottery that epochs don't buy at the winner lr. Tier B, the D13
+  4b pilot ([`findings-phase096-pilot4b.md`](findings-phase096-pilot4b.md)):
+  **D13 passes at lr 3e-4** — the 1b-ratified 1.2e-3 is destroyed by a
+  warmup-peak edge-of-stability spike amplified by the SASA AuxK revival
+  cascade (arm-independent: scalar spikes identically; no clipping in
+  the loop); 6e-4 recovers damaged. Calendar probe: both rings available
+  in the 4b stream across the site list; renorm the only arm capturing
+  both families (month ring at the perm floor + weekday 7/7, best FVU);
+  destroyed dictionaries show consolidation-without-order (mega-block).
+  **Ratified by a9 2026-07-18:** (i) 4b optimizer point **lr 3e-4
+  cosine** (λ=1e-3, enc-wd 0 unchanged; ~4.5e-4 rung noted unexplored —
+  order tracks lr below the edge); (ii) **site list
+  (9,12,15,18,21,24,27,30)** frozen for the production harvest;
+  (iii) **F7: site-renorm designated** on ring-side + FVU + allocation
+  evidence, conditional on the 3e-4 point (renorm's stability edge is
+  lower); (iv) **AuxK capped for Phase 1** — the concrete mechanism
+  (s_aux scaled to the live dead-set size, or α_aux < 1) moves off the
+  SASA-faithful point and is pinned at Phase-1 config freeze; the
+  loss-spike guard remains a requirement alongside it. Standing eval
+  rule from the mega-block observation: top-1 capture is never read
+  without ring order and FVU beside it.

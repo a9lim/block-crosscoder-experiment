@@ -114,10 +114,12 @@ pilot budget; **renorm is the only arm capturing both families** (month
 ring-side evidence; destroyed dictionaries show consolidation-without-
 order (mega-block) — never read top-1 capture without ring order + FVU;
 scalar smearing replicates (7 distinct month features, 1 weekday
-feature). **Awaiting a9 ratification: 4b lr 3e-4 (~4.5e-4 unexplored),
-site list (9,12,15,18,21,24,27,30), F7 renorm designation, spike
-guard / AuxK cap.** Phase 1 store commit otherwise unblocked on the
-NVMe install. Color-word probe and the rest of the manifold zoo: parked
+feature). **Ratified by a9 2026-07-18: 4b lr 3e-4 cosine, site list
+(9,12,15,18,21,24,27,30), F7 renorm designated, AuxK capped for
+Phase 1 (mechanism pinned at config freeze) + spike guard required**
+(design decision log). Phase 1 store commit now waits only on the
+NVMe install. Post-pilot analysis pass (evalstats, planarity screen,
+manifold hunt, figures) in progress 2026-07-18. Color-word probe and the rest of the manifold zoo: parked
 until a proper 4b run (a9 2026-07-17).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
