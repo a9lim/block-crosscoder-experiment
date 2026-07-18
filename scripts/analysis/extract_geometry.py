@@ -49,10 +49,19 @@ RUNS = {
 }
 
 
+CHUNK = 32768  # cusolver batched kernels cap at 65535 (efb4f9b); stay under
+
+
 def orthobasis(D: torch.Tensor) -> torch.Tensor:
     """[N, b, d] rows -> [N, d, b] orthonormal column bases (batched QR)."""
-    q, _ = torch.linalg.qr(D.transpose(1, 2))
-    return q
+    qs = [torch.linalg.qr(D[i : i + CHUNK].transpose(1, 2))[0]
+          for i in range(0, D.shape[0], CHUNK)]
+    return torch.cat(qs)
+
+
+def svdvals_chunked(A: torch.Tensor) -> torch.Tensor:
+    return torch.cat([torch.linalg.svdvals(A[i : i + CHUNK])
+                      for i in range(0, A.shape[0], CHUNK)])
 
 
 def pair_principal_cos(Q: torch.Tensor, sites: int) -> tuple[np.ndarray, list]:
@@ -61,11 +70,12 @@ def pair_principal_cos(Q: torch.Tensor, sites: int) -> tuple[np.ndarray, list]:
     out = []
     for a, b_ in pairs:
         cross = Q[a].transpose(1, 2) @ Q[b_]  # [G, b, b]
-        out.append(torch.linalg.svdvals(cross).clamp(0, 1))
+        out.append(svdvals_chunked(cross).clamp(0, 1))
     return torch.stack(out, dim=1).cpu().numpy(), pairs
 
 
-def extract(name: str, root: Path, device: str, out_dir: Path) -> None:
+def extract(name: str, root: Path, device: str, out_dir: Path,
+            sites: list[int]) -> None:
     ckpt = torch.load(root / "latest.pt", map_location="cpu", weights_only=False)
     report = json.loads((root / "report.json").read_text())
     cfg = ckpt["model_cfg"]
@@ -86,7 +96,7 @@ def extract(name: str, root: Path, device: str, out_dir: Path) -> None:
     enc_share = (enc_energy / enc_energy.sum(1, keepdim=True)).cpu().numpy()
 
     # Per-site spectra.
-    svals = torch.linalg.svdvals(D.reshape(S * G, b, d)).reshape(S, G, b)
+    svals = svdvals_chunked(D.reshape(S * G, b, d)).reshape(S, G, b)
 
     # Cross-site frame rotation + shuffled-block null.
     Q = orthobasis(D.reshape(S * G, b, d)).reshape(S, G, d, b)
@@ -101,11 +111,11 @@ def extract(name: str, root: Path, device: str, out_dir: Path) -> None:
 
     # Cross-site stacked spectrum.
     stacked = D.permute(1, 0, 2, 3).reshape(G, S * b, d)
-    stacked_svals = torch.linalg.svdvals(stacked).cpu().numpy()
+    stacked_svals = svdvals_chunked(stacked).cpu().numpy()
 
     # Encoder-decoder span alignment.
     Qe = orthobasis(E.reshape(S * G, b, d)).reshape(S, G, d, b)
-    encdec = torch.linalg.svdvals(
+    encdec = svdvals_chunked(
         Q.reshape(S * G, d, b).transpose(1, 2) @ Qe.reshape(S * G, d, b)
     ).reshape(S, G, b).clamp(0, 1)
 
@@ -131,9 +141,9 @@ def extract(name: str, root: Path, device: str, out_dir: Path) -> None:
                 "lr": report.get("lr"),
                 "schedule": report.get("schedule"),
                 "site_renorm": report.get("site_renorm"),
-                "fvu_pooled": report["eval"]["topk"]["fvu_pooled"],
-                "fvu_per_site": report["eval"]["topk"]["fvu_per_site"],
-                "sites": [7, 10, 13, 17, 20, 22],
+                "fvu_pooled": report.get("eval", {}).get("topk", {}).get("fvu_pooled"),
+                "fvu_per_site": report.get("eval", {}).get("topk", {}).get("fvu_per_site"),
+                "sites": sites,
             }
         ),
     )
@@ -148,14 +158,25 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, default=Path("/data/runs/bcc-analysis"))
+    ap.add_argument(
+        "--runs", nargs="*", default=None, metavar="NAME=PATH",
+        help="override the default run map (0.9.6: name=path pairs)",
+    )
+    ap.add_argument(
+        "--sites", type=int, nargs="*", default=[7, 10, 13, 17, 20, 22],
+        help="site layer list recorded in meta (pilot 4b: 9 12 15 18 21 24 27 30)",
+    )
     args = ap.parse_args()
+    runs = RUNS
+    if args.runs:
+        runs = dict(pair.split("=", 1) for pair in args.runs)
     args.out.mkdir(parents=True, exist_ok=True)
-    for name, root in RUNS.items():
+    for name, root in runs.items():
         root = Path(root)
         if not (root / "latest.pt").exists():
             print(f"{name}: missing {root}, skipped")
             continue
-        extract(name, root, args.device, args.out)
+        extract(name, root, args.device, args.out, args.sites)
 
 
 if __name__ == "__main__":

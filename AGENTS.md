@@ -130,8 +130,21 @@ per digit, no line); **renorm binds numbers across notation**
 instead binds calendar granularity (March/April/May + spring);
 consolidation-without-order also occurs in healthy runs (primary
 weekday 7/7 top-1, ring 2/7) — the mega-block eval rule applies to
-every capture claim. Color-word probe still parked
-until a proper 4b run (a9 2026-07-17).
+every capture claim. A **second analysis pass (2026-07-18, geometry —
+findings doc §cross-depth geometry)** closed the open items: the
+mid-stack shear zone (frame rotation trough L18-L21) with captured
+blocks' frames tracking their stream manifold's rotation at r ≥ 0.92;
+cross-depth frame coherence as a training-health signature (destroyed
+run decoheres); the two arms shown to be different gauges of the same
+manifolds (paired-token code maps at the perm floor, cardinal span cos
+0.80); 4b packing cliques (14+4/19+2 primary/seed1 vs 5 renorm) as
+cross-block tilings of one early context-detector subspace (renorm's
+decodes as citation/date scaffold); the shape-space census
+(`p4b_census.png`); and the number-identity blocks decoded as numeral
+blocks (197x/196x/15xx years, durations, ISBNs; b1808 spelled round
+decades) — block identity persisting across the renorm toggle at
+shared init (both arms' b1018 = the '197x' block). Color-word probe
+still parked until a proper 4b run (a9 2026-07-17).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

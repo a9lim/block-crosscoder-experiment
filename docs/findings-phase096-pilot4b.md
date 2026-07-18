@@ -323,6 +323,156 @@ class-mean selection score); season/compass carry known polysemy with
 no capitalization rescue and C=4 ring stats have almost no
 permutation power.
 
+## Cross-depth geometry & cross-arm correspondence (2026-07-18, second analysis pass — exploratory, not gate evidence)
+
+Full-dictionary weight geometry (`extract_geometry.py`, now
+`--runs`/`--sites`-general with chunked batched linalg for the scalar
+G=16384 stack) over seven pilot checkpoints, plus the eval-split
+evalstats, the paired zoo codes, and targeted frame dumps
+(`dump_block_frames.py`, new). Analysis scripts:
+`crossarm_tests.py` (new), `fig_geometry4b.py` / `fig_geometry4b_3d.py`
+(new). Numbers: `geometry4b_summary.json`, `crossarm_pilot4b.json`;
+contexts: `identity_contexts_{renorm4b,pilot4b}.json`.
+
+### Depth allocation, weight-level (F7 replication)
+
+Share-argmax over sites [9,12,15,18,21,24,27,30]: **primary parks
+3407/4096 blocks' energy peak at L30** (seed1 3421, lr6e-4 3537,
+destroyed 3673, scalar 11033/16384) with literally zero peaks at
+L12–L18; **renorm spreads peaks across all eight sites**
+([818,73,398,865,518,280,896,248]). The 1b renorm allocation reversal
+replicates at 4b in the decoder weights themselves
+(`p4b_geo_share.png`, `p4b_geo_share_3d.html`).
+
+### The mid-stack shear zone, and frames that track the stream
+
+Adjacent-site frame rotation (median top-2 principal cosine) is
+U-shaped in depth for every healthy arm — ~0.84 at L9-L12, trough
+**0.71–0.75 at L18-L21**, relocking to 0.90–0.91 at L27-L30 — the 4b
+analogue, at matching relative depth, of the 1b L13→L17 shear zone.
+The **stream's own manifolds rotate through the same trough, harder**
+(month first-harmonic plane cosine 0.47 at L18-L21), and each captured
+block's per-site frames **track their manifold's rotation profile at
+r = 0.92–0.98** (month b595, weekday b862, cardinal b3194/b2146,
+ordinal b382), each frame trough exceeding the dictionary median
+exactly where its manifold's rotation does (`p4b_geo_rotation.png`).
+"One shared code, rotating frames" is not just available at 4b — the
+learned frames follow the model's own re-embedding of the manifold.
+
+Cross-site stacked spectra: healthy blocks are **one slowly rotating
+subspace** (participation ratio median 6.6 of [4 = rigid, 32 = fresh
+per site]; renorm 8.6; scalar features rotate too, PR 2.0 of 8). The
+destroyed lr1.2e-3 dictionary decoheres to PR 11.8 with mid-stack
+rotation cosines 0.43–0.49 — **cross-depth frame coherence is a
+training-health signature**, cheap to compute from weights alone
+(`p4b_geo_dimensions.png`).
+
+### Cross-arm correspondence (open item closed)
+
+On the paired 82k zoo tokens, the two surviving arms' family blocks
+correspond token-by-token, not just class-by-class: held-out linear
+code maps primary→renorm beat the **within-class** permutation null at
+the floor (p 5e-4) for every captured family — cardinal
+b2146↔b3194 R² 0.62 (score-corr 0.82), ordinal 0.50, weekday 0.45,
+month 0.40 — and their decoder spans align per site at mean top-2
+cosine **0.80 (cardinal)** / 0.64 (month) / 0.58 / 0.50 against a
+0.038 random-pair scale. Digits, per the individuation story, show
+nothing (R² 0.02, span 0.13). Month score-corr is *negative* (−0.23):
+b1270 covers only Mar–May, b595 the full ring — same coordinates,
+different class coverage. The two dictionaries are, for these
+families, **different gauges of the same manifold**
+(`crossarm_pilot4b.json`, `p4b_crossarm_cardinal_3d.html`).
+
+### Packing cliques at 4b (open item closed)
+
+J>0.9 co-activation components on the 1M-token eval split: primary a
+**14-block clique + a 4-block clique**, seed1 19+2, renorm **5** —
+clique mass tracks the late-heavy allocation and renorm suppresses it.
+Clique blocks all fire at ~0.0018 frequency with **rank-1 codes**
+(census position PR≈1, top-2≈1.0). Their frames share spans at early
+sites (within-clique mean top-2 cos up to 0.90 at L15) and go
+near-orthogonal late (0.09–0.14 at L27–L30; union spectrum PR 61/72)
+— **one early context-detector subspace fanning into a tiling of
+distinct late-site output directions**, i.e. cross-block packing of a
+high-dimensional late-site event, not the Phase −1 within-block
+signature. Decoded contexts: the renorm clique is a
+citation/date-scaffold family — b552 fires on whitespace inside
+journal-reference strings, b819/b1825 co-fire on the pre-year slot
+("As long ago as ␣", "…in October ␣"). Primary's clique blocks are
+hyper-late (48% mean share at L30); renorm's small clique is
+early-heavy instead (`p4b_geo_packing.png`).
+
+### Shape-space census
+
+Over all sane-frequency blocks (freq ∈ [1e-4, 0.05]; ~4070/4096 per
+arm), code PR vs top-2 eigenvalue mass separates the named structures
+(`p4b_census.png`): **rings sit at PR 2.3–3.1** with top-2 mass
+0.73–0.82, **lines at PR 1.9–2.2**, **numeral-identity blocks at PR
+1.4–1.6** (nearly 1-dimensional codes), **clique blocks pinned at
+(1.0, 1.0)**, oddballs (b510 Latin, b2324 duration, b2987 magnitude,
+b1219 dollar-digits, b3227 late-teens) on the same planar shelf as the
+rings. Renorm has fewer near-rank-1 codes than primary (2.7% vs 7.0%
+PR<1.5) and uses its four dims more fully.
+
+### Identity-block decode (open item closed): they are numeral blocks
+
+Top-24 contexts for the renorm cross-notation blocks revise the
+binding story: each is a **numeral-digit block** whose strongest
+firings are digits inside larger numbers, with the ordinal word form
+riding along — b1018 ("7/seventh") fires overwhelmingly on '7' in
+"197x" years, b3234 ("6/sixth") on "196x", b2820 on "15xx"
+(Copernicus/Shakespeare-era years), b1609 ("4/fourth") on round
+durations (30/45/90 minutes), b2407 ("3/third") on generic '3'
+(Isaiah 3, DOI .3, 193x), and b1808 on **spelled round decades**
+(forty/fifty/Sixty/Thirty, cross-case). The year flavor is corpus
+frequency (fineweb-edu), not necessarily mechanism: what binds is
+numeral identity across notations. Related singles: b1255 = digit '5'
+inside ISBNs, b1393 = ordinal-suffix 'th' in "5th edition" citations,
+b2446 = sentence-initial "One", b1512 = winter-habitat, b2295 =
+"Central" as region head (`identity_contexts_renorm4b.json`).
+
+Primary-arm decode (`identity_contexts_pilot4b.json`): b2146 fires on
+cardinal words (Two/two — the line block as advertised); b382's
+'third' firings are heavily the "third-party" collocation; **b1270's
+top firings are all spring/Spring** — primary's cross-family block is
+a *season* block that swallowed Mar–May class means, inverting the
+month-first reading; b2982 fires across weekday names (capture
+without order, lexically real); b127 is a genuine
+north/west/east compass block (the zoo's C=4 order stat just has no
+power); b349 = South/Latin compound-geography prefixes. Two
+same-index coincidences that aren't: **primary b1018 and renorm b1018
+are both the '197x' digit-7 block, and both b636s are quantity-digit
+blocks** — the arms share seed-0 init, so tier A's "block identity is
+init-determined" extends across the renorm toggle. Primary's clique
+blocks decode only to weak near-theta apostrophe/function-token tails
+on fresh text (scores 6–16 vs 20–80 for the named blocks) — their
+defining 0.0018-frequency eval event is store-idiosyncratic, in
+contrast to the renorm clique's crisp citation reading.
+
+### Honesty box (this pass)
+
+Exploratory, one seed per arm; evalstats from the 1M-token eval split
+in stored order; decode contexts are the top-24 score tail on 2M fresh
+fineweb tokens (not class means — both facts can coexist with the zoo
+top-1 maps); the 3D flow views use a fixed joint-PCA basis holding
+only 31–38% of cross-depth class-mean variance and all 3D alignment is
+viz gauge; census coordinates are spectrum summaries, not manifold
+proofs; cross-arm "same manifold" claims rest on the paired-token maps
+and span angles, with the season pair inheriting b1270's month
+structure.
+
+### New figures (this pass, `figures/pilot4b/`)
+
+| figure | shows |
+|---|---|
+| `p4b_geo_share.png` / `p4b_geo_share_3d.html` | depth-energy allocation: the L30 cliff vs renorm's plateau |
+| `p4b_geo_rotation.png` | the mid-stack shear zone; block frames tracking stream-manifold rotation r ≥ 0.92 |
+| `p4b_geo_dimensions.png` | one-rotating-subspace blocks; collapse decoheres; scalar rotates too |
+| `p4b_geo_packing.png` | clique census, code anisotropy, clique depth profiles |
+| `p4b_census.png` | shape-space census with named manifolds on the planar shelf |
+| `p4b_month_flow_3d.html` / `p4b_cardinal_flow_3d.html` | manifold drift through depth in one fixed basis (the component Procrustes stacks gauge away) |
+| `p4b_crossarm_cardinal_3d.html` | the cardinal line through both arms' blocks, cross-arm mismatch rungs |
+
 ## Remaining
 
 1. ~~a9 ratification items~~ **Ratified 2026-07-18** (design decision
@@ -335,9 +485,13 @@ permutation power.
    `fig_pilot4b.py` / `fig_pilot4b_3d.py`).
 3. ~~Zoo probe~~ **Complete 2026-07-18** — section above; 7 zoo 3D
    stacks added to `figures/pilot4b/`.
-4. Still open: cross-arm correspondence (b1270/b705/b595 span
-   alignment — now also b2146↔b3194 for the cardinal line), 4b
-   packing-clique check (evalstats coact), code-anisotropy at 4b,
-   deeper decode of oddball planar blocks (b510 Latin, b1623
-   astonishment-intensity), and the renorm number-identity blocks
-   (do 3/third-style bindings decode as numeral contexts?).
+4. ~~Cross-arm correspondence, 4b packing cliques, code anisotropy,
+   oddball + number-identity decodes~~ **Closed 2026-07-18** by the
+   second analysis pass (geometry section above): the arms are
+   different gauges of the same manifolds; cliques are cross-block
+   tilings of citation/date-scaffold events; identity blocks decode
+   as numeral blocks.
+5. Still open: steering/causal validation of any discovered block
+   (Phase-2 territory), the b1623 astonishment plane's affect
+   structure, and whether the shear zone (L18-L21) matches where
+   gemma-3-4b's induction/attention regime shifts.
