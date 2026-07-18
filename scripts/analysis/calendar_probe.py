@@ -67,6 +67,12 @@ def main() -> None:
         help="override the default run map (name=path pairs)",
     )
     ap.add_argument(
+        "--per-class-cap", type=int, default=0,
+        help="keep at most this many labeled tokens per (family, class); "
+        "0 = unlimited. Needed for plentiful families (digits/cardinals): "
+        "uncapped zoo scans OOM host RAM at the final concat",
+    )
+    ap.add_argument(
         "--families", nargs="+", default=["weekday", "month"],
         help="label families from phase0.labels.FAMILIES; fam index in the "
         "saved npz follows this order",
@@ -126,6 +132,7 @@ def main() -> None:
     bg_acts = []
     scanned = 0
     bg_phase = 0
+    kept = {}  # (fam, cls) -> kept count, for --per-class-cap
 
     @torch.no_grad()
     def process(toks: torch.Tensor) -> None:
@@ -149,6 +156,16 @@ def main() -> None:
             cls[hit] = c[hit]
             fam[hit] = fi
         hit = fam >= 0
+        hit_all = hit.clone()  # pre-cap mask: background must stay family-free
+        if args.per_class_cap and int(hit.sum()):
+            # first-N cap per (family, class); labeled counts per batch are
+            # small, so the python loop is cheap
+            for j in hit.nonzero(as_tuple=True)[0].tolist():
+                key = (int(fam[j]), int(cls[j]))
+                if kept.get(key, 0) >= args.per_class_cap:
+                    hit[j] = False
+                else:
+                    kept[key] = kept.get(key, 0) + 1
         if int(hit.sum()):
             lab_acts.append(xw[hit].cpu())
             lab_cls.append(cls[hit].cpu())
@@ -156,7 +173,7 @@ def main() -> None:
             lab_tok.append(ids[hit].cpu())
         if sum(a.shape[0] for a in bg_acts) < BACKGROUND_CAP:
             sel = torch.arange(bg_phase, xw.shape[0], BACKGROUND_STRIDE)
-            keep = sel[~hit[sel]]
+            keep = sel[~hit_all[sel]]
             bg_acts.append(xw[keep].cpu())
             bg_phase = int((bg_phase + xw.shape[0]) % BACKGROUND_STRIDE)
         scanned += xw.shape[0]
