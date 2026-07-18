@@ -12,7 +12,9 @@ needs the 4 TB NVMe).
 consolidation universal, calendar order a 2/6 seed lottery, epochs
 don't help at winner lr, G8192 not tame at 3.6 % dead). Decision map
 resolved: **`PILOT_EPOCHS=2 PILOT_EXTRA_SEED=1 PILOT_G8192=0`**; tier B
-launched 18:59 with those knobs. Two same-day fixes: cusolver batched-
+launched 18:59 with those knobs and completed 2026-07-17/18 — **D13
+passes at lr 3e-4** (results + calendar probe:
+[`findings-phase096-pilot4b.md`](findings-phase096-pilot4b.md)). Two same-day fixes: cusolver batched-
 eigvalsh chunking (`efb4f9b`, G8192 step-0 crash) and `--calib-batches
 64` on the tier-A G8192 line (θ-calibration OOM at 128 batches on 61 GB
 host RAM; recovered via `--resume` without retraining).

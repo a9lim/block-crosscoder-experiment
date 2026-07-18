@@ -123,7 +123,7 @@ def main() -> None:
             for i in range(0, acts.shape[0], 8192):
                 xb = acts[i : i + 8192].to(args.device, torch.float32)
                 if report.get("site_renorm"):
-                    xb = xb * renorm_scalars.view(1, -1, 1)
+                    xb = xb * renorm_scalars.to(args.device).view(1, -1, 1)
                 z = bsc.encode(xb)
                 zs.append(z.cpu())
                 ps.append(bsc.scores(z).cpu())

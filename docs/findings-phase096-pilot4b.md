@@ -127,27 +127,90 @@ the store head; ring tests via `tier_a_ring_tests.py` with the pilot
 store/tokenizer/acts — capitalized-only labels, class-mean top-1/top-2
 consolidation, top-plane adjacency statistic, 20k-perm null)
 
-**RESULTS PENDING — probe launched 23:45 on jobe (nohup, survives the
-session), writes `/data/runs/bcc-analysis/calendar_probe_acts_pilot4b.npz`
-+ `calendar_probe_codes_<name>_pilot4b.npz` for
-primary_3e4 / renorm_3e4 / seed1_3e4 / scalar_3e4 / primary_6e4.**
+Run history: the 8M scan + acts npz completed overnight (18,398 month /
+936 weekday labeled positions, 60k background); the in-script encode
+phase then CUDA-OOM'd beside the still-loaded gemma-4b (8 GB bmm
+chunks), so the code-level tests ran next morning from the saved acts —
+`tier_a_ring_tests.py` on CUDA (which exposed a renorm-scalars
+device-placement fix; tier A never hit it on CPU) plus the new
+`depth_scalar_tests.py` companion covering what that script skips:
+per-site depth availability and scalar individuation (no-background
+family/overall ratio screen — the interim fallback, validated against
+the z-score screen at 1b). Outputs `ring_tests_pilot4b.json` +
+`depth_scalar_pilot4b.json` in `/data/runs/bcc-analysis/`, mirrored to
+`data/analysis/`.
 
-Handoff to the next session (compaction expected here):
+### Depth availability (raw whitened stream, class-mean top plane)
 
-1. Check the probe finished: `ssh jobe 'tail /data/runs/bcc-pilot4b/probe.log'`.
-2. Ring tests: `python scripts/analysis/tier_a_ring_tests.py
-   --out-root /data/runs/bcc-pilot4b
-   --acts /data/runs/bcc-analysis/calendar_probe_acts_pilot4b.npz
-   --store /data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb
-   --tokenizer google/gemma-3-4b-pt
-   --out /data/runs/bcc-analysis/ring_tests_pilot4b.json` (on jobe;
-   bsc arms only — scalar individuation needs the top-1-latent count
-   from the codes npz, per the interim Methods).
-3. Fill this section: consolidation + ring per arm; scalar top-1 month
-   feature count; compare depth availability (the 4b ring band should
-   sit early per Phase 0.5 — sites 9/12/15 carry it).
-4. a9 ratification items: **4b lr 3e-4** (the amended optimizer point),
-   site list (9,12,15,18,21,24,27,30), F7 renorm designation, spike
-   guard / AuxK cap for Phase 1.
-5. Parked analysis: eval_activation_stats + planarity screen on the
+Month ring 12/12 at L9/12/15/21/24 (L18: 10/12), fading to **9/12 at
+L27/L30**; top-plane var only 0.33–0.54 — order-perfect but not
+plane-concentrated in whitened coords. Weekday ring **7/7 at every
+site** (p at its 2.75e-3 floor): the 1b "weekday null" does **not**
+transfer to the 4b stream (consistent with Phase 0.5's layer-9 weekday
+circularity 0.981 — that was this model). Net: both calendar rings are
+available across essentially the whole site list at 4b, weakest late —
+the site list sees the band, and "early-only" undersells 4b in
+whitened coordinates.
+
+### Dictionary capture (code-level ring tests, 20k-perm null)
+
+| arm | FVU | month top1 | top2 | code ring | perm p | weekday ring |
+|---|---|---|---|---|---|---|
+| primary 3e-4 | 0.430 | 3/12 (b1270) | 5/12 | 6/12 | 1.2e-2 | 2/7 ns |
+| seed 1, 3e-4 | 0.430 | 7/12 (b705) | 11/12 | **10/12** | **5.0e-5** | 3/7 ns |
+| renorm 3e-4 | **0.415** | **10/12** (b595) | 11/12 | **10/12** | **5.0e-5** | **7/7 (floor)** |
+| 6e-4 (spiked, recovered) | 0.553 | 9/12 (b1270) | 12/12 | 8/12 | 4.5e-4 | 3/7 ns |
+| 6e-4 renorm (destroyed) | 1.105 | 5/12 (b595) | 11/12 | 7/12 | 2.4e-3 | 5/7 |
+| 1.2e-3 (destroyed) | 1.134 | 12/12 (b3964) | 12/12 | 6/12 | 1.2e-2 | 2/7 ns |
+
+Readings:
+
+1. **Capture consolidation is not universal at the pilot budget** —
+   unlike 1b at 16M optimizer tokens, where every run ended ≥11/12.
+   The pilot sits at 12M optimizer tokens at a forced-low lr; tier A
+   showed order tracks total effective optimization, and 4b-at-3e-4 is
+   simply lower on that curve. Pre-registered acceptable (runbook:
+   "ring order a bonus at 8M optimizer tokens; pilot success = D13
+   gates + any month-selective block" — several arms clear that bar).
+2. **Renorm is the only arm that captures both calendar families**:
+   month 10/12 with its code ring at the permutation floor *and* the
+   full 7/7 weekday ring, at the best pooled FVU. Mechanistically
+   coherent with interim §D: the rings live shallow, and renorm
+   reweights the loss toward shallow sites. F7 now has **ring-side**
+   evidence at 4b on top of the FVU win and the allocation reversal.
+3. **Consolidation-without-order is a failure signature**: the
+   destroyed 1.2e-3 dictionary's b3964 claims all 12 months —
+   a mega-block in an FVU>1 dictionary — with ring only 6/12.
+   Top-1 consolidation must never be read without ring order and FVU
+   beside it (Phase-1 standing-eval note).
+4. The **lr→order gradient replicates at 4b**: seed-0 baseline goes
+   6/12 → 8/12 from 3e-4 to 6e-4 (despite the 6e-4 spike damage)
+   before the edge destroys everything above. Sharpens the unexplored
+   ~4.5e-4 rung question.
+5. **Block identity is init-determined at 4b too**: seed-0 baseline
+   arms converge on b1270 at both lrs, renorm arms on b595 at both —
+   and renorm *redirects* which block wins at a fixed seed.
+6. **Scalar smearing replicates (qualitative H3)**: clean-scalar month
+   top-1 collapses to 7 distinct features (one claims
+   Jul/Aug/Sep/Dec), weekday to **one feature for all 7 days**;
+   population ring over the top-24 selective features only 5/12
+   (p 0.048, plane 51%). Block units individuate what the scalar
+   dictionary carries diffusely — caveat: the BSC baseline has its own
+   seed lottery (3/12 vs 7/12), so the clean contrast is
+   renorm-vs-scalar at this budget.
+
+Honesty box: weekday classes are small after the capitalization filter
+(~10² tokens/class); month ring p floors at 5.0e-5 (1/20001); six arms
+× two families were tested — the floor-level results survive any
+multiple-comparisons correction, the 1.2e-2 ones do not.
+
+## Remaining
+
+1. **a9 ratification items**: 4b lr 3e-4 (amended optimizer point;
+   tension: order tracks lr, ~4.5e-4 unexplored), site list
+   (9,12,15,18,21,24,27,30 — depth-availability now measured, above),
+   **F7 renorm designation** (4b evidence: FVU win + allocation
+   reversal + only-arm-with-both-rings; cost: lower stability edge),
+   spike guard / AuxK cap for Phase 1.
+2. Parked analysis: eval_activation_stats + planarity screen on the
    3e-4 checkpoints (runbook, Analysis pass).

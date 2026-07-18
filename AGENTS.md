@@ -95,13 +95,30 @@ inconclusive under the lottery (F7 primary deferred to 4b), G8192 not
 tame (3.6 % dead, 36× G4096). Weekday null holds. Block identity is
 init-determined. Two same-day fixes: cusolver batched-eigvalsh chunk
 (`efb4f9b`) and G8192 θ-calibration `--calib-batches 64` (host-RAM OOM).
-**Tier B (D13 4b pilot) launched 18:59** with the decision-map knobs
-`PILOT_EPOCHS=2 PILOT_EXTRA_SEED=1 PILOT_G8192=0`; ~373 GB store on the
-existing /data disk (the pilot never needed the 4 TB NVMe; only the
-production store does). Site list (9,12,15,18,21,24,27,30) resolved from
-the 25–90% band, still flagged for a9 ratification. Color-word probe and
-the rest of the manifold zoo: parked until a proper 4b run (a9
-2026-07-17).
+**Tier B (D13 4b pilot) COMPLETE 2026-07-17/18**
+([`docs/findings-phase096-pilot4b.md`](docs/findings-phase096-pilot4b.md)):
+**D13 passes at lr 3e-4** — the ratified 1b optimizer point (1.2e-3) is
+catastrophically unstable at 4b (warmup-peak edge-of-stability seed +
+SASA-AuxK cascade amplifier, no gradient clipping in the loop; scalar
+spikes identically, so it's the shared stack, not the Gram machinery);
+6e-4 marginal, 3e-4 clean everywhere (BSC 0.430 / renorm 0.415 / scalar
+0.368 pooled FVU). All other gates green; two θ-calibration host-RAM
+OOMs make the Phase-1 streaming quantile mandatory. 348 GB store on the
+existing /data disk (only the production store needs the 4 TB NVMe).
+Calendar probe at 4b (next morning, from saved acts after an encode
+OOM): both calendar rings available in the raw stream across nearly the
+whole site list (weekday 7/7 at *every* site — the 1b weekday null does
+not transfer to 4b); capture consolidation NOT universal at the 12M-token
+pilot budget; **renorm is the only arm capturing both families** (month
+10/12 + ring at the perm floor + weekday 7/7, at the best FVU) — F7
+ring-side evidence; destroyed dictionaries show consolidation-without-
+order (mega-block) — never read top-1 capture without ring order + FVU;
+scalar smearing replicates (7 distinct month features, 1 weekday
+feature). **Awaiting a9 ratification: 4b lr 3e-4 (~4.5e-4 unexplored),
+site list (9,12,15,18,21,24,27,30), F7 renorm designation, spike
+guard / AuxK cap.** Phase 1 store commit otherwise unblocked on the
+NVMe install. Color-word probe and the rest of the manifold zoo: parked
+until a proper 4b run (a9 2026-07-17).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
