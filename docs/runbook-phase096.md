@@ -5,7 +5,17 @@
 store, and **tier B**, the design-mandated **D13 4b exact-config pilot**,
 which fits on jobe's existing `/data` disk (~290 GB stored vs ~600 GB
 usable above the ShardWriter floor — only the 53M-token production store
-needs the 4 TB NVMe). Everything is staged; **nothing has been launched.**
+needs the 4 TB NVMe).
+
+**LAUNCHED 2026-07-17.** Tier A completed same day (results:
+[`findings-phase096-tier-a.md`](findings-phase096-tier-a.md) — capture
+consolidation universal, calendar order a 2/6 seed lottery, epochs
+don't help at winner lr, G8192 not tame at 3.6 % dead). Decision map
+resolved: **`PILOT_EPOCHS=2 PILOT_EXTRA_SEED=1 PILOT_G8192=0`**; tier B
+launched 18:59 with those knobs. Two same-day fixes: cusolver batched-
+eigvalsh chunking (`efb4f9b`, G8192 step-0 crash) and `--calib-batches
+64` on the tier-A G8192 line (θ-calibration OOM at 128 batches on 61 GB
+host RAM; recovered via `--resume` without retraining).
 Motivating context: `docs/findings-interim-artifact-analysis.md` (the
 2026-07-17 interim sweep — block-23 month ring, consolidation-vs-optimizer
 open question, F7 mechanism, renorm/lr confound).

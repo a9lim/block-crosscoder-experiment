@@ -40,7 +40,9 @@ run renorm_lr12 $WINNER --site-renorm
 
 # A4: G ladder at the winner optimizer
 run G2048 $WINNER --blocks 2048
-run G8192_k32 $WINNER --blocks 8192 --k 32
+# G=8192 needs the calib cap: 128 batches is a ~17 GB score matrix and
+# OOM-killed 61 GB jobe on the first pass (2026-07-17).
+run G8192_k32 $WINNER --blocks 8192 --k 32 --calib-batches 64
 
 # A2: epoch ladder (4 and 8 passes over the 8M train split; ~8/16 min each)
 run ep4_seed0 $WINNER --epochs 4

@@ -82,15 +82,26 @@ instability (loss-spike guard for Phase 1); a 4-block packing clique
 exists at G=4096 (Jaccard >0.9). Single-block ring consolidation varies
 with lr/seed — carry a known-ring-consolidation probe into Phase-1 eval.
 
-**Phase 0.9.6 is staged, not launched**
-([`docs/runbook-phase096.md`](docs/runbook-phase096.md), a9-directed
-2026-07-17): tier A = 1b consolidation/robustness matrix (seeds, epoch
-ladder, renorm@winner-lr F7 deconfound, G ladder); tier B = **the D13 4b
-exact-config pilot on the existing /data disk** (~290 GB store — the
-pilot never needed the 4 TB NVMe; only the production store does). Site
-list (9,12,15,18,21,24,27,30) resolved from the 25–90% band, flagged for
-a9 ratification. Color-word probe and the rest of the manifold zoo:
-parked until a proper 4b run (a9 2026-07-17).
+**Phase 0.9.6 LAUNCHED 2026-07-17**
+([`docs/runbook-phase096.md`](docs/runbook-phase096.md), a9-directed).
+**Tier A complete same day**
+([`docs/findings-phase096-tier-a.md`](docs/findings-phase096-tier-a.md)):
+capture consolidation is universal (every seed/epoch/G/renorm run ends
+with one block claiming ≥11/12 months top-1), but **calendar order is a
+seed lottery** — ring {12,7,10,2,3,12}/12 across seeds 0–5, epochs don't
+buy order at the winner lr (they can migrate block ownership, seed-1
+ep8), lr 3e-4 + ep8 partially catches up (5→9), renorm@1.2e-3
+inconclusive under the lottery (F7 primary deferred to 4b), G8192 not
+tame (3.6 % dead, 36× G4096). Weekday null holds. Block identity is
+init-determined. Two same-day fixes: cusolver batched-eigvalsh chunk
+(`efb4f9b`) and G8192 θ-calibration `--calib-batches 64` (host-RAM OOM).
+**Tier B (D13 4b pilot) launched 18:59** with the decision-map knobs
+`PILOT_EPOCHS=2 PILOT_EXTRA_SEED=1 PILOT_G8192=0`; ~373 GB store on the
+existing /data disk (the pilot never needed the 4 TB NVMe; only the
+production store does). Site list (9,12,15,18,21,24,27,30) resolved from
+the 25–90% band, still flagged for a9 ratification. Color-word probe and
+the rest of the manifold zoo: parked until a proper 4b run (a9
+2026-07-17).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
