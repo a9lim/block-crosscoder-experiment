@@ -451,6 +451,22 @@ contrast to the renorm clique's crisp citation reading.
 
 ### Honesty box (this pass)
 
+**May contamination (caught by a9, 2026-07-18):** the zoo means npz
+applies no capitalization filter, and the month label map includes
+lowercase forms — May's first-N 4000-token cap is **88% modal 'may'**
+(every other month 93–100% capitalized). The zoo *ring statistics*
+always filtered to capitalized tokens (May count 474 ✓) and are
+unaffected; the contaminated means only reached visualization and the
+month stream-rotation curve. Fixed: `fig_geometry4b{,_3d}.py` now
+compute cap-only month means from the calendar probe — May rejoins
+the ring (L24 in-plane radius 4.4 vs others' 3.7, from 7.6
+contaminated; off-plane 6.3 vs 5.4, from 9.8), the stream-rotation
+trough *deepens* slightly (0.47→0.41 at L18-L21), and b595 tracking
+holds at r 0.97. `p4b_zoo_month_3d.html` (zoo-means view) still
+renders the contaminated May; the calendar-probe month figures are
+canonical. Cap-only still can't remove sentence-initial modal "May" —
+the class stays slightly heavy.
+
 Exploratory, one seed per arm; evalstats from the 1M-token eval split
 in stored order; decode contexts are the top-24 score tail on 2M fresh
 fineweb tokens (not class means — both facts can coexist with the zoo

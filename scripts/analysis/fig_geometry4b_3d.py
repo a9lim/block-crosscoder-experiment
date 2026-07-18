@@ -73,9 +73,26 @@ def share_surface() -> None:
     print("share 3d written", flush=True)
 
 
+def month_means_cap() -> np.ndarray:
+    """Cap-only month class means [S, 12, d] from the calendar probe.
+
+    The zoo means npz applies no capitalization filter and May's first-N
+    cap is 88% modal 'may' — unusable for month geometry (2026-07-18).
+    """
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    zc = np.load(
+        DATA / "block_codes_bsc_lam0.001_seed0_G4096_k32_renorm_pilot4b.npz")
+    m = (za["fam"] == 1) & zc["is_cap"]
+    a, c = za["acts"][m], za["cls"][m]
+    return np.stack([a[c == k].mean(0) for k in range(12)], 1)
+
+
 def flow(family: str, means_key: str, labels: list[str]) -> None:
-    zm = np.load(DATA / "zoo_means_zoo4b.npz")
-    M = zm[means_key].transpose(1, 0, 2).astype(np.float64)  # [S, C, d]
+    if family == "month":
+        M = month_means_cap().astype(np.float64)
+    else:
+        zm = np.load(DATA / "zoo_means_zoo4b.npz")
+        M = zm[means_key].transpose(1, 0, 2).astype(np.float64)  # [S, C, d]
     C = M.shape[1]
     Mc = M - M.mean(1, keepdims=True)          # center per site
     X = Mc.reshape(S * C, -1)

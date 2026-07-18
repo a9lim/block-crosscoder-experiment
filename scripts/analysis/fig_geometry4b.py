@@ -216,9 +216,17 @@ def fig_rotation(summary):
               for arm, blk in pairs]
     dict_med = {a: np.median(adj_rot(geo(n)), 0)
                 for n, a in (("pilot", "primary"), ("pilot_renorm", "renorm"))}
+    # cap-only month means: the zoo means' May class is 88% modal 'may'
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    zc = np.load(
+        DATA / "block_codes_bsc_lam0.001_seed0_G4096_k32_renorm_pilot4b.npz")
+    mcap = (za["fam"] == 1) & zc["is_cap"]
+    a, c = za["acts"][mcap], za["cls"][mcap]
+    month_cap = np.stack([a[c == k].mean(0) for k in range(12)], 1)
     for j, (fam, cyc, arm, blk) in enumerate(panels):
         ax = fig.add_subplot(sub[j])
-        M = zm[f"{fam}_means"].transpose(1, 0, 2)
+        M = month_cap if fam == "month" \
+            else zm[f"{fam}_means"].transpose(1, 0, 2)
         stream = plane_rot([stream_plane(M[s], cyc) for s in range(S)])
         fz = frames[arm]
         fr = frame_rot(fz["frames"][:, fz["blocks"].tolist().index(blk)])
