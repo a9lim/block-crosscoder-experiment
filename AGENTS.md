@@ -118,8 +118,19 @@ feature). **Ratified by a9 2026-07-18: 4b lr 3e-4 cosine, site list
 (9,12,15,18,21,24,27,30), F7 renorm designated, AuxK capped for
 Phase 1 (mechanism pinned at config freeze) + spike guard required**
 (design decision log). Phase 1 store commit now waits only on the
-NVMe install. Post-pilot analysis pass (evalstats, planarity screen,
-manifold hunt, figures) in progress 2026-07-18. Color-word probe and the rest of the manifold zoo: parked
+NVMe install. Post-pilot analysis pass **complete 2026-07-18**
+(evalstats, planarity screen, 8 PNG + 11 interactive 3D figures,
+7-family zoo probe — findings doc §manifold zoo): number-lines are
+depth-pervasive in the stream and straighten with depth (ordinal rho
+0.91→0.99); **the cardinal number-line is captured as a single block
+in both arms** (primary b2146 17/20, code order at the perm floor);
+ordinals split by frequency band; digits fully individuate (one block
+per digit, no line); **renorm binds numbers across notation**
+(3/third, 4/fourth, 6/sixth, 7/seventh same-block) where primary
+instead binds calendar granularity (March/April/May + spring);
+consolidation-without-order also occurs in healthy runs (primary
+weekday 7/7 top-1, ring 2/7) — the mega-block eval rule applies to
+every capture claim. Color-word probe still parked
 until a proper 4b run (a9 2026-07-17).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),

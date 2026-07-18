@@ -241,6 +241,88 @@ Honesty box: weekday classes are small after the capitalization filter
 × two families were tested — the floor-level results survive any
 multiple-comparisons correction, the 1.2e-2 ones do not.
 
+## The manifold zoo at 4b (2026-07-18, exploratory — not gate evidence)
+
+Generalized probe over 7 single-token families
+(weekday/month/ordinal/cardinal/digit/season/compass; the zoo tranche
+in `phase0/labels.py`), 8M fineweb tokens, `--per-class-cap 4000`
+(first-N; added after an uncapped scan OOM-killed jobe's 61 GB host
+RAM), tested against both surviving 3e-4 dictionaries with
+`zoo_block_tests.py` (consolidation + order per family: adjacency ring
+for cyclic, Spearman |rho| along PC1 for linear, 20k-perm nulls).
+Artifacts: `zoo_block_tests_zoo4b.json`, `zoo_means_zoo4b.npz`,
+`zoo_codes_{renorm,primary}_zoo4b.npz`.
+
+**Number-lines are depth-pervasive in the raw stream and straighten
+with depth** — Spearman |rho| of class order along PC1 of class means:
+
+| family | L9 | L12 | L15 | L18 | L21 | L24 | L27 | L30 |
+|---|---|---|---|---|---|---|---|---|
+| ordinal (20) | 0.91 | 0.92 | 0.95 | 0.97 | 0.98 | 0.99 | 0.99 | 0.99 |
+| cardinal (20) | 0.92 | 0.94 | 0.94 | 0.92 | 0.93 | 0.96 | 0.98 | 0.98 |
+| digit (10) | 0.79 | 0.87 | 0.90 | 0.90 | 0.88 | 0.94 | 0.92 | 0.93 |
+
+PC1 spacing is closer to linear than log at every depth (cardinal
+Pearson 0.94–0.97 linear vs 0.85–0.94 log) — though 1–20 is too small
+a range to discriminate strongly against the log-scale literature.
+
+**Dictionary capture (best block per family; the b595/b862 calendar
+rows replicate tier A on this independent 8M sample):**
+
+| family | renorm | primary |
+|---|---|---|
+| weekday | b862 6/7, **ring 7/7** (p 2.75e-3, floor) | b2982 **7/7 top-1, ring 2/7** (p 0.74) |
+| month | b595 10/12, **ring 10/12** (p 5e-5, floor) | b1270 3/12, ring 6/12 (p 1.2e-2) |
+| ordinal | b1393 6/20, 11 distinct, rho 0.16 (n.s.) | b382 **11/20, rho 0.60** (p 6.4e-3) |
+| cardinal | b3194 16/20, rho 0.58 (p 8e-3) | b2146 **17/20, rho 0.90** (p 5e-5, floor) |
+| digit | 10/10 distinct (full individuation) | 9/10 distinct |
+| season, compass | no capture, order nulls | no capture, order nulls |
+
+Readings:
+
+1. **The cardinal number-line is captured as a single block in both
+   arms** — primary b2146 claims two→nineteen with code-plane order at
+   the permutation floor. The strongest non-calendar manifold capture
+   in the pilot.
+2. **Ordinals split by frequency band.** Primary consolidates an
+   ordered 3rd–12th segment into b382 while the frequency giants
+   'first' (n=4000, capped) and 'second' individuate. Renorm scatters
+   the family across 11 blocks — planarity-screen hit **b3227 is real
+   but is the rare late-teens band** (13th/14th/16th/17th/18th, n=5–77
+   per class), a segment block, not the line.
+3. **Digits individuate; no dictionary forms a digit line** (10/10 and
+   9/10 distinct top-1 blocks) despite stream rho ≈ 0.9 — the
+   inverse of scalar smearing: one *block* per digit class.
+4. **Cross-notation number binding (renorm only):** 5 of renorm's 6
+   cross-family top-1 blocks pair a digit with its ordinal form —
+   3/third, 4/fourth, 6/sixth, 7/seventh, plus a round-number block
+   b1808 (ten/tenth/twenty). Renorm trades the ordinal *line* for
+   per-number *identity* blocks. Primary's single cross-family block
+   is calendar-side instead: b1270 = March/April/May + 'spring'.
+5. **Consolidation-without-order occurs in healthy runs too**:
+   primary's weekday block claims all 7 days top-1 with ring 2/7
+   (p 0.74). The mega-block rule (top-1 capture is unreadable without
+   ring/order + FVU) is not just a destroyed-run signature — it
+   applies to every capture claim.
+6. **Arm pattern, hypothesis-grade**: renorm wins both calendar
+   *rings*, primary wins both word-number *lines*. One seed per arm
+   under a known consolidation lottery — a Phase-1 eval question
+   (probe both families per arm), not a conclusion.
+
+3D stacks (`figures/pilot4b/p4b_zoo_{family}_3d.html`, regenerate with
+`fig_pilot4b_3d.py` — cyclic families get first-harmonic planes,
+linear families PCA planes, consecutive depths Procrustes-aligned):
+ordinal/cardinal/digit show the line manifolds down the full depth
+stack; season/compass show the polysemy soup.
+
+Honesty box: exploratory, one seed per arm; ordinal/cardinal class
+counts span 3 orders of magnitude ('first' capped at 4000 vs
+'fourteenth' n=5 — rare-class means are noisy); the first-N cap is
+not a random sample; top-1 maps are soft attribution (argmax of
+class-mean selection score); season/compass carry known polysemy with
+no capitalization rescue and C=4 ring stats have almost no
+permutation power.
+
 ## Remaining
 
 1. ~~a9 ratification items~~ **Ratified 2026-07-18** (design decision
@@ -251,17 +333,11 @@ multiple-comparisons correction, the 1.2e-2 ones do not.
    b3227, digit b1219, duration b2324, magnitude b2987), 8 PNG figures
    + 4 interactive 3D stacks (`figures/pilot4b/`, scripts
    `fig_pilot4b.py` / `fig_pilot4b_3d.py`).
-3. **Zoo probe in flight (2026-07-18)**: 7-family scan
-   (weekday/month/ordinal/cardinal/digit/season/compass,
-   `--per-class-cap 4000` after an uncapped-scan host-RAM OOM) chained
-   into `zoo_block_tests.py` on jobe — `zoo_rerun.log`, marker
-   `ZOO_ALL_DONE`. On completion: pull `zoo_means_pilot4b.npz` +
-   `zoo_block_tests_zoo4b.json` + `zoo_codes_*_zoo4b.npz` to Mac
-   `data/analysis/`, rerun `fig_pilot4b_3d.py` (zoo 3D views
-   auto-generate from the means npz), read the order stats (does
-   b3227 own an ordered ordinal line the way b595 owns the month
-   ring?), add the zoo section here.
-4. Still open beyond that: cross-arm correspondence
-   (b1270/b705/b595 span alignment), 4b packing-clique check
-   (evalstats coact), code-anisotropy at 4b, deeper decode of oddball
-   planar blocks (b510 Latin, b1623 astonishment-intensity).
+3. ~~Zoo probe~~ **Complete 2026-07-18** — section above; 7 zoo 3D
+   stacks added to `figures/pilot4b/`.
+4. Still open: cross-arm correspondence (b1270/b705/b595 span
+   alignment — now also b2146↔b3194 for the cardinal line), 4b
+   packing-clique check (evalstats coact), code-anisotropy at 4b,
+   deeper decode of oddball planar blocks (b510 Latin, b1623
+   astonishment-intensity), and the renorm number-identity blocks
+   (do 3/third-style bindings decode as numeral contexts?).

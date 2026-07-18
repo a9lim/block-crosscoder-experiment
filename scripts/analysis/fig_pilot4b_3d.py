@@ -216,8 +216,12 @@ def main() -> None:
         print(f"{family}: stream + b{block} frames written", flush=True)
 
     # -- zoo stream views (means extracted from the zoo probe) -----------
-    zoo = DATA / "zoo_means_pilot4b.npz"
-    if zoo.exists():
+    zoo = next(
+        (p for p in (DATA / "zoo_means_zoo4b.npz",
+                     DATA / "zoo_means_pilot4b.npz") if p.exists()),
+        None,
+    )
+    if zoo is not None:
         zm = np.load(zoo)
         for family in FAMILY_LABELS:
             key = f"{family}_means"
