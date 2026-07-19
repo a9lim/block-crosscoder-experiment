@@ -1,9 +1,14 @@
 # Phase 0.9.9 tranche 1 — engineering validation findings
 
-**Status: in progress (overnight campaign 2026-07-18 → 19).** E1 and the
-E3 revival axis are final; E2/E3-cascade sections fill as the jobe
-campaign drains. Runbook: [`runbook-phase099.md`](runbook-phase099.md).
-Raw artifacts: `/data/runs/bcc-phase099/` (jobe), `data/e3_revival_report.json`
+**Status: COMPLETE (overnight campaign 2026-07-18 → 19, finished
+03:42).** E1/E2/E3 (both axes) final with the rcap pin recommendation
+awaiting a9's ratification; E4/E5 validated offline and dogfooded by
+every overnight run; E6 offline-validated (extension run not yet
+executed). Bonus same-night results: the preregistered R-D codec's
+first real numbers (tranche 3 first light) and the completed 2×2
+factorial at seed 0 (tranche 2 first look). Runbook:
+[`runbook-phase099.md`](runbook-phase099.md). Raw artifacts:
+`/data/runs/bcc-phase099/` (jobe), `data/e3_revival_report.json`
 (repo, committed).
 
 ## E1 — streaming θ-quantile: ALL GATES GREEN (3/3 checkpoints)
@@ -367,6 +372,47 @@ gauges, and refusal timing/shape is trajectory-specific (1018 / 1050 /
   past the pilot's row-consumption upper bound (10,805 + 64 margin),
   harvest under the frozen whitener, merged `train12m` manifest
   (tested read path). Not yet run — ~245 GB, /data has 506 GB free.
+
+## Tranche 2 first look — the 2×2 factorial completed (seed 0, pilot store)
+
+Both single-site cells trained overnight (`run_phase099_single_site.py`,
+all 8 sites per store pass, exact per-site parameter/rate matching to
+the joint arms; guard armed + streaming θ + prefetch — the full E-series
+stack, silent everywhere: 0 guard events across 16 site-runs, dead ≤0.7%
+BSF, 0.0 SAE). Pooled FVU (topk), eval split:
+
+| | cross-site (tied code) | single-site | tying effect |
+|---|---|---|---|
+| **block** (4096×b4, k=32, λ=1e-3) | **0.4299** | 0.4497 | **−0.0198** |
+| **scalar** (16384×b1, k=128, λ=0) | **0.3682** | 0.3768 | −0.0086 |
+
+**The interaction term is positive: +0.011 pooled FVU** — cross-site
+code tying helps block dictionaries ~2.3× more than scalar ones. This
+is the thesis's predicted synergy (shared code × subspace units) as a
+first measurement. Within each row λ is matched, so both tying deltas
+are internally clean; the interaction is their difference. Caveats:
+one seed, pilot 12M-token × 2-epoch budget, threshold-mode numbers
+essentially identical.
+
+Secondary findings:
+
+- **Tying helps in both geometries** — the joint crosscoder beats
+  independent per-site training at matched per-site parameters and
+  rate even for scalars. The shared code is not a constraint being
+  paid for; it pools the selection signal across depth. (At the bits
+  level it is also an 8× support amortization — the single-site cells
+  each pay their own support stream.)
+- **The single-site cells are the fair-allocation control, and they
+  vindicate F7**: both BSF and SAE show the early-good/late-worse
+  per-site profile (BSF site 9: 0.270 → site 30: 0.523; SAE 0.220 →
+  0.440) that the *renorm* joint arm reproduces almost exactly
+  (0.303 → 0.526), while the primary gauge shifts capacity deep. The
+  deep tilt of raw-whitened joint training is an artifact of
+  shrinkage-whitener retained power, now shown against independent
+  per-site models in both unit geometries — the strongest allocation
+  evidence for the renorm designation yet.
+- Single-site training is fast: 16 min per cell (8 models in
+  lockstep, one store pass, 13k tok/s).
 
 ## Tranche 2/3 machinery landed same night (commits `99bf1c1`, `06a2977`)
 

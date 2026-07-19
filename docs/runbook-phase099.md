@@ -13,6 +13,22 @@ discretion** ("the more experiments, the better"); the factorial is
 extended to the full literature 2×2 (BSF and ordinary-crosscoder
 comparisons — see tranche 2).
 
+**Progress (overnight 2026-07-19, autonomous; details in
+[`findings-phase099-tranche1.md`](findings-phase099-tranche1.md)):**
+tranche 1 COMPLETE — E1 green 3/3; E2 regression suite green (r1/r2/r3
++ discovery that 4b training is bit-deterministic across runs); E3
+both axes done, **ratio cap 1.0 recommended for the pin — awaits a9's
+ratification at config freeze** (static α eliminated, frac cap
+dominated; guard/cap/skip shown to partition the failure modes
+exactly); E4/E5 landed and dogfooded by every subsequent run; E6
+offline-validated, extension run pending. Tranche 3 codec built,
+offline-tested (incl. R13 gauge invariance), and run on the three
+pilot checkpoints — support amortization measured at 4.08×, q=6
+transparent; frontier trainings (λ=0) still pending. Tranche 2 both
+new cells trained at seed 0 — **interaction term positive (+0.011
+pooled FVU)**; seeds 1–2 pending (tranche 4). Nothing in tranches
+4–7 started.
+
 Standing epistemic rule for the whole phase: the calendar/zoo/atlas
 families are **burned** as selection criteria — three analysis passes
 have inspected them extensively, and further tuning on them is probe

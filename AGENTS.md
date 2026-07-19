@@ -186,6 +186,40 @@ authorization**: bcc-phase09 + bcc-phase0 stores deleted (findings
 committed, regenerable by script); /data ≈ 507 GB free; /data/runs
 kept (backs committed figures).
 
+**Tranche 1 + factorial + codec first light COMPLETE (overnight
+2026-07-18 → 19, autonomous;
+[`docs/findings-phase099-tranche1.md`](docs/findings-phase099-tranche1.md))**:
+E1 streaming θ 3/3 green (the 61 GB OOM case now 19.5 GB, full-split θ
+*better*); E2 guard suite green (silent + 4th-digit FVU replication at
+3e-4; refused 6e-4/1.2e-3 — and **4b training is bit-deterministic
+across runs**, spike sites exactly reproducible; both unstable lrs blow
+mid-run, not at warmup peak); E3 two-axis verdict — static α eliminated
+(revival-killing), frac cap dominated (not inert when healthy —
+perturbs from the first dead block — weaker suppression, FVU-neutral),
+**ratio cap 1.0 recommended for the Phase-1 pin (a9 ratifies at config
+freeze)**: bit-inert on healthy trajectories, engages at amplifier
+ignition, crushes the SASA cascade 100×+ (peak grads 107.9→0.52,
+527.7→2.53, renorm 220,670→36.9), converts self-defeating revival into
+functional (final dead 3.08%→0.098%, the healthy band), best capped
+FVU (0.524 vs 0.553) — but does NOT rescue bad operating points
+(renorm 6e-4 destroyed either way): guard refuses seeds/runaways,
+guard skips poison batches (step-1600 event proven **batch-locked**
+across 3 divergent trajectories), cap defuses amplifiers — exact
+partition, no overlap. **Codec first light**: q=6 transparent, q=4
++0.005 FVU; **support-bit amortization measured at 4.08×** (scalar
+1,067 vs BSC 261 bits/tok support at equal amp); matched-L0 scalar
+"win" costs 2.06× the bit-rate — H3 sharply posed, λ=0 frontiers
+decide. **2×2 factorial complete at seed 0**: interaction term
+**positive (+0.011 pooled FVU)** — tying helps blocks ~2.3× more than
+scalars (BSC 0.4299 / BSF 0.4497 / scalar-cross 0.3682 / SAE 0.3768);
+tying helps both geometries; single-site cells are the fair-allocation
+control and **vindicate F7** (BSF/SAE per-site profiles land on the
+renorm arm's, primary's deep tilt = whitener retained-power artifact).
+E4/E5 dogfooded by every run (guard+prefetch+streaming θ, 16 site-runs
+silent). E6 offline-validated, extension run still pending. Remaining
+tranches: E6 execution, λ=0 frontier trainings, ≥3 seeds, epochs-vs-
+fresh, harvest derisk, guarded lr-recovery (last).
+
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
   Engels' weekday ring on GPT-2; on gemma layer 22 the discovery
