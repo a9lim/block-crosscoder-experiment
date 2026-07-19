@@ -246,9 +246,15 @@ renorm weights are uniform ±2%, F7 as a single vector. **E6 COMPLETE
 07-19 13:54**: +6M corpus-disjoint tokens under the frozen whitener,
 drift check green with margin (extension held-out spectrum deviation
 uniformly below the pilot's own baseline), merged `train12m` manifest
-(12M/80 shards), /data 183 GB free. Remaining tranches: **6
-(epochs-vs-fresh) now UNBLOCKED**, 7 (harvest derisk), 5 (guarded
-lr-recovery, last).
+(12M/80 shards), /data 183 GB free. **Tranche 6 LAUNCHED 07-19
+13:59** (`scripts/run_phase099_tranche6.sh`): 4 cells at matched 24M
+optimizer tokens ({6M×4ep, 12M×2ep} × {primary, renorm}), full v2.4
+stack incl. rcap 1.0 — longest Phase-1-config dogfood yet; codec
+passes at the tail. Tranche 7 partial from the E6 drill: 40,960
+B/token exact, production store 2.171 TB (fits 4 TB NVMe, 45%
+headroom), harvest ≈3 GPU-hrs at 5,000 tok/s, writer 205 MB/s.
+Remaining: tranche 6 verdict, tranche 7 tail (checksum drill +
+whitener-stability items), 5 (guarded lr-recovery, last).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

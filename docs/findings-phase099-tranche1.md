@@ -587,3 +587,40 @@ Readings:
    the F7 renorm designation.
 5. Bernoulli sensitivity tracks the primary rate within ~5% in all
    arms — the frozen count model isn't doing load-bearing work.
+
+## Tranche 7 partial — production-harvest forecast from the E6 drill
+
+The E6 extension harvest doubles as the tranche-7 throughput drill
+(runbook: "the harvest is the drill"). Measured on the real path
+(gemma-3-4b → frozen whitener → bf16 shards on /data):
+
+- **Bytes/token: 40,960 exactly** (245.76 GB / 6M tokens, 8 sites ×
+  2560 dims × bf16 + shard overhead) — the design's "~40 KB/token"
+  is exact, not approximate.
+- **Production store: 53M tokens → 2.171 TB** — confirms the 2.17 TB
+  plan number against a measured harvest; fits the purchased 4 TB
+  NVMe with ~45% headroom.
+- **Harvest compute: ~5,000 tok/s sustained on the 4090** (batch-rows
+  8, model + writer concurrent) → the full production harvest is
+  ≈ 3.0 GPU-hours, not a multi-day affair. Corpus fast-forward is
+  free (784 rows/s; skipping the entire pilot+extension consumption
+  would cost < 1 min).
+- **Writer throughput: ~205 MB/s sustained** — an order of magnitude
+  below NVMe write limits; the writer will not be the bottleneck.
+- Checksum/resume drill and the remaining tranche-7 items (whitener
+  stability at the 5M production slice, late-layer bf16 tail stats,
+  renorm-scalar stability across independent slices) still open —
+  the checksum pass over the extension shards is deferred until the
+  tranche-6 factorial drains (avoid I/O contention with training).
+
+## Tranche 6 launched — epochs-vs-fresh factorial (07-19 13:59)
+
+Four cells at matched 24M optimizer tokens (5856 steps, identical
+cosine shape): {6M unique × 4 epochs, 12M unique × 2 epochs (the E6
+`train12m` merge)} × {primary, renorm}, λ=1e-3, seed 0, all on the
+full v2.4 pinned stack (guard + streaming θ + prefetch 4 + **rcap
+1.0**) — the campaign doubles as the longest-duration dogfood of the
+exact Phase-1 configuration. Codec passes at the tail price all four
+cells. Anchors from the 12M-optimizer-token headline cells: primary
+0.4299 / renorm 0.4154. Question: is *data* or *optimization* the
+binding budget at pilot scale? Results land in a follow-on section.
