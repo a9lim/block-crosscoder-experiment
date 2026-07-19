@@ -1,0 +1,128 @@
+"""Offline tests for the preregistered R-D codec (tranche 3)."""
+
+import torch
+
+from block_crosscoder_experiment.codec import CodecSpec, evaluate_rd, fit_codec
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
+
+G, B, S, D = 8, 4, 3, 16
+
+
+def make_model(seed=0, b=B, g=G, k=3.0):
+    cfg = BSCConfig(n_blocks=g, block_dim=b, n_sites=S, d_model=D, k=k, seed=seed)
+    m = BlockCrosscoder(cfg)
+    return m
+
+
+def calibrated(m, x):
+    m.fit_threshold_([x], m.cfg.k)
+    return m
+
+
+def batches_of(x, n=4):
+    return list(x.split(x.shape[0] // n))
+
+
+def test_codec_fits_and_evaluates():
+    torch.manual_seed(0)
+    m = calibrated(make_model(), torch.randn(2048, S, D))
+    x = torch.randn(4096, S, D)
+    spec = CodecSpec(qs=(4, 8), floor=10, n_bootstrap=64)
+    codec = fit_codec(m, batches_of(x), spec)
+    assert codec.calib_tokens == 4096
+    assert codec.n_included > 0
+    res = evaluate_rd(m, codec, batches_of(torch.randn(2048, S, D)), row_len=128)
+    assert res["n_rows"] == 16
+    p4, p8 = res["points"]["4"], res["points"]["8"]
+    # More levels: distortion no worse, amplitude bits higher.
+    assert p8["fvu_pooled"] <= p4["fvu_pooled"] + 1e-9
+    assert p8["amplitude_bits_per_token"] > p4["amplitude_bits_per_token"]
+    assert p4["rate_bits_per_token"] > p4["amplitude_bits_per_token"]
+    lo, hi = p4["fvu_ci95"]
+    assert lo <= p4["fvu_pooled"] <= hi
+    assert len(p4["fvu_per_site"]) == S
+
+
+def test_high_q_approaches_unquantized():
+    torch.manual_seed(1)
+    m = calibrated(make_model(), torch.randn(2048, S, D))
+    x = torch.randn(4096, S, D)
+    spec = CodecSpec(qs=(12,), floor=10, n_bootstrap=8)
+    codec = fit_codec(m, batches_of(x), spec)
+    ev = torch.randn(2048, S, D)
+    res = evaluate_rd(m, codec, batches_of(ev), row_len=128)
+
+    # Reference: unquantized threshold-mode FVU with the same exclusion
+    # and the same calib-mean centering.
+    with torch.no_grad():
+        err = tot = 0.0
+        mu = codec.calib_mean.float()
+        for xb in batches_of(ev):
+            z = m.encode(xb)
+            mask = m.select(z, mode="threshold") & codec.included.unsqueeze(0)
+            xhat = m.decode(z * mask.unsqueeze(-1))
+            err += float((xb - xhat).double().pow(2).sum())
+            tot += float((xb - mu).double().pow(2).sum())
+    assert abs(res["points"]["12"]["fvu_pooled"] - err / tot) < 5e-3
+
+
+def test_gauge_rotation_invariance():
+    """R13: rotating a block's decoder/encoder/code gauge must not move
+    the codec's R-D point — the canonical orientation absorbs it."""
+    from block_crosscoder_experiment.battery import rotate_blocks_
+
+    torch.manual_seed(2)
+    calib = torch.randn(4096, S, D)
+    ev = torch.randn(2048, S, D)
+    spec = CodecSpec(qs=(4,), floor=10, n_bootstrap=8)
+
+    m1 = calibrated(make_model(seed=3), calib[:2048])
+    m2 = calibrated(make_model(seed=3), calib[:2048])
+    rotate_blocks_(m2, seed=99)
+    # Same function represented in a rotated gauge: outputs identical.
+    with torch.no_grad():
+        assert torch.allclose(m1(ev[:64]).xhat, m2(ev[:64]).xhat, atol=1e-4)
+
+    r1 = evaluate_rd(m1, fit_codec(m1, batches_of(calib), spec),
+                     batches_of(ev), row_len=128)
+    r2 = evaluate_rd(m2, fit_codec(m2, batches_of(calib), spec),
+                     batches_of(ev), row_len=128)
+    f1, f2 = r1["points"]["4"]["fvu_pooled"], r2["points"]["4"]["fvu_pooled"]
+    assert abs(f1 - f2) < 5e-3, (f1, f2)
+    assert abs(r1["support_bits_per_token"] - r2["support_bits_per_token"]) < 1e-6
+
+
+def test_floor_exclusion_reported_and_enforced():
+    torch.manual_seed(4)
+    m = calibrated(make_model(), torch.randn(2048, S, D))
+    x = torch.randn(2048, S, D)
+    # Impossible floor: everything excluded -> no bits, FVU = ratio to mean.
+    spec = CodecSpec(qs=(4,), floor=10**9, n_bootstrap=8)
+    codec = fit_codec(m, batches_of(x), spec)
+    assert codec.n_included == 0
+    assert codec.meta["n_excluded"] == G
+    res = evaluate_rd(m, codec, batches_of(x), row_len=128)
+    assert res["avg_count"] == 0.0
+    assert res["points"]["4"]["amplitude_bits_per_token"] == 0.0
+
+
+def test_scalar_b1_path():
+    torch.manual_seed(5)
+    m = calibrated(make_model(b=1, g=32, k=12.0), torch.randn(2048, S, D))
+    x = torch.randn(4096, S, D)
+    spec = CodecSpec(qs=(6,), floor=10, n_bootstrap=8)
+    codec = fit_codec(m, batches_of(x), spec)
+    res = evaluate_rd(m, codec, batches_of(torch.randn(2048, S, D)), row_len=128)
+    p = res["points"]["6"]
+    # b=1: amplitude bits = q * realized count.
+    assert abs(p["amplitude_bits_per_token"] - 6 * res["avg_count"]) < 1e-9
+
+
+def test_count_model_prices_unseen_counts():
+    torch.manual_seed(6)
+    m = calibrated(make_model(), torch.randn(2048, S, D))
+    spec = CodecSpec(qs=(4,), floor=1, n_bootstrap=8)
+    codec = fit_codec(m, batches_of(torch.randn(2048, S, D)), spec)
+    k = torch.tensor([0, 1, 10**6])
+    lp = codec.log2_count_prob(k)
+    assert torch.isfinite(lp).all()  # smoothing: no -inf anywhere
