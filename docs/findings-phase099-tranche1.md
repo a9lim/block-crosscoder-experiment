@@ -430,11 +430,41 @@ the post-campaign sweep):**
   0.4156 vs 0.4154). The codec table's λ-mismatch caveat is
   empirically negligible on the FVU axis; the 1b λ-ladder result
   transfers.
-- The frontier's matched-*bits* comparisons (BSC k64 ≈ scalar k32 at
-  ~1.5 kbit; renorm k32 vs scalar k16 in the ~800-bit region, where
-  renorm's FVU 0.416 already beats scalar k16's 0.425 *before* its
-  ~5% rate advantage is priced) are the H3 preview proper — exact
-  positions from the codec sweep.
+**The H3 preview verdict (codec sweep on all frontier checkpoints;
+q=4 positions; figure `figures/phase099/rd_frontier.png`):**
+
+| region | block arm | scalar arm | verdict |
+|---|---|---|---|
+| ~390 bits | bsc k16: 0.508 @ 391 | *(none — needs k≈6)* | blocks extend the frontier into the ultra-cheap region |
+| ~770–820 bits | **renorm k32: 0.4207 @ 770.5** / bsc k32: 0.4360 @ 772.7 | scalar k16: 0.4306 @ 822.0 | **renorm strictly dominates** (better FVU at fewer bits); primary vs scalar non-dominated |
+| ~1.5 kbit | bsc k64: 0.3813 @ 1493.5 | scalar k32: 0.3718 @ 1588.4 (interp @ 1494 ≈ 0.379) | statistical tie on the primary gauge (Δ ≈ 0.002 ≈ CI width) |
+| ~2.9 kbit | *(none — needs k=128)* | scalar k64: 0.3249 @ 2900 | scalar extends the frontier at the expensive end |
+
+- **The matched-L0 "block tax" inverts on the honest axis.** At
+  matched latent count the scalar arm wins by 0.047 FVU; at matched
+  *bits* the renorm gauge strictly dominates the scalar frontier in
+  the region where they overlap, and the primary gauge ties it. This
+  is H3's preregistered question answered in preview form: the
+  support-bit amortization (measured 4.07×/4.08×/4.01× at k16/32/64)
+  is real purchasing power, not accounting.
+- **R-D positions are seed-stable**: renorm 0.4205/0.4206/0.4207,
+  scalar k32 0.3718/0.3730/0.3733, bsc λ0 0.4360/0.4370 — spreads at
+  or below CI width.
+- **Known gap**: the renorm × k grid has only k32 (the ratified-gauge
+  frontier needs k16/k64 renorm runs — two 30-min runs — before the
+  H3 figure is production-grade). The scalar arm's cheap end (k≈6–8)
+  is unexplored; its interpolated frontier is used for the tie
+  verdict.
+- **Cross-site tying priced at the bits level** (single-site codec
+  passes, bsf seed 0): each single-site block model costs ~738–775
+  bits/token *per site* (support ≈ 234–262 each); reconstructing all
+  8 sites via independent per-site models costs ~6,031 bits/token
+  against the joint arm's 772.7 — **cross-site code tying is a ~7.8×
+  rate reduction at ≈ equal pooled distortion**. One support set and
+  one amplitude vector serve all eight depths; that is the
+  architecture's core bet, now priced. (Per-site pooled placement
+  with exact sq_tot weights + the SAE cell's identical accounting
+  land with the sweep's tail.)
 
 **Seed stability at the ratified point (pooled FVU, topk; campaign
 complete 09:35, all 14 runs green):**
