@@ -414,6 +414,44 @@ Secondary findings:
 - Single-site training is fast: 16 min per cell (8 models in
   lockstep, one store pass, 13k tok/s).
 
+## Tranches 3+4 trainings (second overnight campaign, 03:47 → ~10:00)
+
+**λ=0 frontier, seed 0 (pooled FVU, topk; codec R-D positions pending
+the post-campaign sweep):**
+
+| k (blocks) | BSC | renorm | scalar (4k latents) |
+|---|---|---|---|
+| 16 | 0.502 | — | 0.425 |
+| 32 | 0.4297 | 0.4156 | 0.3682 |
+| 64 | 0.3738 | — | 0.3201 |
+
+- **λ is ~free at 4b on both gauges**: λ=0 k32 lands on the λ=1e-3
+  ratified arms to the third decimal (BSC 0.4297 vs 0.4299; renorm
+  0.4156 vs 0.4154). The codec table's λ-mismatch caveat is
+  empirically negligible on the FVU axis; the 1b λ-ladder result
+  transfers.
+- The frontier's matched-*bits* comparisons (BSC k64 ≈ scalar k32 at
+  ~1.5 kbit; renorm k32 vs scalar k16 in the ~800-bit region, where
+  renorm's FVU 0.416 already beats scalar k16's 0.425 *before* its
+  ~5% rate advantage is priced) are the H3 preview proper — exact
+  positions from the codec sweep.
+
+**Seed stability at the ratified point (pooled FVU, topk):**
+
+| cell | s0 | s1 | s2 | spread |
+|---|---|---|---|---|
+| renorm λ1e-3 | 0.4154 | 0.4152 | 0.4154 | **0.0002** |
+| scalar λ0 | 0.3682 | 0.3684 | *(running)* | 0.0002 so far |
+| bsc λ0 k32 | 0.4297 | 0.4306 | — | 0.0009 |
+| bsc λ1e-3 | 0.4299 | *(pilot s1)* | *(running)* | — |
+
+Seed noise at 4b/3e-4 sits at the 3rd–4th decimal — far below every
+effect read tonight (tying deltas 0.009–0.020, interaction 0.011,
+gauge differences 0.014, frontier steps 0.05+). All overnight runs
+carried guard + streaming θ + prefetch: **zero guard events at 3e-4
+across the entire campaign** — the skip-rate ≤ 0.1% Phase-1 gate is
+passing with margin at the ratified point.
+
 ## Tranche 2/3 machinery landed same night (commits `99bf1c1`, `06a2977`)
 
 - `run_phase099_single_site.py`: both single-site factorial cells, all
