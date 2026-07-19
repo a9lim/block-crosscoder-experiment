@@ -27,7 +27,7 @@ The pooled FVU across per-site models (sum sq_err / sum centered_tot) is
 directly comparable to the joint arms' pooled FVU at matched parameters
 and rate; per-site FVU compares site-by-site.
 
-  python -u scripts/run_phase099_single_site.py --arm bsf \
+  python -u scripts/train_single_site.py --arm bsf \
       --store /data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb \
       --out-root /data/runs/bcc-phase099 --blocks 4096 --k 32 --guard
 """

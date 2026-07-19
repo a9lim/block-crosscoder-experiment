@@ -8,7 +8,7 @@ the renorm arm in its own gauge, as everywhere) against the two
 both poolings (filled = whitened, open = renorm/uniform). Log-x makes
 the ~7.9x rate cut legible as a fixed offset.
 
-  python scripts/analysis/plot_rd_tying.py
+  python scripts/analysis/fig_rd_tying.py
 """
 
 from __future__ import annotations

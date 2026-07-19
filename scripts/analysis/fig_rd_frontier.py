@@ -5,7 +5,7 @@ FVU vs bits/token with bootstrap CI bars, one color per arm, one marker
 per q, dashed per-arm connection across rate points. Seeds are drawn
 individually (never averaged) per the tranche-4 battery rule.
 
-  python scripts/analysis/plot_rd_frontier.py \
+  python scripts/analysis/fig_rd_frontier.py \
       --inputs data/phase0/rd_*.json data/phase0/f_*.json data/phase0/s_*.json --out figures/phase0/rd_frontier.png
 """
 

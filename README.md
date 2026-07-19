@@ -46,8 +46,9 @@ Training runs on the 4090 box (CUDA); harvest/analysis on the M5 Max
 
 ```text
 block_crosscoder_experiment/  model, trainer, store, codec, battery
-scripts/                      phase entry points (ladder-era names)
-scripts/analysis/             probes + figure regeneration (winner.py)
+scripts/                      phase-neutral tools: train_bsc, harvest_store,
+                              validate_codec, run_battery, … (+ archive/)
+scripts/analysis/             probe_* + fig_* + winner.py + regen_figures.sh
 data/phase0/                  committed compact evidence (R-D payloads,
                               placement, SAE-era provenance, winner.json)
 figures/phase0/               canonical figures, regenerated from winner

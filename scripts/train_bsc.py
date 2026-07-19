@@ -10,8 +10,8 @@ deterministic stream), threshold calibration on the calibration split,
 eval determinism (the eval pass runs twice and must agree exactly), and
 per-site whitened FVU on the held-out eval split.
 
-  python -u scripts/run_phase09_rehearsal.py --arm bsc --lam 1e-3
-  python -u scripts/run_phase09_rehearsal.py --arm scalar
+  python -u scripts/train_bsc.py --arm bsc --lam 1e-3
+  python -u scripts/train_bsc.py --arm scalar
 """
 
 from __future__ import annotations

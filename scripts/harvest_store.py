@@ -20,7 +20,7 @@ evidence), 2M calibration + 1M eval + 6M train stored whitened bf16
 (9.1M x 8 x 2560 x 2B ~ 373 GB), first 100k calibration tokens also raw.
 fp16 forbidden throughout; free-space abort before every shard write.
 
-  nohup python -u scripts/harvest_pilot4b_store.py \
+  nohup python -u scripts/harvest_store.py \
       > /data/runs/bcc-pilot4b/harvest.log 2>&1 &
 """
 

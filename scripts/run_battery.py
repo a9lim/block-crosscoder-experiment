@@ -2,9 +2,9 @@
 """Run the Phase -1 scenario battery (design v2.2).
 
 Full battery on jobe:
-    python scripts/run_phase_minus1.py --out data/phase_minus1_report.json
+    python scripts/run_battery.py --out data/phase_minus1_report.json
 Quick plumbing smoke:
-    python scripts/run_phase_minus1.py --scenario core --steps 300 --seeds 0
+    python scripts/run_battery.py --scenario core --steps 300 --seeds 0
 """
 
 import argparse

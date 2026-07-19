@@ -5,8 +5,14 @@ learning whose unit is a *subspace* with one shared code across
 layers, filling the {block} × {cross-site} cell of the literature's
 2×2 on gemma. Not a library — phased experiments with explicit
 go/no-go gates. Naming: **Phase 0** = the completed pilot program
-(2026-07-15 → 07-19; internally it used a −1 → 0.9.9 ladder whose
-names survive in `scripts/`); **Phase 1** = the production run.
+(2026-07-15 → 07-19; internally it used a −1 → 0.9.9 ladder — its
+one-shot scripts live in `scripts/archive/` with a rename map);
+**Phase 1** = the production run. Live tools are phase-neutral:
+`train_bsc.py`, `train_single_site.py`, `harvest_store.py`,
+`extend_store.py`, `verify_store.py`, `validate_{codec,theta,revival}.py`,
+`run_battery.py`, `sweep_{bundle,capture}.py`; analysis probes are
+`scripts/analysis/probe_*.py`, figures `fig_*.py`, regenerated via
+`regen_figures.sh` from the winner pointer.
 
 ## Read first
 

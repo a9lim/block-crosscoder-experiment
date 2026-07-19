@@ -13,7 +13,9 @@ Naming note: these documents use the original internal phase ladder
 (−1 → 0 → 0.5 → 0.9 → 0.9.5 → 0.9.6 → 0.9.9). Under the 2026-07-19
 renumbering, that entire ladder **is Phase 0**; the production run
 (formerly "Phase 1" in these documents too — the number survives) is
-Phase 1. Script names in `scripts/` keep their ladder-era names.
+Phase 1. The ladder-era scripts these documents name were moved to
+`scripts/archive/` in the same restructure; the live tools carry
+phase-neutral names (rename map in `scripts/archive/README.md`).
 
 ## Map (old ladder → what it was)
 

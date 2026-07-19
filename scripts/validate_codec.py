@@ -9,7 +9,7 @@ caution: pooled FVU at matched activation count is NOT a bits-distortion
 verdict; this codec is where the support-bit amortization the block bet
 is priced on becomes measurable.
 
-  python -u scripts/validate_rd_codec.py \
+  python -u scripts/validate_codec.py \
       --ckpt /data/runs/bcc-pilot4b/bsc_lam0.001_seed0_G4096_k32/latest.pt \
       --store /data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb \
       --out /data/runs/bcc-phase099/rd_bsc_primary.json

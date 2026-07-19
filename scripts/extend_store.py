@@ -29,7 +29,7 @@ whose shard entries point into ../train and ../train_ext — readable by
 StoreReader(store, "train12m") with no reader changes (the tranche-6
 epochs-vs-fresh factorial's 12M x 2ep arm).
 
-  nohup python -u scripts/extend_pilot4b_store.py \
+  nohup python -u scripts/extend_store.py \
       > /data/runs/bcc-phase099/extend_store.log 2>&1 &
 """
 
