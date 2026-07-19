@@ -294,8 +294,52 @@ Full three-way comparison at 6e-4 unguarded:
   run will meet its analogues. The guard's skip path is the designed
   handler; the cap bounds what the batch's kill-wave can cascade into.
 
-*(r6b renorm + ratio cap: pending — does the cap save the renorm arm
-from its unguarded destruction at 1.105?)*
+**r6b (renorm + ratio cap 1.0, no guard, 6e-4): the cap does NOT save
+the renorm gauge — final FVU 1.124 vs the uncapped 1.105, equally
+destroyed.** The trajectory shows why, and completes the failure-mode
+taxonomy. Renorm's 6e-4 failure is a *sustained* rec-led runaway: by
+step 1000 both arms sit at rec ~2.65 with dead ~2.6% climbing to
+~7.6%, and neither ever returns to a healthy state (rec grinds down
+to ~1.1 — a destroyed dictionary, FVU > 1). Along the way the
+uncapped baseline's aux monsters are colossal — grad 1,080 (step
+1100), 5,424 (1200), peak **220,670** (1180) — and the cap crushes
+all of it (peak 36.9, four orders of magnitude). It makes no
+difference: under sustained main-loss runaway, the kill pressure is
+main-driven, revival can't win at any s_aux, and the endpoint is
+gauge-destruction either way. This failure class belongs entirely to
+the guard, which refused it at step 977 (r6) — saving ~2,000 steps of
+compute and refusing to hand downstream analysis a destroyed
+dictionary that *looks* converged in FVU-vs-steps plots.
+
+### E3 verdict and the cap-pin recommendation (for a9 to ratify at config freeze)
+
+The full failure-mode × mechanism matrix, measured live at 4b:
+
+| failure mode | guard | ratio cap 1.0 | frac cap 0.5 | static α 0.5 |
+|---|---|---|---|---|
+| healthy training (3e-4) | silent, FVU bit-replicates | **bit-inert** (1011 steps exact) | perturbs from first dead block | perturbs always |
+| transient wobble + cascade (primary 6e-4) | refuses (correct: endpoint damaged regardless) | amplifier −100×, **mortality 3.08%→0.098%**, FVU 0.553→0.524 | amplifier −10×, mortality →0.12%, FVU neutral | (kills revival: 9–10/16 dead on battery) |
+| poison batch (step-1600, batch-locked ×3) | skip-and-recover (demonstrated live, r5) | bounds the cascade it seeds | partially bounds | — |
+| sustained rec runaway (renorm 6e-4) | **refuses (the only mechanism that matters)** | no effect on endpoint | untested (dominated) | — |
+| rare-feature retention (battery) | n/a | PASS (trivially — never engages) | PASS (engages, free) | FAIL |
+
+**Recommendation: pin `aux-ratio-cap 1.0`, alongside the guard, for
+Phase 1.** The evidence chain: it is the only candidate that is
+*bit-exactly* inert on healthy trajectories (the ratified operating
+point is provably unperturbed — running with the cap is running the
+ratified config); it engages precisely at amplifier ignition and
+tightens as the cascade grows (registered prediction, confirmed); it
+converts the SASA slam from self-defeating (re-killing its own
+revivals, chronic 3–6% mortality) into functional revival (final dead
+exactly the healthy band); and it is the only cap arm that recovers
+reconstruction quality from the suppression. What it does not do —
+rescue bad operating points — is the guard's job, and the pair
+partition the observed failure modes exactly: guard handles seed
+wobbles (refuse) and poison batches (skip), cap handles the
+amplifier. The frac cap is strictly dominated at 4b (weaker
+suppression, FVU-neutral, healthy-trajectory perturbation); static
+attenuation is eliminated (revival-killing). Skip-rate gate for
+Phase 1 stands as specified (healthy point: zero events).
 
 **r6 (renorm + ratio cap 1.0 + guard, 6e-4): refused at step 977.**
 The renorm arm's wobble is its own — earlier (near-misses from 963,
