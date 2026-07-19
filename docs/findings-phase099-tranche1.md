@@ -180,7 +180,42 @@ wobble to a materially better *endpoint* — requires the guard off;
 that is tranche 1b (r4b/r5b/r6b, unguarded, queued behind this
 campaign).
 
-*(r5 frac cap + guard, r6 renorm + ratio cap + guard: pending)*
+**r5 (frac cap 0.5 + guard, 6e-4): refused at step 1050 — and the frac
+cap is NOT inert when healthy.** The trajectory diverges from r1
+starting at step ~250–260: the first dead block appears in the
+dead-window at step 250 (1/4096, the normal early revival transient),
+and from that moment the frac cap clamps s_aux_eff from 256 toward
+~max(1, 0.5·n_dead), altering the aux loss on every subsequent step
+(rec delta 4e-7 at step 260, growing). Everything downstream is a
+different — not obviously worse — trajectory:
+
+- The instability still arrives, ~8 steps later (near-miss ramp
+  1017–1020 vs r1's 1009–1012): **6e-4 is unstable on a second,
+  independent trajectory**, reinforcing that this is an
+  operating-point property, not batch poison.
+- **The guard's skip-and-recover path worked transiently, live**: a
+  3-skip burst at 1021–1023 (rec 0.41–0.46) was followed by ~20
+  accepted steps (rec back to 0.11–0.28) — the first in-vivo
+  demonstration of the recovery path outside unit tests.
+- A second, harder excursion then blew the weights (1045–1050, grads
+  12–17.5, rec 0.62–0.84) → consecutive-skip cap → refusal. The large
+  blown-state grads are consistent with the registered prediction that
+  the frac cap *weakens* as the dead set grows (dead↑ → allowed
+  s_aux_eff↑) — though magnitudes across different trajectories aren't
+  directly comparable.
+
+**r4 vs r5, the surgical criterion**: the ratio cap preserved
+bit-determinism through 1011 healthy steps and engaged only at
+amplifier ignition; the frac cap perturbs training from the first
+routinely-dead block onward. Both refused under guard (correctly —
+the seed wobble is main-loss-driven). On every axis measured so far
+the ratio cap dominates: inert-when-healthy (bit-exact at 4b),
+tightens-under-cascade (grad 3.4 → 1.0 at the blown state),
+revival-retaining (battery PASS). The frac cap's remaining claim to
+the pin would be a materially better *unguarded* endpoint — tranche
+1b decides.
+
+*(r6 renorm + ratio cap + guard: pending)*
 
 ## E4/E5/E6 — offline-validated (commit `99bf1c1`)
 
