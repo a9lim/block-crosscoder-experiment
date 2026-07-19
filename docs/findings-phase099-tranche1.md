@@ -613,14 +613,24 @@ The E6 extension harvest doubles as the tranche-7 throughput drill
   the checksum pass over the extension shards is deferred until the
   tranche-6 factorial drains (avoid I/O contention with training).
 
-## Tranche 6 launched — epochs-vs-fresh factorial (07-19 13:59)
+## Tranche 6 launched — epochs-vs-fresh factorial (07-19, relaunched 14:56)
 
 Four cells at matched 24M optimizer tokens (5856 steps, identical
 cosine shape): {6M unique × 4 epochs, 12M unique × 2 epochs (the E6
-`train12m` merge)} × {primary, renorm}, λ=1e-3, seed 0, all on the
-full v2.4 pinned stack (guard + streaming θ + prefetch 4 + **rcap
-1.0**) — the campaign doubles as the longest-duration dogfood of the
-exact Phase-1 configuration. Codec passes at the tail price all four
+`train12m` merge)} × {primary, renorm}, **k=32** (the ratified
+headline operating point), λ=1e-3, seed 0, all on the full v2.4
+pinned stack (guard + streaming θ + prefetch 4 + **rcap 1.0**) — the
+campaign doubles as the longest-duration dogfood of the exact
+Phase-1 configuration. Codec passes at the tail price all four
 cells. Anchors from the 12M-optimizer-token headline cells: primary
 0.4299 / renorm 0.4154. Question: is *data* or *optimization* the
 binding budget at pilot scale? Results land in a follow-on section.
+
+Launch correction: the 13:59 first launch omitted `--k 32` and
+trained at the k=16 default; killed at 1.3/4 cells and relaunched.
+The completed cell is kept as a **bonus k16 epochs-scaling
+datapoint**: primary 6M×4ep at k16 = 0.4832 pooled topk vs the k16
+2-epoch anchor 0.502 — doubling optimization on the same 6M tokens
+buys −0.019 FVU at k16 (λ0 vs λ1e-3 mismatch, empirically ~free).
+Textbook health at 5856 steps: 0 guard events, dead 0.02% — the
+first half-length rcap-1.0 dogfood already banked.
