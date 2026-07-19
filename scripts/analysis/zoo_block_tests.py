@@ -36,14 +36,41 @@ from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.phase0.labels import FAMILIES
 from block_crosscoder_experiment.store import Whitener
 
+from _geo import COUNTRY_GEO
 from tier_a_ring_tests import perm_p, ring_stats
 
 CAP_FAMILIES = {"weekday", "month"}
 CYCLIC = {"weekday", "month", "season", "compass"}
+# color: ring statistic over the hue-wheel prefix only (achromatic
+# classes 6-10 participate in capture but sit off the circle)
+RING_SUBSET = {"color": 6}
+GEO = {"country"}
+GEO_MIN_COUNT = 5  # drop classes rarer than this from the geo fit
 RUNS = {
     "renorm": "/data/runs/bcc-pilot4b/bsc_lam0.001_seed0_G4096_k32_renorm",
     "primary": "/data/runs/bcc-pilot4b/bsc_lam0.001_seed0_G4096_k32",
 }
+
+
+def geo_r2_p(means: np.ndarray, latlon: np.ndarray, n_perms: int,
+             seed: int = 0):
+    """R² of linear lat/lon decode from class-mean code coords + perm null.
+
+    means [C, b] (b=4 predictors + intercept vs C≈48 rows keeps the
+    in-sample fit honest; the permutation null carries the df anyway).
+    """
+    X = np.column_stack([means - means.mean(0), np.ones(len(means))])
+    Y = (latlon - latlon.mean(0)) / latlon.std(0)
+
+    def r2(Yp):
+        beta, *_ = np.linalg.lstsq(X, Yp, rcond=None)
+        resid = Yp - X @ beta
+        return 1 - resid.var(0).sum() / Yp.var(0).sum()
+
+    obs = r2(Y)
+    rng = np.random.default_rng(seed)
+    ge = sum(r2(Y[rng.permutation(len(Y))]) >= obs for _ in range(n_perms))
+    return float(obs), (1 + ge) / (n_perms + 1)
 
 
 def spearman_p(order_vals: np.ndarray, n_perms: int, seed: int = 0):
@@ -177,11 +204,19 @@ def main() -> None:
                 zc[c == k].mean(0) if (c == k).any() else np.zeros(zc.shape[1])
                 for k in range(C)
             ])
-            if family in CYCLIC:
-                hits, top2 = ring_stats(means)
-                e["order"] = {"kind": "ring", "hits": hits, "max": C,
+            if family in GEO:
+                names = FAMILIES[family]
+                keep = counts[family] >= GEO_MIN_COUNT
+                latlon = np.array([COUNTRY_GEO[n][:2] for n in names])
+                r2, p = geo_r2_p(means[keep], latlon[keep], args.perms)
+                e["order"] = {"kind": "geo", "r2": round(r2, 3),
+                              "n_classes": int(keep.sum()), "perm_p": p}
+            elif family in CYCLIC or family in RING_SUBSET:
+                n_ring = RING_SUBSET.get(family, C)
+                hits, top2 = ring_stats(means[:n_ring])
+                e["order"] = {"kind": "ring", "hits": hits, "max": n_ring,
                               "top_plane_var": round(top2, 3),
-                              "perm_p": perm_p(hits, C, args.perms)}
+                              "perm_p": perm_p(hits, n_ring, args.perms)}
             else:
                 X = means - means.mean(0)
                 _, _, Vt = np.linalg.svd(X, full_matrices=False)
@@ -190,6 +225,7 @@ def main() -> None:
                               "perm_p": p}
             o = e["order"]
             stat = (f"ring {o['hits']}/{o['max']}" if o["kind"] == "ring"
+                    else f"geo R2 {o['r2']}" if o["kind"] == "geo"
                     else f"|rho| {o['spearman']}")
             print(f"{name} {family}: best b{e['best_block']} "
                   f"top1 {e['top1_claimed']}/{len(FAMILIES[family])} "

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["FAMILIES", "build_label_map", "label_tokens"]
+__all__ = ["CAP_ONLY", "FAMILIES", "build_label_map", "label_tokens"]
 
 WEEKDAYS = [
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
@@ -40,6 +40,40 @@ DIGITS = [str(d) for d in range(10)]
 SEASONS = ["winter", "spring", "summer", "autumn"]
 COMPASS = ["north", "east", "south", "west"]
 
+# Atlas tranche (post-pilot analysis pass 3): non-1D manifold candidates.
+# Colors lead with the hue circle in wheel order (classes 0-5; achromatic
+# 6-10 join for capture/individuation but sit off the ring — order tests
+# use the chromatic prefix only). Countries and planets are
+# capitalized-only (lowercase turkey/china/mercury are other words, the
+# May lesson applied at the source); elements are listed in atomic-number
+# order so the default line statistic reads Z-order directly.
+COLORS = [
+    "red", "orange", "yellow", "green", "blue", "purple",  # hue ring
+    "pink", "brown", "gray", "black", "white",
+]
+COUNTRIES = [
+    "England", "France", "Germany", "Italy", "Spain", "Portugal",
+    "Ireland", "Scotland", "Russia", "China", "Japan", "India",
+    "Australia", "Canada", "Mexico", "Brazil", "Egypt", "Israel",
+    "Iran", "Iraq", "Turkey", "Greece", "Poland", "Sweden", "Norway",
+    "Denmark", "Finland", "Austria", "Switzerland", "Netherlands",
+    "Belgium", "Argentina", "Chile", "Peru", "Cuba", "Kenya",
+    "Nigeria", "Ethiopia", "Vietnam", "Korea", "Thailand", "Indonesia",
+    "Pakistan", "Afghanistan", "Ukraine", "Hungary", "Romania",
+    "Iceland",
+]
+ELEMENTS = [
+    "hydrogen", "helium", "lithium", "boron", "carbon", "nitrogen",
+    "oxygen", "sodium", "magnesium", "aluminum", "silicon",
+    "phosphorus", "sulfur", "chlorine", "potassium", "calcium",
+    "titanium", "iron", "nickel", "copper", "zinc", "silver", "tin",
+    "gold", "mercury", "lead", "uranium",
+]
+PLANETS = [
+    "Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn",
+    "Uranus", "Neptune", "Pluto",
+]
+
 FAMILIES: dict[str, list[str]] = {
     "weekday": WEEKDAYS,
     "month": MONTHS,
@@ -49,10 +83,20 @@ FAMILIES: dict[str, list[str]] = {
     "digit": DIGITS,
     "season": SEASONS,
     "compass": COMPASS,
+    "color": COLORS,
+    "country": COUNTRIES,
+    "element": ELEMENTS,
+    "planet": PLANETS,
 }
 
+# Families whose lowercase surface forms are *different words*
+# (turkey the bird, china the porcelain, mercury the metal).
+CAP_ONLY = {"country", "planet"}
 
-def _surface_forms(word: str) -> list[str]:
+
+def _surface_forms(word: str, cap_only: bool = False) -> list[str]:
+    if cap_only:
+        return [f" {word}", word]
     return [f" {word}", word, f" {word.lower()}", word.lower()]
 
 
@@ -61,7 +105,7 @@ def build_label_map(tokenizer, family: str) -> dict[int, int]:
     words = FAMILIES[family]
     mapping: dict[int, int] = {}
     for k, word in enumerate(words):
-        for form in dict.fromkeys(_surface_forms(word)):
+        for form in dict.fromkeys(_surface_forms(word, family in CAP_ONLY)):
             # add_special_tokens=False: gemma-style tokenizers prepend BOS
             # on bare encode, which made every form look multi-token.
             ids = tokenizer.encode(form, add_special_tokens=False)
