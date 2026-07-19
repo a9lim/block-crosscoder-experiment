@@ -86,6 +86,14 @@ def main() -> None:
                         help="cap revived blocks/step at ceil(frac x dead-set)")
     parser.add_argument("--aux-ratio-cap", type=float, default=None,
                         help="cap aux grad norm at ratio x main grad norm")
+    parser.add_argument("--sites", type=int, nargs="*", default=None,
+                        help="E4 site-subset view: train on a subset of the "
+                        "stored sites (layer numbers, stored order; a single "
+                        "site = the factorial's S=1 cells). At matched seed "
+                        "the stream is the joint run's, sliced. Default: all.")
+    parser.add_argument("--prefetch", type=int, default=0,
+                        help="E5: training-stream prefetch depth (0 = off); "
+                        "overlaps shard reads with GPU steps, order-preserving")
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
     parser.add_argument("--device", default="cuda")
@@ -101,20 +109,25 @@ def main() -> None:
     import torch
 
     from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
-    from block_crosscoder_experiment.store import StoreReader, Whitener
+    from block_crosscoder_experiment.store import StoreReader, Whitener, prefetch_batches
     from block_crosscoder_experiment.trainer import TrainConfig, Trainer
 
     whitener = Whitener.load(args.store / "whitener.pt")
-    train_reader = StoreReader(args.store, "train", expected_whitener_hash=whitener.hash)
+    train_reader = StoreReader(
+        args.store, "train", expected_whitener_hash=whitener.hash, sites=args.sites
+    )
     n_sites = train_reader.n_sites
     d_model = train_reader.d_model
+    # Whitener-side indices of the (possibly subset) site axis — the
+    # renorm scalars must follow the view (E4).
+    site_idx = [whitener.sites.index(s) for s in train_reader.sites]
 
     # F7 renorm arm (design v2.3.2): dtype-preserving per-site scalar
     # multiply at batch load — equivalent to a renormed store up to one
     # bf16 rounding. Every data path below flows through renormed().
     renorm_scale = None
     if args.site_renorm:
-        renorm_scale = whitener.site_rms_scalars().view(1, -1, 1)
+        renorm_scale = whitener.site_rms_scalars()[site_idx].view(1, -1, 1)
         print(
             "site-renorm scalars (F7 arm): "
             f"{[round(float(v), 3) for v in renorm_scale.flatten()]}",
@@ -166,6 +179,8 @@ def main() -> None:
         tag += f"_rcap{args.aux_ratio_cap:g}"
     if args.alpha_aux != 1.0:
         tag += f"_aaux{args.alpha_aux:g}"
+    if args.sites is not None:
+        tag += "_site" + "-".join(str(s) for s in train_reader.sites)
     run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}{tag}"
     run_dir = args.out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +225,8 @@ def main() -> None:
         batches = itertools.islice(batches, trainer.step_idx, None)
         # islice is lazy; the skip cost lands on the first next() below.
         print(f"fast-forwarding stream by {trainer.step_idx} batches", flush=True)
+    if args.prefetch:
+        batches = prefetch_batches(batches, depth=args.prefetch)
 
     stop_at = min(total_steps, args.max_steps or total_steps)
     t0 = time.time()
@@ -245,7 +262,8 @@ def main() -> None:
     # count so the scalar arm (G·b latents) stays within budget. Streaming
     # quantiles are a Phase-1 item — 13M calib tokens will need them.
     calib_reader = StoreReader(
-        args.store, "calibration", expected_whitener_hash=whitener.hash
+        args.store, "calibration", expected_whitener_hash=whitener.hash,
+        sites=args.sites,
     )
     n_calib_batches = min(args.calib_batches, calib_reader.n_tokens // BATCH)
     theta = model.fit_threshold_(
@@ -262,7 +280,9 @@ def main() -> None:
     trainer.save_checkpoint(ckpt)
 
     # ---- eval: per-site whitened FVU, run twice (determinism gate) -------
-    eval_reader = StoreReader(args.store, "eval", expected_whitener_hash=whitener.hash)
+    eval_reader = StoreReader(
+        args.store, "eval", expected_whitener_hash=whitener.hash, sites=args.sites
+    )
 
     @torch.no_grad()
     def eval_pass(mode: str, m=model, dtype=torch.float32) -> dict:
@@ -327,6 +347,8 @@ def main() -> None:
             "n_blocks": model_cfg.n_blocks, "block_dim": model_cfg.block_dim,
             "k": model_cfg.k, "n_sites": n_sites, "d_model": d_model,
         },
+        "sites": list(train_reader.sites),
+        "prefetch": args.prefetch,
         "total_steps": total_steps,
         "epochs": args.epochs,
         "calib_batches": n_calib_batches,

@@ -39,6 +39,7 @@ __all__ = [
     "WhitenerAccumulator",
     "ShardWriter",
     "StoreReader",
+    "prefetch_batches",
 ]
 
 DEFAULT_RIDGE_SCALE = 1.0  # saklas mahalanobis.py convention, pinned by design
@@ -302,6 +303,45 @@ class ShardWriter:
         return manifest
 
 
+def prefetch_batches(
+    it: Iterator[torch.Tensor], depth: int = 4
+) -> Iterator[torch.Tensor]:
+    """E5 (runbook-phase099 tranche 1): drive an I/O-bound batch iterator
+    from a daemon thread, holding up to ``depth`` batches ahead of the
+    consumer. Order-preserving, so determinism is untouched; worker
+    exceptions are re-raised at the consumption point. The 0.9 rehearsal
+    measured 55-70% data-wait on the training loop — this overlaps shard
+    reads with GPU steps.
+
+    If the consumer abandons the generator early (e.g. total_steps hit),
+    the worker thread parks on a full queue holding ~depth batches + one
+    shard until process exit — acceptable for one-training-per-process
+    scripts, not for long-lived services.
+    """
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue(maxsize=depth)
+    end = object()
+
+    def worker() -> None:
+        try:
+            for x in it:
+                q.put(x)
+            q.put(end)
+        except BaseException as e:  # noqa: BLE001 — re-raised consumer-side
+            q.put(e)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is end:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
 class StoreReader:
     """Sequential buffered-shuffle reads from a written split.
 
@@ -318,6 +358,7 @@ class StoreReader:
         split: str,
         *,
         expected_whitener_hash: str | None = None,
+        sites: Sequence[int] | None = None,
     ) -> None:
         self.dir = Path(root) / split
         manifest_path = self.dir / MANIFEST_NAME
@@ -334,8 +375,39 @@ class StoreReader:
                 f"{self.whitener_hash[:12]}…, expected {expected_whitener_hash[:12]}…"
             )
         self.n_tokens = self.manifest["n_tokens"]
-        self.n_sites = len(self.manifest["sites"])
+        stored_sites = list(self.manifest["sites"])
+        # E4 site-subset view (runbook-phase099 tranche 1): `sites` selects a
+        # subset of the stored site axis by layer number, sliced AFTER shard
+        # load so generator consumption (shard order, buffer permutations)
+        # is byte-identical to the full-width read at the same seed — the
+        # factorial's matched-data guarantee: a single-site cell sees exactly
+        # the joint run's token stream, sliced. Stored order is preserved;
+        # reordering is refused rather than silently permuting frames.
+        if sites is None:
+            self.sites = tuple(stored_sites)
+            self._site_sel: torch.Tensor | None = None
+        else:
+            req = [int(s) for s in sites]
+            missing = [s for s in req if s not in stored_sites]
+            if missing:
+                raise ValueError(f"sites {missing} not in store (has {stored_sites})")
+            if len(set(req)) != len(req):
+                raise ValueError(f"duplicate sites in {req}")
+            idx = [stored_sites.index(s) for s in req]
+            if idx != sorted(idx):
+                raise ValueError(
+                    f"sites {req} not in stored order {stored_sites} — "
+                    "reordering the site axis is not supported"
+                )
+            self.sites = tuple(req)
+            self._site_sel = torch.tensor(idx, dtype=torch.long)
+        self.n_sites = len(self.sites)
         self.d_model = self.manifest["d_model"]
+
+    def _subset(self, acts: torch.Tensor) -> torch.Tensor:
+        if self._site_sel is None:
+            return acts
+        return acts.index_select(1, self._site_sel)
 
     def _shard_tokens(self, name: str, *, verify: bool = False) -> torch.Tensor:
         from safetensors import safe_open
@@ -369,7 +441,7 @@ class StoreReader:
         """Stored-order stream, never RAM-resident beyond one shard (eval)."""
         carry: torch.Tensor | None = None
         for s in self.manifest["shards"]:
-            acts = self._shard_tokens(s["file"])
+            acts = self._subset(self._shard_tokens(s["file"]))
             if carry is not None:
                 acts = torch.cat([carry, acts], dim=0)
             n_full = acts.shape[0] // batch_size * batch_size
@@ -394,7 +466,9 @@ class StoreReader:
             buffer: list[torch.Tensor] = []
             buffered = 0
             for shard_idx in order.tolist():
-                acts = self._shard_tokens(self.manifest["shards"][shard_idx]["file"])
+                acts = self._subset(
+                    self._shard_tokens(self.manifest["shards"][shard_idx]["file"])
+                )
                 buffer.append(acts)
                 buffered += acts.shape[0]
                 while buffered >= buffer_tokens:

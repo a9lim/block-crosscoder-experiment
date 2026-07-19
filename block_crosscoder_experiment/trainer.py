@@ -369,6 +369,7 @@ class Trainer:
         l_aux = None
         alpha_eff = None
         grad_norm_aux = None
+        s_aux_eff = None
         if cfg.aux_variant != "none":
             dead = None
             s_aux_eff = cfg.s_aux
@@ -532,6 +533,8 @@ class Trainer:
             record["grad_norm_aux"] = grad_norm_aux
         if alpha_eff is not None and cfg.aux_ratio_cap is not None:
             record["alpha_aux_eff"] = alpha_eff
+        if s_aux_eff is not None and cfg.aux_frac_cap is not None:
+            record["s_aux_eff"] = s_aux_eff
         if skip_reason is not None:
             record["skip_reason"] = skip_reason
             record["skipped"] = skipped

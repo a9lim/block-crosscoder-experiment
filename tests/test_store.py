@@ -183,3 +183,108 @@ def test_manifest_contents(tmp_path):
     assert manifest["whitener_hash"] == "abc"
     assert manifest["sites"] == [7, 10, 13]
     assert sum(s["n_tokens"] for s in manifest["shards"]) == manifest["n_tokens"]
+
+
+def test_site_subset_view_matches_sliced_full_stream(tmp_path):
+    """E4: at matched seed, the subset reader's shuffled stream is exactly
+    the full reader's stream sliced to the requested sites — the
+    factorial's matched-data guarantee."""
+    write_store(tmp_path)
+    full = StoreReader(tmp_path, "train", expected_whitener_hash="abc")
+    sub = StoreReader(tmp_path, "train", expected_whitener_hash="abc", sites=[10])
+    assert sub.n_sites == 1 and sub.sites == (10,)
+    assert sub.n_tokens == full.n_tokens
+
+    kw = dict(seed=5, epochs=1, buffer_tokens=256)
+    for xf, xs in zip(full.shuffled_batches(64, **kw), sub.shuffled_batches(64, **kw)):
+        assert xs.shape == (64, 1, D)
+        assert torch.equal(xs, xf[:, 1:2])
+
+    seq_full = torch.cat(list(full.sequential_batches(64)), dim=0)
+    seq_sub = torch.cat(list(sub.sequential_batches(64)), dim=0)
+    assert torch.equal(seq_sub, seq_full[:, 1:2])
+
+    # Multi-site subsets keep stored order; verify() still checks full shards.
+    pair = StoreReader(tmp_path, "train", sites=[7, 13])
+    x = next(pair.sequential_batches(64))
+    assert torch.equal(x, torch.cat(list(full.sequential_batches(64)))[:64][:, [0, 2]])
+    assert pair.verify() == 1000
+
+
+def test_site_subset_rejects_bad_requests(tmp_path):
+    write_store(tmp_path)
+    with pytest.raises(ValueError, match="not in store"):
+        StoreReader(tmp_path, "train", sites=[99])
+    with pytest.raises(ValueError, match="duplicate"):
+        StoreReader(tmp_path, "train", sites=[10, 10])
+    with pytest.raises(ValueError, match="stored order"):
+        StoreReader(tmp_path, "train", sites=[13, 7])
+
+
+def test_prefetch_preserves_order_and_reraises(tmp_path):
+    """E5: prefetch is a transparent, order-preserving wrapper; worker
+    exceptions surface at the consumption point."""
+    from block_crosscoder_experiment.store import prefetch_batches
+
+    write_store(tmp_path)
+    reader = StoreReader(tmp_path, "train", expected_whitener_hash="abc")
+    kw = dict(seed=5, epochs=1, buffer_tokens=256)
+    plain = list(reader.shuffled_batches(64, **kw))
+    fetched = list(prefetch_batches(reader.shuffled_batches(64, **kw), depth=3))
+    assert len(plain) == len(fetched)
+    assert all(torch.equal(a, b) for a, b in zip(plain, fetched))
+
+    def boom():
+        yield torch.zeros(2)
+        raise RuntimeError("worker died")
+
+    it = prefetch_batches(boom(), depth=2)
+    next(it)
+    with pytest.raises(RuntimeError, match="worker died"):
+        next(it)
+
+
+def test_merged_manifest_reads_across_splits(tmp_path):
+    """E6: a merged manifest whose shard entries point into sibling split
+    dirs (../train/...) reads as one logical split — the epochs-vs-fresh
+    12M arm's access path."""
+    write_store(tmp_path, n_tokens=500)
+    gen = torch.Generator().manual_seed(2)
+    w = ShardWriter(
+        tmp_path, "train_ext", whitener_hash="abc", sites=[7, 10, 13],
+        d_model=D, tokens_per_shard=128, free_space_floor_frac=0.0,
+    )
+    ext = 0.01 * torch.randn(300, 3, D, generator=gen)
+    ids = torch.arange(500, 800)
+    ext[:, 0, 0] = (ids // 256).float() + 1
+    ext[:, 0, 1] = (ids % 256).float() + 1
+    w.add(ext)
+    ext_manifest = w.close()
+
+    train_manifest = json.loads((tmp_path / "train" / "split.json").read_text())
+    merged_dir = tmp_path / "train_all"
+    merged_dir.mkdir()
+    merged = {
+        "split": "train_all",
+        "whitener_hash": "abc",
+        "sites": [7, 10, 13],
+        "d_model": D,
+        "n_tokens": 800,
+        "shards": (
+            [{"file": f"../train/{s['file']}", "n_tokens": s["n_tokens"]}
+             for s in train_manifest["shards"]]
+            + [{"file": f"../train_ext/{s['file']}", "n_tokens": s["n_tokens"]}
+               for s in ext_manifest["shards"]]
+        ),
+        "meta": {},
+    }
+    (merged_dir / "split.json").write_text(json.dumps(merged))
+
+    reader = StoreReader(tmp_path, "train_all", expected_whitener_hash="abc")
+    assert reader.verify() == 800
+    seq = torch.cat(list(reader.sequential_batches(50)), dim=0)
+    assert torch.equal(token_ids(seq), torch.arange(800))
+    got = torch.cat(
+        [token_ids(b) for b in reader.shuffled_batches(50, seed=3, epochs=1, buffer_tokens=200)]
+    )
+    assert got.unique().numel() == got.numel()
