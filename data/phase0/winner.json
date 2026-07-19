@@ -1,0 +1,20 @@
+{
+  "_comment": "The current best BSC — the dynamic pointer every showcase figure regenerates from (swap this, rerun scripts/analysis/regen_figures.sh, and the canonical figure set follows). 'best' = the ratified operating point (k=32, lam=1e-3, renorm gauge) with the lowest pooled FVU at the largest training budget; frontier/off-point runs (other k, lam=0) stay out of contention.",
+  "run_name": "bsc_lam0.001_seed0_G4096_k32_renorm",
+  "ckpt": "/data/runs/bcc-pilot4b/bsc_lam0.001_seed0_G4096_k32_renorm/latest.pt",
+  "host": "jobe",
+  "arm": "bsc",
+  "site_renorm": true,
+  "n_blocks": 4096,
+  "block_dim": 4,
+  "k": 32,
+  "lam": 0.001,
+  "lr": 3e-4,
+  "sites": [9, 12, 15, 18, 21, 24, 27, 30],
+  "optimizer_tokens": 12000000,
+  "fvu_pooled_topk": 0.4154,
+  "store": "/data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb",
+  "model": "google/gemma-3-4b-pt",
+  "date": "2026-07-18",
+  "notes": "0.9.6 pilot renorm cell (the F7-designating run; month block b595, weekday b862, atlas b1781). Expected to be superseded by the tranche-6 24M-token renorm cells the evening of 2026-07-19."
+}

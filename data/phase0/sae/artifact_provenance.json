@@ -1,0 +1,141 @@
+{
+  "generated": "2026-07-17T02:18:42.212252+00:00",
+  "sae_lens_version": "6.46.0",
+  "checks": [
+    {
+      "name": "control is Bloom 2024 reformatted release",
+      "ok": true,
+      "detail": "jbloom/GPT2-Small-SAEs-Reformatted"
+    },
+    {
+      "name": "control d_in == 768",
+      "ok": true,
+      "detail": "768"
+    },
+    {
+      "name": "control d_sae == 24576",
+      "ok": true,
+      "detail": "24576"
+    },
+    {
+      "name": "control hook is layer-7 resid_pre",
+      "ok": true,
+      "detail": "blocks.7.hook_resid_pre"
+    },
+    {
+      "name": "target sae_ids parse",
+      "ok": true,
+      "detail": "4 layers"
+    },
+    {
+      "name": "width_16k/l0_medium exists at layer 22",
+      "ok": true,
+      "detail": "available: ['16k/big', '16k/medium', '16k/small', '1m/big', '1m/medium', '1m/small', '262k/big', '262k/medium', '262k/small', '65k/big', '65k/medium', '65k/small']"
+    },
+    {
+      "name": "target d_in matches gemma-3-4b hidden size",
+      "ok": true,
+      "detail": "2560"
+    },
+    {
+      "name": "selected layer in 40-90% workspace band",
+      "ok": true,
+      "detail": "layer 22/33 = 67%"
+    },
+    {
+      "name": "phase 0.5 has >= 3 depths available",
+      "ok": true,
+      "detail": "layers [9, 17, 22, 29]"
+    }
+  ],
+  "control": {
+    "release": "gpt2-small-res-jb",
+    "sae_id": "blocks.7.hook_resid_pre",
+    "d_in": 768,
+    "d_sae": 24576,
+    "hook_name": "blocks.7.hook_resid_pre",
+    "architecture": "standard",
+    "W_dec_shape": [
+      24576,
+      768
+    ],
+    "W_dec_sha256": "212ed251c43c41c485bc25711badf70365411a2a3fa7a8365ce831aacc396516",
+    "repo_id": "jbloom/GPT2-Small-SAEs-Reformatted",
+    "repo_sha": "57d08a4fd333fbf18caf3fbea63ceeb88e2f50d9",
+    "model": "gpt2-small"
+  },
+  "target": {
+    "release": "gemma-scope-2-4b-pt-res",
+    "sae_id": "layer_22_width_16k_l0_medium",
+    "d_in": 2560,
+    "d_sae": 16384,
+    "hook_name": "blocks.22.hook_resid_post",
+    "architecture": "jumprelu",
+    "W_dec_shape": [
+      16384,
+      2560
+    ],
+    "W_dec_sha256": "821bf314f7d627e19e3c4632f734a1861c85949af7327301f3a7d2441621aae0",
+    "repo_id": "google/gemma-scope-2-4b-pt",
+    "repo_sha": "a0ffd6132a985bc84077a66d1a1033e10b604fa8",
+    "model": "google/gemma-3-4b-pt",
+    "model_n_layers": 34,
+    "selected_layer": 22,
+    "layer_fraction": 0.6667,
+    "available_layers": [
+      9,
+      17,
+      22,
+      29
+    ],
+    "available_at_layer": [
+      "16k/big",
+      "16k/medium",
+      "16k/small",
+      "1m/big",
+      "1m/medium",
+      "1m/small",
+      "262k/big",
+      "262k/medium",
+      "262k/small",
+      "65k/big",
+      "65k/medium",
+      "65k/small"
+    ],
+    "width_rationale": "nearest available width to the Engels ~24k control scale (16k vs 65k/262k/1m); larger widths also inflate the dense similarity matrix spectral clustering needs"
+  },
+  "phase05_depth_coverage": [
+    9,
+    17,
+    22,
+    29
+  ],
+  "verdict": "PASS",
+  "reroute_width_65k": {
+    "generated": "2026-07-17T05:55:08.763359+00:00",
+    "repo_id": "google/gemma-scope-2-4b-pt",
+    "repo_sha": "a0ffd6132a985bc84077a66d1a1033e10b604fa8",
+    "geometry": {
+      "layer_22_width_16k_l0_medium": {
+        "d_in": 2560,
+        "d_sae": 16384,
+        "hook_name": "blocks.22.hook_resid_post",
+        "W_dec_sha256": "821bf314f7d627e19e3c4632f734a1861c85949af7327301f3a7d2441621aae0",
+        "overcompleteness": 6.4,
+        "median_max_neighbor_cos": 0.2181,
+        "frac_neighbor_gt_0.7": 0.0483,
+        "frac_neighbor_gt_0.5": 0.0993
+      },
+      "layer_22_width_65k_l0_medium": {
+        "d_in": 2560,
+        "d_sae": 65536,
+        "hook_name": "blocks.22.hook_resid_post",
+        "W_dec_sha256": "a5836cf69fd15717e0d640342fd4b7bdc4b1bd10967cf1bbc005699df543947e",
+        "overcompleteness": 25.6,
+        "median_max_neighbor_cos": 0.1956,
+        "frac_neighbor_gt_0.7": 0.0206,
+        "frac_neighbor_gt_0.5": 0.0468
+      }
+    }
+  }
+}

@@ -10,14 +10,14 @@ weights are deep-tilted 7.3x by shrinkage-whitener retained power, the
 renormed weights are uniform within 2%).
 
 Usage:  python scripts/analysis/place_single_site_rd.py
-Reads data/phase099/*.json, writes data/phase099/single_site_placement.json.
+Reads data/phase0/*.json, writes data/phase0/single_site_placement.json.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-DATA = Path(__file__).resolve().parents[2] / "data" / "phase099"
+DATA = Path(__file__).resolve().parents[2] / "data" / "phase0"
 SITES = (9, 12, 15, 18, 21, 24, 27, 30)
 
 

@@ -22,8 +22,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA = ROOT / "data" / "phase099"
-OUT = ROOT / "figures" / "phase099" / "rd_tying.png"
+DATA = ROOT / "data" / "phase0"
+OUT = ROOT / "figures" / "phase0" / "rd_tying.png"
 
 ARM_COLORS = {
     "bsc": "#1f77b4",
