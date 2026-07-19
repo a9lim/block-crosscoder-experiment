@@ -229,10 +229,17 @@ cross-site tying ≈ 7.8× rate cut vs per-site models at ≈equal pooled
 FVU (`figures/phase099/rd_frontier.png`). Morning of 07-19 (a9):
 **rcap pin ratified, design updated to v2.4 (pinned Phase-1 stack)**,
 renorm k16/k64 frontier completion + E6 +6M store extension launched
-(`scripts/run_phase099_ext.sh`). Remaining tranches: 6 (epochs-vs-
-fresh, needs E6), 7 (harvest derisk), 5 (guarded lr-recovery, last);
-single-site R-D plane placement (sq_tot weights) pending the sweep
-tail.
+(`scripts/run_phase099_ext.sh`). **Single-site R-D placement complete
+same day** (exact eval sq_tot weights via store pass;
+`scripts/analysis/place_single_site_rd.py`,
+`figures/phase099/rd_tying.png`): tying = 7.8×/7.9× rate cut on
+block/scalar geometries; block-side distortion-free in *both* gauges
+(renorm pool an exact wash, 0.4207 = 0.4207); per-site FVU profiles
+of both single-site families land on the renorm profile at r=0.984
+(primary r≈0.4) — the whitened eval weights are 8× deep-tilted while
+renorm weights are uniform ±2%, F7 as a single vector. Remaining
+tranches: 6 (epochs-vs-fresh, needs E6), 7 (harvest derisk), 5
+(guarded lr-recovery, last).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

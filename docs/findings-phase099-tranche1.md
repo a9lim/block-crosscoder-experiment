@@ -455,16 +455,46 @@ q=4 positions; figure `figures/phase099/rd_frontier.png`):**
   H3 figure is production-grade). The scalar arm's cheap end (k≈6–8)
   is unexplored; its interpolated frontier is used for the tie
   verdict.
-- **Cross-site tying priced at the bits level** (single-site codec
-  passes, bsf seed 0): each single-site block model costs ~738–775
-  bits/token *per site* (support ≈ 234–262 each); reconstructing all
-  8 sites via independent per-site models costs ~6,031 bits/token
-  against the joint arm's 772.7 — **cross-site code tying is a ~7.8×
-  rate reduction at ≈ equal pooled distortion**. One support set and
-  one amplitude vector serve all eight depths; that is the
-  architecture's core bet, now priced. (Per-site pooled placement
-  with exact sq_tot weights + the SAE cell's identical accounting
-  land with the sweep's tail.)
+- **Cross-site tying priced at the bits level — exact placement**
+  (single-site codec passes for both families + an exact per-site
+  sq_tot pass over the eval split;
+  `scripts/analysis/place_single_site_rd.py`,
+  `data/phase099/eval_site_sq_tot.json` /
+  `single_site_placement.json`). Reconstructing all 8 sites with
+  independent per-site models costs, at q=4: **bsf 6,031 bits/token
+  vs joint bsc k32 772.7 (7.8×); sae 12,509 vs joint scalar k128
+  1,588.4 (7.9×)** — the tying rate cut is ~7.9× on both unit
+  geometries. Distortion at that price, pooled with the exact
+  eval-split weights, gauge by gauge:
+  - *block side*: in the whitened pool the joint model **strictly
+    dominates** its 8-model control (0.4360 @ 772.7 vs 0.4559 @
+    6,031); in the renorm pool it is an **exact wash** (joint renorm
+    0.4207 @ 770.5 vs system 0.4207 @ 6,031). Cross-site tying is
+    distortion-free in both gauges and ~7.8× cheaper — the
+    architecture's core bet, now priced with nothing left pending.
+  - *scalar side*: whitened pool — joint strictly dominates (0.3718
+    @ 1,588 vs 0.3803 @ 12,509). Under uniform (renorm-gauge)
+    pooling the 8 per-site SAEs pull ahead by 0.031 (0.3485 vs the
+    joint scalar's uniform-pooled 0.3796): the joint scalar buys
+    part of its pooled number by following the whitener's deep tilt.
+    A renormed joint *scalar* cell would close this asymmetry; not
+    run (config exists, one 30-min slot if wanted).
+  - The support amortization replicates inside the single-site
+    cells: sae ≈ 1,051 support bits/site vs bsf ≈ 246 — **4.26×**,
+    matching the joint arms' 4.08× — blocks amortize support per
+    site exactly as they do across sites.
+- **The exact eval weights are the F7 mechanism as a single vector**:
+  whitened-gauge per-site sq_tot weights run 0.033 → 0.275 (sites
+  {9,12,15} together carry < 11% of pooled sq_tot; site 30 alone
+  27%), while the renorm-gauge weights are uniform to within 2%
+  (0.1238–0.1264). Per-site FVU profiles agree: both single-site
+  families correlate with the joint renorm profile at **r = 0.984**
+  (max deviation 0.031) and with the primary profile at only
+  r = 0.43/0.40; the joint scalar profile is the most
+  whitener-distorted of all (r = 0.254 against its own single-site
+  control). Every fairly-allocated model lands on the same intrinsic
+  per-site difficulty ordering (monotone harder with depth); only
+  raw-whitened joint training deviates from it.
 
 **Seed stability at the ratified point (pooled FVU, topk; campaign
 complete 09:35, all 14 runs green):**
