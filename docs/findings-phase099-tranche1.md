@@ -215,7 +215,18 @@ revival-retaining (battery PASS). The frac cap's remaining claim to
 the pin would be a materially better *unguarded* endpoint — tranche
 1b decides.
 
-*(r6 renorm + ratio cap + guard: pending)*
+**r6 (renorm + ratio cap 1.0 + guard, 6e-4): refused at step 977.**
+The renorm arm's wobble is its own — earlier (near-misses from 963,
+non-consecutive: 963/966/969/970, a ~14-step build) and **rec-led**:
+rec climbs 1.28 → 4.34 while grads stay ~0.5–1.9 (already
+rcap-clamped ≈1 at the blown state). The unguarded renorm run ended
+*destroyed* (FVU 1.105) where the primary ended damaged (0.553); the
+guarded ladder shows why — renorm's excursion is a runaway of the
+main reconstruction itself, not a grad-spike event, and the guard's
+rec corroboration catches it cleanly. All three guarded arms refused:
+the guard's verdict on 6e-4 is unanimous across cap settings and both
+gauges, and refusal timing/shape is trajectory-specific (1018 / 1050 /
+977), not an artifact of one spike site.
 
 ## E4/E5/E6 — offline-validated (commit `99bf1c1`)
 
