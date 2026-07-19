@@ -7,8 +7,8 @@ hasn't anyone combined BSF with crosscoders?"). Verification provenance,
 **upgraded 2026-07-16**: every source below has now been read at full text
 (local copies in `references/`; Jiralerspong via the 75-page arXiv PDF —
 no HTML rendering exists) during the round-3 paper-fidelity review
-(`docs/design-review-2026-07-16.md`, findings P1–P25). Bracketed 07-15
-amendments come from the first review (`docs/design-review-2026-07-15.md`);
+(`docs/archive/design-review-2026-07-16.md`, findings P1–P25). Bracketed 07-15
+amendments come from the first review (`docs/archive/design-review-2026-07-15.md`);
 bracketed 07-16 amendments from round 3.*
 
 **Verdict: a block-sparse crosscoder (BSC) — subspace-unit dictionary
@@ -235,7 +235,7 @@ x^s. G blocks of width b:
   mis-transfers SASA, whose full-text penalty is on the product ‖D_k E_k‖_*.
   The corrected, Gram-constrained objective — Σ_s D_g^s D_g^sᵀ = I_b, select
   by exact contribution ‖z_g‖ — is specified in `docs/design.md` v2; the
-  disposition trail is `docs/design-review-2026-07-15.md`.]*
+  disposition trail is `docs/archive/design-review-2026-07-15.md`.]*
 - diagnostics: block-level Latent Scaling as the artifact flag *(07-16:
   "per-site reconstruction-contribution regression" was underspecified —
   Minder fits four coefficients per latent against reconstruction and

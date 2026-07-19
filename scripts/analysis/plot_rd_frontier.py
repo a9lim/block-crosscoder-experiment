@@ -6,7 +6,7 @@ per q, dashed per-arm connection across rate points. Seeds are drawn
 individually (never averaged) per the tranche-4 battery rule.
 
   python scripts/analysis/plot_rd_frontier.py \
-      --inputs data/phase099/rd_*.json --out figures/phase099/rd_frontier.png
+      --inputs data/phase0/rd_*.json data/phase0/f_*.json data/phase0/s_*.json --out figures/phase0/rd_frontier.png
 """
 
 from __future__ import annotations

@@ -14,7 +14,7 @@ extended to the full literature 2×2 (BSF and ordinary-crosscoder
 comparisons — see tranche 2).
 
 **Progress (overnight 2026-07-19, autonomous; details in
-[`findings-phase099-tranche1.md`](findings-phase099-tranche1.md)):**
+[`archive/findings-phase099-tranche1.md`](archive/findings-phase099-tranche1.md)):**
 tranche 1 COMPLETE — E1 green 3/3; E2 regression suite green (r1/r2/r3
 + discovery that 4b training is bit-deterministic across runs); E3
 both axes done, **ratio cap 1.0 RATIFIED by a9 2026-07-19** (static α
