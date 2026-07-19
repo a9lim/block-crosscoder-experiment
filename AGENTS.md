@@ -242,9 +242,13 @@ block/scalar geometries; block-side distortion-free in *both* gauges
 (renorm pool an exact wash, 0.4207 = 0.4207); per-site FVU profiles
 of both single-site families land on the renorm profile at r=0.984
 (primary r≈0.4) — the whitened eval weights are 8× deep-tilted while
-renorm weights are uniform ±2%, F7 as a single vector. Remaining
-tranches: 6 (epochs-vs-fresh, needs E6), 7 (harvest derisk), 5
-(guarded lr-recovery, last).
+renorm weights are uniform ±2%, F7 as a single vector. **E6 COMPLETE
+07-19 13:54**: +6M corpus-disjoint tokens under the frozen whitener,
+drift check green with margin (extension held-out spectrum deviation
+uniformly below the pilot's own baseline), merged `train12m` manifest
+(12M/80 shards), /data 183 GB free. Remaining tranches: **6
+(epochs-vs-fresh) now UNBLOCKED**, 7 (harvest derisk), 5 (guarded
+lr-recovery, last).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

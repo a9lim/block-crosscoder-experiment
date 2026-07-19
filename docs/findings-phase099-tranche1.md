@@ -368,10 +368,18 @@ gauges, and refusal timing/shape is trajectory-specific (1018 / 1050 /
 - **E5 prefetch**: order-preserving daemon-thread wrapper, exceptions
   re-raised at the consumption point (tested). Justified same night:
   the guard runs measure 30% data-wait.
-- **E6 store extension**: replay the pinned corpus stream, fast-forward
-  past the pilot's row-consumption upper bound (10,805 + 64 margin),
-  harvest under the frozen whitener, merged `train12m` manifest
-  (tested read path). Not yet run — ~245 GB, /data has 506 GB free.
+- **E6 store extension — COMPLETE 07-19 13:54** (21 min, ~5,000
+  tok/s): replayed the pinned corpus stream (`corpus_rev 87f09149`),
+  fast-forwarded 10,870 rows (pilot consumption + margin), harvested
+  6M corpus-disjoint tokens in 40 shards under the frozen whitener
+  (hash verified), merged `train12m` manifest (12M tokens, 80
+  shards). **Drift check green with margin**: per-site held-out
+  spectrum deviation vs the shrinkage prediction is uniformly *below*
+  the pilot's own held-out baseline (site 30: 0.0531 vs 0.0601;
+  site 9: 0.0008 vs 0.0012) — no corpus-drift signal, the extension
+  tokens are statistically indistinguishable from pilot tokens under
+  the frozen whitener. Tranche 6 (epochs-vs-fresh at matched 24M
+  optimizer tokens) is unblocked. /data at 81% (183 GB free).
 
 ## Tranche 2 first look — the 2×2 factorial completed (seed 0, pilot store)
 

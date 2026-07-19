@@ -21,17 +21,25 @@ both axes done, **ratio cap 1.0 RATIFIED by a9 2026-07-19** (static α
 eliminated, frac cap dominated; guard/cap/skip partition the failure
 modes exactly; design pinned as v2.4); E4/E5 landed and dogfooded by
 every subsequent run. Tranche 3 codec built, offline-tested (incl.
-R13 gauge invariance); **λ=0 frontier trained and priced** (k∈{16,32,
-64} × both arms; renorm k32; renorm k16/k64 running 07-19): renorm
-strictly dominates the scalar frontier in the ~800-bit overlap
-region, primary ties mid-region, support amortization ≈4× across k,
-tying ≈7.8× rate cut vs per-site models. Tranche 2 COMPLETE —
-**interaction term +0.011 pooled FVU**, single-site cells vindicate
-F7 as the fair-allocation control. Tranche 4 FVU endpoint COMPLETE
-(≥3 seeds every headline cell, spreads 0.0002–0.0009). **E6 extension
-harvest launched 07-19** (`run_phase099_ext.sh`) → tranche 6 unblocks
-on completion. Open: single-site R-D plane placement, tranche 6
-epochs-vs-fresh, tranche 7 derisk, tranche 5 (last).
+R13 gauge invariance); **λ=0 frontier trained and priced, grid
+complete 07-19 afternoon** (k∈{16,32,64} × all three arms): **renorm
+strictly dominates the scalar frontier everywhere they overlap,
+~390 → ~1,600 bits** (k64: 0.3660 @ 1491.6 vs scalar k32 0.3718 @
+1588.4, CIs disjoint), support amortization ≈4× across k, tying
+≈7.8×/7.9× rate cut vs per-site models — **distortion-free on the
+block side in both gauges** (single-site placement with exact
+eval sq_tot weights; the whitened weight vector is 8× deep-tilted,
+renorm's uniform ±2% — F7 as one vector; single-site FVU profiles
+land on renorm's at r=0.984). Tranche 2 COMPLETE — **interaction term
++0.011 pooled FVU**, single-site cells vindicate F7 as the
+fair-allocation control. Tranche 4 FVU endpoint COMPLETE (≥3 seeds
+every headline cell, spreads 0.0002–0.0009). **E6 COMPLETE 07-19
+13:54**: +6M corpus-disjoint tokens under the frozen whitener
+(skip 10,870 rows, 40 shards), drift check green with margin
+(per-site held-out spectrum deviation uniformly *below* the pilot's
+own baseline, site 30: 0.053 vs 0.060), merged `train12m` manifest
+(12M/80 shards), /data 183 GB free → **tranche 6 UNBLOCKED**. Open:
+tranche 6 epochs-vs-fresh, tranche 7 derisk, tranche 5 (last).
 
 Standing epistemic rule for the whole phase: the calendar/zoo/atlas
 families are **burned** as selection criteria — three analysis passes
