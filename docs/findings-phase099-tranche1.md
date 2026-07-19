@@ -378,4 +378,45 @@ gauges, and refusal timing/shape is trajectory-specific (1018 / 1050 /
   codec (orientation, clipped uniform quantizer, frozen count model +
   enumerative support bits, Bernoulli sensitivity, active-count floor,
   sequence bootstrap), 6 offline tests including gauge-rotation
-  invariance (R13). First real-checkpoint numbers pending GPU.
+  invariance (R13).
+
+## Tranche 3 first light — the preregistered codec on the pilot checkpoints
+
+Calib fit on the full 2M-token split (~165 s), eval on 1M tokens
+(~110 s), CIs from the 979-sequence bootstrap (±0.002, tight). All
+three ratified pilot checkpoints, threshold mode:
+
+| arm | q | FVU [CI95] | rate (bits/tok) | support + amp |
+|---|---|---|---|---|
+| bsc primary | 4 | 0.4361 [0.4344, 0.4380] | **772.9** | 261.3 + 511.6 |
+| | 6 | 0.4310 | 1028.7 | 261.3 + 767.4 |
+| bsc renorm | 4 | 0.4205 [0.4191, 0.4222] | **770.6** | 259.8 + 510.7 |
+| | 6 | 0.4160 | 1026.0 | 259.8 + 766.1 |
+| scalar | 4 | 0.3718 [0.3703, 0.3734] | **1588.4** | 1066.9 + 521.5 |
+| | 6 | 0.3682 | 1849.2 | 1066.9 + 782.2 |
+
+Readings:
+
+1. **Quantization is nearly transparent.** q=6 reproduces each arm's
+   unquantized FVU (0.431/0.416/0.368 vs 0.430/0.415/0.368); q=4
+   costs only +0.004–0.005 FVU while cutting the amplitude budget by
+   a third. q=8 adds nothing. The R-D-relevant range is q∈{4,6}.
+2. **The support-bit amortization is measured: 4.08×.** Scalar pays
+   1,066.9 support bits/token (k=128 events from 16,384 features)
+   against BSC's 261.3 (k=32 block events from 4,096), at essentially
+   identical amplitude budgets (≈ q·128 both). This is the block
+   bet's pricing mechanism, now empirical.
+3. **The matched-L0 FVU story does not survive the R-D plane.** At
+   matched latent-L0 the scalar arm "wins" 0.368 vs 0.415 — but it
+   delivers that at 2.06× the bit-rate (1,588 vs 771 bits/token at
+   q=4). Whether a scalar dictionary *at ~770 bits* (k≈64) beats
+   renorm's 0.421 is exactly the λ=0 frontier question the runbook
+   schedules — open, and now sharply posed. Standing caveats worn
+   openly: BSC arms are λ=1e-3 vs scalar λ=0 (H3 *preview*, not
+   verdict), single seed, pilot 2M-token calib (floor excludes
+   9–15% of blocks but ≤0.6% of events).
+4. **Renorm dominates primary on the R-D plane** — same bits within
+   2/1000, −0.015 FVU at every q — independent codec-side support for
+   the F7 renorm designation.
+5. Bernoulli sensitivity tracks the primary rate within ~5% in all
+   arms — the frozen count model isn't doing load-bearing work.
