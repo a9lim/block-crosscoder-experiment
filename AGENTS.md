@@ -143,8 +143,23 @@ decodes as citation/date scaffold); the shape-space census
 (`p4b_census.png`); and the number-identity blocks decoded as numeral
 blocks (197x/196x/15xx years, durations, ISBNs; b1808 spelled round
 decades) — block identity persisting across the renorm toggle at
-shared init (both arms' b1018 = the '197x' block). Color-word probe
-still parked until a proper 4b run (a9 2026-07-17).
+shared init (both arms' b1018 = the '197x' block). A **third pass
+(2026-07-18, atlas tranche — findings doc §analysis pass 3)** probed
+non-1D families (color/country/element/planet, 12M fresh tokens,
+cap-only label maps for country/planet): **renorm b1781 is an atlas
+block** — 36/48 countries top-1, lat/lon LOO-decodable from its 4-dim
+code (lat 0.34 / lon 0.15, p 1e-3; giants individuate, tail
+consolidates), on a stream that carries the Gurnee-Tegmark world map
+at every site (LOO lat R² 0.57–0.66; longitude washes out at L30) with
+zero continent clustering; color shows **no hue wheel in stream or
+dictionary** (the pilot-scale color look a9 parked — production-run
+color probe still open) but a stable non-wheel geometry; the planet
+sun-distance line exists in-stream (|rho| ≤ 0.88) uncaptured; element
+order dips through the shear zone. New explainer figures:
+block-anatomy 3D (one shared code + rotating frames with ghost
+decodes, b595/b2146), the hoverable all-block BSC atlas
+(`p4b_atlas.html`), the stacked world-map decode
+(`p4b_worldmap_3d.html`).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered

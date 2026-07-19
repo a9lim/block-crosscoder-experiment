@@ -53,6 +53,10 @@ FAMILY_LABELS = {
     "compass": ["N", "E", "S", "W"],
 }
 CYCLIC = {"month", "weekday", "season", "compass"}
+# atlas tranche: labels ride in from the probe npz meta (country names
+# are too many to hardcode twice); color fits harmonic planes on the
+# hue-wheel prefix and projects the achromatic classes into them
+HUE_PREFIX = 6
 
 
 def procrustes_2d(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -85,13 +89,18 @@ def pca_basis(X: np.ndarray):
     return Vt[:2].T, rho
 
 
-def stack_planes(mean_stack, cyclic: bool):
-    """[S, C, d] class means → per-depth aligned 2D planes + stat."""
+def stack_planes(mean_stack, cyclic: bool, fit_idx=None):
+    """[S, C, d] class means → per-depth aligned 2D planes + stat.
+
+    fit_idx: fit the plane basis on this class subset only (hue wheel),
+    then project every class into it.
+    """
     planes = []
     prev = None
     for s in range(mean_stack.shape[0]):
         X = mean_stack[s] - mean_stack[s].mean(0)
-        basis, stat = (harmonic_basis if cyclic else pca_basis)(X)
+        Xf = X if fit_idx is None else X[fit_idx]
+        basis, stat = (harmonic_basis if cyclic else pca_basis)(Xf)
         P = X @ basis
         scale = max(np.sqrt((P**2).mean()), 1e-9)  # viz gauge: per-depth RMS
         P = P / scale
@@ -104,7 +113,8 @@ def stack_planes(mean_stack, cyclic: bool):
     return planes
 
 
-def stack_figure(planes, labels, title, stat_name, clouds=None):
+def stack_figure(planes, labels, title, stat_name, clouds=None,
+                 ring_idx=None):
     C = len(labels)
     colors = st.cyclic_colors(C)
     fig = go.Figure()
@@ -127,12 +137,14 @@ def stack_figure(planes, labels, title, stat_name, clouds=None):
                             opacity=0.25),
                 showlegend=False, hoverinfo="skip",
             ))
-        loop = list(range(C)) + [0]
-        fig.add_trace(go.Scatter3d(
-            x=P[loop, 0], y=P[loop, 1], z=[zpos[s]] * (C + 1),
-            mode="lines", line=dict(color=st.INK2, width=3),
-            showlegend=False, hoverinfo="skip",
-        ))
+        loop = (list(range(C)) + [0]) if ring_idx is None else \
+            (list(ring_idx) + [ring_idx[0]] if len(ring_idx) else [])
+        if loop:
+            fig.add_trace(go.Scatter3d(
+                x=P[loop, 0], y=P[loop, 1], z=[zpos[s]] * len(loop),
+                mode="lines", line=dict(color=st.INK2, width=3),
+                showlegend=False, hoverinfo="skip",
+            ))
         fig.add_trace(go.Scatter3d(
             x=P[:, 0], y=P[:, 1], z=[zpos[s]] * C,
             mode="markers+text",
@@ -215,33 +227,43 @@ def main() -> None:
                        include_plotlyjs=True)
         print(f"{family}: stream + b{block} frames written", flush=True)
 
-    # -- zoo stream views (means extracted from the zoo probe) -----------
-    zoo = next(
-        (p for p in (DATA / "zoo_means_zoo4b.npz",
-                     DATA / "zoo_means_pilot4b.npz") if p.exists()),
-        None,
-    )
-    if zoo is not None:
+    # -- zoo stream views (means extracted from the zoo probes) ----------
+    from block_crosscoder_experiment.phase0.labels import FAMILIES
+
+    zoos = [p for p in (DATA / "zoo_means_zoo4b.npz",
+                        DATA / "zoo_means_atlas4b.npz",
+                        DATA / "zoo_means_pilot4b.npz") if p.exists()]
+    seen = set()
+    for zoo in zoos:
         zm = np.load(zoo)
-        for family in FAMILY_LABELS:
+        families = json.loads(str(zm["meta"]))["families"]
+        for family in families:
             key = f"{family}_means"
-            if key not in zm:
+            if key not in zm or family in seen:
                 continue
+            seen.add(family)
             means = zm[key].transpose(1, 0, 2)  # [C,S,d] -> [S,C,d]
-            labels = FAMILY_LABELS[family]
+            labels = FAMILY_LABELS.get(family, FAMILIES[family])
             cyc = family in CYCLIC
-            planes = stack_planes(means, cyclic=cyc)
+            fit_idx = list(range(HUE_PREFIX)) if family == "color" else None
+            ring_idx = fit_idx if family == "color" else \
+                [] if family == "country" else None
+            planes = stack_planes(means, cyclic=cyc or family == "color",
+                                  fit_idx=fit_idx)
             fig = stack_figure(
                 planes, labels,
                 f"The {family} family across gemma-3-4b depth — raw "
                 f"whitened stream,<br>"
-                + ("first-harmonic planes" if cyc else
+                + ("hue-wheel harmonic planes (achromatic projected in)"
+                   if family == "color" else
+                   "first-harmonic planes" if cyc else
                    "PCA planes (Spearman order along PC1)"),
-                "1st harmonic" if cyc else "|rho|")
+                "1st harmonic" if cyc or family == "color" else "|rho|",
+                ring_idx=ring_idx)
             fig.write_html(OUT / f"p4b_zoo_{family}_3d.html",
                            include_plotlyjs=True)
             print(f"zoo {family}: written", flush=True)
-    else:
+    if not zoos:
         print("no zoo means npz yet — zoo views skipped")
 
 

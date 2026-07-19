@@ -489,6 +489,138 @@ structure.
 | `p4b_month_flow_3d.html` / `p4b_cardinal_flow_3d.html` | manifold drift through depth in one fixed basis (the component Procrustes stacks gauge away) |
 | `p4b_crossarm_cardinal_3d.html` | the cardinal line through both arms' blocks, cross-arm mismatch rungs |
 
+## Analysis pass 3: the atlas tranche + explainer figures (2026-07-18, exploratory — not gate evidence)
+
+Third pass over the pilot artifacts, two prongs: (a) four new
+single-token families probing *non-1D* manifold candidates — color
+(11, hue-wheel prefix first), country (48), element (27,
+atomic-number order), planet (9, sun order) — on a fresh 12M-token
+fineweb slice (`--per-class-cap 2000`; country and planet label maps
+are **capitalized-only at the source** — lowercase turkey/china/
+mercury are other words, the May lesson applied at map-build time);
+(b) a set of explainer figures for what a BSC block *is* (below).
+Machinery: `zoo_block_tests.py` grew a **geo order kind** (linear
+lat/lon decode from a block's code-plane class means, 20k-perm null;
+noise floor R² ≈ 0.13 → p ≈ 0.12, planted map → perm floor) and a
+hue-subset ring; `_geo.py` carries capital-city coordinates +
+continent tags; `atlas_stream_tests.py` and `fig_worldmap_3d.py` are
+the Mac-side stream analyses. Artifacts: `zoo_block_tests_atlas4b.json`,
+`zoo_means_atlas4b.npz`, `zoo_codes_{primary,renorm}_atlas4b.npz`,
+`atlas_stream_tests.json`.
+
+### The world map decodes — from the stream and from one block's code
+
+Leave-one-out linear decode of standardized (lat, lon) from country
+class means (top-10 PCs per site; 1k-perm null; classes with n ≥ 5):
+
+| | L9 | L12 | L15 | L18 | L21 | L24 | L27 | L30 |
+|---|---|---|---|---|---|---|---|---|
+| LOO R² lat | 0.57 | 0.57 | 0.63 | 0.59 | 0.57 | 0.66 | 0.62 | 0.62 |
+| LOO R² lon | 0.36 | 0.37 | 0.42 | 0.35 | 0.34 | 0.41 | 0.24 | **0.01** |
+
+All stream sites at the perm floor (p 1e-3). This is Gurnee &
+Tegmark's linear world model replicated on gemma-3-4b whitened sites,
+out-of-sample, with their lat > lon asymmetry — plus a new depth
+observation: **longitude washes out at L30 while latitude persists**
+(visible in `p4b_worldmap_3d.html` as the top stream layer collapsing
+onto the latitude axis). Continent *clustering* is absent throughout
+(silhouette −0.03 to 0.02): the map is linearly present without
+categorical continent structure.
+
+**Dictionary capture: renorm b1781 is an atlas block.** Top-1 claims
+36/48 countries; its 4-dim code-plane class means decode lat/lon at
+in-sample R² 0.454 (p 5e-5, perm floor) and **LOO R² lat 0.34 / lon
+0.15 (p 1e-3)** — a compressed but real world map in one block's
+code. Card: freq 0.022, code PR 2.24, top-2 mass 0.79 (the planar
+shelf), share profile early-heavy ([0.24, 0.23, 0.21, 0.13, 0.09,
+0.05, 0.03, 0.03] over L9→L30). The 12 unclaimed countries are the
+frequency giants (England, China, Japan, India, Canada, Egypt,
+Israel, Greece, Netherlands, Korea, Iceland, Ireland) — the ordinal
+pattern again: **giants individuate, the block consolidates the
+tail.** The primary arm's b1273 (27/48, in-sample R² 0.163 p 0.04)
+is overfit dressing: LOO lon R² is *negative* (−0.19; lat 0.17,
+p 0.017). The arm pattern extends: renorm captures the geographic
+manifold, primary doesn't.
+
+### The rest of the tranche: three informative nulls
+
+- **Color: no hue wheel anywhere.** Stream hue-prefix adjacency 2–4/6
+  with first-harmonic mass 0.35–0.43 at every site; block-side both
+  arms null (renorm b678 ring 3/6 p 0.5; primary b208 claims 7/11
+  colors top-1 with **ring 2/6 p 0.75** — consolidation-without-order
+  in yet another family). The stream does carry a *stable* color-term
+  geometry (same layout at all 8 sites — chromatic spread wide,
+  achromatic huddled centrally; `p4b_zoo_color_3d.html`), just not the
+  perceptual wheel; its organizing axes are unidentified. The
+  block-level null has an innocent reading: there is no stream ring to
+  capture.
+- **Planet: a sun-distance line in the stream, uncaptured.** Stream
+  |rho| 0.63–0.88 (peak L21–L24; inner planets vs gas giants visibly
+  separated), but no block consolidates the family (best top-1 4/9,
+  order n.s.) — plausibly the 3k-token exposure at pilot budget is
+  below the capture threshold.
+- **Element: moderate stream order, no line block.** |rho| 0.65 (L9)
+  dipping to 0.34 at L18 (the shear zone again) and recovering to
+  0.57; both arms scatter the family (best block claims ≤ 18/27 with
+  order n.s.; renorm's b1282 is a metals-adjacent cluster, not a
+  Z-line). Element polysemy (iron/lead/gold/mercury) is worn as noted
+  at fixture time.
+
+### Explainer figures: what a BSC block is
+
+Three new interactive figures (all `figures/pilot4b/`, regeneration
+scripts in `scripts/analysis/`):
+
+- **Block anatomy** (`fig_block_anatomy_3d.py` →
+  `p4b_anatomy_b595_month.html`, `p4b_anatomy_b2146_cardinal.html`):
+  two linked scenes per flagship block. Left: the one shared 4-dim
+  code — every labeled token, all depths at once, class means threaded
+  (ring loop / line path). Right: the stream's per-depth manifold
+  planes (Procrustes-stacked) with the block's decoded class means
+  D_g^s z̄_k projected in as open ghosts — the same code re-embedded
+  at every depth by the rotating frames. Per-depth labels carry the
+  frame⋂stream plane cosine and decoder share; ghost/stream in-plane
+  radius is honest amplitude (renorm decodes un-rescaled by the
+  store's site-RMS scalars first). b595 reads: frame cos 0.63–0.83,
+  amplitude 0.42→0.57 rising with depth, and the stream's own month
+  plane degrading to first-harmonic 27% at L30 while the ghost ring
+  stays clean — the "frames hold the ring where the stream's top
+  plane loses it" story as one picture. b2146 reads: |ρ| 92–98% at
+  every depth in the stream, ghost line tracking, share climbing to
+  21% at L30 while frame⋂stream cos *drops* to 0.20 — at its
+  highest-share sites the block's plane departs the stream's
+  frequency-dominated top plane.
+- **The BSC atlas** (`fig_bsc_atlas.py` → `p4b_atlas.html`): every
+  sane-frequency block of both arms at (code PR, top-2 mass), colored
+  by decoder-energy peak site, sized by firing frequency; hover gives
+  the block card (name, freq, spectrum, unicode share/site-energy
+  sparklines); named blocks outlined, clique members ×. The
+  arms' depth allocation difference (primary's L30 wall vs renorm's
+  spread) is visible before any hovering.
+- **The world map** (`fig_worldmap_3d.py` → `p4b_worldmap_3d.html`):
+  per-depth LOO-decoded country positions with error whiskers to
+  truth, continent-colored, stream layers stacked below the two
+  country-block code layers.
+
+Supporting registry: `_names.py` (findings-named blocks + clique
+lists + site-RMS scalars) now feeds all figure scripts.
+
+### Honesty box (pass 3)
+
+Exploratory, one seed per arm, all soft attribution. Geo ground truth
+is capital-city coordinates (rounded); the LOO decode is linear-only
+and 44–48 classes are few rows for 10 predictors (the perm null
+carries the df). **b1781 fires on ~2.2% of all tokens — an order of
+magnitude more than country tokens** — so it is a broad
+geographic-context block whose code carries the map, not a
+countries-only unit; a fresh-text context decode is pending. Planet
+n = 3,052 tokens total ('Pluto' etc. thin); element and season-style
+polysemy worn as fixtured. The atlas scan is a fresh 12M-token slice
+with the same `skip_docs` as the zoo scan (overlapping corpus region,
+independent of the training store's head). Color/planet cap-only maps
+mean *no* lowercase forms — sentence-initial usage is the residual
+contaminant, not cross-word collision.
+
 ## Remaining
 
 1. ~~a9 ratification items~~ **Ratified 2026-07-18** (design decision
@@ -511,3 +643,9 @@ structure.
    (Phase-2 territory), the b1623 astonishment plane's affect
    structure, and whether the shear zone (L18-L21) matches where
    gemma-3-4b's induction/attention regime shifts.
+6. From pass 3: fresh-text context decode of b1781 (what else the
+   2.2%-frequency atlas block fires on); whether the planet line gets
+   captured at production token budget (stream |rho| 0.88 with no
+   block is a capture-threshold data point); identifying the axes of
+   the stable non-wheel color geometry; carry the geo-decode probe
+   (alongside the ring probe) into Phase-1 eval.
