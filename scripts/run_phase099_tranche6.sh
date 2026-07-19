@@ -24,7 +24,7 @@ run() {
 }
 
 REH="python -u scripts/run_phase09_rehearsal.py --store $STORE --out-root $OUT
-     --blocks 4096 --lam 1e-3 --seed 0 --guard --theta-method streaming
+     --blocks 4096 --k 32 --lam 1e-3 --seed 0 --guard --theta-method streaming
      --prefetch 4 --aux-ratio-cap 1.0"
 RD="python -u scripts/validate_rd_codec.py --store $STORE"
 
@@ -38,16 +38,16 @@ run t6_12m_renorm  $REH --arm bsc --train-split train12m --site-renorm
 
 # R-D positions for all four cells
 run rd_t6_ep4_primary $RD \
-  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_ep4_guard_rcap1/latest.pt" \
+  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_k32_ep4_guard_rcap1/latest.pt" \
   --out "$OUT/rd/t6_ep4_primary.json"
 run rd_t6_ep4_renorm $RD --site-renorm \
-  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_renorm_ep4_guard_rcap1/latest.pt" \
+  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1/latest.pt" \
   --out "$OUT/rd/t6_ep4_renorm.json"
 run rd_t6_12m_primary $RD \
-  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_train12m_guard_rcap1/latest.pt" \
+  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_k32_train12m_guard_rcap1/latest.pt" \
   --out "$OUT/rd/t6_12m_primary.json"
 run rd_t6_12m_renorm $RD --site-renorm \
-  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_renorm_train12m_guard_rcap1/latest.pt" \
+  --ckpt "$OUT/bsc_lam0.001_seed0_G4096_k32_renorm_train12m_guard_rcap1/latest.pt" \
   --out "$OUT/rd/t6_12m_renorm.json"
 
 echo "[t6] tranche 6 complete $(date)"
