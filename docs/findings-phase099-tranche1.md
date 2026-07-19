@@ -141,9 +141,46 @@ literally zero events.
 
 ## E3 cascade axis — caps at the 4b 6e-4 reproduction point
 
-*(pending: r4 ratio cap, r5 frac cap, r6 renorm + ratio cap; unguarded
-references — 6e-4: 0.553 damaged / renorm 1.105 destroyed; clean 3e-4:
-0.430 / renorm 0.415 / scalar 0.368)*
+Unguarded references — 6e-4: 0.553 damaged / renorm 1.105 destroyed;
+clean 3e-4: 0.430 / renorm 0.415 / scalar 0.368.
+
+### Guarded integration arms (r4/r5/r6): guard and cap are orthogonal, by construction and now by measurement
+
+**r4 (ratio cap 1.0 + guard, 6e-4): refused at step 1018 — the exact
+registered prediction** ("the ratio cap won't engage during the
+1009–1012 ramp; r4 reaches the same blown state at 1013 and the guard
+refuses at ~1018 exactly as in r1"). The event ladder against r1:
+
+| step window | r1 grad_norm | r4 grad_norm | rec (identical) | reading |
+|---|---|---|---|---|
+| ≤1011 (102 logged + near-misses) | — | **bit-identical to r1** | identical | cap inert when healthy, at 4b, live |
+| 1012 (last accepted ramp step) | 0.3921 | **0.3798** | 0.2807 | first engagement — kills begin, cap trims only the aux component |
+| 1013–1018 (skipped, frozen weights) | 3.26–3.55 | **0.95–1.03** | 0.85–0.92 | cap clamps the SASA slam ~3.4× (aux ≤ main, was 97–100% aux) |
+
+Three conclusions:
+
+1. **The ratio cap's inertness-when-healthy transfers from the battery
+   to 4b** — bit-for-bit, through 1011 steps including the sub-threshold
+   ramp. Its first engagement coincides with the first block-kills at
+   step 1012, i.e. it activates exactly at the amplifier's ignition and
+   not one step earlier.
+2. **It suppresses the amplifier hard**: the frozen-state skipped steps
+   see total grad ~1.0 instead of ~3.4 — consistent with clamping an
+   aux gradient that is 97–100% of the total down to ≤1× the main
+   gradient. Engagement tightens as the cascade grows, as predicted.
+3. **The guard still (correctly) refuses.** The rec corroboration
+   signal reads the blown *main* weights — identical to r1 at 4
+   decimals on all six fresh skipped batches — and the seed wobble is
+   main-loss-driven, so no aux cap can un-blow it. Cap and guard attack
+   different stages (amplifier vs seed): the production stack wants
+   both, and neither masks the other.
+
+The decisive measurement — whether cap-suppressed dynamics ride the
+wobble to a materially better *endpoint* — requires the guard off;
+that is tranche 1b (r4b/r5b/r6b, unguarded, queued behind this
+campaign).
+
+*(r5 frac cap + guard, r6 renorm + ratio cap + guard: pending)*
 
 ## E4/E5/E6 — offline-validated (commit `99bf1c1`)
 
