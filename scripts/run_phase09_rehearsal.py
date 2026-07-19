@@ -63,8 +63,29 @@ def main() -> None:
         "--calib-batches", type=int, default=128,
         help="cap on calibration batches for fit_threshold_ (host-RAM "
         "guard: the pooled score matrix is n_tokens x G*b fp32 on CPU — "
-        "at 16k latents, 128x4096 tokens is ~34 GB; use 64 there)",
+        "at 16k latents, 128x4096 tokens is ~34 GB; use 64 there). "
+        "Irrelevant under --theta-method streaming (O(bins) memory).",
     )
+    parser.add_argument(
+        "--theta-method", choices=("exact", "streaming"), default="exact",
+        help="fit_threshold_ estimator (E1): exact host-side kthvalue "
+        "(0.9.6 behavior) or the bounded-memory streaming histogram "
+        "(Phase-1 production path; mandatory for G>=8192 / scalar arms)",
+    )
+    # E2 spike guard (runbook-phase099 tranche 1).
+    parser.add_argument("--guard", action="store_true",
+                        help="enable the batch-skip loss-spike guard (E2)")
+    parser.add_argument("--guard-factor", type=float, default=20.0)
+    parser.add_argument("--guard-loss-factor", type=float, default=5.0)
+    parser.add_argument("--guard-window", type=int, default=50)
+    parser.add_argument("--guard-max-consecutive", type=int, default=5)
+    # E3 AuxK cap candidates (mechanism pinned at Phase-1 config freeze).
+    parser.add_argument("--alpha-aux", type=float, default=1.0,
+                        help="global aux weight (SASA-faithful 1.0)")
+    parser.add_argument("--aux-frac-cap", type=float, default=None,
+                        help="cap revived blocks/step at ceil(frac x dead-set)")
+    parser.add_argument("--aux-ratio-cap", type=float, default=None,
+                        help="cap aux grad norm at ratio x main grad norm")
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
     parser.add_argument("--device", default="cuda")
@@ -137,6 +158,14 @@ def main() -> None:
         tag += "_renorm"
     if args.epochs != EPOCHS:
         tag += f"_ep{args.epochs}"
+    if args.guard:
+        tag += "_guard"
+    if args.aux_frac_cap is not None:
+        tag += f"_fcap{args.aux_frac_cap:g}"
+    if args.aux_ratio_cap is not None:
+        tag += f"_rcap{args.aux_ratio_cap:g}"
+    if args.alpha_aux != 1.0:
+        tag += f"_aaux{args.alpha_aux:g}"
     run_name = f"{args.arm}_lam{args.lam:g}_seed{args.seed}{tag}"
     run_dir = args.out_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +182,12 @@ def main() -> None:
     train_cfg = TrainConfig(
         total_steps=total_steps, lr=args.lr, schedule=args.schedule,
         encoder_weight_decay=args.encoder_wd, log_every=10,
+        guard=args.guard, guard_factor=args.guard_factor,
+        guard_loss_factor=args.guard_loss_factor,
+        guard_window=args.guard_window,
+        guard_max_consecutive=args.guard_max_consecutive,
+        alpha_aux=args.alpha_aux, aux_frac_cap=args.aux_frac_cap,
+        aux_ratio_cap=args.aux_ratio_cap,
     )
 
     if args.resume:
@@ -216,9 +251,11 @@ def main() -> None:
     theta = model.fit_threshold_(
         renormed(itertools.islice(calib_reader.sequential_batches(BATCH), n_calib_batches)),
         target_avg_blocks=model.cfg.k,
+        method=args.theta_method,
     )
-    print(f"calibrated theta {theta:.5f} (target avg blocks {model.cfg.k}, "
-          f"{n_calib_batches * BATCH:,} calib tokens)", flush=True)
+    print(f"calibrated theta {theta:.5f} ({args.theta_method}, target avg "
+          f"blocks {model.cfg.k}, {n_calib_batches * BATCH:,} calib tokens)",
+          flush=True)
     # Re-save so the calibrated theta is serialized with the checkpoint
     # (design: theta frozen and serialized with the codec — sol S1; the
     # pre-calibration save above holds theta = NaN).
@@ -304,6 +341,16 @@ def main() -> None:
         "shuffle_seed": SHUFFLE_SEED,
         "whitener_hash": whitener.hash,
         "theta": theta,
+        "theta_method": args.theta_method,
+        # E2/E3 gate surface (runbook-phase099 tranche 1): skip rate is a
+        # gate, guard events carry the postmortem.
+        "guard": args.guard,
+        "skipped_steps": trainer.skipped_steps,
+        "skip_rate": round(trainer.skipped_steps / max(1, trainer.step_idx), 6),
+        "guard_events": trainer.guard_events,
+        "alpha_aux": args.alpha_aux,
+        "aux_frac_cap": args.aux_frac_cap,
+        "aux_ratio_cap": args.aux_ratio_cap,
         "eval": results,
         "dead_frac_final_window": dead_frac,
         "train_minutes": round(train_minutes, 2),

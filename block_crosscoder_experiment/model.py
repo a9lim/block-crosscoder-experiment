@@ -12,6 +12,7 @@ optimizer-step -> retract -> recast ordering are the trainer's job.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
@@ -20,7 +21,77 @@ from torch import nn
 
 from .gram import init_decoder_stack, rank_penalty
 
-__all__ = ["BSCConfig", "BSCOutput", "BlockCrosscoder", "batch_topk_mask", "bsc_loss"]
+__all__ = [
+    "BSCConfig",
+    "BSCOutput",
+    "BlockCrosscoder",
+    "StreamingScoreQuantile",
+    "batch_topk_mask",
+    "bsc_loss",
+]
+
+
+class StreamingScoreQuantile:
+    """Bounded-memory pooled-score quantile (E1, runbook-phase099).
+
+    A fixed log-spaced histogram over the selection-score range: scores
+    are non-negative block norms, so bins span [lo, hi] geometrically
+    with dedicated underflow (score <= lo, including exact zeros) and
+    overflow bins. Counts are int64 — accumulation is deterministic and
+    batch-order independent, unlike any floating-point running sum. Peak
+    memory is O(n_bins) (~8 MB at the default 2^20), independent of the
+    calibration token count; per-batch work is one bucketize + bincount
+    on the scores' device.
+
+    Resolution: one bin = hi/lo spread over n_bins geometrically =
+    ~3.1e-5 relative width at the defaults — far inside the
+    |Δ avg-blocks| <= 0.1 validation gate. The quantile returns the
+    geometric midpoint of the crossing bin.
+
+    Non-finite scores raise: a NaN/inf selection score is a bug upstream
+    and silence here would launder it into theta.
+    """
+
+    def __init__(
+        self,
+        n_bins: int = 1 << 20,
+        lo: float = 1e-9,
+        hi: float = 1e5,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        if not (0 < lo < hi):
+            raise ValueError("need 0 < lo < hi")
+        self.lo, self.hi, self.n_bins = float(lo), float(hi), int(n_bins)
+        self.edges = torch.logspace(
+            math.log10(lo), math.log10(hi), n_bins + 1,
+            dtype=torch.float32, device=device,
+        )
+        # counts[0] = underflow (<= lo), counts[1..n_bins] = bins,
+        # counts[n_bins+1] = overflow (> hi).
+        self.counts = torch.zeros(n_bins + 2, dtype=torch.int64)
+
+    @torch.no_grad()
+    def update(self, scores: torch.Tensor) -> None:
+        s = scores.detach().flatten().float()
+        if not torch.isfinite(s).all():
+            raise ValueError("non-finite selection scores in calibration batch")
+        idx = torch.bucketize(s, self.edges.to(s.device), right=False)
+        self.counts += torch.bincount(idx, minlength=self.n_bins + 2).cpu()
+
+    def quantile(self, q: float) -> float:
+        n = int(self.counts.sum())
+        if n == 0:
+            raise ValueError("no scores accumulated")
+        target = min(max(int(round(q * n)), 1), n)
+        cum = torch.cumsum(self.counts, dim=0)
+        bin_idx = int(torch.searchsorted(cum, torch.tensor(target), right=False))
+        if bin_idx == 0:
+            return self.lo
+        if bin_idx >= self.n_bins + 1:
+            return self.hi
+        lo_edge = float(self.edges[bin_idx - 1])
+        hi_edge = float(self.edges[bin_idx])
+        return math.sqrt(lo_edge * hi_edge)
 
 
 @dataclass
@@ -170,28 +241,46 @@ class BlockCrosscoder(nn.Module):
             self.E.mul_(mean_p.median() / mean_p.mean())
 
     @torch.no_grad()
-    def fit_threshold_(self, batches, target_avg_blocks: float) -> float:
+    def fit_threshold_(
+        self, batches, target_avg_blocks: float, *, method: str = "exact"
+    ) -> float:
         """Fit the frozen inference threshold theta on the calibration
         split so the average active-block count hits the preregistered
         target (D10): mean count = G * P(p > theta), so theta is the
         (1 - target/G) quantile of the pooled score distribution.
-        Uses kthvalue, not torch.quantile (which caps at ~16M elements).
-        Scores accumulate on CPU: at G=4096 the pooled score matrix is
-        ~8.6 GB for the 0.9 calibration split and cannot sit next to the
-        model on a 24 GB card (0.9.5 dead-arm OOM). The estimator is
-        unchanged — exact pooled quantile, just host-side. The Phase-1
-        13M-token calibration needs the streaming quantile regardless
-        (carry item; ~213 GB at G=4096 exceeds host RAM too).
+
+        method="exact": kthvalue over host-accumulated scores (not
+        torch.quantile, which caps at ~16M elements). At G=4096 the
+        pooled score matrix is ~8.6 GB for the 0.9 calibration split and
+        cannot sit next to the model on a 24 GB card (0.9.5 dead-arm
+        OOM); at pilot scale the scalar arm OOM'd 61 GB host RAM even at
+        64 batches. Kept as the validation reference.
+
+        method="streaming": bounded-memory log-histogram quantile
+        (E1, runbook-phase099 tranche 1) — the Phase-1 production path,
+        mandatory for the 13M-token calibration split, any G >= 8192
+        config, and the scalar production arm. Deterministic
+        (batch-order independent, int64 counts); resolution ~3e-5
+        relative in theta. Validation gate vs exact:
+        |Δ avg-blocks| <= 0.1.
         """
-        scores = torch.cat(
-            [self.scores(self.encode(x.to(self.E.device, self.E.dtype)))
-             .flatten().float().cpu()
-             for x in batches]
-        )
-        n = scores.numel()
         q = 1.0 - target_avg_blocks / self.cfg.n_blocks
-        idx = min(max(int(round(q * n)), 1), n)
-        theta = float(scores.kthvalue(idx).values)
+        if method == "streaming":
+            hist = StreamingScoreQuantile(device=self.E.device)
+            for x in batches:
+                hist.update(self.scores(self.encode(x.to(self.E.device, self.E.dtype))))
+            theta = hist.quantile(q)
+        elif method == "exact":
+            scores = torch.cat(
+                [self.scores(self.encode(x.to(self.E.device, self.E.dtype)))
+                 .flatten().float().cpu()
+                 for x in batches]
+            )
+            n = scores.numel()
+            idx = min(max(int(round(q * n)), 1), n)
+            theta = float(scores.kthvalue(idx).values)
+        else:
+            raise ValueError("method must be 'exact' or 'streaming'")
         self.theta.fill_(theta)
         return theta
 

@@ -141,3 +141,65 @@ def test_train_smoke_loss_decreases(device):
         assert gram_residual(model.D).max().item() < 1e-4
     assert losses[-1] < 0.5 * losses[0]
     assert all(torch.isfinite(torch.tensor(losses)))
+
+
+# -- E1 streaming theta quantile (runbook-phase099 tranche 1) ----------------
+
+
+def test_streaming_quantile_matches_exact_kthvalue(device):
+    from block_crosscoder_experiment.model import StreamingScoreQuantile
+
+    gen = torch.Generator().manual_seed(5)
+    scores = torch.rand(200_000, generator=gen).pow(2) * 30  # skewed, positive
+    hist = StreamingScoreQuantile(device=device)
+    for chunk in scores.to(device).split(4096):
+        hist.update(chunk)
+    for q in (0.5, 0.99, 0.9921875):  # last = 1 - 32/4096, the pilot target
+        n = scores.numel()
+        idx = min(max(int(round(q * n)), 1), n)
+        exact = float(scores.kthvalue(idx).values)
+        assert abs(hist.quantile(q) - exact) / exact < 1e-3
+
+
+def test_streaming_quantile_batch_order_independent(device):
+    from block_crosscoder_experiment.model import StreamingScoreQuantile
+
+    gen = torch.Generator().manual_seed(6)
+    chunks = [torch.rand(1000, generator=gen) * 50 for _ in range(20)]
+    a, b = StreamingScoreQuantile(device=device), StreamingScoreQuantile(device=device)
+    for c in chunks:
+        a.update(c.to(device))
+    for c in reversed(chunks):
+        b.update(c.to(device))
+    assert torch.equal(a.counts, b.counts)
+    assert a.quantile(0.99) == b.quantile(0.99)
+
+
+def test_streaming_quantile_rejects_nonfinite(device):
+    from block_crosscoder_experiment.model import StreamingScoreQuantile
+
+    hist = StreamingScoreQuantile(device=device)
+    bad = torch.tensor([1.0, float("nan")], device=device)
+    with pytest.raises(ValueError, match="non-finite"):
+        hist.update(bad)
+
+
+def test_fit_threshold_streaming_matches_exact(device):
+    """The E1 validation gate in miniature: theta and realized avg-blocks
+    agree between methods on the same calibration batches."""
+    model = BlockCrosscoder(CFG).to(device)
+    gen = torch.Generator().manual_seed(7)
+    calib = [
+        torch.randn(512, CFG.n_sites, CFG.d_model, generator=gen).to(device)
+        for _ in range(8)
+    ]
+    theta_exact = model.fit_threshold_(calib, float(CFG.k), method="exact")
+    counts_exact = torch.cat(
+        [model(x, mode="threshold").mask.sum(dim=1).float() for x in calib]
+    )
+    theta_stream = model.fit_threshold_(calib, float(CFG.k), method="streaming")
+    counts_stream = torch.cat(
+        [model(x, mode="threshold").mask.sum(dim=1).float() for x in calib]
+    )
+    assert abs(theta_stream - theta_exact) / theta_exact < 1e-3
+    assert abs(float(counts_stream.mean()) - float(counts_exact.mean())) <= 0.1

@@ -256,3 +256,127 @@ def test_adamw8bit_retraction_ordering():
     assert history[-1]["rec"] < 0.5 * history[0]["rec"]
     assert float(gram_residual(trainer.master.D).max()) < 1e-4
     assert all(torch.isfinite(p).all() for p in trainer.master.parameters())
+
+
+# -- E2 spike guard (runbook-phase099 tranche 1) -----------------------------
+
+
+def _warm_guarded_trainer(device, *, window=10, max_consecutive=3, **overrides):
+    """Trainer with the guard armed: enough clean accepted steps to fill
+    the trailing-median window."""
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(
+        model,
+        train_cfg(
+            total_steps=200,
+            guard=True,
+            guard_window=window,
+            guard_max_consecutive=max_consecutive,
+            **overrides,
+        ),
+    )
+    for x in planted_batches(device, n_batches=window + 5, seed=11):
+        trainer.step(x)
+    assert trainer.skipped_steps == 0
+    return trainer
+
+
+def test_guard_skips_poisoned_batch_and_recovers(device):
+    trainer = _warm_guarded_trainer(device)
+    clean = planted_batches(device, n_batches=2, seed=13)
+    before = [p.detach().clone() for p in trainer.master.parameters()]
+    rec = trainer.step(clean[0] * 1e4)  # grad AND loss anomalous -> skip
+    assert rec["skipped"] is True and rec["skip_reason"] == "spike"
+    for p, b in zip(trainer.master.parameters(), before):
+        assert torch.equal(p.detach(), b), "skipped step must not move params"
+    assert trainer.skipped_steps == 1
+    assert trainer.guard_events[-1]["reason"] == "spike"
+    assert "batch_hash" in trainer.guard_events[-1]
+    rec2 = trainer.step(clean[1])  # clean batch accepted, counter resets
+    assert "skipped" not in rec2
+    assert trainer._guard_consecutive == 0
+
+
+def test_guard_nonfinite_always_skips(device):
+    trainer = _warm_guarded_trainer(device)
+    x = planted_batches(device, n_batches=1, seed=17)[0].clone()
+    x[0, 0, 0] = float("nan")
+    before = [p.detach().clone() for p in trainer.master.parameters()]
+    rec = trainer.step(x)
+    assert rec["skipped"] is True and rec["skip_reason"] == "nonfinite"
+    for p, b in zip(trainer.master.parameters(), before):
+        assert torch.equal(p.detach(), b)
+
+
+def test_guard_consecutive_cap_raises(device):
+    trainer = _warm_guarded_trainer(device, max_consecutive=2)
+    poison = planted_batches(device, n_batches=1, seed=19)[0] * 1e4
+    trainer.step(poison)
+    trainer.step(poison)
+    with pytest.raises(RuntimeError, match="not stable"):
+        trainer.step(poison)
+
+
+def test_guard_state_survives_checkpoint(device, tmp_path):
+    trainer = _warm_guarded_trainer(device)
+    trainer.step(planted_batches(device, n_batches=1, seed=23)[0] * 1e4)
+    ckpt = tmp_path / "guarded.pt"
+    trainer.save_checkpoint(ckpt)
+    restored = Trainer.load_checkpoint(ckpt, device=device)
+    assert restored.skipped_steps == trainer.skipped_steps
+    assert restored._guard_grad_hist == trainer._guard_grad_hist
+    assert restored._guard_rec_hist == trainer._guard_rec_hist
+    assert restored.guard_events == trainer.guard_events
+    assert restored.cfg.guard and restored.cfg.guard_window == 10
+
+
+def test_guard_off_by_default_unchanged(device):
+    """Two trainers, guard off vs on, identical clean data: identical
+    parameters — the guard must be a no-op on clean runs."""
+    runs = []
+    for guard in (False, True):
+        model = BlockCrosscoder(CFG).to(device)
+        trainer = Trainer(model, train_cfg(total_steps=30, guard=guard))
+        trainer.fit(planted_batches(device, n_batches=30, seed=29))
+        assert trainer.skipped_steps == 0
+        runs.append([p.detach().clone() for p in trainer.master.parameters()])
+    for a, b in zip(*runs):
+        assert torch.equal(a, b)
+
+
+# -- E3 AuxK caps ------------------------------------------------------------
+
+
+def _aux_cfg(**overrides):
+    """SASA aux with a tiny window and an impossible threshold: every block
+    counts as dead once the window fills, so the cap arithmetic is exercised
+    deterministically."""
+    return train_cfg(
+        aux_variant="sasa",
+        dead_threshold=1.0,
+        dead_window_batches=3,
+        s_aux=8,
+        **overrides,
+    )
+
+
+def test_aux_frac_cap_changes_selection(device):
+    recs = {}
+    for frac in (None, 0.25):
+        model = BlockCrosscoder(CFG).to(device)
+        trainer = Trainer(model, _aux_cfg(aux_frac_cap=frac))
+        for x in planted_batches(device, n_batches=6, seed=31):
+            rec = trainer.step(x)
+        recs[frac] = rec
+    # all G=16 blocks dead: uncapped keep=8, frac-capped keep=ceil(.25*16)=4
+    assert "aux" in recs[None] and "aux" in recs[0.25]
+    assert recs[None]["aux"] != recs[0.25]["aux"]
+
+
+def test_aux_ratio_cap_bounds_alpha(device):
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(model, _aux_cfg(aux_ratio_cap=1e-6, log_every=1))
+    for x in planted_batches(device, n_batches=6, seed=37):
+        rec = trainer.step(x)
+    assert rec["alpha_aux_eff"] < 1.0
+    assert rec["grad_norm_aux"] > 0

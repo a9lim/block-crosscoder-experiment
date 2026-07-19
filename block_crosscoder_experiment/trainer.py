@@ -35,6 +35,7 @@ import importlib.util
 import json
 import math
 import shutil
+import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -86,6 +87,30 @@ class TrainConfig:
     dead_threshold: float = 1e-4
     dead_window_batches: int = 100
     dead_horizon_batches: int = 500
+    # Loss-spike guard (E2, runbook-phase099 tranche 1): batch-skip with
+    # corroboration. Trigger = grad_norm > guard_factor x trailing median
+    # AND rec > guard_loss_factor x trailing median, medians over the last
+    # guard_window ACCEPTED steps (unarmed until the window fills). A
+    # grad-only anomaly is logged as a near-miss and never skipped — AuxK
+    # engagement legitimately moves gradient scale. Non-finite grad/loss
+    # always skips. More than guard_max_consecutive skips in a row raises:
+    # a run that needs sustained skipping is not at a stable operating
+    # point, and the guard must not censor that evidence (skip rate is a
+    # reported gate, runbook tranche 1).
+    guard: bool = False
+    guard_factor: float = 20.0
+    guard_loss_factor: float = 5.0
+    guard_window: int = 50
+    guard_max_consecutive: int = 5
+    # AuxK cap candidates (E3; mechanism pinned at Phase-1 config freeze).
+    # aux_frac_cap: revived blocks/step <= ceil(frac x live dead-set size)
+    # (dead-set variants only — fel has no dead set). aux_ratio_cap:
+    # rescale alpha so the aux gradient norm never exceeds ratio x the
+    # main-loss gradient norm (two extra grad passes per step where the
+    # dead set is nonempty). alpha_aux < 1 is the third candidate and
+    # needs no mechanism — it is already a config field.
+    aux_frac_cap: float | None = None
+    aux_ratio_cap: float | None = None
     # BatchTopK budget annealing (capture-sweep finding: budget ratio drives
     # the capture-vs-tiling basin). When set, k is interpolated linearly from
     # k_anneal_from to the model config's k over k_anneal_steps (default:
@@ -304,6 +329,13 @@ class Trainer:
         self.step_idx = 0
         self._k_final = float(model.cfg.k)  # annealing target
         self.ema_min_score: float | None = None  # diagnostic only (D10)
+        # Guard state (E2). Histories hold ACCEPTED-step values only, so a
+        # spike never poisons its own reference median.
+        self._guard_grad_hist: list[float] = []
+        self._guard_rec_hist: list[float] = []
+        self._guard_consecutive = 0
+        self.skipped_steps = 0
+        self.guard_events: list[dict] = []
         self._prev_shares = site_frobenius_shares(self.master.D).detach().clone()
         self.history: list[dict] = []
         self._log_file = Path(log_path).open("a") if log_path is not None else None
@@ -328,9 +360,18 @@ class Trainer:
         parts = bsc_loss(out, x, self.fwd)
         self.tracker.update(out.mask)
 
+        trainable = [p for p in self.fwd.parameters() if p.requires_grad]
+
+        def norm_of(loss: torch.Tensor) -> float:
+            g = torch.autograd.grad(loss, trainable, retain_graph=True, allow_unused=True)
+            return math.sqrt(sum(float(t.float().pow(2).sum()) for t in g if t is not None))
+
         l_aux = None
+        alpha_eff = None
+        grad_norm_aux = None
         if cfg.aux_variant != "none":
             dead = None
+            s_aux_eff = cfg.s_aux
             if cfg.aux_variant in ("sasa", "long_horizon"):
                 dead = self.tracker.dead(
                     cfg.aux_variant,
@@ -338,21 +379,36 @@ class Trainer:
                     window=cfg.dead_window_batches,
                     horizon=cfg.dead_horizon_batches,
                 )
-            l_aux = aux_loss(self.fwd, x, out, cfg.aux_variant, dead, cfg.s_aux)
+                if cfg.aux_frac_cap is not None:
+                    # E3 frac cap: revival budget proportional to the live
+                    # dead set, never the full s_aux slam.
+                    n_dead = int(dead.sum().item())
+                    s_aux_eff = min(
+                        cfg.s_aux, max(1, math.ceil(cfg.aux_frac_cap * n_dead))
+                    )
+            l_aux = aux_loss(self.fwd, x, out, cfg.aux_variant, dead, s_aux_eff)
             if l_aux is not None:
                 alpha = 1.0 / cfg.s_aux if cfg.aux_variant == "fel" else cfg.alpha_aux
+                alpha_eff = alpha
+                if cfg.aux_ratio_cap is not None:
+                    # E3 ratio cap: bound the aux update energy relative to
+                    # the main-loss gradient, exactly (two extra grad
+                    # passes; the cascade signature is grad_norm_aux
+                    # 3e-4 -> 108 while the main loss barely moves).
+                    grad_norm_aux = norm_of(l_aux)
+                    norm_main = norm_of(parts["total"])
+                    if alpha * grad_norm_aux > cfg.aux_ratio_cap * norm_main:
+                        alpha_eff = (
+                            cfg.aux_ratio_cap * norm_main / max(grad_norm_aux, 1e-12)
+                        )
                 parts["aux"] = l_aux
-                parts["total"] = parts["total"] + alpha * l_aux
+                parts["total"] = parts["total"] + alpha_eff * l_aux
 
         # Aux/main gradient norms are a pilot logging requirement; the aux
-        # norm is measured exactly on log steps via a separate grad pass.
-        grad_norm_aux = None
-        trainable = [p for p in self.fwd.parameters() if p.requires_grad]
-        if log_step and l_aux is not None:
-            g = torch.autograd.grad(l_aux, trainable, retain_graph=True, allow_unused=True)
-            grad_norm_aux = math.sqrt(
-                sum(float(t.float().pow(2).sum()) for t in g if t is not None)
-            )
+        # norm is measured exactly on log steps via a separate grad pass
+        # (already available on every step when the ratio cap is active).
+        if log_step and l_aux is not None and grad_norm_aux is None:
+            grad_norm_aux = norm_of(l_aux)
 
         self.opt.zero_grad(set_to_none=True)
         if self.fwd is not self.master:
@@ -376,21 +432,81 @@ class Trainer:
             )
         )
 
+        # E2 guard: decide before any state is touched. Non-finite always
+        # skips; a corroborated spike (grad AND loss anomalous vs the
+        # accepted-step trailing medians) skips; a grad-only anomaly is a
+        # near-miss, logged and applied.
+        rec_val = float(parts["rec"].detach())
+        skip_reason = None
+        if cfg.guard:
+            if not (math.isfinite(grad_norm) and math.isfinite(rec_val)):
+                skip_reason = "nonfinite"
+            elif len(self._guard_grad_hist) >= cfg.guard_window:
+                g_med = statistics.median(self._guard_grad_hist)
+                r_med = statistics.median(self._guard_rec_hist)
+                grad_anom = grad_norm > cfg.guard_factor * g_med
+                loss_anom = rec_val > cfg.guard_loss_factor * r_med
+                if grad_anom and loss_anom:
+                    skip_reason = "spike"
+                elif grad_anom:
+                    skip_reason = "near_miss"  # logged below, not skipped
+        skipped = skip_reason in ("nonfinite", "spike")
+        if cfg.guard and skip_reason is not None:
+            event = {
+                "step": self.step_idx,
+                "reason": skip_reason,
+                "skipped": skipped,
+                "grad_norm": grad_norm,
+                "rec": rec_val,
+                "lr": self.sched.get_last_lr()[0],
+                # Cheap deterministic batch identity for the postmortem
+                # (the step-1600 lesson: spikes can be data-driven).
+                "batch_hash": f"{x.shape[0]}x{float(x.float().sum()):.6e}",
+            }
+            self.guard_events.append(event)
+            if self._log_file is not None:
+                self._log_file.write(json.dumps({"guard_event": event}) + "\n")
+                self._log_file.flush()
+
         # The load-bearing ordering: step on master -> retract master ->
         # regenerate the forward copy -> measure the post-cast residual.
-        self.opt.step()
-        self.sched.step()
+        # A skipped step drops the update but still advances the schedule,
+        # so run length and the lr curve stay deterministic.
         floor_hits = 0
-        if self.step_idx % cfg.retract_every == 0:
-            floor_hits = retract_(self.master.D.data, eig_floor=self.master.cfg.eig_floor)
-        if self.fwd is not self.master:
-            with torch.no_grad():
-                for m, f in zip(self.master.parameters(), self.fwd.parameters()):
-                    f.copy_(m)
-                self.fwd.theta.copy_(self.master.theta)
+        if skipped:
+            self.opt.zero_grad(set_to_none=True)
+            self.sched.step()
+            self.skipped_steps += 1
+            self._guard_consecutive += 1
+            if self._guard_consecutive > cfg.guard_max_consecutive:
+                raise RuntimeError(
+                    f"spike guard skipped {self._guard_consecutive} consecutive "
+                    f"steps at step {self.step_idx} (lr "
+                    f"{self.sched.get_last_lr()[0]:.2e}) — this operating point "
+                    "is not stable; the guard refuses to censor it (E2)"
+                )
+        else:
+            self.opt.step()
+            self.sched.step()
+            if self.step_idx % cfg.retract_every == 0:
+                floor_hits = retract_(
+                    self.master.D.data, eig_floor=self.master.cfg.eig_floor
+                )
+            if self.fwd is not self.master:
+                with torch.no_grad():
+                    for m, f in zip(self.master.parameters(), self.fwd.parameters()):
+                        f.copy_(m)
+                    self.fwd.theta.copy_(self.master.theta)
+            self._guard_consecutive = 0
+            if cfg.guard and math.isfinite(grad_norm) and math.isfinite(rec_val):
+                self._guard_grad_hist.append(grad_norm)
+                self._guard_rec_hist.append(rec_val)
+                if len(self._guard_grad_hist) > cfg.guard_window:
+                    self._guard_grad_hist.pop(0)
+                    self._guard_rec_hist.pop(0)
 
         selected = out.scores.detach()[out.mask]
-        if selected.numel() > 0:
+        if selected.numel() > 0 and not skipped:
             batch_min = float(selected.min())
             self.ema_min_score = (
                 batch_min
@@ -400,7 +516,7 @@ class Trainer:
 
         record = {
             "step": self.step_idx,
-            "rec": float(parts["rec"].detach()),
+            "rec": rec_val,
             "total": float(parts["total"].detach()),
             "lr": self.sched.get_last_lr()[0],
             "grad_norm": grad_norm,
@@ -414,6 +530,11 @@ class Trainer:
             record["aux"] = float(l_aux.detach())
         if grad_norm_aux is not None:
             record["grad_norm_aux"] = grad_norm_aux
+        if alpha_eff is not None and cfg.aux_ratio_cap is not None:
+            record["alpha_aux_eff"] = alpha_eff
+        if skip_reason is not None:
+            record["skip_reason"] = skip_reason
+            record["skipped"] = skipped
         if log_step:
             record.update(self._diagnostics())
             self.history.append(record)
@@ -464,6 +585,15 @@ class Trainer:
             "step_idx": self.step_idx,
             "k_final": self._k_final,  # cfg.k may be mid-anneal at save time
             "ema_min_score": self.ema_min_score,
+            # Guard state (E2): histories feed future skip decisions, so
+            # resume must restore them for bit-compatible continuation.
+            "guard": {
+                "grad_hist": list(self._guard_grad_hist),
+                "rec_hist": list(self._guard_rec_hist),
+                "consecutive": self._guard_consecutive,
+                "skipped_steps": self.skipped_steps,
+                "events": list(self.guard_events),
+            },
             "model_cfg": asdict(self.master.cfg),
             "train_cfg": asdict(self.cfg),
             "optimizer_kind": self.optimizer_kind,
@@ -503,6 +633,13 @@ class Trainer:
         trainer.step_idx = payload["step_idx"]
         trainer._k_final = payload.get("k_final", float(model_cfg.k))
         trainer.ema_min_score = payload["ema_min_score"]
+        guard_state = payload.get("guard")  # absent in pre-E2 checkpoints
+        if guard_state is not None:
+            trainer._guard_grad_hist = list(guard_state["grad_hist"])
+            trainer._guard_rec_hist = list(guard_state["rec_hist"])
+            trainer._guard_consecutive = guard_state["consecutive"]
+            trainer.skipped_steps = guard_state["skipped_steps"]
+            trainer.guard_events = list(guard_state["events"])
         if trainer.fwd is not trainer.master:
             with torch.no_grad():
                 for m, f in zip(trainer.master.parameters(), trainer.fwd.parameters()):
