@@ -223,10 +223,15 @@ silent). **Second overnight campaign (03:47–09:35) completed the λ=0
 frontier (k∈{16,32,64} × both arms + renorm k32) and tranche-4 seeds
 (≥3 per headline cell, spreads 0.0002–0.0009; tying delta replicates
 3/3; λ ~free at 4b both gauges)** — H3 preview verdict: support
-amortization ≈4× across k, **renorm strictly dominates the scalar
-frontier in the ~800-bit overlap region**, primary ties mid-region,
-cross-site tying ≈ 7.8× rate cut vs per-site models at ≈equal pooled
-FVU (`figures/phase099/rd_frontier.png`). Morning of 07-19 (a9):
+amortization ≈4× across k, cross-site tying ≈ 7.8× rate cut vs
+per-site models at ≈equal pooled FVU
+(`figures/phase099/rd_frontier.png`). **Renorm k16/k64 extension runs
+(07-19 afternoon) completed the ratified-gauge frontier: renorm
+strictly dominates the scalar frontier everywhere they overlap,
+~390 → ~1,600 bits** (k64: 0.3660 @ 1491.6 vs scalar k32 0.3718 @
+1588.4, CIs disjoint — the mid-region primary-gauge tie upgraded to
+strict dominance); scalar holds only the unanswered ≥2.9 kbit end
+(needs block k128). Morning of 07-19 (a9):
 **rcap pin ratified, design updated to v2.4 (pinned Phase-1 stack)**,
 renorm k16/k64 frontier completion + E6 +6M store extension launched
 (`scripts/run_phase099_ext.sh`). **Single-site R-D placement complete

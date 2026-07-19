@@ -416,14 +416,18 @@ Secondary findings:
 
 ## Tranches 3+4 trainings (second overnight campaign, 03:47 → ~10:00)
 
-**λ=0 frontier, seed 0 (pooled FVU, topk; codec R-D positions pending
-the post-campaign sweep):**
+**λ=0 frontier, seed 0 (pooled FVU, topk; renorm k16/k64 landed with
+the 07-19 extension chain — grid complete):**
 
 | k (blocks) | BSC | renorm | scalar (4k latents) |
 |---|---|---|---|
-| 16 | 0.502 | — | 0.425 |
+| 16 | 0.502 | 0.4822 | 0.425 |
 | 32 | 0.4297 | 0.4156 | 0.3682 |
-| 64 | 0.3738 | — | 0.3201 |
+| 64 | 0.3738 | 0.3598 | 0.3201 |
+
+The renorm advantage is k-stable (+0.020/+0.014/+0.014 at k16/32/64);
+both extension runs were textbook (0 guard events, dead 0.15%/0.0%,
+monotone per-site profiles).
 
 - **λ is ~free at 4b on both gauges**: λ=0 k32 lands on the λ=1e-3
   ratified arms to the third decimal (BSC 0.4297 vs 0.4299; renorm
@@ -435,26 +439,30 @@ q=4 positions; figure `figures/phase099/rd_frontier.png`):**
 
 | region | block arm | scalar arm | verdict |
 |---|---|---|---|
-| ~390 bits | bsc k16: 0.508 @ 391 | *(none — needs k≈6)* | blocks extend the frontier into the ultra-cheap region |
+| ~390 bits | **renorm k16: 0.4869 @ 390.7** / bsc k16: 0.508 @ 391 | *(none — needs k≈6)* | blocks extend the frontier into the ultra-cheap region; renorm leads it |
 | ~770–820 bits | **renorm k32: 0.4207 @ 770.5** / bsc k32: 0.4360 @ 772.7 | scalar k16: 0.4306 @ 822.0 | **renorm strictly dominates** (better FVU at fewer bits); primary vs scalar non-dominated |
-| ~1.5 kbit | bsc k64: 0.3813 @ 1493.5 | scalar k32: 0.3718 @ 1588.4 (interp @ 1494 ≈ 0.379) | statistical tie on the primary gauge (Δ ≈ 0.002 ≈ CI width) |
+| ~1.5 kbit | **renorm k64: 0.3660 @ 1491.6** / bsc k64: 0.3813 @ 1493.5 | scalar k32: 0.3718 @ 1588.4 | **renorm strictly dominates** (CIs disjoint: 0.3675 < 0.3703, at ~100 fewer bits); primary vs scalar a statistical tie |
 | ~2.9 kbit | *(none — needs k=128)* | scalar k64: 0.3249 @ 2900 | scalar extends the frontier at the expensive end |
 
 - **The matched-L0 "block tax" inverts on the honest axis.** At
   matched latent count the scalar arm wins by 0.047 FVU; at matched
-  *bits* the renorm gauge strictly dominates the scalar frontier in
-  the region where they overlap, and the primary gauge ties it. This
-  is H3's preregistered question answered in preview form: the
-  support-bit amortization (measured 4.07×/4.08×/4.01× at k16/32/64)
-  is real purchasing power, not accounting.
+  *bits* the renorm gauge **strictly dominates the scalar frontier
+  everywhere they overlap (~390 → ~1,600 bits)** — the k64 renorm
+  extension run (07-19) upgraded the mid-region from "primary-gauge
+  tie" to strict dominance on the ratified gauge. This is H3's
+  preregistered question answered in preview form: the support-bit
+  amortization (measured 4.07×/4.08×/4.01× at k16/32/64) is real
+  purchasing power, not accounting. The renorm advantage over primary
+  is k-stable on the R-D plane too (−0.021/−0.015/−0.015 FVU at
+  essentially identical rates).
 - **R-D positions are seed-stable**: renorm 0.4205/0.4206/0.4207,
   scalar k32 0.3718/0.3730/0.3733, bsc λ0 0.4360/0.4370 — spreads at
   or below CI width.
-- **Known gap**: the renorm × k grid has only k32 (the ratified-gauge
-  frontier needs k16/k64 renorm runs — two 30-min runs — before the
-  H3 figure is production-grade). The scalar arm's cheap end (k≈6–8)
-  is unexplored; its interpolated frontier is used for the tie
-  verdict.
+- **Known gaps** (both at the frontier's ends, neither touches the
+  overlap verdict): the block arm's expensive end (k=128, would test
+  whether scalar's ~2.9 kbit lead survives a renorm point there) and
+  the scalar arm's cheap end (k≈6–8, would test whether scalar can
+  reach the ~390-bit region at all).
 - **Cross-site tying priced at the bits level — exact placement**
   (single-site codec passes for both families + an exact per-site
   sq_tot pass over the eval split;
