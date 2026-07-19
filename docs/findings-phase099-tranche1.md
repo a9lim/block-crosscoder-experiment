@@ -215,6 +215,55 @@ revival-retaining (battery PASS). The frac cap's remaining claim to
 the pin would be a materially better *unguarded* endpoint — tranche
 1b decides.
 
+### Unguarded cap arms (tranche 1b): what the cap is actually for
+
+**r4b (ratio cap 1.0, no guard, 6e-4): ran to completion through both
+excursions.** Side-by-side with the unguarded uncapped baseline
+(bit-identical seed wobble through step 1010, then):
+
+| | uncapped baseline | rcap 1.0 |
+|---|---|---|
+| excursion-1 peak grad (step ~1050) | **107.9** | **0.52** |
+| excursion-2 peak grad (step 1600) | **527.7** | **2.53** (≈ rcap geometry: aux ≤ main at rec-spike main-grad) |
+| peak dead (kill wave, ~1110–1150) | 13.0% | 15.3% |
+| dead by step 1590 (revival) | 6.1% | **0.17%** |
+| final dead | 3.08% | **0.098% — the healthy band exactly** |
+| final grad noise (step 2920) | 0.074 | 0.0039 |
+| pooled FVU (topk) | 0.553 | **0.524** |
+
+Four conclusions, sharper than the registered prediction:
+
+1. **The cap does not rescue the endpoint** — 0.524 vs 0.553, both
+   damaged against clean 3e-4's 0.430. The lasting damage is done by
+   the main-loss wobble itself; no aux mechanism can prevent it. The
+   guard's refusal remains the correct production posture for 6e-4;
+   lr recovery is not what the cap buys.
+2. **The cap crushes the amplifier by 2 orders of magnitude** (107.9 →
+   0.52; 527.7 → 2.53) — the registered prediction (rcap tightens as
+   the cascade grows) confirmed at full scale.
+3. **The kill wave is NOT aux-driven — but chronic mortality is.** The
+   cap did not shrink the kill wave (15.3% vs 13.0% peak: deaths come
+   from the blown main weights). What it changed is what happens
+   *after*: under the cap, revival works (15.3% → 0.17% before the
+   second excursion; final 0.098%, indistinguishable from a healthy
+   run) while the uncapped s_aux=256 slam is **self-defeating** —
+   grad-100+ revival steps re-kill what they revive, and the baseline
+   never gets below ~3–6% dead again. The SASA cascade's real
+   production cost is chronic elevated mortality, and the ratio cap
+   eliminates exactly that.
+4. **The step-1600 excursion is batch-locked**: it fires at step 1600
+   in both runs although their weights diverged at 1013 — a
+   data-driven event (poison-batch class), precisely what the guard's
+   freeze-and-skip path handles. Seed wobble → guard refuses the
+   operating point; poison batch → guard skips it; cascade amplifier →
+   cap defuses it. The three mechanisms partition the observed failure
+   modes with no overlap.
+
+*(r5b frac cap, r6b renorm + ratio cap: pending. Registered
+expectation for r5b: at 13% dead the frac cap allows s_aux_eff ≈ 266
+> 256 — no protection exactly when the cascade is largest — so its
+dead-block endpoint should look like the uncapped baseline's.)*
+
 **r6 (renorm + ratio cap 1.0 + guard, 6e-4): refused at step 977.**
 The renorm arm's wobble is its own — earlier (near-misses from 963,
 non-consecutive: 963/966/969/970, a ~14-step build) and **rec-led**:
