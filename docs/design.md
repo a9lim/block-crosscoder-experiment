@@ -1093,3 +1093,39 @@ public (P23, round-3 novelty verdict).
   loss-spike guard remains a requirement alongside it. Standing eval
   rule from the mega-block observation: top-1 capture is never read
   without ring order and FVU beside it.
+- **2026-07-18 (Phase 0.9.9 chartered — pre-NVMe campaign)** — a9
+  ratified the pre-NVMe campaign
+  ([`runbook-phase099.md`](runbook-phase099.md); fable recon + Codex
+  sol consult `cx-20260718-230829-9fe8`, whose center-of-gravity
+  correction — factorial baselines, honest R-D, and robustness
+  outrank optimizer headroom — is adopted). Scope: (i) the
+  Phase-1-blocking engineering (streaming θ-quantile first, spike
+  guard with skip-rate-as-gate discipline, AuxK cap pinned via
+  cascade-suppression × Phase −1 revival-retention, prefetch);
+  (ii) **the 2×2 factorial completed** — two additive baseline cells,
+  {block, single-site} (S=1 "BSF cell"; Gram at S=1 = per-block
+  orthonormal decoder) and {scalar, single-site} (per-site SAE), both
+  config-only with exact per-site parameter/rate matching (the S=1
+  limit deletes only code tying); the existing b=1 Gram arm is
+  recognized as the {scalar, cross-site} ordinary-crosscoder cell.
+  The paper's thesis becomes a positive interaction term; (iii) the
+  preregistered R-D codec implemented + validated on the pilot store,
+  with λ=0 pilot frontiers (k ∈ {16,32,64} × both arms, 2 seeds) as
+  the H3 preview; (iv) ≥3 seeds per headline cell, balanced;
+  (v) targeted lr recovery demoted behind (i)–(iv), renorm-first
+  {3e-4, 4.5e-4, 6e-4}, no 9e-4, re-ratification only on predeclared
+  aggregate endpoints — **calendar/zoo/atlas families are burned as
+  selection criteria** (probe-overfitting guard); a fresh sealed
+  six-family probe panel (zodiac, US states, ranks, SI prefixes, size
+  adjectives, alphabet) is preregistered blind and opened only at
+  config freeze; (vi) a +6M-token store extension on /data enabling
+  the epochs-vs-fresh factorial at matched 24M optimizer tokens;
+  (vii) production-harvest derisk (5M-slice whitener stability,
+  tail stats, throughput forecast). **Causal intervention explicitly
+  deferred by a9** (the consult's top qualitative pick; Phase-2
+  territory). **Data-purge authorization exercised**: bcc-phase09
+  (143 GB) and bcc-phase0 (22 GB) stores deleted — findings committed,
+  pinned artifacts in-repo, both regenerable by script; /data ≈
+  507 GB free. Additive arms and instruments only — no frozen surface
+  changed; the 3e-4/renorm/site-list ratifications stand unless the
+  tranche-5 bar is met.

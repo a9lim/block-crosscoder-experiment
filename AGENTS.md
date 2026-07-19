@@ -40,10 +40,11 @@ experiments with explicit go/no-go gates.
   bracketed 07-15 review amendments; it is the literature ground truth for
   this project.
 
-**Status: Phases −1, 0, 0.5, 0.9, and 0.9.5 PASSED/COMPLETE
-(2026-07-16/17). Next: Phase 1 (4b) — blocked on the 4 TB NVMe install
-and two a9 decisions; the ≥3M-token 4b pilot (D13) precedes the store
-commit.** A paper-fidelity audit (2026-07-17, fable + sol
+**Status: Phases −1, 0, 0.5, 0.9, 0.9.5, and 0.9.6 (incl. the D13 4b
+pilot) PASSED/COMPLETE (2026-07-16/17/18). Active: Phase 0.9.9, the
+a9-ratified pre-NVMe campaign
+([`docs/runbook-phase099.md`](docs/runbook-phase099.md)). Phase 1
+store commit waits only on the 4 TB NVMe install.** A paper-fidelity audit (2026-07-17, fable + sol
 counter-review;
 [`docs/design-review-2026-07-17-fidelity.md`](docs/design-review-2026-07-17-fidelity.md))
 produced the v2.3.2 amendment set, **ratified by a9 2026-07-17**,
@@ -160,6 +161,30 @@ block-anatomy 3D (one shared code + rotating frames with ghost
 decodes, b595/b2146), the hoverable all-block BSC atlas
 (`p4b_atlas.html`), the stacked world-map decode
 (`p4b_worldmap_3d.html`).
+
+**Phase 0.9.9 CHARTERED 2026-07-18**
+([`docs/runbook-phase099.md`](docs/runbook-phase099.md), a9-ratified;
+design decision log) — the pre-NVMe campaign, center of gravity per
+the Codex sol consult: (1) Phase-1-blocking engineering (streaming
+θ-quantile → spike guard with skip-rate-as-gate → AuxK cap pinned via
+cascade-suppression × Phase −1 revival retention → prefetch); (2) the
+**2×2 factorial completed** — new {block, single-site} "BSF cell" and
+{scalar, single-site} per-site-SAE cells, config-only at exact
+per-site parameter/rate matching (S=1 deletes only code tying; the
+existing b=1 Gram arm is the ordinary-crosscoder cell) — the thesis
+becomes a positive interaction term; (3) the preregistered R-D codec
+(currently **unimplemented**) built + validated on the pilot store,
+λ=0 pilot frontiers as the H3 preview; (4) ≥3 seeds per headline
+cell; (5) lr recovery demoted and guarded — **calendar/zoo/atlas
+families are burned as selection criteria**; a sealed six-family
+panel (zodiac/US states/ranks/SI prefixes/size adjectives/alphabet)
+is preregistered blind, opened only at config freeze; (6) +6M-token
+store extension on /data → epochs-vs-fresh factorial at matched 24M
+optimizer tokens; (7) production-harvest derisk. Causal intervention
+explicitly deferred by a9. **Purge executed under a9's 2026-07-18
+authorization**: bcc-phase09 + bcc-phase0 stores deleted (findings
+committed, regenerable by script); /data ≈ 507 GB free; /data/runs
+kept (backs committed figures).
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
