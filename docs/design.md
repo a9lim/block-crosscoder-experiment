@@ -62,7 +62,7 @@ C.1 positively separated), and the recovery-vs-frequency calibration
 (clean to f=0.01 at 10M tokens). Design re-frozen from this state; the
 decision log remains as provenance, and the body supersedes older log
 entries wherever both speak.
-**v2.3.2, 2026-07-17 (current)**: fidelity amendments after the
+**v2.3.2, 2026-07-17**: fidelity amendments after the
 paper-fidelity audit + sol counter-review (F1–F11, S1–S7; disposition
 in [`docs/design-review-2026-07-17-fidelity.md`](design-review-2026-07-17-fidelity.md)).
 Adds the **0.9.5 calibration addendum** (lr × schedule ladder on both
@@ -73,6 +73,21 @@ whitener, the Phase-3 freeze items (web+chat corpus mix, per-model
 init pairing), and the S-series code fixes (θ serialization, bf16
 shadow eval, corpus-revision pinning, checkpoint free-space floor).
 Ratified by a9 2026-07-17; design frozen as v2.3.2.
+**v2.4, 2026-07-19 (current)**: the Phase-1 training stack pinned
+from the 0.9.9 tranche-1–4 evidence (overnight campaign 2026-07-18→19,
+[`findings-phase099-tranche1.md`](findings-phase099-tranche1.md)):
+**AuxK aux-ratio-cap 1.0 ratified by a9 2026-07-19** (bit-inert when
+healthy at 4b, engages at cascade ignition, restores revival function
+under pathology; frac cap dominated, static α eliminated), loss-spike
+guard + streaming full-split θ + prefetch made mandatory production
+components, λ confirmed ~free at 4b on both gauges (primary stays
+λ=1e-3 per the largest-admissible protocol), seed determinism of the
+4b FVU endpoint recorded (spreads ≤ 0.0009; capture/order metrics
+remain the seed-sensitive surface), and the H3 preview + factorial
+interaction entered as evidence (renorm strictly dominates the scalar
+frontier in the overlap region; tying-×-blocking interaction +0.011
+pooled FVU). Body updated in *Configurations* (pinned stack); the
+gates and phase ladder are unchanged.
 
 ## Hypotheses
 
@@ -491,6 +506,26 @@ veto passed {3e-4, 1e-3} and failed 3e-3 (share concentration), making
 one-seed frontier exploration at 4b → both confirmatory
 seeds only at the preselected operating points. The 4b headline runs are
 not a hyperparameter search.
+
+### Phase-1 pinned training stack (v2.4, from the 0.9.9 evidence — a9 ratifications 2026-07-18 and -19)
+
+| component | pinned value | evidence (findings-phase099-tranche1) |
+|---|---|---|
+| optimizer point | **lr 3e-4 cosine**, enc-wd 0, 8-bit Adam, batch 4096 | ratified 2026-07-18; zero guard events across the full 0.9.9 campaign; 6e-4 and 1.2e-3 refused by the guard (mid-run instabilities, not warmup-peak) |
+| λ (BSC arms) | **1e-3** (largest admissible; H3/frontier comparisons at λ=0 per protocol) | λ empirically ~free at 4b: λ=0 ↔ 1e-3 within 0.0002 pooled FVU on both gauges |
+| gauge | **site-renorm (F7)** | three independent lines: fair-allocation match to single-site controls; R-D strict dominance of the scalar frontier in the overlap region; pilot ring evidence (0.9.6) |
+| AuxK | SASA C.1 + **aux-ratio-cap 1.0** (a9 2026-07-19) | bit-inert on healthy trajectories (1011 steps exact at 4b); engages at amplifier ignition; crushes cascades 100×+ (peak grads 107.9→0.52, 527.7→2.53); converts self-defeating revival into functional (final dead 3.08%→0.098%); frac cap dominated (not inert, FVU-neutral), static α eliminated (kills revival) |
+| loss-spike guard | **mandatory**: corroborated trigger (grad > 20× AND rec > 5× trailing accepted-median, window 50), skip advances scheduler, > 5 consecutive skips → refuse; **skip-rate ≤ 0.1% is a run gate** | silent at 3e-4 with 4th-digit FVU replication; refuses both unstable lrs rather than censoring them; skip-and-recover demonstrated live; poison batches are batch-locked (step-1600 event fired on 3 divergent trajectories) so the skip path is the designed handler |
+| θ calibration | **streaming log-histogram quantile over the full 13M calib split** (exact kthvalue banned at production scale) | 3/3 checkpoints within Δavg-blocks ≤ 0.0043; 19.5 GB RSS on the 61 GB-RAM case that OOM'd exact at 64 batches; full-split θ realizes *closer* to target k than capped exact |
+| data path | store-reader **prefetch 4** (order-preserving, exception-propagating); site-subset view available for single-site cells | data-wait 30% → 12% measured; subset stream provably identical to the joint stream sliced |
+| seeds | 2 confirmatory seeds at the operating points (unchanged) | 4b FVU endpoint is seed-deterministic (headline-cell spreads 0.0002–0.0009; tying delta replicates 3/3) — seed risk lives in capture/order metrics, which route through the sealed panel, not FVU |
+| eval | threshold-mode primary with realized counts; codec q ∈ {4, 6} (q=6 transparent, q=8 adds nothing); bf16 shadow both modes | q=6 reproduces unquantized FVU to the 3rd decimal on all arms; count model non-load-bearing (Bernoulli within ~5%) |
+
+Standing 4b facts the stack relies on: training is **bit-deterministic
+across runs** (8-bit Adam + CUDA included) — regression suites and
+spike forensics are exact; the healthy dead-block band at G=4096 is
+≈ 0.1–0.15%; support-bit amortization is stable at ≈ 4× across
+k ∈ {16, 32, 64}.
 
 ## Data & training topology
 
@@ -1129,3 +1164,45 @@ public (P23, round-3 novelty verdict).
   507 GB free. Additive arms and instruments only — no frozen surface
   changed; the 3e-4/renorm/site-list ratifications stand unless the
   tranche-5 bar is met.
+- **2026-07-19 (0.9.9 tranches 1–4 executed overnight; AuxK ratio cap
+  ratified; stack pinned as v2.4)** — the full tranche-1 engineering
+  campaign, the 2×2 factorial, the R-D codec first light, and the
+  seed battery ran autonomously overnight
+  ([`findings-phase099-tranche1.md`](findings-phase099-tranche1.md)).
+  E1 streaming θ 3/3 green (full-split θ *better* than capped exact;
+  the 61 GB OOM case now 19.5 GB). E2 guard suite green — silent at
+  3e-4 (FVU replicates the pilot to the 4th digit), refused 6e-4 @
+  step 1018 and 1.2e-3 @ 766; **4b training is bit-deterministic
+  across runs**, so spike sites are exactly reproducible; both
+  unstable lrs blow mid-run at partially-decayed lr (the earlier
+  "warmup-peak" shorthand is corrected). E3 two-axis verdict: the
+  6e-4 excursion decomposes into a main-loss seed wobble (cap-immune,
+  guard's job) + the SASA s_aux=256 revival slam amplifying to
+  97–100% of the gradient; the slam is *self-defeating* (re-kills its
+  own revivals — chronic 3–6% dead downstream) and the **ratio cap
+  1.0** suppresses it 100×+ while restoring functional revival (final
+  dead back to the 0.098% healthy band) and staying bit-inert on
+  healthy trajectories; the frac cap is dominated (perturbs training
+  from the first dead block, weaker suppression, FVU-neutral), static
+  α eliminated (9–10/16 blocks dead on the battery).
+  **a9 ratified the aux-ratio-cap 1.0 pin 2026-07-19.** The step-1600
+  event is batch-locked (fires at the same step on three divergent
+  trajectories): guard-skip is the designed handler; guard refuses
+  operating-point instability; cap defuses the amplifier — an exact
+  partition of observed failure modes. Factorial (seed 0, replicated
+  where seeded): interaction term **+0.011 pooled FVU** (tying helps
+  blocks ~2.3× more than scalars; BSC 0.4299 / BSF 0.4497 /
+  scalar-cross 0.3682 / SAE 0.3768); single-site cells are the
+  fair-allocation control and land on the renorm arm's per-site
+  profile (F7's third independent evidence line). Codec/H3 preview:
+  support amortization measured at ≈ 4× across k; **renorm strictly
+  dominates the scalar frontier in the ~800-bit overlap region**
+  (0.4207 @ 770.5 bits vs scalar k16 0.4306 @ 822.0); primary ties
+  mid-region; cross-site tying priced at ≈ **7.8× rate reduction**
+  vs independent per-site models at ≈ equal pooled distortion.
+  Seed battery: every headline cell ≥ 3 seeds, spreads 0.0002–0.0009;
+  λ ~free at 4b both gauges (λ=0 ↔ 1e-3 within 0.0002). Same
+  morning, a9 directed the renorm k16/k64 frontier completion and
+  the E6 +6M store extension (both launched). Stack pinned as the
+  v2.4 *Phase-1 pinned training stack* table; gates and phase ladder
+  unchanged.
