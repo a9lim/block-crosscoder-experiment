@@ -196,8 +196,11 @@ across runs**, spike sites exactly reproducible; both unstable lrs blow
 mid-run, not at warmup peak); E3 two-axis verdict — static α eliminated
 (revival-killing), frac cap dominated (not inert when healthy —
 perturbs from the first dead block — weaker suppression, FVU-neutral),
-**ratio cap 1.0 recommended for the Phase-1 pin (a9 ratifies at config
-freeze)**: bit-inert on healthy trajectories, engages at amplifier
+**ratio cap 1.0 RATIFIED by a9 2026-07-19 — the Phase-1 AuxK pin**
+(design v2.4 carries the full pinned training stack: lr 3e-4 cosine,
+λ=1e-3, renorm gauge, guard mandatory with skip-rate gate, streaming
+full-split θ, prefetch 4, rcap 1.0): bit-inert on healthy
+trajectories, engages at amplifier
 ignition, crushes the SASA cascade 100×+ (peak grads 107.9→0.52,
 527.7→2.53, renorm 220,670→36.9), converts self-defeating revival into
 functional (final dead 3.08%→0.098%, the healthy band), best capped
@@ -216,9 +219,20 @@ tying helps both geometries; single-site cells are the fair-allocation
 control and **vindicate F7** (BSF/SAE per-site profiles land on the
 renorm arm's, primary's deep tilt = whitener retained-power artifact).
 E4/E5 dogfooded by every run (guard+prefetch+streaming θ, 16 site-runs
-silent). E6 offline-validated, extension run still pending. Remaining
-tranches: E6 execution, λ=0 frontier trainings, ≥3 seeds, epochs-vs-
-fresh, harvest derisk, guarded lr-recovery (last).
+silent). **Second overnight campaign (03:47–09:35) completed the λ=0
+frontier (k∈{16,32,64} × both arms + renorm k32) and tranche-4 seeds
+(≥3 per headline cell, spreads 0.0002–0.0009; tying delta replicates
+3/3; λ ~free at 4b both gauges)** — H3 preview verdict: support
+amortization ≈4× across k, **renorm strictly dominates the scalar
+frontier in the ~800-bit overlap region**, primary ties mid-region,
+cross-site tying ≈ 7.8× rate cut vs per-site models at ≈equal pooled
+FVU (`figures/phase099/rd_frontier.png`). Morning of 07-19 (a9):
+**rcap pin ratified, design updated to v2.4 (pinned Phase-1 stack)**,
+renorm k16/k64 frontier completion + E6 +6M store extension launched
+(`scripts/run_phase099_ext.sh`). Remaining tranches: 6 (epochs-vs-
+fresh, needs E6), 7 (harvest derisk), 5 (guarded lr-recovery, last);
+single-site R-D plane placement (sq_tot weights) pending the sweep
+tail.
 
 - **Phase 0** ([`docs/findings-phase0-gemma.md`](docs/findings-phase0-gemma.md),
   control in `findings-phase0-control.md`): positive control recovered
