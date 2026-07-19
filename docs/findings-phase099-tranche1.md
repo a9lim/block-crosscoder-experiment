@@ -436,21 +436,28 @@ the post-campaign sweep):**
   ~5% rate advantage is priced) are the H3 preview proper — exact
   positions from the codec sweep.
 
-**Seed stability at the ratified point (pooled FVU, topk):**
+**Seed stability at the ratified point (pooled FVU, topk; campaign
+complete 09:35, all 14 runs green):**
 
 | cell | s0 | s1 | s2 | spread |
 |---|---|---|---|---|
-| renorm λ1e-3 | 0.4154 | 0.4152 | 0.4154 | **0.0002** |
-| scalar λ0 | 0.3682 | 0.3684 | *(running)* | 0.0002 so far |
-| bsc λ0 k32 | 0.4297 | 0.4306 | — | 0.0009 |
-| bsc λ1e-3 | 0.4299 | *(pilot s1)* | *(running)* | — |
+| bsc λ1e-3 (headline) | 0.4299 | 0.4305 | 0.4305 | 0.0006 |
+| renorm λ1e-3 (headline) | 0.4154 | 0.4152 | 0.4154 | **0.0002** |
+| scalar λ0 (headline) | 0.3682 | 0.3684 | 0.3683 | **0.0002** |
+| bsf λ1e-3 (headline) | 0.4497 | 0.4500 | 0.4498 | 0.0003 |
+| bsc λ0 k32 (frontier) | 0.4297 | 0.4306 | — | 0.0009 |
 
-Seed noise at 4b/3e-4 sits at the 3rd–4th decimal — far below every
-effect read tonight (tying deltas 0.009–0.020, interaction 0.011,
-gauge differences 0.014, frontier steps 0.05+). All overnight runs
-carried guard + streaming θ + prefetch: **zero guard events at 3e-4
-across the entire campaign** — the skip-rate ≤ 0.1% Phase-1 gate is
-passing with margin at the ratified point.
+Every headline cell now has ≥3 seeds (tranche-4 requirement met for
+the FVU endpoint; R-D positions and shared-code correspondence to
+follow). Seed noise at 4b/3e-4 sits at the 3rd–4th decimal — far
+below every effect read tonight — and the effects themselves
+replicate across seeds: the block tying delta is 0.0198/0.0195/0.0193
+at seeds 0/1/2. The 1b "seed lottery" affected ring *order*, not FVU;
+at 4b the FVU endpoint is essentially deterministic. All overnight
+runs carried guard + streaming θ + prefetch: **zero guard events at
+3e-4 across the entire campaign** (verified in every run's
+steps.jsonl) — the skip-rate ≤ 0.1% Phase-1 gate passes with margin
+at the ratified point.
 
 ## Tranche 2/3 machinery landed same night (commits `99bf1c1`, `06a2977`)
 
