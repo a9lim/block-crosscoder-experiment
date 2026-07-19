@@ -94,6 +94,10 @@ def main() -> None:
     parser.add_argument("--prefetch", type=int, default=0,
                         help="E5: training-stream prefetch depth (0 = off); "
                         "overlaps shard reads with GPU steps, order-preserving")
+    parser.add_argument(
+        "--train-split", default="train",
+        help="store split to train on (tranche 6: 'train12m' for the "
+             "fresh-data cell of the epochs-vs-fresh factorial)")
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--out-root", type=Path, default=Path("/data/runs/bcc-phase09"))
     parser.add_argument("--device", default="cuda")
@@ -114,7 +118,8 @@ def main() -> None:
 
     whitener = Whitener.load(args.store / "whitener.pt")
     train_reader = StoreReader(
-        args.store, "train", expected_whitener_hash=whitener.hash, sites=args.sites
+        args.store, args.train_split,
+        expected_whitener_hash=whitener.hash, sites=args.sites,
     )
     n_sites = train_reader.n_sites
     d_model = train_reader.d_model
@@ -171,6 +176,8 @@ def main() -> None:
         tag += "_renorm"
     if args.epochs != EPOCHS:
         tag += f"_ep{args.epochs}"
+    if args.train_split != "train":
+        tag += f"_{args.train_split}"
     if args.guard:
         tag += "_guard"
     if args.aux_frac_cap is not None:
