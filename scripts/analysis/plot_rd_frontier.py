@@ -42,8 +42,12 @@ def arm_of(payload: dict, path: str) -> tuple[str, str]:
         return ("bsc", Path(path).stem)
     base, lam, seed = m.groups()
     arm = "renorm" if (base == "bsc" and renorm) else base
-    km = re.search(r"_k(\d+)", ckpt)
-    k = km.group(1) if km else "?"
+    cfg = payload.get("model_cfg", {})
+    # k in block units (scalar cells run 4x latents at b=1)
+    k = cfg.get("k")
+    if k is not None and cfg.get("block_dim") == 1:
+        k = k / 4
+    k = f"{k:g}" if k is not None else "?"
     label = f"{arm} λ={lam} k={k} s{seed}"
     return (arm, label)
 
@@ -80,11 +84,13 @@ def main() -> None:
             xs, ys = zip(*sorted(pts))
             ax.plot(xs, ys, "--", color=color, lw=0.8, alpha=0.6, zorder=2)
             seen_arms.setdefault(arm, []).append((label, sorted(pts)))
-            # label the cheapest point of each payload with its k/seed
-            x0, y0 = sorted(pts)[0]
-            short = re.sub(r"^[a-z]+ ", "", label)
-            ax.annotate(short, (x0, y0), textcoords="offset points",
-                        xytext=(4, -10), fontsize=7, color=color)
+            # label the cheapest point, seed-0 payloads only (seeds
+            # overplot within marker size)
+            if label.endswith("s0"):
+                x0, y0 = sorted(pts)[0]
+                short = re.sub(r"^[a-z]+ ", "", label)
+                ax.annotate(short, (x0, y0), textcoords="offset points",
+                            xytext=(4, -10), fontsize=7, color=color)
 
     handles = [Line2D([], [], color=ARM_COLORS[a], marker="o", ls="--",
                       label=a) for a in seen_arms]

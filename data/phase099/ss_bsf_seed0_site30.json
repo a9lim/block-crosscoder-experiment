@@ -1,0 +1,96 @@
+{
+  "ckpt": "/data/runs/bcc-phase099/bsf_lam0.001_seed0/site30/latest.pt",
+  "model_cfg": {
+    "n_blocks": 4096,
+    "block_dim": 4,
+    "n_sites": 1,
+    "k": 32.0
+  },
+  "theta": 1.661133885383606,
+  "site_renorm": false,
+  "sites": [
+    30
+  ],
+  "whitener_hash": "3b219820a4b09ef187b52aa42c9e194d450922771f70513eb87b2de32df6ca4b",
+  "spec": {
+    "qs": [
+      4,
+      6,
+      8
+    ],
+    "clip": [
+      0.001,
+      0.999
+    ],
+    "floor": 1000,
+    "n_bootstrap": 1000
+  },
+  "results": {
+    "n_rows": 979,
+    "n_tokens": 1000000,
+    "row_len": 1022,
+    "avg_count": 32.077188,
+    "codec_meta": {
+      "n_blocks": 4096,
+      "block_dim": 4,
+      "k_max_obs": 585,
+      "n_excluded": 22,
+      "excluded_calib_event_share": 0.00032803398789837956
+    },
+    "eval_excluded_event_share": 0.0003504066512193553,
+    "support_bits_per_token": 262.09066403755827,
+    "support_bits_ci95": [
+      259.9192323438197,
+      264.08280810232884
+    ],
+    "bernoulli_bits_per_token": 223.36261352432342,
+    "bernoulli_bits_ci95": [
+      221.13614607101374,
+      225.7039327665952
+    ],
+    "points": {
+      "4": {
+        "q": 4,
+        "fvu_pooled": 0.5281562694691903,
+        "fvu_ci95": [
+          0.5264138448731971,
+          0.5301093261168707
+        ],
+        "fvu_per_site": [
+          0.5281562694691903
+        ],
+        "amplitude_bits_per_token": 513.235008,
+        "rate_bits_per_token": 775.3256720375582,
+        "rate_bits_bernoulli": 736.5976215243234
+      },
+      "6": {
+        "q": 6,
+        "fvu_pooled": 0.5230868599254984,
+        "fvu_ci95": [
+          0.5212053476585147,
+          0.5247542813146538
+        ],
+        "fvu_per_site": [
+          0.5230868599254984
+        ],
+        "amplitude_bits_per_token": 769.852512,
+        "rate_bits_per_token": 1031.9431760375583,
+        "rate_bits_bernoulli": 993.2151255243234
+      },
+      "8": {
+        "q": 8,
+        "fvu_pooled": 0.5227996322367708,
+        "fvu_ci95": [
+          0.52099001770164,
+          0.5245505273599655
+        ],
+        "fvu_per_site": [
+          0.5227996322367708
+        ],
+        "amplitude_bits_per_token": 1026.470016,
+        "rate_bits_per_token": 1288.5606800375583,
+        "rate_bits_bernoulli": 1249.8326295243235
+      }
+    }
+  }
+}
