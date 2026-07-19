@@ -259,10 +259,43 @@ Four conclusions, sharper than the registered prediction:
    cap defuses it. The three mechanisms partition the observed failure
    modes with no overlap.
 
-*(r5b frac cap, r6b renorm + ratio cap: pending. Registered
-expectation for r5b: at 13% dead the frac cap allows s_aux_eff ≈ 266
-> 256 — no protection exactly when the cascade is largest — so its
-dead-block endpoint should look like the uncapped baseline's.)*
+**r5b (frac cap 0.5, no guard, 6e-4): completed; the registered
+expectation was partially wrong, in an instructive way.** The
+expectation — "at 13% dead the frac cap allows s_aux_eff ≈ 266 > 256,
+no protection when the cascade is largest" — assumed the dead set
+would grow as in the baseline. It didn't, because the cap's own
+suppression is self-stabilizing: dead peaked at 11.7%, s_aux_eff
+stayed well below 256, and the slams were damped ~6–13× (peak grad
+24.2 at excursion 1, 41.0 at excursion 2, vs 107.9/527.7 uncapped).
+Full three-way comparison at 6e-4 unguarded:
+
+| | uncapped | fcap 0.5 | rcap 1.0 |
+|---|---|---|---|
+| exc-1 peak grad | 107.9 | 24.2 | **0.52** |
+| exc-2 peak grad (step 1600) | 527.7 | 41.0 | **2.53** |
+| dead at 1590 (revival) | 6.1% | 0.76% | **0.17%** |
+| final dead | 3.08% | 0.12% | **0.098%** |
+| pooled FVU (topk) | 0.553 | 0.549 | **0.524** |
+
+- **fcap fixes mortality but not distortion**: final dead lands near
+  the healthy band, yet FVU ≈ the uncapped baseline. rcap is the only
+  arm that converts amplifier suppression into reconstruction gains
+  (plausibly via its stronger mid-run revival — more live capacity
+  through the second epoch).
+- **fcap's trajectory perturbation is not free**: it altered the run
+  from the first routine dead block (here even *preventing* the
+  baseline's benign early deaths at steps ~1000–1010), which makes its
+  healthy-run behavior a different operating point rather than the
+  ratified one plus a safety net.
+- **The step-1600 event fired at step 1600 on a third divergent
+  trajectory** (rec spike 2.25 here, 1.19 rcap, 0.98 base) — the
+  batch-locked reading is now triple-confirmed: that position in the
+  fixed shuffled stream is intrinsically hostile, and any production
+  run will meet its analogues. The guard's skip path is the designed
+  handler; the cap bounds what the batch's kill-wave can cascade into.
+
+*(r6b renorm + ratio cap: pending — does the cap save the renorm arm
+from its unguarded destruction at 1.105?)*
 
 **r6 (renorm + ratio cap 1.0 + guard, 6e-4): refused at step 977.**
 The renorm arm's wobble is its own — earlier (near-misses from 963,
