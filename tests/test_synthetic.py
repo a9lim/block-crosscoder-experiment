@@ -136,7 +136,7 @@ def test_planted_config_is_learnable(device):
             optimizer="adamw",
             aux_variant="sasa",
             s_aux=4,
-            dead_window_batches=10,
+            dead_window_tokens=10 * 512,
             log_every=50,
         ),
     )

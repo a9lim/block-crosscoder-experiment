@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 
-from block_crosscoder_experiment.analysis.artifacts import FIGURES_DIR
+from block_crosscoder_experiment.analysis.artifacts import FIGURES_DIR, WINNER_PATH
 from block_crosscoder_experiment.analysis.catalog import (
     CAP_ONLY,
     FAMILIES,
@@ -28,6 +28,13 @@ def test_zodiac_is_a_burned_tuning_ring_not_a_figure_family():
 
 
 def test_committed_figure_catalog_is_complete_and_shared_runtime():
+    # Phase 0.5 deliberately has no winner or generated catalog. The shared
+    # runtime remains source infrastructure; the full contract resumes only
+    # after an explicit promotion.
+    if not WINNER_PATH.exists():
+        assert not (FIGURES_DIR / "manifest.json").exists()
+        assert (FIGURES_DIR / "assets" / "plotly.min.js").stat().st_size > 1_000_000
+        return
     manifest = json.loads((FIGURES_DIR / "manifest.json").read_text())
     assert tuple(sorted(manifest["families"])) == ZOO_FAMILIES
     assert (FIGURES_DIR / "assets" / "plotly.min.js").stat().st_size > 1_000_000

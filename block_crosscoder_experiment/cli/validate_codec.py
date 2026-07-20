@@ -9,12 +9,18 @@ a bits–distortion verdict; this codec prices support amortization directly.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import time
 from pathlib import Path
 
 BATCH = 4096
+
+
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main() -> None:
@@ -33,13 +39,17 @@ def main() -> None:
     ap.add_argument("--n-bootstrap", type=int, default=1000)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument(
+        "--codec-out", type=Path, default=None,
+        help="serialized codec path (default: <out stem>.codec.pt)",
+    )
     args = ap.parse_args()
 
     import torch
 
-    from block_crosscoder_experiment.codec import CodecSpec, evaluate_rd, fit_codec
+    from block_crosscoder_experiment.codec import Codec, CodecSpec, evaluate_rd, fit_codec
     from block_crosscoder_experiment.store import StoreReader, Whitener
-    from block_crosscoder_experiment.trainer import Trainer
+    from block_crosscoder_experiment.trainer import Trainer, validate_run_binding
 
     whitener = Whitener.load(args.store / "whitener.pt")
     trainer = Trainer.load_checkpoint(args.ckpt, device=args.device)
@@ -52,6 +62,44 @@ def main() -> None:
                         expected_whitener_hash=whitener.hash, sites=args.sites)
     eval_r = StoreReader(args.store, "eval",
                          expected_whitener_hash=whitener.hash, sites=args.sites)
+    folded_site_renorm = bool(whitener.meta.get("site_rms_renorm_folded"))
+    if folded_site_renorm and args.site_renorm:
+        raise SystemExit(
+            "--site-renorm would double-identify a folded-renorm checkpoint; "
+            "omit the flag for production folded stores"
+        )
+    if trainer.run_binding is None:
+        raise SystemExit("codec evaluation refuses a legacy/unbound checkpoint")
+    train_split = trainer.run_binding.get("train_split")
+    if not train_split:
+        raise SystemExit("checkpoint binding has no train_split")
+    bound_train = StoreReader(
+        args.store,
+        train_split,
+        expected_whitener_hash=whitener.hash,
+        sites=args.sites,
+    )
+    expected_binding = {
+        "whitener_hash": whitener.hash,
+        "sites": list(calib.sites),
+        "gauge": {
+            "normalization": whitener.mode,
+            "site_rms_renorm": bool(args.site_renorm or folded_site_renorm),
+            "site_renorm_at_load": bool(args.site_renorm),
+            "site_renorm_folded": folded_site_renorm,
+        },
+        "model_id": whitener.meta.get("model"),
+        "train_manifest_sha256": _json_sha256(bound_train.manifest),
+        "train_tokens": bound_train.n_tokens,
+    }
+    try:
+        validate_run_binding(
+            trainer.run_binding,
+            expected_binding,
+            keys=tuple(expected_binding),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     site_idx = [whitener.sites.index(s) for s in calib.sites]
     scale = (
         whitener.site_rms_scalars()[site_idx].view(1, -1, 1)
@@ -74,6 +122,14 @@ def main() -> None:
 
     t0 = time.time()
     codec = fit_codec(model, renormed(calib_it), spec, device=args.device)
+    codec.meta["run_binding"] = trainer.run_binding
+    codec.meta["calibration_manifest_sha256"] = _json_sha256(calib.manifest)
+    codec.meta["eval_manifest_sha256"] = _json_sha256(eval_r.manifest)
+    codec_path = args.codec_out or args.out.with_suffix(".codec.pt")
+    codec.save(codec_path)
+    # Evaluate the artifact that was actually serialized, not the transient
+    # fit object, so publication output exercises the reload path.
+    codec = Codec.load(codec_path)
     print(f"codec fit: {codec.calib_tokens:,} calib tokens, "
           f"{codec.n_included}/{model.cfg.n_blocks} blocks included "
           f"(excluded calib-event share "
@@ -102,9 +158,14 @@ def main() -> None:
             "n_sites": model.cfg.n_sites, "k": model.cfg.k,
         },
         "theta": float(model.theta),
-        "site_renorm": args.site_renorm,
+        "site_renorm": bool(args.site_renorm or folded_site_renorm),
+        "site_renorm_at_load": args.site_renorm,
+        "normalization": whitener.mode,
+        "site_renorm_folded": folded_site_renorm,
         "sites": list(calib.sites),
         "whitener_hash": whitener.hash,
+        "run_binding": trainer.run_binding,
+        "codec": str(codec_path),
         "spec": {"qs": list(spec.qs), "clip": [spec.clip_lo, spec.clip_hi],
                  "floor": spec.floor, "n_bootstrap": spec.n_bootstrap},
         "results": res,

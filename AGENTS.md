@@ -2,48 +2,48 @@
 
 Research repository for **block-sparse crosscoders (BSCs)**: sparse
 dictionary learning whose unit is a subspace with one code shared across
-layers. This is a phased experiment with explicit go/no-go gates, not a
+sites. This is a phased experiment with explicit go/no-go gates, not a
 general-purpose library.
 
-**Phase 0** is the completed pilot program (2026-07-15 through 2026-07-19).
-**Phase 1** is the production Gemma 3 4B run.
+**Phase 0.5** is the active evidentiary reset (opened 2026-07-20). Phase-0
+results, winner pointers, evidence, and figures are withdrawn. Do not describe
+Phase 1 as ready or use a former block/checkpoint identity.
 
 ## Read first
 
-- [`docs/findings-phase0.md`](docs/findings-phase0.md): the authoritative,
-  pilot result.
-- [`docs/design.md`](docs/design.md): the complete normative architecture.
-- [`docs/literature.md`](docs/literature.md): intellectual lineage.
-- [`figures/README.md`](figures/README.md): the current winner-scoped figure
-  inventory and qualification status.
+- [`docs/audit_2026-07-20.md`](docs/audit_2026-07-20.md): flaw/remediation
+  ledger.
+- [`docs/paper_comparison.md`](docs/paper_comparison.md): exact paper bridges,
+  hyperparameter comparison, and staged matrix.
+- [`docs/design.md`](docs/design.md): normative Phase-0.5 architecture and
+  operating contract.
+- [`docs/findings-phase0.md`](docs/findings-phase0.md): withdrawal notice.
 
-## Status (2026-07-19)
+## Status (2026-07-20)
 
-Phase 0 is complete. At matched 24M optimizer tokens, optimizer budget does
-the work and fresh data changes the clean comparison by only 0.0013 FVU. The
-promoted site-renormalized epoch cell reaches 0.3997 pooled FVU. The current
-winner arm qualifies month, weekday, and country; its matched primary-gauge
-counterpart qualifies cardinal and ordinal. A 2M-token whitener is adequate,
-site-renorm scalars are stable to roughly 1%, whitened bf16 is validated,
-resume/checksum drills passed, and production harvest forecasts at about
-three hours plus one hour verification.
+The training, checkpoint, codec, normalization, provenance, and trained-
+endpoint stacks have been remediated. The old large runs/stores on `jobe` and
+all committed evidence/figures derived from them were removed. The executable
+Phase-0.5 matrix declares an 80-cell paper-bridge screen followed, only if the
+screen has no failures, by 68,220 recipe-valid factorial cells.
 
-Phase 1 waits only on installation of the purchased 4 TB NVMe in jobe.
-Record its mount point in this file, `docs/design.md`, and the workspace-root
-`AGENTS.md` before harvest. The pinned stack is `lr=3e-4` cosine,
-`λ=1e-3`, site-renormalized shrinkage whitening, SASA C.1-style AuxK with
-gradient-ratio cap 1.0, mandatory spike guard with skip rate at most 0.1%,
-full-split streaming threshold fitting, and prefetch 4.
+The active screen uses five aligned normalization stores (`none`, `scalar`,
+token `layer`, shrinkage `whiten`, and `whiten_renorm`) and explicitly includes
+`lr=1e-4`, longer training, lambda, selector, encoder-bias, constraint,
+regularizer, Aux, dead-window, and cap factors. No configuration is promoted
+until saved-codec, raw-FVU, shared-code, used-span, safety, and provenance
+gates pass.
 
-[`data/winner.json`](data/winner.json) is the only current checkpoint
-pointer. Block identities are checkpoint-specific and must be derived from
-winner artifacts. [`data/showcase.json`](data/showcase.json) records the
-two-gauge Phase-0 election; do not hard-code it into current figures.
+The purchased 4 TB NVMe is still not installed. The current `/data` disk can
+hold the reduced Phase-0.5 stores and sequential one-checkpoint-at-a-time
+matrix, but not the former 2.171 TB production plan. Record the new mount point
+here, `docs/design.md`, and the workspace-root `AGENTS.md` before a later
+production harvest.
 
 ## Code and commands
 
-All implementations live inside `block_crosscoder_experiment/`. The unified
-entry point is `bsc`; do not recreate a parallel `scripts/` package.
+All implementations live inside `block_crosscoder_experiment/`; `bsc` is the
+only executable surface.
 
 ```bash
 bsc --help
@@ -52,57 +52,57 @@ bsc train --help
 bsc train-single-site --help
 bsc verify-store --help
 bsc validate-codec --help
-bsc capture-zoo --help
-bsc probe-families --help
-bsc extract-geometry --help
+bsc reproduce-papers --help
+bsc phase05-matrix --help
+bsc trained-endpoints --help
 bsc refresh-analysis --help
 ```
 
-`block_crosscoder_experiment/discovery/` owns SAE discovery, topology/null
-tests, and the sealed panel. `analysis/` owns the family registry, probes,
-winner-scoped extraction, and figures. `cli/` owns operational entry points.
-Core model/trainer/store/codec modules remain at package root.
-
-The canonical figure contract is one consolidated index plus exactly four
-winner-arm diagnostics per zoo family:
-
-```text
-figures/<family>/{frames,flow,stream,code}.html
-figures/summary/*.png
-figures/index.html
-```
-
-Every family page must stamp winner run, block, top-1 count, order statistic,
-qualification, and FVU. An unqualified candidate is a diagnostic, not a
-captured manifold. HTMLs share `figures/assets/plotly.min.js`; never embed a
-fresh Plotly runtime in every file.
+`discovery/` owns SAE discovery, topology/null tests, and the sealed panel.
+`analysis/` owns trained endpoints, family probes, winner-scoped extraction,
+and figures. `cli/` owns entry points. Core model/trainer/store/codec modules
+remain at package root. Do not recreate a parallel `scripts/` package.
 
 ## Data and repository conventions
 
-- Use plain shared Python 3.12; no project venv and no `uv`. Install the
-  workspace root once and this package editable.
-- `data/evidence/` is committed compact evidence. `data/analysis/` and
-  `logs/` are ignored regenerated artifacts. `data/winner.json` and
-  `data/showcase.json` are committed control pointers.
-- Current figure artifacts and their manifest are committed. Run
-  `bsc refresh-analysis` on jobe after promoting a winner; use `bsc figures`
-  only for a render-only pass over existing compact artifacts.
-- The Phase-2 consumer bridge is deferred until publication and lands in
-  saklas, not here. Do not import sibling experiments. Local saklas
-  development may use `python -m pip install -e ../../saklas`.
+- Use shared plain Python 3.12; no project venv and no `uv`.
+- `data/evidence/` stays empty until corrected Phase-0.5 evidence qualifies.
+  `data/analysis/` and `logs/` are ignored regenerated artifacts.
+- Absence of `data/winner.json` and `data/showcase.json` is the valid
+  pre-promotion state; analysis commands must fail clearly or require an
+  explicit run rather than import-time crash.
+- Generated figures remain absent until promotion. After a valid winner,
+  `bsc refresh-analysis` regenerates source artifacts and figures; `bsc
+  figures` is render-only.
+- Decoder capacity must never be labeled used/effective dimension. Figures use
+  activation-weighted contribution/centered spans and explicit eligibility.
+- The Phase-2 consumer bridge remains deferred and belongs in saklas.
+
+## Campaign operations
+
+```bash
+bsc phase05-matrix status --root /data/runs/bcc-phase05
+bsc phase05-matrix campaign \
+  --root /data/runs/bcc-phase05 \
+  --store-root /data/stores/bcc-phase05
+```
+
+The campaign is resumable. `campaign_state.json`, `harvest_state.json`, and
+`state.json` are authoritative. Screen failure stops the full factorial.
+Successful non-promoted cells retain reports/logs/manifests and discard only
+their large `latest.pt`. Never delete a non-final checkpoint unless the job
+report is complete.
 
 ## Hardware
 
-- Training and the production harvest run on jobe's RTX 4090. Mac MPS is
-  appropriate for smaller harvest/analysis. Long MPS loops need periodic
-  `torch.mps.synchronize()` and zero-row guards.
-- fp16 is banned in harvest and store; use raw-model bf16, transformed bf16
-  storage, and fp32/fp64 statistics as designed.
-- Never load checkpoints concurrently with training on jobe. Restoring fp32
-  masters and Adam beside the training residency reaches the 24 GB limit.
-- Sequential buffered store reads only; no token-random mmap. Every shard
-  carries the frozen transform hash.
-- Exact store rate is 40,960 bytes/token. Production is 2.171 TB. Host RAM is
-  61 GB, so calibration and eval must stream.
-- Primary config is `G=4096 × b=4 × 8 sites`, about 671M parameters and
-  about 9 GB train VRAM with 8-bit Adam. `G=8192` remains reserved.
+- Training/harvest run on `jobe`'s RTX 4090. Mac MPS is suitable for smaller
+  analysis; long loops need synchronization and zero-row guards.
+- fp16 is banned in harvest/store. Use model bf16, store bf16, transform fp32,
+  statistics fp64.
+- Never load checkpoints concurrently with training on the 24 GB GPU.
+- Sequential buffered reads only; no token-random mmap. Every shard carries a
+  frozen transform hash.
+- `prefetch=4` is queue depth, with producer/current-shard residency in
+  addition; early exit must close the iterator.
+- Exact eight-site bf16 store rate is 40,960 bytes/token. Host RAM is 61 GB;
+  calibration and eval stream.

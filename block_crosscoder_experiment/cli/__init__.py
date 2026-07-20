@@ -24,6 +24,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
         "block_crosscoder_experiment.cli.run_battery",
         "run the synthetic recovery battery",
     ),
+    "reproduce-papers": (
+        "block_crosscoder_experiment.cli.reproduce_papers",
+        "run paper-faithful synthetic bridge experiments",
+    ),
     "sweep-bundle": (
         "block_crosscoder_experiment.cli.sweep_bundle",
         "sweep synthetic bundle controls",
@@ -35,6 +39,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "sweep-manifolds": (
         "block_crosscoder_experiment.cli.sweep_manifolds",
         "run the pre-NVMe real-manifold tuning screen",
+    ),
+    "phase05-matrix": (
+        "block_crosscoder_experiment.cli.phase05_matrix",
+        "plan, run, and inspect the Phase-0.5 paper-bridge matrix",
     ),
     "validate-codec": (
         "block_crosscoder_experiment.cli.validate_codec",
@@ -79,6 +87,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "activation-stats": (
         "block_crosscoder_experiment.analysis.eval_activation_stats",
         "stream evaluation activation statistics",
+    ),
+    "trained-endpoints": (
+        "block_crosscoder_experiment.analysis.trained_endpoints",
+        "validate trained shared codes and effective spans",
     ),
     "dump-frames": (
         "block_crosscoder_experiment.analysis.dump_block_frames",

@@ -26,7 +26,7 @@ def test_config_summary_names_the_comparison_axes():
         "b": 4,
         "k": 32.0,
         "lr": 3e-4,
-        "lambda_rank": 1e-3,
+        "lambda_regularizer": 1e-3,
         "site_renorm": True,
         "optimizer_tokens": 11_993_088,
         "seed": 0,

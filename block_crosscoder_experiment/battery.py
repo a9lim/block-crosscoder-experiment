@@ -142,7 +142,7 @@ def run_one_full(
         n_sites=bc.n_sites,
         d_model=bc.d_model,
         k=k,
-        lambda_rank=lam,
+        lambda_regularizer=lam,
         seed=learner_seed,
     )
     learner = BlockCrosscoder(cfg).to(device)
@@ -166,7 +166,7 @@ def run_one_full(
             aux_ratio_cap=aux_ratio_cap,
             k_anneal_from=k_anneal_from,
             k_anneal_steps=k_anneal_steps,
-            dead_window_batches=10,
+            dead_window_tokens=10 * bc.batch_size,
             log_every=max(100, bc.steps // 10),
         ),
     )

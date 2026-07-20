@@ -42,7 +42,8 @@ def _config_summary(config: dict) -> str:
     return (
         f"G{config.get('G', '?')} b{config.get('b', '?')} "
         f"k{config.get('k', '?'):g}; lr {config.get('lr', '?')}; "
-        f"λ {config.get('lambda_rank', '?')}; {gauge}; "
+        f"λ {config.get('lambda_regularizer', config.get('lambda_rank', '?'))}; "
+        f"{gauge}; "
         f"{token_label}; seed {config.get('seed', '?')}"
     )
 

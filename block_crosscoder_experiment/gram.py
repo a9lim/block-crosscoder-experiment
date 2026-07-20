@@ -40,6 +40,9 @@ __all__ = [
     "retract_",
     "site_singular_values",
     "rank_penalty",
+    "site_profile_penalty",
+    "map_nuclear_penalty",
+    "project_block_frobenius_",
     "site_frobenius_shares",
     "init_decoder_stack",
 ]
@@ -123,8 +126,8 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     if D.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
         chunks = []
         for start in range(0, D.shape[1], _SPECTRUM_BLOCK_CHUNK):
-            block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK]
-            gram = torch.einsum("sgbd,sgcd->sgbc", block, block).float()
+            block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK].float()
+            gram = torch.einsum("sgbd,sgcd->sgbc", block, block)
             flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
             # CUDA's batched solver reserves roughly 256 KiB per 4x4 matrix;
             # with optimizer state resident that dominates the actual 1 MiB
@@ -135,7 +138,8 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
             chunks.append(evals)
         return (torch.cat(chunks, dim=1).clamp_min(0.0) + eps).sqrt()
 
-    gram_s = torch.einsum("sgbd,sgcd->sgbc", D, D).float()
+    D32 = D.float()
+    gram_s = torch.einsum("sgbd,sgcd->sgbc", D32, D32)
     # cusolver's batched syev rejects large batch counts (measured on
     # CUDA 12.8 / 4090: S*G = 24576 passes, 32768 fails with
     # CUSOLVER_STATUS_INVALID_VALUE on finite input), so chunk the flat
@@ -154,16 +158,63 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
 
 
 def rank_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
-    """Normalized per-site nuclear-norm penalty, pinned reduction (R12).
+    """Backward-compatible alias for :func:`site_profile_penalty`."""
+    return site_profile_penalty(D, eps=eps)
 
-    R_rank = mean_g (sum_s ||D_g^s||_* - b) / b. Under the Gram constraint
-    the per-block sum ranges over [b, b*sqrt(S)], so this lives in
-    [0, sqrt(S)-1]: 0 = fully site-concentrated, sqrt(S)-1 = flat.
+
+def site_profile_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    """Normalized site-profile nuclear penalty.
+
+    R_profile = mean_g (sum_s ||D_g^s||_* - b) / b. Under the concatenated
+    Gram constraint this ranges over [0, sqrt(S)-1]. It is deliberately not
+    called a rank penalty: the full concatenated decoder remains rank b, and
+    the zero set includes orthogonal coordinate-wise partitions across sites.
     """
     sv = site_singular_values(D, eps=eps)  # [S, G, b]
     b = D.shape[2]
     nuc = sv.sum(dim=(0, 2))  # [G]
     return ((nuc - b) / b).mean()
+
+
+def map_nuclear_penalty(
+    D: torch.Tensor, E: torch.Tensor, *, eps: float = 1e-8
+) -> torch.Tensor:
+    """SASA end-to-end map nuclear penalty for concatenated site maps.
+
+    For block ``g`` let ``Dbar`` and ``Ebar`` be the decoder and encoder
+    matrices with all site dimensions concatenated.  SASA penalizes
+    ``||Dbar.T @ Ebar||_*``.  Its non-zero squared singular values are the
+    eigenvalues of ``sqrt(M_D) @ M_E @ sqrt(M_D)``, where ``M_D`` and ``M_E``
+    are the two small ``b x b`` row Grams.  This implementation therefore
+    remains exact for Gram-constrained, Frobenius-constrained, and completely
+    free decoders without ever materializing an ``(S*d) x (S*d)`` map.
+    """
+    if D.shape != E.shape:
+        raise ValueError(f"D and E must have identical shape, got {D.shape} and {E.shape}")
+    Df, Ef = D.float(), E.float()
+    md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
+    me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+    evals_d, evecs_d = torch.linalg.eigh(md)
+    sqrt_md = (
+        evecs_d
+        @ torch.diag_embed(evals_d.clamp_min(0.0).sqrt())
+        @ evecs_d.transpose(-1, -2)
+    )
+    squared_sv = torch.linalg.eigvalsh(sqrt_md @ me @ sqrt_md).clamp_min(0.0)
+    return (squared_sv.add(eps).sqrt().sum(dim=-1) / E.shape[2]).mean()
+
+
+@torch.no_grad()
+def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
+    """Project concatenated decoder blocks onto a Frobenius ball.
+
+    At S=1 this is Fel's Vanilla-BSF decoder constraint. For S>1 it is the
+    direct concatenated-site extension. Returns the number of clipped blocks.
+    """
+    norms = D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()  # [G]
+    scale = (max_norm / norms.clamp_min(1e-12)).clamp(max=1.0)
+    D.mul_(scale.to(D.dtype).view(1, -1, 1, 1))
+    return int((norms > max_norm).sum().item())
 
 
 def site_frobenius_shares(D: torch.Tensor) -> torch.Tensor:

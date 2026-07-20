@@ -1,8 +1,8 @@
 """Block-sparse crosscoder: G blocks of width b, one shared code across sites.
 
-All model mathematics lives in whitened per-site coordinates (design v2.2,
-*Sites, coordinates, whitening*); this module never sees raw activations.
-Inputs are whitened batches x: [B, S, d].
+All model mathematics lives in the store's declared per-site coordinates;
+the model is agnostic to whether they are raw, scalar-normalized,
+token-LayerNorm, or whitened. Inputs are batches x: [B, S, d].
 
 Parameter stacks are [S, G, b, d] so that ``reshape(S, G*b, d)`` is a free
 view and encode/decode run as cuBLAS batched matmuls with no per-forward
@@ -19,7 +19,13 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from .gram import init_decoder_stack, rank_penalty
+from .gram import (
+    init_decoder_stack,
+    map_nuclear_penalty,
+    project_block_frobenius_,
+    retract_,
+    site_profile_penalty,
+)
 
 __all__ = [
     "BSCConfig",
@@ -27,6 +33,7 @@ __all__ = [
     "BlockCrosscoder",
     "StreamingScoreQuantile",
     "batch_topk_mask",
+    "token_topk_mask",
     "bsc_loss",
 ]
 
@@ -101,10 +108,50 @@ class BSCConfig:
     n_sites: int  # S
     d_model: int  # d
     k: float  # average active blocks/token (BatchTopK budget; fractional OK)
-    lambda_rank: float = 0.0  # lambda_* on the pinned R_rank reduction
+    lambda_regularizer: float = 0.0
     eig_floor: float = 1e-6  # retraction eigenvalue floor
     sv_eps: float = 1e-8  # eps inside sqrt(eig + eps)
     seed: int = 0
+    selection: str = "batch_topk"  # batch_topk | token_topk | threshold | dense
+    encoder_mode: str = "untied"  # untied | tied
+    encoder_bias: bool = False
+    code_activation: str = "signed"  # signed | relu | group_soft_threshold
+    selection_score: str = "code_norm"  # code_norm | decoder_weighted
+    decoder_constraint: str = "gram"  # gram | frobenius | free
+    regularizer: str | None = None  # plus map nuclear, crosscoder L1, group L21
+
+    def __post_init__(self) -> None:
+        if self.selection not in {"batch_topk", "token_topk", "threshold", "dense"}:
+            raise ValueError(
+                "selection must be batch_topk, token_topk, threshold, or dense"
+            )
+        if self.encoder_mode not in {"untied", "tied"}:
+            raise ValueError("encoder_mode must be untied or tied")
+        if self.code_activation not in {"signed", "relu", "group_soft_threshold"}:
+            raise ValueError(
+                "code_activation must be signed, relu, or group_soft_threshold"
+            )
+        if self.selection_score not in {"code_norm", "decoder_weighted"}:
+            raise ValueError("selection_score must be code_norm or decoder_weighted")
+        if self.decoder_constraint not in {"gram", "frobenius", "free"}:
+            raise ValueError("decoder_constraint must be gram, frobenius, or free")
+        if self.regularizer is None:
+            self.regularizer = (
+                "site_profile" if self.lambda_regularizer > 0 else "none"
+            )
+        if self.regularizer not in {
+            "none", "site_profile", "map_nuclear", "crosscoder_l1", "group_l21"
+        }:
+            raise ValueError("unknown regularizer")
+        if self.regularizer == "crosscoder_l1" and self.code_activation != "relu":
+            raise ValueError("crosscoder_l1 requires relu codes")
+        if self.regularizer == "group_l21" and self.code_activation != "group_soft_threshold":
+            raise ValueError("group_l21 requires group_soft_threshold codes")
+        if self.selection == "dense" and self.code_activation != "relu":
+            if self.code_activation != "group_soft_threshold":
+                raise ValueError("dense selection requires relu or group_soft_threshold codes")
+        if self.selection_score == "decoder_weighted" and self.code_activation != "relu":
+            raise ValueError("decoder_weighted selection is the ReLU crosscoder bridge")
 
     @property
     def n_latents(self) -> int:
@@ -112,7 +159,7 @@ class BSCConfig:
 
 
 class BSCOutput(NamedTuple):
-    xhat: torch.Tensor  # [B, S, d] whitened reconstruction
+    xhat: torch.Tensor  # [B, S, d] reconstruction in declared coordinates
     z: torch.Tensor  # [B, G, b] pre-selection code
     z_selected: torch.Tensor  # [B, G, b] post-selection code (masked)
     scores: torch.Tensor  # [B, G] selection scores p_g = ||z_g||
@@ -136,6 +183,18 @@ def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     return mask.view(B, G)
 
 
+def token_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
+    """Per-token block TopK used by the published BSF and SASA recipes."""
+    B, G = scores.shape
+    n_keep = min(max(int(round(k)), 0), G)
+    if n_keep == 0:
+        return torch.zeros(B, G, dtype=torch.bool, device=scores.device)
+    idx = scores.topk(n_keep, dim=1, sorted=False).indices
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    mask.scatter_(1, idx, True)
+    return mask
+
+
 class BlockCrosscoder(nn.Module):
     """Gram-constrained block-sparse crosscoder (design v2.2 architecture).
 
@@ -145,7 +204,7 @@ class BlockCrosscoder(nn.Module):
     decode:  xhat^s = c^s + sum_{g active} D_g^s^T z_g
     """
 
-    E: nn.Parameter  # [S, G, b, d]
+    E: nn.Parameter | None  # [S, G, b, d], absent for tied Grassmannian
     D: nn.Parameter  # [S, G, b, d]
     c: nn.Parameter  # [S, d]
     theta: torch.Tensor  # scalar buffer, inference selection threshold
@@ -164,12 +223,33 @@ class BlockCrosscoder(nn.Module):
         D = init_decoder_stack(
             cfg.n_sites, cfg.n_blocks, cfg.block_dim, cfg.d_model, generator=gen
         )
+        if cfg.decoder_constraint == "frobenius":
+            project_block_frobenius_(D)
         if device is not None:
             D = D.to(device)
         self.D = nn.Parameter(D)
         # Transpose-tied at init only (Fel App. D convention); encoder scale
         # is norm-calibrated on a data batch via calibrate_encoder_scale_.
-        self.E = nn.Parameter(D.detach().clone())
+        if cfg.encoder_mode == "untied":
+            self.E = nn.Parameter(D.detach().clone())
+            self.register_parameter("log_gamma", None)
+        else:
+            self.register_parameter("E", None)
+            self.log_gamma = nn.Parameter(torch.zeros((), device=D.device))
+        if cfg.encoder_bias:
+            self.a = nn.Parameter(
+                torch.zeros(cfg.n_blocks, cfg.block_dim, device=D.device)
+            )
+        else:
+            self.register_parameter("a", None)
+        if cfg.code_activation == "group_soft_threshold":
+            # softplus(-2.252...) ~= 0.1.  One positive learned threshold per
+            # block is Fel's Group-Lasso BSF parameterization.
+            self.log_threshold = nn.Parameter(
+                torch.full((cfg.n_blocks,), -2.2521685, device=D.device)
+            )
+        else:
+            self.register_parameter("log_threshold", None)
         self.c = nn.Parameter(torch.zeros(cfg.n_sites, cfg.d_model, device=D.device))
         # Inference threshold theta: fit on the calibration split, frozen and
         # serialized with the codec (D10). NaN until calibrated.
@@ -180,21 +260,48 @@ class BlockCrosscoder(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, S, d] -> z: [B, G, b]."""
         cfg = self.cfg
-        W = self.E.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)  # view
+        E = self.D * self.log_gamma.exp() if self.E is None else self.E
+        W = E.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)  # view
         # [S, B, d] @ [S, d, G*b] -> [S, B, G*b], summed over sites.
         z = torch.bmm(x.transpose(0, 1), W.transpose(1, 2)).sum(dim=0)
-        return z.view(-1, cfg.n_blocks, cfg.block_dim)
+        z = z.view(-1, cfg.n_blocks, cfg.block_dim)
+        if self.a is not None:
+            z = z + self.a
+        if cfg.code_activation == "relu":
+            z = torch.relu(z)
+        elif cfg.code_activation == "group_soft_threshold":
+            norm = z.norm(dim=-1, keepdim=True)
+            threshold = torch.nn.functional.softplus(self.log_threshold).view(1, -1, 1)
+            z = z * torch.relu(1.0 - threshold / norm.clamp_min(1e-12))
+        return z
 
     def scores(self, z: torch.Tensor) -> torch.Tensor:
-        """Selection score p_g = ||z_g||_2 — exact contribution energy."""
-        return z.norm(dim=-1)
+        """Configured sparse-event score.
+
+        Gram-constrained BSCs use the block norm, which is exactly isolated
+        decoded energy.  Minder's scalar BatchTopK crosscoder instead uses a
+        ReLU activation multiplied by the sum of its site decoder norms.
+        """
+        score = z.norm(dim=-1)
+        if self.cfg.selection_score == "decoder_weighted":
+            site_norms = self.D.float().pow(2).sum(dim=(2, 3)).sqrt().sum(dim=0)
+            score = score * site_norms.to(score.dtype).unsqueeze(0)
+        return score
 
     def select(self, z: torch.Tensor, *, mode: str = "topk") -> torch.Tensor:
         """Bool mask [B, G]. ``topk`` = training BatchTopK; ``threshold`` =
         inference against the frozen calibrated theta."""
         p = self.scores(z)
         if mode == "topk":
-            return batch_topk_mask(p, self.cfg.k)
+            if self.cfg.selection == "batch_topk":
+                return batch_topk_mask(p, self.cfg.k)
+            if self.cfg.selection == "token_topk":
+                return token_topk_mask(p, self.cfg.k)
+            if self.cfg.selection == "threshold":
+                if torch.isnan(self.theta):
+                    raise RuntimeError("training threshold not calibrated")
+                return p > self.theta
+            return p > 0
         if mode == "threshold":
             if torch.isnan(self.theta):
                 raise RuntimeError("inference threshold not calibrated")
@@ -233,12 +340,32 @@ class BlockCrosscoder(nn.Module):
         the global scale the tied Gram-constrained init already gives.
         """
         p = self.scores(self.encode(x))  # [B, G]
+        if self.E is None:
+            # Fel Grassmannian has one learned gamma, not per-block scales.
+            return
         mean_p = p.mean(dim=0).clamp_min(eps)  # [G]
         if per_block:
             scale = mean_p.median() / mean_p  # [G]
             self.E.mul_(scale.view(1, -1, 1, 1))
         else:
             self.E.mul_(mean_p.median() / mean_p.mean())
+
+    @property
+    def parameter_device(self) -> torch.device:
+        return self.D.device
+
+    @property
+    def parameter_dtype(self) -> torch.dtype:
+        return self.D.dtype
+
+    @torch.no_grad()
+    def project_decoder_(self) -> int:
+        """Apply the configured decoder constraint after an optimizer step."""
+        if self.cfg.decoder_constraint == "gram":
+            return retract_(self.D.data, eig_floor=self.cfg.eig_floor)
+        if self.cfg.decoder_constraint == "frobenius":
+            return project_block_frobenius_(self.D.data)
+        return 0
 
     @torch.no_grad()
     def fit_threshold_(
@@ -265,13 +392,17 @@ class BlockCrosscoder(nn.Module):
         """
         q = 1.0 - target_avg_blocks / self.cfg.n_blocks
         if method == "streaming":
-            hist = StreamingScoreQuantile(device=self.E.device)
+            hist = StreamingScoreQuantile(device=self.parameter_device)
             for x in batches:
-                hist.update(self.scores(self.encode(x.to(self.E.device, self.E.dtype))))
+                hist.update(self.scores(self.encode(
+                    x.to(self.parameter_device, self.parameter_dtype)
+                )))
             theta = hist.quantile(q)
         elif method == "exact":
             scores = torch.cat(
-                [self.scores(self.encode(x.to(self.E.device, self.E.dtype)))
+                [self.scores(self.encode(
+                    x.to(self.parameter_device, self.parameter_dtype)
+                ))
                  .flatten().float().cpu()
                  for x in batches]
             )
@@ -289,8 +420,7 @@ def bsc_loss(
 ) -> dict[str, torch.Tensor]:
     """Pinned reductions (R12) so lambda and alpha transfer across configs.
 
-    L_rec  = mean over tokens, sites, dims of the squared whitened residual.
-    R_rank = mean over blocks of (sum_s ||D_g^s||_* - b)/b.
+    L_rec = mean over tokens, sites, dims of the squared residual.
     L_aux  lives in the trainer (AuxK needs cross-step frequency state).
 
     Reductions run in fp32 regardless of forward dtype — a bf16 mean over
@@ -300,9 +430,27 @@ def bsc_loss(
     l_rec = (out.xhat.float() - x.float()).pow(2).mean()
     total = l_rec
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
-    if cfg.lambda_rank > 0:
-        r_rank = rank_penalty(model.D, eps=cfg.sv_eps)
-        parts["rank"] = r_rank
-        total = total + cfg.lambda_rank * r_rank
+    if cfg.lambda_regularizer > 0 and cfg.regularizer != "none":
+        if cfg.regularizer == "site_profile":
+            reg = site_profile_penalty(model.D, eps=cfg.sv_eps)
+        elif cfg.regularizer == "map_nuclear":
+            E = model.D * model.log_gamma.exp() if model.E is None else model.E
+            reg = map_nuclear_penalty(model.D, E, eps=cfg.sv_eps)
+        elif cfg.regularizer == "crosscoder_l1":
+            # Anthropic's sitewise decoder-norm-weighted activation L1.
+            # For the paper-faithful bridge b=1; the Frobenius extension is
+            # well-defined for blocks but is not claimed as their objective.
+            site_cost = model.D.float().pow(2).sum(dim=(2, 3)).sqrt().sum(dim=0)
+            reg = (out.scores.float() * site_cost.unsqueeze(0)).sum(dim=1).mean()
+        elif cfg.regularizer == "group_l21":
+            # Fel Group-Lasso BSF: mean over examples of the sum of activated
+            # block norms.  The learned group soft threshold lives in encode.
+            reg = out.z.float().norm(dim=-1).sum(dim=1).mean()
+        else:  # guarded by BSCConfig
+            raise AssertionError(cfg.regularizer)
+        parts["regularizer"] = reg
+        # Legacy key retained for old reports/tests while the audit migrates.
+        parts["rank"] = reg
+        total = total + cfg.lambda_regularizer * reg
     parts["total"] = total
     return parts

@@ -6,7 +6,7 @@ site's slice). With the joint arms this completes the 2x2:
 
   {block, cross-site}   = BSC (joint arm)
   {scalar, cross-site}  = ordinary BatchTopK crosscoder (exists: scalar arm)
-  {block, single-site}  = BSF cell        (--arm bsf, this script)
+  {block, single-site}  = S=1 BSC cell    (--arm bsc, this script)
   {scalar, single-site} = per-site SAE    (--arm sae, this script)
 
 S=1 deletes exactly one degree of freedom — code tying across sites. The
@@ -44,14 +44,13 @@ SHUFFLE_SEED = 0  # the joint runs' seed, verbatim (design: shared stream)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=("bsf", "sae"), required=True)
+    parser.add_argument("--arm", choices=("bsc", "sae"), required=True)
     parser.add_argument("--blocks", type=int, default=4096,
                         help="G of the JOINT bsc arm being matched")
     parser.add_argument("--k", type=float, default=32.0,
                         help="k of the JOINT bsc arm being matched")
     parser.add_argument("--lam", type=float, default=None,
-                        help="default: 1e-3 for bsf (ratified joint value), "
-                        "0 for sae (b=1: not a rank penalty)")
+                        help="default: 1e-3 for S=1 BSC, 0 for SAE")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--schedule", default="cosine")
@@ -88,10 +87,12 @@ def main() -> None:
     from block_crosscoder_experiment.trainer import TrainConfig, Trainer
 
     if args.lam is None:
-        args.lam = 1e-3 if args.arm == "bsf" else 0.0
+        args.lam = 1e-3 if args.arm == "bsc" else 0.0
     if args.arm == "sae" and args.lam != 0.0:
-        raise SystemExit("sae cell runs at lambda=0 (b=1: nuclear term is "
-                         "not a rank penalty — same rule as the scalar arm)")
+        raise SystemExit(
+            "SAE cell runs at lambda=0; select a scalar-compatible regularizer "
+            "through the joint training command for other comparisons"
+        )
 
     whitener = Whitener.load(args.store / "whitener.pt")
     train_reader = StoreReader(
@@ -101,7 +102,7 @@ def main() -> None:
     sites = list(train_reader.sites)
     d_model = train_reader.d_model
 
-    if args.arm == "bsf":
+    if args.arm == "bsc":
         cell_G, cell_b, cell_k = args.blocks, 4, args.k
     else:
         cell_G, cell_b, cell_k = args.blocks * 4, 1, args.k * 4
@@ -159,7 +160,7 @@ def main() -> None:
             # convention as seed sweeps (the joint arm's seed is the base).
             cfg = BSCConfig(
                 n_blocks=cell_G, block_dim=cell_b, n_sites=1, d_model=d_model,
-                k=cell_k, lambda_rank=args.lam, seed=args.seed * 1000 + L,
+                k=cell_k, lambda_regularizer=args.lam, seed=args.seed * 1000 + L,
             )
             model = BlockCrosscoder(cfg, device=args.device)
             model.calibrate_encoder_scale_(
@@ -290,7 +291,7 @@ def main() -> None:
     report = {
         "arm": args.arm,
         "factorial_cell": (
-            "block,single-site (BSF)" if args.arm == "bsf"
+            "block,single-site (S=1 BSC)" if args.arm == "bsc"
             else "scalar,single-site (per-site SAE)"
         ),
         "matched_joint": {"G": args.blocks, "b": 4, "k": args.k},
@@ -314,7 +315,7 @@ def main() -> None:
         "guard_events": {str(L): trainers[L].guard_events for L in sites},
         "dead_frac_per_site": {
             str(L): float(
-                (trainers[L].tracker.frequency(train_cfg.dead_window_batches)
+                (trainers[L].tracker.frequency(train_cfg.dead_window_tokens)
                  <= train_cfg.dead_threshold).float().mean()
             )
             for L in sites

@@ -1,8 +1,8 @@
-"""Paths and provenance for winner-scoped analysis artifacts.
+"""Paths and provenance for explicitly promoted analysis artifacts.
 
-``data/winner.json`` is the only model pointer used by current analysis.
-Promoting a checkpoint changes that file; probes and figures then follow it
-without hard-coded run names or block identities.
+Absence of ``data/winner.json`` is the valid Phase-0.5 pre-promotion state.
+After promotion it is the only default model pointer; commands that need it
+fail at execution time rather than making analysis modules unimportable.
 """
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ FIGURES_DIR = REPO_ROOT / "figures"
 
 
 def load_winner() -> dict:
+    if not WINNER_PATH.exists():
+        raise SystemExit(
+            "no promoted winner in Phase 0.5; pass an explicit run to a "
+            "supported command or promote a fully qualified matrix result first"
+        )
     w = json.loads(WINNER_PATH.read_text())
     w.pop("_comment", None)
     return w

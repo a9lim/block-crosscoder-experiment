@@ -29,7 +29,6 @@ import numpy as np
 
 from .artifacts import analysis_dir
 
-DATA = analysis_dir()
 CAP_FAMS = {"weekday", "month"}  # calendar families are cap-restricted
 N_PERM = 2000
 TRAIN_FRAC = 0.8
@@ -74,30 +73,40 @@ def code_map(x: np.ndarray, y: np.ndarray, cls: np.ndarray, rng) -> dict:
 
 
 def span_alignment(fp: np.ndarray, fr: np.ndarray) -> list[list[float]]:
-    """Per-site principal cosines between two [S, b, d] frame stacks."""
+    """Per-site principal cosines between numerical decoder row-spans."""
     out = []
     for s in range(fp.shape[0]):
-        qa, _ = np.linalg.qr(fp[s].T)
-        qb, _ = np.linalg.qr(fr[s].T)
-        out.append(np.linalg.svd(qa.T @ qb, compute_uv=False).round(4).tolist())
+        def basis(frame: np.ndarray) -> np.ndarray:
+            _, values, vt = np.linalg.svd(frame, full_matrices=False)
+            cutoff = max(float(values[0]) * 1e-5, 1e-10) if len(values) else 1e-10
+            return vt[values > cutoff].T
+
+        qa, qb = basis(fp[s]), basis(fr[s])
+        if min(qa.shape[1], qb.shape[1]) == 0:
+            out.append([])
+        else:
+            out.append(
+                np.linalg.svd(qa.T @ qb, compute_uv=False).round(4).tolist()
+            )
     return out
 
 
 def main() -> None:
+    data = analysis_dir()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--frames-primary", type=Path,
-                    default=DATA / "frames_primary.npz")
+                    default=data / "frames_primary.npz")
     ap.add_argument("--frames-renorm", type=Path,
-                    default=DATA / "frames_winner.npz")
+                    default=data / "frames_winner.npz")
     ap.add_argument("--geometry", type=Path,
-                    default=DATA / "geometry_primary.npz",
+                    default=data / "geometry_primary.npz",
                     help="dictionary-wide null scale for span alignment")
-    ap.add_argument("--out", type=Path, default=DATA / "crossarm.json")
+    ap.add_argument("--out", type=Path, default=data / "crossarm.json")
     args = ap.parse_args()
 
-    zt = json.load(open(DATA / "zoo_block_tests.json"))
-    zp = np.load(DATA / "zoo_codes_primary.npz")
-    zr = np.load(DATA / "zoo_codes_winner.npz")
+    zt = json.load(open(data / "zoo_block_tests.json"))
+    zp = np.load(data / "zoo_codes_primary.npz")
+    zr = np.load(data / "zoo_codes_winner.npz")
     assert np.array_equal(zp["token_ids"], zr["token_ids"])
     pb, rb = zp["blocks"].tolist(), zr["blocks"].tolist()
     fam, cls, is_cap = zp["fam"], zp["cls"], zp["is_cap"]
@@ -133,7 +142,9 @@ def main() -> None:
         null_mean = None
         if args.geometry.exists():
             g = np.load(args.geometry)
-            null_mean = round(float(g["null_pair_cos"].astype(np.float32).mean()), 4)
+            null_mean = round(
+                float(np.nanmean(g["null_pair_cos"].astype(np.float32))), 4
+            )
         report["span_null_pair_cos_mean"] = null_mean
         report["span"] = {}
         for name in report["pairs"]:
@@ -142,10 +153,10 @@ def main() -> None:
             if bp in fpb and br in frb:
                 cos = span_alignment(fpz["frames"][:, fpb.index(bp)],
                                      frz["frames"][:, frb.index(br)])
+                top = [value for site in cos for value in site[:2]]
                 report["span"][name] = {
                     "per_site_cos": cos,
-                    "mean_top2": round(float(np.mean(
-                        [c[:2] for c in cos])), 4),
+                    "mean_top2": round(float(np.mean(top)), 4) if top else None,
                 }
                 print(f"span {name} b{bp}~b{br} mean top-2 cos",
                       report["span"][name]["mean_top2"], flush=True)

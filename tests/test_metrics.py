@@ -128,7 +128,7 @@ def test_end_to_end_recovery(device):
         TrainConfig(
             total_steps=2000, lr=3e-3, warmup_steps=20, forward_dtype="fp32",
             optimizer="adamw", aux_variant="sasa", s_aux=2,
-            dead_window_batches=10, log_every=500,
+            dead_window_tokens=10 * 1024, log_every=500,
         ),
     )
     trainer.fit(truth.batches(1024, 2000, seed=7))

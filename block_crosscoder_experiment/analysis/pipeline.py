@@ -120,6 +120,18 @@ def main() -> None:
         shutil.copyfile(artifact_dir / "showcase_blocks.json", REPO_ROOT / "data" / "showcase.json")
 
         _run(
+            "activation-stats",
+            "--device",
+            args.device,
+            "--out",
+            artifact_dir,
+            "--store",
+            winner["store"],
+            "--runs",
+            *runs,
+            env=env,
+        )
+        _run(
             "extract-geometry",
             "--device",
             args.device,
@@ -132,7 +144,7 @@ def main() -> None:
             env=env,
         )
         _run(
-            "activation-stats",
+            "trained-endpoints",
             "--device",
             args.device,
             "--out",

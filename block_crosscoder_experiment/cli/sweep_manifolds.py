@@ -144,7 +144,7 @@ def _cell_fingerprint(args, cell_name: str, cell: dict, seed: int) -> dict:
         "k": cell["k"],
         "lr": cell["lr"],
         "schedule": cell.get("schedule", "cosine"),
-        "lambda_rank": args.lam,
+        "lambda_regularizer": args.lam,
         "epochs": args.epochs,
         "train_split": args.train_split,
         "warmup_steps": args.warmup_steps,

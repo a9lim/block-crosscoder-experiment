@@ -197,7 +197,7 @@ def evaluate_recovery(
     learned blocks under it are counted as dead-on-eval and excluded.
     """
     batch = truth.sample(n_eval, seed=seed)
-    device, dtype = learner.E.device, learner.E.dtype
+    device, dtype = learner.parameter_device, learner.parameter_dtype
     x = batch.x.to(device, dtype)
     out = learner(x, mode=mode)
     z_l = out.z_selected.float().cpu()

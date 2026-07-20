@@ -14,7 +14,7 @@ dead-block machinery in its three comparison variants (P8):
                     <= threshold; per-token top-s_aux dead blocks by
                     residual energy re-encode the frozen residual.
     "long_horizon"  the former v2.1 rule — dead = zero activations over a
-                    long batch horizon; same selection mechanics.
+                    long accepted-token horizon; same selection mechanics.
     "fel"           Fel-style runner-up AuxK — no dead set; the next
                     s_aux runner-up blocks (by main-code norm, unselected)
                     explain the residual with the *main* code;
@@ -22,8 +22,8 @@ dead-block machinery in its three comparison variants (P8):
                     next-l runner-ups with alpha = 1/l where l is the MAIN
                     block sparsity — faithful only when s_aux = k.
 
-The data interface is any iterable of whitened [B, S, d] batches —
-synthetic tensors in Phase -1, the disk store in Phase 1. The trainer owns
+The data interface is any iterable of declared-coordinate [B, S, d] batches —
+synthetic tensors or a normalized/raw disk store. The trainer owns
 no data randomness: permutation seeds live with the data source (design:
 the store's shuffle seed is recorded and shared by BSC and baseline).
 """
@@ -38,7 +38,7 @@ import shutil
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Sequence
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -46,7 +46,14 @@ from torch.optim.lr_scheduler import LambdaLR
 from .gram import gram_residual, retract_, site_frobenius_shares
 from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
 
-__all__ = ["TrainConfig", "DeadTracker", "Trainer", "aux_loss", "tensor_batches"]
+__all__ = [
+    "TrainConfig",
+    "DeadTracker",
+    "Trainer",
+    "aux_loss",
+    "tensor_batches",
+    "validate_run_binding",
+]
 
 AUX_VARIANTS = ("none", "sasa", "long_horizon", "fel")
 CHECKPOINT_FREE_FLOOR_FRAC = 0.15  # same D14 floor as store.ShardWriter
@@ -84,8 +91,11 @@ class TrainConfig:
     s_aux: int = 256
     alpha_aux: float = 1.0  # SASA lambda_aux; the Fel arm overrides to 1/s_aux
     dead_threshold: float = 1e-4
-    dead_window_batches: int = 100
-    dead_horizon_batches: int = 500
+    # Deadness is a property of token exposure, not optimizer-step count.
+    # These defaults preserve the former 100/500-batch production windows at
+    # B=4096 while remaining invariant to batch size and partial batches.
+    dead_window_tokens: int = 409_600
+    dead_horizon_tokens: int = 2_048_000
     # Loss-spike guard: batch-skip with
     # corroboration. Trigger = grad_norm > guard_factor x trailing median
     # AND rec > guard_loss_factor x trailing median, medians over the last
@@ -101,6 +111,7 @@ class TrainConfig:
     guard_loss_factor: float = 5.0
     guard_window: int = 50
     guard_max_consecutive: int = 5
+    guard_max_skip_rate: float = 1e-3
     # AuxK caps; the production CLI pins the gradient-ratio cap at 1.0.
     # aux_frac_cap: revived blocks/step <= ceil(frac x live dead-set size)
     # (dead-set variants only — fel has no dead set). aux_ratio_cap:
@@ -127,26 +138,90 @@ class TrainConfig:
             raise ValueError("forward_dtype must be 'bf16' or 'fp32'")
         if self.schedule not in ("cosine", "linear_fifth"):
             raise ValueError("schedule must be 'cosine' or 'linear_fifth'")
+        if self.s_aux <= 0:
+            raise ValueError("s_aux must be positive")
+        if self.dead_threshold < 0.0:
+            raise ValueError("dead_threshold must be non-negative")
+        if self.dead_window_tokens <= 0 or self.dead_horizon_tokens <= 0:
+            raise ValueError("dead token windows must be positive")
+        if not (0.0 <= self.guard_max_skip_rate <= 1.0):
+            raise ValueError("guard_max_skip_rate must be in [0, 1]")
+
+
+def validate_run_binding(
+    actual: dict | None,
+    expected: dict,
+    *,
+    keys: Sequence[str] | None = None,
+) -> None:
+    """Fail closed when a checkpoint is not bound to the expected run.
+
+    Exact resume validation compares the whole canonical binding. Consumers
+    such as codec evaluation may compare only the fields relevant to their
+    store/gauge view. Legacy checkpoints deliberately fail whenever an
+    expected binding is supplied.
+    """
+    if actual is None:
+        raise ValueError("checkpoint has no run binding (legacy/unbound checkpoint)")
+    names = list(keys) if keys is not None else sorted(set(actual) | set(expected))
+    mismatches = {
+        name: {"checkpoint": actual.get(name), "expected": expected.get(name)}
+        for name in names
+        if actual.get(name) != expected.get(name)
+    }
+    if mismatches:
+        raise ValueError(
+            "checkpoint run binding mismatch: "
+            + json.dumps(mismatches, sort_keys=True, default=str)
+        )
 
 
 class DeadTracker:
-    """Ring buffer of per-batch activation counts, on device.
+    """Ring buffer of accepted-observation activation counts, on device.
 
     Supports both dead criteria: SASA windowed frequency (counts over the
-    last `window` batches divided by tokens seen) and long-horizon (zero
-    activations over the last `horizon` batches). A block is never flagged
-    dead before the relevant history is full — a fresh model has no dead
-    blocks, only unobserved ones.
+    most recent whole observations covering at least `window_tokens`) and
+    long-horizon (zero activations over `horizon_tokens`). A block is never
+    flagged dead before enough accepted tokens have been observed — a fresh
+    model has no dead blocks, only unobserved ones.
+
+    ``capacity`` remains denominated in observation slots. When
+    ``max_tokens`` is supplied, the ring grows rather than discarding history
+    until it can cover that many tokens, so variable and partial batch sizes
+    cannot silently shorten a token window.
     """
 
-    def __init__(self, n_blocks: int, capacity: int, device) -> None:
+    def __init__(
+        self,
+        n_blocks: int,
+        capacity: int,
+        device,
+        *,
+        max_tokens: int | None = None,
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if max_tokens is not None and max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
         self.counts = torch.zeros(capacity, n_blocks, device=device)
         self.tokens = torch.zeros(capacity, device=device)
+        self.max_tokens = max_tokens
         self.ptr = 0
         self.filled = 0
 
     def update(self, mask: torch.Tensor) -> None:
         """mask: [B, G] bool from the training forward."""
+        if mask.ndim != 2 or mask.shape[1] != self.counts.shape[1]:
+            raise ValueError(
+                f"mask must have shape [B, {self.counts.shape[1]}], got "
+                f"{tuple(mask.shape)}"
+            )
+        if mask.shape[0] <= 0:
+            raise ValueError("dead-tracker observations must contain tokens")
+        if self.filled == self.counts.shape[0] and self.max_tokens is not None:
+            retained = float(self.tokens.sum() - self.tokens[self.ptr]) + mask.shape[0]
+            if retained < self.max_tokens:
+                self._grow()
         # The one-shot CUDA reduction requests a ~256 MiB workspace at
         # B=4096,G=8192, enough to cross the 4090 ceiling after optimizer
         # state is resident. Row chunks preserve the exact integer count in
@@ -159,31 +234,76 @@ class DeadTracker:
         self.ptr = (self.ptr + 1) % self.counts.shape[0]
         self.filled = min(self.filled + 1, self.counts.shape[0])
 
+    def _grow(self) -> None:
+        """Double slot capacity while preserving oldest-to-newest order."""
+        old_counts, old_tokens = self._last(self.filled)
+        old_counts = old_counts.flip(0)
+        old_tokens = old_tokens.flip(0)
+        capacity = max(1, 2 * self.counts.shape[0])
+        counts = self.counts.new_zeros((capacity, self.counts.shape[1]))
+        tokens = self.tokens.new_zeros(capacity)
+        counts[: self.filled].copy_(old_counts)
+        tokens[: self.filled].copy_(old_tokens)
+        self.counts = counts
+        self.tokens = tokens
+        self.ptr = self.filled
+
     def _last(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         cap = self.counts.shape[0]
         idx = (self.ptr - 1 - torch.arange(n, device=self.counts.device)) % cap
         return self.counts[idx], self.tokens[idx]
 
-    def frequency(self, window: int) -> torch.Tensor:
-        """Per-block activation frequency over the last `window` batches."""
-        n = min(window, self.filled)
-        if n == 0:
+    def _recent_tokens(
+        self, target_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Newest whole observations covering ``target_tokens`` when able."""
+        if target_tokens <= 0:
+            raise ValueError("target_tokens must be positive")
+        if self.filled == 0:
+            return self.counts[:0], self.tokens[:0]
+        counts, tokens = self._last(self.filled)
+        cumulative = tokens.cumsum(dim=0)
+        n = min(self.filled, int((cumulative < target_tokens).sum().item()) + 1)
+        return counts[:n], tokens[:n]
+
+    @property
+    def history_tokens(self) -> int:
+        if self.filled == 0:
+            return 0
+        _, tokens = self._last(self.filled)
+        return int(tokens.sum().item())
+
+    def frequency(self, window_tokens: int) -> torch.Tensor:
+        """Per-block frequency over the last ``window_tokens`` accepted tokens.
+
+        The oldest included observation may cross the boundary; aggregate
+        masks cannot split a batch after the fact, so its tokens are included
+        whole and form the denominator.
+        """
+        counts, tokens = self._recent_tokens(window_tokens)
+        if tokens.numel() == 0:
             return torch.zeros_like(self.counts[0])
-        counts, tokens = self._last(n)
         return counts.sum(dim=0) / tokens.sum().clamp_min(1.0)
 
-    def dead(self, variant: str, *, threshold: float, window: int, horizon: int) -> torch.Tensor:
-        """Bool [G]. All-False until the relevant history is full."""
+    def dead(
+        self,
+        variant: str,
+        *,
+        threshold: float,
+        window_tokens: int,
+        horizon_tokens: int,
+    ) -> torch.Tensor:
+        """Bool [G]. All-False until the token-denominated history is full."""
         G = self.counts.shape[1]
         device = self.counts.device
         if variant == "sasa":
-            if self.filled < window:
+            if self.history_tokens < window_tokens:
                 return torch.zeros(G, dtype=torch.bool, device=device)
-            return self.frequency(window) <= threshold
+            return self.frequency(window_tokens) <= threshold
         if variant == "long_horizon":
-            if self.filled < horizon:
+            if self.history_tokens < horizon_tokens:
                 return torch.zeros(G, dtype=torch.bool, device=device)
-            counts, _ = self._last(horizon)
+            counts, _ = self._recent_tokens(horizon_tokens)
             return counts.sum(dim=0) == 0
         raise ValueError(f"no dead criterion for variant {variant!r}")
 
@@ -191,13 +311,21 @@ class DeadTracker:
         return {
             "counts": self.counts,
             "tokens": self.tokens,
+            "max_tokens": self.max_tokens,
             "ptr": self.ptr,
             "filled": self.filled,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.counts.copy_(state["counts"])
-        self.tokens.copy_(state["tokens"])
+        counts = state["counts"].to(self.counts.device)
+        tokens = state["tokens"].to(self.tokens.device)
+        if counts.shape != self.counts.shape:
+            self.counts = counts.clone()
+            self.tokens = tokens.clone()
+        else:
+            self.counts.copy_(counts)
+            self.tokens.copy_(tokens)
+        self.max_tokens = state.get("max_tokens", self.max_tokens)
         self.ptr = state["ptr"]
         self.filled = state["filled"]
 
@@ -253,14 +381,20 @@ def build_optimizer(model: BlockCrosscoder, cfg: TrainConfig) -> tuple[torch.opt
     8-bit moments); plain AdamW elsewhere.
     """
     kind = cfg.optimizer
-    device = model.E.device
+    device = next(model.parameters()).device
     if kind == "auto":
         has_bnb = importlib.util.find_spec("bitsandbytes") is not None
         kind = "adamw8bit" if (device.type == "cuda" and has_bnb) else "adamw"
-    groups = [
-        {"params": [model.E], "weight_decay": cfg.encoder_weight_decay},
-        {"params": [model.D, model.c], "weight_decay": 0.0},
+    no_decay_ids = {id(model.D), id(model.c)}
+    encoder_params = [
+        p for p in model.parameters() if id(p) not in no_decay_ids
     ]
+    groups = []
+    if encoder_params:
+        groups.append(
+            {"params": encoder_params, "weight_decay": cfg.encoder_weight_decay}
+        )
+    groups.append({"params": [model.D, model.c], "weight_decay": 0.0})
     if kind == "adamw8bit":
         import bitsandbytes as bnb
 
@@ -305,6 +439,42 @@ def tensor_batches(
         epoch += 1
 
 
+def _floating_tensors(obj) -> Iterator[torch.Tensor]:
+    if torch.is_tensor(obj):
+        if obj.is_floating_point() or obj.is_complex():
+            yield obj
+        return
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield from _floating_tensors(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            yield from _floating_tensors(value)
+
+
+def _all_finite(obj) -> bool:
+    return all(bool(torch.isfinite(t).all()) for t in _floating_tensors(obj))
+
+
+def _project_decoder_(model: BlockCrosscoder) -> int:
+    project = getattr(model, "project_decoder_", None)
+    if project is not None:
+        result = project()
+        return 0 if result is None else int(result)
+    return retract_(model.D.data, eig_floor=model.cfg.eig_floor)
+
+
+def _constraint_residual(model: BlockCrosscoder) -> float | None:
+    measure = getattr(model, "decoder_constraint_residual", None)
+    if measure is not None:
+        value = measure()
+        return float(value.max() if torch.is_tensor(value) else value)
+    constraint = getattr(model.cfg, "decoder_constraint", "gram")
+    if constraint == "gram":
+        return float(gram_residual(model.D.float()).max())
+    return None
+
+
 class Trainer:
     """Owns the master/forward-copy pair, the optimizer, the retraction
     schedule, dead-block tracking, and diagnostics logging."""
@@ -315,8 +485,10 @@ class Trainer:
         cfg: TrainConfig,
         *,
         log_path: str | Path | None = None,
+        run_binding: dict | None = None,
     ) -> None:
         self.cfg = cfg
+        self.run_binding = copy.deepcopy(run_binding)
         self.master = model  # fp32 masters
         if any(p.dtype != torch.float32 for p in model.parameters()):
             raise TypeError("master model must be fp32")
@@ -330,8 +502,9 @@ class Trainer:
         self.sched = LambdaLR(self.opt, _lr_factor(cfg))
         self.tracker = DeadTracker(
             model.cfg.n_blocks,
-            max(cfg.dead_window_batches, cfg.dead_horizon_batches),
-            device=model.E.device,
+            capacity=128,
+            device=next(model.parameters()).device,
+            max_tokens=max(cfg.dead_window_tokens, cfg.dead_horizon_tokens),
         )
         self.step_idx = 0
         self._k_final = float(model.cfg.k)  # annealing target
@@ -351,7 +524,8 @@ class Trainer:
 
     def step(self, x: torch.Tensor) -> dict:
         cfg = self.cfg
-        x = x.to(device=self.fwd.E.device, dtype=self.fwd.E.dtype)
+        fwd_param = next(self.fwd.parameters())
+        x = x.to(device=fwd_param.device, dtype=fwd_param.dtype)
         log_step = self.step_idx % cfg.log_every == 0
 
         k_now = None
@@ -365,7 +539,6 @@ class Trainer:
 
         out = self.fwd(x)
         parts = bsc_loss(out, x, self.fwd)
-        self.tracker.update(out.mask)
 
         trainable = [p for p in self.fwd.parameters() if p.requires_grad]
 
@@ -384,8 +557,8 @@ class Trainer:
                 dead = self.tracker.dead(
                     cfg.aux_variant,
                     threshold=cfg.dead_threshold,
-                    window=cfg.dead_window_batches,
-                    horizon=cfg.dead_horizon_batches,
+                    window_tokens=cfg.dead_window_tokens,
+                    horizon_tokens=cfg.dead_horizon_tokens,
                 )
                 if cfg.aux_frac_cap is not None:
                     # E3 frac cap: revival budget proportional to the live
@@ -440,14 +613,28 @@ class Trainer:
             )
         )
 
+        state_finite = _all_finite(tuple(self.master.parameters())) and _all_finite(
+            self.opt.state
+        )
+
         # E2 guard: decide before any state is touched. Non-finite always
         # skips; a corroborated spike (grad AND loss anomalous vs the
         # accepted-step trailing medians) skips; a grad-only anomaly is a
         # near-miss, logged and applied.
         rec_val = float(parts["rec"].detach())
         skip_reason = None
+        pre_step_nonfinite = not (
+            math.isfinite(grad_norm)
+            and math.isfinite(rec_val)
+            and math.isfinite(float(parts["total"].detach()))
+            and state_finite
+        )
+        if pre_step_nonfinite and not cfg.guard:
+            raise RuntimeError(
+                "non-finite loss/gradient/parameter/optimizer state with spike guard disabled"
+            )
         if cfg.guard:
-            if not (math.isfinite(grad_norm) and math.isfinite(rec_val)):
+            if pre_step_nonfinite:
                 skip_reason = "nonfinite"
             elif len(self._guard_grad_hist) >= cfg.guard_window:
                 g_med = statistics.median(self._guard_grad_hist)
@@ -495,16 +682,31 @@ class Trainer:
                 )
         else:
             self.opt.step()
+            if not (
+                _all_finite(tuple(self.master.parameters()))
+                and _all_finite(self.opt.state)
+            ):
+                self.opt.zero_grad(set_to_none=True)
+                raise RuntimeError(
+                    "optimizer produced non-finite parameter/state; refusing to "
+                    "continue (reload the last atomic checkpoint)"
+                )
             self.sched.step()
             if self.step_idx % cfg.retract_every == 0:
-                floor_hits = retract_(
-                    self.master.D.data, eig_floor=self.master.cfg.eig_floor
+                floor_hits = _project_decoder_(self.master)
+            if not _all_finite(tuple(self.master.parameters())):
+                raise RuntimeError(
+                    "decoder projection produced non-finite parameters; refusing "
+                    "to continue (reload the last atomic checkpoint)"
                 )
             if self.fwd is not self.master:
                 with torch.no_grad():
                     for m, f in zip(self.master.parameters(), self.fwd.parameters()):
                         f.copy_(m)
                     self.fwd.theta.copy_(self.master.theta)
+            # Dead-frequency history is accepted-step state. A guarded poison
+            # batch must not influence which blocks receive future AuxK.
+            self.tracker.update(out.mask)
             self._guard_consecutive = 0
             if cfg.guard and math.isfinite(grad_norm) and math.isfinite(rec_val):
                 self._guard_grad_hist.append(grad_norm)
@@ -557,17 +759,29 @@ class Trainer:
     @torch.no_grad()
     def _diagnostics(self) -> dict:
         d = {
-            "gram_residual_master": float(gram_residual(self.master.D).max()),
             "dead_frac_window": float(
-                (self.tracker.frequency(self.cfg.dead_window_batches) <= self.cfg.dead_threshold)
+                (
+                    self.tracker.frequency(self.cfg.dead_window_tokens)
+                    <= self.cfg.dead_threshold
+                )
                 .float()
                 .mean()
             ),
         }
+        master_residual = _constraint_residual(self.master)
+        if master_residual is not None:
+            d["decoder_constraint_residual_master"] = master_residual
+            # Compatibility key for existing Gram-constrained reports.
+            if getattr(self.master.cfg, "decoder_constraint", "gram") == "gram":
+                d["gram_residual_master"] = master_residual
         if self.ema_min_score is not None:
             d["ema_min_score"] = self.ema_min_score
         if self.fwd is not self.master:
-            d["gram_residual_postcast"] = float(gram_residual(self.fwd.D.float()).max())
+            postcast_residual = _constraint_residual(self.fwd)
+            if postcast_residual is not None:
+                d["decoder_constraint_residual_postcast"] = postcast_residual
+                if getattr(self.fwd.cfg, "decoder_constraint", "gram") == "gram":
+                    d["gram_residual_postcast"] = postcast_residual
         shares = site_frobenius_shares(self.master.D).detach()
         d["share_jump"] = float((shares - self._prev_shares).abs().max())
         self._prev_shares = shares.clone()
@@ -583,6 +797,18 @@ class Trainer:
         if self._log_file is not None:
             self._log_file.flush()
         return self.history
+
+    def validate_run_gates(self) -> None:
+        """Enforce terminal run-quality gates before evaluation/publication."""
+        if not self.cfg.guard:
+            return
+        skip_rate = self.skipped_steps / max(1, self.step_idx)
+        if skip_rate > self.cfg.guard_max_skip_rate:
+            raise RuntimeError(
+                f"spike-guard skip rate {skip_rate:.4%} exceeds the "
+                f"{self.cfg.guard_max_skip_rate:.4%} run gate "
+                f"({self.skipped_steps}/{self.step_idx}); refusing evaluation"
+            )
 
     # -- checkpointing (exercised by the Phase -1 battery and the pilot) ----
 
@@ -607,6 +833,7 @@ class Trainer:
             "model_cfg": asdict(self.master.cfg),
             "train_cfg": asdict(self.cfg),
             "optimizer_kind": self.optimizer_kind,
+            "run_binding": copy.deepcopy(self.run_binding),
         }
         path = Path(path)
         # Free-space check that aborts *before* the write (D14) — the atomic
@@ -626,9 +853,29 @@ class Trainer:
 
     @classmethod
     def load_checkpoint(
-        cls, path: str | Path, *, device: torch.device | str = "cpu"
+        cls,
+        path: str | Path,
+        *,
+        device: torch.device | str = "cpu",
+        expected_binding: dict | None = None,
     ) -> "Trainer":
         payload = torch.load(path, map_location=device, weights_only=True)
+        stored_binding = payload.get("run_binding")
+        if stored_binding is not None:
+            bound_model_cfg = dict(payload["model_cfg"])
+            # The live cfg.k is temporarily annealed; the binding records the
+            # run's final target, which is serialized separately for resume.
+            bound_model_cfg["k"] = payload.get("k_final", bound_model_cfg["k"])
+            validate_run_binding(
+                stored_binding,
+                {
+                    "model_cfg": bound_model_cfg,
+                    "train_cfg": payload["train_cfg"],
+                },
+                keys=("model_cfg", "train_cfg"),
+            )
+        if expected_binding is not None:
+            validate_run_binding(stored_binding, expected_binding)
         model_cfg = BSCConfig(**payload["model_cfg"])
         cfg = TrainConfig(**{
             **payload["train_cfg"],
@@ -636,7 +883,7 @@ class Trainer:
         })
         model = BlockCrosscoder(model_cfg).to(device)
         model.load_state_dict(payload["model"])
-        trainer = cls(model, cfg)
+        trainer = cls(model, cfg, run_binding=stored_binding)
         trainer.opt.load_state_dict(payload["optimizer"])
         trainer.sched.load_state_dict(payload["scheduler"])
         trainer.tracker.load_state_dict(payload["tracker"])

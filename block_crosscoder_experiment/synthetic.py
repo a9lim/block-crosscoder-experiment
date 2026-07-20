@@ -33,7 +33,7 @@ from typing import Iterator, NamedTuple
 
 import torch
 
-__all__ = ["BlockSpec", "SyntheticBatch", "PlantedModel"]
+__all__ = ["BlockSpec", "SyntheticBatch", "PlantedModel", "ExactKPlantedModel"]
 
 GEOMETRIES = ("gaussian", "shell")
 
@@ -191,3 +191,26 @@ class PlantedModel:
         u = self._intrinsic(spec, n, gen) * spec.scale
         c = torch.einsum("nr,sdr->snd", u, self.contribution_maps(g))
         return torch.einsum("snd,sne->sde", c, c) / n
+
+
+class ExactKPlantedModel(PlantedModel):
+    """Fel-style additive manifold superposition with exactly k factors.
+
+    The original Phase-minus-1 generator samples independent Bernoulli gates,
+    which is the desired BSC stress test but not Fel's toy protocol. This
+    variant samples a uniformly random support without replacement so a
+    per-token TopK learner can be tested at exactly matched block sparsity.
+    """
+
+    def __init__(self, *args, active_per_sample: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if not 1 <= active_per_sample <= len(self.specs):
+            raise ValueError("active_per_sample must be in [1, n_factors]")
+        self.active_per_sample = int(active_per_sample)
+
+    def _gates(self, n: int, gen: torch.Generator) -> torch.Tensor:
+        scores = torch.rand(n, len(self.specs), generator=gen)
+        idx = scores.topk(self.active_per_sample, dim=1, sorted=False).indices
+        gates = torch.zeros(n, len(self.specs), dtype=torch.bool)
+        gates.scatter_(1, idx, True)
+        return gates

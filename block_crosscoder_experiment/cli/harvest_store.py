@@ -1,4 +1,4 @@
-"""Harvest the Phase-1 Gemma 3 4B activation store.
+"""Harvest a reproducible Phase-0.5/Phase-1 Gemma 3 4B activation store.
 
 The model, corpus, packing convention, and eight residual-post sites are
 frozen by ``docs/design.md``:
@@ -6,15 +6,20 @@ frozen by ``docs/design.md``:
   sites = 8 evenly spaced in the 25-90% band of 34 layers
         = (9, 12, 15, 18, 21, 24, 27, 30)
 Defaults are the production split sizes: a 5M-token statistics prefix,
-13M calibration, 2M eval, and 38M train. Stored activations are whitened
-bf16; statistics and transforms use fp32/fp64. fp16 is forbidden. The output
-mount is explicit so this cannot silently target the old pilot disk.
+13M calibration, 2M eval, and 38M train. Stored activations use one explicit
+normalization mode and bf16; statistics and fixed transforms use fp32/fp64.
+Separate stores make normalization a real matrix factor rather than an
+implicit training gauge. The output mount is always explicit.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
+import importlib.metadata
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -24,6 +29,39 @@ SITES = (9, 12, 15, 18, 21, 24, 27, 30)  # 25-90% band of 34, step 3
 CTX = 1024
 DROP_POSITIONS = 2  # BOS + position 1
 RAW_VALIDATION_TOKENS = 100_000
+
+
+def _close_iterators(*iterators: object) -> None:
+    """Close a nested finite-prefix stream from outermost to innermost."""
+    first_error: BaseException | None = None
+    for iterator in iterators:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _git_revision() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[2], text=True,
+    ).strip()
+
+
+def _source_sha256() -> str:
+    repo = Path(__file__).resolve().parents[2]
+    paths = sorted((repo / "block_crosscoder_experiment").rglob("*.py"))
+    paths += [repo / "pyproject.toml"]
+    h = hashlib.sha256()
+    for path in paths:
+        h.update(str(path.relative_to(repo)).encode() + b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()
 
 
 def main() -> None:
@@ -37,6 +75,18 @@ def main() -> None:
     )
     parser.add_argument("--batch-rows", type=int, default=8)
     parser.add_argument(
+        "--normalization", choices=("none", "scalar", "layer", "whiten"),
+        default="whiten", help="activation coordinates written to the store",
+    )
+    parser.add_argument(
+        "--site-renorm", action=argparse.BooleanOptionalAction, default=False,
+        help="whiten-only per-site RMS equalization folded into the transform",
+    )
+    parser.add_argument(
+        "--model-revision", default=None,
+        help="optional HF revision; resolved to an immutable commit SHA",
+    )
+    parser.add_argument(
         "--out", type=Path, required=True,
     )
     parser.add_argument("--device", default="cuda")
@@ -44,7 +94,9 @@ def main() -> None:
     print(
         f"config: model={MODEL} sites={SITES} corpus={CORPUS} ctx={CTX} "
         f"whitener={args.whitener_tokens:,} calib={args.calib_tokens:,} "
-        f"eval={args.eval_tokens:,} train={args.train_tokens:,} out={args.out}",
+        f"eval={args.eval_tokens:,} train={args.train_tokens:,} "
+        f"normalization={args.normalization} site_renorm={args.site_renorm} "
+        f"out={args.out}",
         flush=True,
     )
 
@@ -58,8 +110,25 @@ def main() -> None:
         WhitenerAccumulator,
     )
 
+    from huggingface_hub import HfApi
+
+    hf = HfApi()
+    model_info = hf.model_info(
+        MODEL, revision=args.model_revision, files_metadata=True
+    )
+    model_sha = model_info.sha
+    tokenizer_artifacts = {}
+    for sibling in model_info.siblings or []:
+        name = sibling.rfilename
+        if "token" not in name.lower() and name not in {
+            "config.json", "special_tokens_map.json", "generation_config.json"
+        }:
+            continue
+        lfs = getattr(sibling, "lfs", None)
+        digest = getattr(lfs, "sha256", None) if lfs is not None else None
+        tokenizer_artifacts[name] = digest or getattr(sibling, "blob_id", None)
     model = HookedSAETransformer.from_pretrained_no_processing(
-        MODEL, dtype=torch.bfloat16
+        MODEL, dtype=torch.bfloat16, revision=model_sha
     ).to(args.device)
     model.eval()
     d_model = int(model.cfg.d_model)
@@ -71,16 +140,15 @@ def main() -> None:
     stop_at = max(SITES) + 1
     bos = model.tokenizer.bos_token_id
 
-    from huggingface_hub import HfApi
-
-    corpus_sha = HfApi().dataset_info(CORPUS[0]).sha
+    corpus_sha = hf.dataset_info(CORPUS[0]).sha
     stream = load_dataset(
         CORPUS[0], name=CORPUS[1], split="train", streaming=True,
         revision=corpus_sha,
     )
+    stream_iter = iter(stream)
 
     def token_docs():
-        for doc in stream:
+        for doc in stream_iter:
             yield model.tokenizer.encode(doc["text"], add_special_tokens=False)
 
     tokens_per_row = CTX - DROP_POSITIONS
@@ -88,10 +156,21 @@ def main() -> None:
         args.whitener_tokens + args.calib_tokens + args.eval_tokens + args.train_tokens
     )
     n_rows = -(-total_tokens // tokens_per_row) + 5 * args.batch_rows + 2
-    rows = pack_token_rows(token_docs(), ctx=CTX, bos_id=bos, n_rows=n_rows)
+    documents = token_docs()
+    rows = pack_token_rows(documents, ctx=CTX, bos_id=bos, n_rows=n_rows)
 
     corpus_meta = {
         "model": MODEL,
+        "model_revision": model_sha,
+        "tokenizer_revision": model_sha,
+        "tokenizer_artifacts": tokenizer_artifacts,
+        "tokenizer_class": type(model.tokenizer).__name__,
+        "tokenizer_vocab_size": len(model.tokenizer),
+        "tokenizer_special_ids": {
+            "bos": model.tokenizer.bos_token_id,
+            "eos": model.tokenizer.eos_token_id,
+            "pad": model.tokenizer.pad_token_id,
+        },
         "corpus": CORPUS[0],
         "corpus_config": CORPUS[1],
         "corpus_revision": corpus_sha,
@@ -103,7 +182,15 @@ def main() -> None:
         "hook_names": hook_names,
         "model_dtype": "bfloat16",
         "pack_convention": "concat-no-boundary",
-        "campaign": "Phase 1 production",
+        "campaign": "Phase 0.5 normalization matrix",
+        "normalization": args.normalization,
+        "site_renorm": args.site_renorm,
+        "code_revision": _git_revision(),
+        "source_sha256": _source_sha256(),
+        "dependencies": {
+            name: importlib.metadata.version(name)
+            for name in ("torch", "transformers", "transformer-lens", "sae-lens", "datasets")
+        },
     }
 
     @torch.no_grad()
@@ -128,6 +215,13 @@ def main() -> None:
 
     batches = act_batches()
 
+    def close_stream_chain() -> None:
+        _close_iterators(batches, rows, documents, stream_iter)
+
+    # Also own the exceptional path: an argument/data/write failure must close
+    # the live HF range reader before interpreter teardown begins.
+    atexit.register(close_stream_chain)
+
     # ---- Stage 1: whitener slice (accumulated, never stored) -------------
     print("=== stage 1: whitener slice ===", flush=True)
     quarters = [
@@ -147,10 +241,16 @@ def main() -> None:
 
     halves = [quarters[0].merge(quarters[1]), quarters[2].merge(quarters[3])]
     full = halves[0].merge(halves[1])
-    whitener = full.finalize(sites=SITES, meta=corpus_meta, site_renorm=True)
+    whitener = full.finalize(
+        sites=SITES, meta=corpus_meta, site_renorm=args.site_renorm,
+        mode=args.normalization,
+    )
     for label, accs in (("half", halves), ("quarter", quarters)):
         for i, acc in enumerate(accs):
-            w_i = acc.finalize(sites=SITES, meta=corpus_meta, site_renorm=True)
+            w_i = acc.finalize(
+                sites=SITES, meta=corpus_meta, site_renorm=args.site_renorm,
+                mode=args.normalization,
+            )
             rel = (
                 (w_i.W - whitener.W).flatten(1).norm(dim=1)
                 / whitener.W.flatten(1).norm(dim=1)
@@ -178,8 +278,6 @@ def main() -> None:
         ("eval", args.eval_tokens),
         ("train", args.train_tokens),
     ]
-    w_gpu = whitener.W.to(args.device)
-    mu_gpu = whitener.mean.to(args.device)
     raw_writer = writer_for("raw_validation")
     raw_writer.whitener_hash = "raw:" + whitener.hash
     raw_remaining = RAW_VALIDATION_TOKENS
@@ -197,7 +295,7 @@ def main() -> None:
             acts = next(batches)
             take = min(acts.shape[0], quota - written)
             raw = acts[:take]
-            xw = torch.einsum("sde,nse->nsd", w_gpu, raw.float() - mu_gpu)
+            xw = whitener.apply(raw)
             if split == "calibration":
                 if raw_remaining > 0:
                     n_raw = min(raw_remaining, take)
@@ -222,21 +320,33 @@ def main() -> None:
         manifest = writer.close()
         print(f"  {split}: {manifest['n_tokens']:,} tokens in "
               f"{len(manifest['shards'])} shards", flush=True)
+
+    # Streaming datasets retain a live fsspec/HF HTTP generator when we stop
+    # after a finite prefix.  Letting that generator die during interpreter
+    # finalization can race its retry worker and abort an otherwise complete
+    # harvest (PyGILState_Release with no thread state).  Close the generator
+    # chain while Python and the GIL are fully live, immediately after the last
+    # activation batch has been consumed.
+    close_stream_chain()
+    atexit.unregister(close_stream_chain)
     raw_manifest = raw_writer.close()
     print(f"  raw_validation: {raw_manifest['n_tokens']:,} tokens", flush=True)
 
-    # ---- held-out transformed-second-moment validation (D9, S4) ----------
+    # ---- held-out transformed-second-moment validation -------------------
     m2 = (heldout_m2 / max(heldout_n, 1)).cpu()
     dev_vs_pred, mean_dev_vs_one = [], []
     for s in range(len(SITES)):
         held = torch.linalg.eigvalsh(m2[s]).flip(0)
-        reg = whitener.eigenvalues[s].double().flip(0)
-        lam = float(whitener.ridge[s])
-        predicted = (reg - lam) / reg
-        if whitener.meta.get("site_rms_renorm_folded"):
-            scalar = float(whitener.meta["site_rms_scalars"][s])
-            predicted = predicted * scalar**2
-        dev_vs_pred.append(float((held - predicted).abs().mean()))
+        if whitener.mode == "whiten":
+            reg = whitener.eigenvalues[s].double().flip(0)
+            lam = float(whitener.ridge[s])
+            predicted = (reg - lam) / reg
+            if whitener.meta.get("site_rms_renorm_folded"):
+                scalar = float(whitener.meta["site_rms_scalars"][s])
+                predicted = predicted * scalar**2
+            dev_vs_pred.append(float((held - predicted).abs().mean()))
+        else:
+            dev_vs_pred.append(float("nan"))
         mean_dev_vs_one.append(float(held.sub(1).abs().mean()))
     print(f"held-out whitened spectrum, mean |eig - predicted| per site: "
           f"{[round(v, 4) for v in dev_vs_pred]}", flush=True)
@@ -246,6 +356,8 @@ def main() -> None:
 
     report = {
         "whitener_hash": whitener.hash,
+        "normalization": whitener.mode,
+        "site_renorm": args.site_renorm,
         "heldout_eig_dev_vs_predicted": dev_vs_pred,
         "heldout_eig_dev_vs_identity": mean_dev_vs_one,
         "heldout_tokens": heldout_n,

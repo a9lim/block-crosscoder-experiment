@@ -13,6 +13,52 @@ import time
 from pathlib import Path
 
 
+def _verify_round_trip(
+    whitener,
+    raw_reader,
+    stored_reader,
+    *,
+    device: str,
+    batch_size: int = 8_192,
+) -> tuple[int, float, float]:
+    """Compare a raw prefix to its stored transform with bounded memory."""
+    import torch
+
+    stored_batches = iter(stored_reader.sequential_batches(batch_size))
+    stored_carry = None
+    n_tokens = 0
+    diff_sq = 0.0
+    denom_sq = 0.0
+    exact_values = 0
+    n_values = 0
+    for raw in raw_reader.sequential_batches(batch_size):
+        need = raw.shape[0]
+        pieces = []
+        while need:
+            if stored_carry is None or stored_carry.shape[0] == 0:
+                try:
+                    stored_carry = next(stored_batches)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "stored calibration is shorter than raw-validation prefix"
+                    ) from exc
+            take = min(need, stored_carry.shape[0])
+            pieces.append(stored_carry[:take])
+            stored_carry = stored_carry[take:]
+            need -= take
+        stored = torch.cat(pieces) if len(pieces) > 1 else pieces[0]
+        transformed = whitener.apply(raw.to(device)).to(torch.bfloat16).cpu()
+        delta = transformed.float() - stored.float()
+        diff_sq += float(delta.square().sum(dtype=torch.float64))
+        denom_sq += float(stored.float().square().sum(dtype=torch.float64))
+        exact_values += int((transformed == stored).sum())
+        n_values += stored.numel()
+        n_tokens += raw.shape[0]
+    rel = (diff_sq / max(denom_sq, 1e-300)) ** 0.5
+    exact = exact_values / max(n_values, 1)
+    return n_tokens, rel, exact
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -26,8 +72,6 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     print(f"config: store={args.store} device={args.device}", flush=True)
-
-    import torch
 
     from block_crosscoder_experiment.store import StoreReader, Whitener
 
@@ -61,20 +105,12 @@ def main() -> None:
               f"shards verified in {time.time() - t0:.0f}s", flush=True)
         readers[split] = reader
 
-    raw = torch.cat(list(readers["raw_validation"].sequential_batches(16_384)))
-    need, got = raw.shape[0], []
-    for batch in readers["calibration"].sequential_batches(16_384):
-        got.append(batch)
-        if sum(g.shape[0] for g in got) >= need:
-            break
-    stored = torch.cat(got)[:need]
-    w_dev = whitener.W.to(args.device)
-    mu_dev = whitener.mean.to(args.device)
-    xw = torch.einsum(
-        "sde,nse->nsd", w_dev, raw.to(args.device).float() - mu_dev
-    ).to(torch.bfloat16).cpu()
-    rel = float((xw.float() - stored.float()).norm() / stored.float().norm())
-    exact = float((xw == stored).float().mean())
+    need, rel, exact = _verify_round_trip(
+        whitener,
+        readers["raw_validation"],
+        readers["calibration"],
+        device=args.device,
+    )
     print(f"round trip: {need:,} tokens, rel err {rel:.3e}, "
           f"bf16 exact-match fraction {exact:.4f}", flush=True)
     print("store verified", flush=True)

@@ -4,6 +4,8 @@ from the pilot spec, exercised early), checkpoint/resume, and threshold
 calibration. The CUDA-only test verifies the ordering against the actual
 8-bit-Adam implementation."""
 
+from dataclasses import asdict
+
 import pytest
 import torch
 
@@ -116,22 +118,57 @@ def test_dead_tracker_criteria(device):
     tracker.update(first)
     for _ in range(3):
         tracker.update(mask)
-    # Warmup gating: window not yet full at window=6.
-    assert not tracker.dead("sasa", threshold=1e-4, window=6, horizon=8).any()
+    # Warmup gating: the 6-batch-equivalent token window is not yet full.
+    assert not tracker.dead(
+        "sasa", threshold=1e-4, window_tokens=6 * B, horizon_tokens=8 * B
+    ).any()
     tracker.update(mask)
     tracker.update(mask)
-    dead = tracker.dead("sasa", threshold=1e-4, window=6, horizon=8)
+    dead = tracker.dead(
+        "sasa", threshold=1e-4, window_tokens=6 * B, horizon_tokens=8 * B
+    )
     # Block 1 and 3: never active. Block 2: freq 1/384 > 1e-4. Block 0: alive.
     assert dead.tolist() == [False, True, False, True]
-    freq = tracker.frequency(6)
+    freq = tracker.frequency(6 * B)
     assert abs(float(freq[2]) - 1 / (6 * B)) < 1e-6
     # Long-horizon at horizon=8: not full yet, then dead once block 2's
     # single activation scrolls out of the window.
-    assert not tracker.dead("long_horizon", threshold=1e-4, window=6, horizon=8).any()
+    assert not tracker.dead(
+        "long_horizon",
+        threshold=1e-4,
+        window_tokens=6 * B,
+        horizon_tokens=8 * B,
+    ).any()
     for _ in range(4):
         tracker.update(mask)
-    dead_lh = tracker.dead("long_horizon", threshold=1e-4, window=6, horizon=8)
+    dead_lh = tracker.dead(
+        "long_horizon",
+        threshold=1e-4,
+        window_tokens=6 * B,
+        horizon_tokens=8 * B,
+    )
     assert dead_lh.tolist() == [False, True, True, True]
+
+
+def test_dead_tracker_windows_are_token_denominated(device):
+    tracker = DeadTracker(n_blocks=2, capacity=2, device=device, max_tokens=10)
+    first = torch.tensor([[True, False]] * 6, device=device)
+    second = torch.tensor([[False, True]] * 2, device=device)
+    third = torch.tensor([[False, True]] * 2, device=device)
+    tracker.update(first)
+    tracker.update(second)
+    assert not tracker.dead(
+        "sasa", threshold=0.5, window_tokens=10, horizon_tokens=10
+    ).any()
+    # The third observation forces slot growth: overwriting the six-token
+    # observation would leave only four tokens of history.
+    tracker.update(third)
+    assert tracker.counts.shape[0] == 4
+    assert tracker.history_tokens == 10
+    assert tracker.frequency(4).tolist() == [0.0, 1.0]
+    assert tracker.dead(
+        "sasa", threshold=0.5, window_tokens=10, horizon_tokens=10
+    ).tolist() == [False, True]
 
 
 def test_auxk_revives_dead_encoders(device):
@@ -150,8 +187,8 @@ def test_auxk_revives_dead_encoders(device):
                 total_steps=80,
                 aux_variant=variant,
                 s_aux=8,
-                dead_window_batches=4,
-                dead_horizon_batches=8,
+                dead_window_tokens=4 * 256,
+                dead_horizon_tokens=8 * 256,
             ),
         )
         trainer.fit(planted_batches(device))
@@ -285,6 +322,10 @@ def test_guard_skips_poisoned_batch_and_recovers(device):
     trainer = _warm_guarded_trainer(device)
     clean = planted_batches(device, n_batches=2, seed=13)
     before = [p.detach().clone() for p in trainer.master.parameters()]
+    tracker_before = {
+        k: v.clone() if torch.is_tensor(v) else v
+        for k, v in trainer.tracker.state_dict().items()
+    }
     rec = trainer.step(clean[0] * 1e4)  # grad AND loss anomalous -> skip
     assert rec["skipped"] is True and rec["skip_reason"] == "spike"
     for p, b in zip(trainer.master.parameters(), before):
@@ -292,6 +333,12 @@ def test_guard_skips_poisoned_batch_and_recovers(device):
     assert trainer.skipped_steps == 1
     assert trainer.guard_events[-1]["reason"] == "spike"
     assert "batch_hash" in trainer.guard_events[-1]
+    tracker_after = trainer.tracker.state_dict()
+    for key, value in tracker_before.items():
+        if torch.is_tensor(value):
+            assert torch.equal(value, tracker_after[key])
+        else:
+            assert value == tracker_after[key]
     rec2 = trainer.step(clean[1])  # clean batch accepted, counter resets
     assert "skipped" not in rec2
     assert trainer._guard_consecutive == 0
@@ -344,6 +391,64 @@ def test_guard_off_by_default_unchanged(device):
         assert torch.equal(a, b)
 
 
+def test_guard_skip_rate_gate_fails_closed(device):
+    trainer = _warm_guarded_trainer(device, guard_max_skip_rate=1e-3)
+    trainer.step(planted_batches(device, n_batches=1, seed=41)[0] * 1e4)
+    with pytest.raises(RuntimeError, match="skip rate"):
+        trainer.validate_run_gates()
+
+
+def test_post_step_nonfinite_refuses_run(device, monkeypatch):
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(model, train_cfg(total_steps=2))
+    original_step = trainer.opt.step
+
+    def poison_step(*args, **kwargs):
+        result = original_step(*args, **kwargs)
+        with torch.no_grad():
+            next(trainer.master.parameters()).view(-1)[0] = float("nan")
+        return result
+
+    monkeypatch.setattr(trainer.opt, "step", poison_step)
+    with pytest.raises(RuntimeError, match="optimizer produced non-finite"):
+        trainer.step(planted_batches(device, n_batches=1, seed=43)[0])
+
+
+def test_checkpoint_binding_roundtrip_and_mismatch(device, tmp_path):
+    cfg = train_cfg(total_steps=2)
+    binding = {
+        "whitener_hash": "abc",
+        "sites": [9, 12],
+        "gauge": "whiten",
+        "model_cfg": asdict(CFG),
+        "train_cfg": asdict(cfg),
+    }
+    model = BlockCrosscoder(CFG).to(device)
+    trainer = Trainer(model, cfg, run_binding=binding)
+    path = tmp_path / "bound.pt"
+    trainer.save_checkpoint(path)
+    restored = Trainer.load_checkpoint(
+        path, device=device, expected_binding=binding
+    )
+    assert restored.run_binding == binding
+    with pytest.raises(ValueError, match="binding mismatch"):
+        Trainer.load_checkpoint(
+            path,
+            device=device,
+            expected_binding={**binding, "whitener_hash": "different"},
+        )
+
+
+def test_expected_binding_rejects_legacy_checkpoint(device, tmp_path):
+    trainer = Trainer(BlockCrosscoder(CFG).to(device), train_cfg(total_steps=2))
+    path = tmp_path / "legacy.pt"
+    trainer.save_checkpoint(path)
+    with pytest.raises(ValueError, match="legacy/unbound"):
+        Trainer.load_checkpoint(
+            path, device=device, expected_binding={"whitener_hash": "abc"}
+        )
+
+
 # -- E3 AuxK caps ------------------------------------------------------------
 
 
@@ -354,7 +459,7 @@ def _aux_cfg(**overrides):
     return train_cfg(
         aux_variant="sasa",
         dead_threshold=1.0,
-        dead_window_batches=3,
+        dead_window_tokens=3 * 256,
         s_aux=8,
         **overrides,
     )

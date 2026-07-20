@@ -1,5 +1,8 @@
 """Offline tests for the preregistered R-D codec (tranche 3)."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from block_crosscoder_experiment.codec import CodecSpec, evaluate_rd, fit_codec
@@ -103,7 +106,61 @@ def test_floor_exclusion_reported_and_enforced():
     assert codec.meta["n_excluded"] == G
     res = evaluate_rd(m, codec, batches_of(x), row_len=128)
     assert res["avg_count"] == 0.0
+    assert res["support_bits_per_token"] == 0.0
+    assert res["bernoulli_bits_per_token"] == 0.0
     assert res["points"]["4"]["amplitude_bits_per_token"] == 0.0
+
+
+def test_codec_serialization_roundtrip(tmp_path):
+    torch.manual_seed(44)
+    m = calibrated(make_model(), torch.randn(2048, S, D))
+    codec = fit_codec(
+        m,
+        batches_of(torch.randn(2048, S, D)),
+        CodecSpec(qs=(4, 6), floor=10, n_bootstrap=8),
+    )
+    codec.meta["binding"] = {"whitener_hash": "abc"}
+    path = tmp_path / "codec.pt"
+    codec.save(path)
+    loaded = type(codec).load(path)
+    assert loaded.spec == codec.spec
+    assert loaded.calib_tokens == codec.calib_tokens
+    assert loaded.meta == codec.meta
+    for name in (
+        "included", "rotation", "lo", "hi", "count_log2p",
+        "bernoulli_log2p", "bernoulli_log2q", "calib_events", "calib_mean",
+    ):
+        assert torch.equal(getattr(loaded, name), getattr(codec, name))
+
+
+def test_count_model_is_fit_after_floor_exclusion():
+    class StubModel:
+        cfg = SimpleNamespace(n_blocks=3, block_dim=1, n_sites=1, d_model=1)
+
+        def __call__(self, x, mode):
+            masks = torch.tensor(
+                [[1, 1, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                dtype=torch.bool,
+                device=x.device,
+            )
+            z = torch.ones(4, 3, 1, device=x.device)
+            z_selected = z * masks.unsqueeze(-1)
+            return SimpleNamespace(
+                xhat=torch.zeros_like(x), z=z, z_selected=z_selected,
+                scores=z.squeeze(-1), mask=masks,
+            )
+
+    codec = fit_codec(
+        StubModel(),
+        [torch.arange(4, dtype=torch.float32).view(4, 1, 1)],
+        CodecSpec(qs=(4,), floor=2, n_bootstrap=8),
+    )
+    assert codec.included.tolist() == [True, True, False]
+    probs = codec.count_log2p.exp2()
+    # Included counts are [2,1,1,0], so add-one-smoothed masses are 2,3,2.
+    assert probs[0] == pytest.approx(2 / 17)
+    assert probs[1] == pytest.approx(3 / 17)
+    assert probs[2] == pytest.approx(2 / 17)
 
 
 def test_scalar_b1_path():

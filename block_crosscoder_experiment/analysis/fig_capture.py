@@ -19,17 +19,26 @@ from . import style as st
 from .artifacts import analysis_dir, load_winner, summary_dir
 from .catalog import ZOO
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = summary_dir()
-SITES = W["sites"]
-ARMS = {
-    "site-renorm winner": (W["run_name"], Path(W["ckpt"]).parent),
-    "primary gauge": (
-        Path(W["counterpart_primary"]).name,
-        Path(W["counterpart_primary"]),
-    ),
-}
+W = None
+DATA = None
+OUT = None
+SITES = []
+ARMS = {}
+
+
+def _configure() -> None:
+    global W, DATA, OUT, SITES, ARMS
+    W = load_winner()
+    DATA = analysis_dir(W)
+    OUT = summary_dir()
+    SITES = W["sites"]
+    ARMS = {
+        "site-renorm winner": (W["run_name"], Path(W["ckpt"]).parent),
+        "primary gauge": (
+            Path(W["counterpart_primary"]).name,
+            Path(W["counterpart_primary"]),
+        ),
+    }
 
 
 def _tests() -> dict:
@@ -122,6 +131,7 @@ def fig_allocation() -> None:
 
 
 def main() -> None:
+    _configure()
     st.apply()
     OUT.mkdir(parents=True, exist_ok=True)
     fig_capture(_tests())

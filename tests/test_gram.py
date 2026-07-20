@@ -14,6 +14,8 @@ from block_crosscoder_experiment.gram import (
     block_gram,
     gram_residual,
     init_decoder_stack,
+    map_nuclear_penalty,
+    project_block_frobenius_,
     rank_penalty,
     retract_,
     site_frobenius_shares,
@@ -123,6 +125,56 @@ def test_rank_penalty_endpoints(device):
     flat = (q.T / math.sqrt(S)).expand(S, G, B_DIM, D_MODEL).contiguous().to(device)
     assert gram_residual(flat).max().item() < 1e-5
     assert abs(rank_penalty(flat).item() - (math.sqrt(S) - 1)) < 1e-3
+
+
+def test_site_partition_is_zero_profile_not_zero_joint_rank(device):
+    D = site_exclusive_stack(device)
+    assert rank_penalty(D).item() < 1e-3
+    assert torch.linalg.matrix_rank(
+        D[:, 0].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL).float()
+    ) == B_DIM
+
+
+def test_map_nuclear_matches_explicit_end_to_end_map(device):
+    D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
+    E = random_stack(device, seed=21)
+    actual = map_nuclear_penalty(D, E, eps=0.0)
+    explicit = []
+    for g in range(G):
+        dbar = D[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        ebar = E[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        explicit.append(torch.linalg.svdvals(dbar.T @ ebar).sum() / B_DIM)
+    assert torch.allclose(actual, torch.stack(explicit).mean(), atol=1e-4)
+
+
+def test_map_nuclear_matches_explicit_for_unconstrained_decoder(device):
+    D = random_stack(device, seed=24, scale=0.3)
+    E = random_stack(device, seed=25, scale=0.2)
+    actual = map_nuclear_penalty(D, E, eps=0.0)
+    explicit = []
+    for g in range(G):
+        dbar = D[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        ebar = E[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        explicit.append(torch.linalg.svdvals(dbar.T @ ebar).sum() / B_DIM)
+    assert torch.allclose(actual, torch.stack(explicit).mean(), atol=2e-4)
+
+
+def test_frobenius_projection(device):
+    D = random_stack(device, scale=3.0)
+    hits = project_block_frobenius_(D)
+    norms = D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()
+    assert hits == G
+    assert norms.max() <= 1.0 + 1e-5
+
+
+def test_site_singular_values_casts_before_gram(device):
+    D = random_stack(device, seed=22)
+    expected = site_singular_values(D)
+    actual = site_singular_values(D.to(torch.bfloat16))
+    # The only difference is the input parameter cast, not bf16 accumulation.
+    reference = site_singular_values(D.to(torch.bfloat16).float())
+    assert torch.equal(actual, reference)
+    assert torch.allclose(actual, expected, atol=2e-2)
 
 
 def test_rank_penalty_bounds_and_grad(device):

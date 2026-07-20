@@ -35,6 +35,7 @@ import torch
 
 __all__ = [
     "DEFAULT_RIDGE_SCALE",
+    "NORMALIZATION_MODES",
     "Whitener",
     "WhitenerAccumulator",
     "ShardWriter",
@@ -43,6 +44,7 @@ __all__ = [
 ]
 
 DEFAULT_RIDGE_SCALE = 1.0  # saklas mahalanobis.py convention, pinned by design
+NORMALIZATION_MODES = ("none", "scalar", "layer", "whiten")
 FORBIDDEN_DTYPES = (torch.float16,)
 STORE_DTYPE = torch.bfloat16
 MANIFEST_NAME = "split.json"
@@ -87,25 +89,56 @@ class WhitenerAccumulator:
         meta: dict,
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
         site_renorm: bool = False,
+        mode: str = "whiten",
     ) -> "Whitener":
-        """Fit and freeze the transform in fp64 on CPU.
+        """Fit and freeze one Phase-0.5 normalization transform in fp64.
 
-        ``site_renorm=True`` folds the calibration-fit site RMS scalar into
-        ``W``. Production stores require it; old pilot stores remain readable.
+        ``none`` stores raw activations, ``scalar`` mean-centres each site and
+        divides by its dataset RMS, ``layer`` applies token-wise LayerNorm at
+        write time, and ``whiten`` uses the shrinkage-covariance transform.
+        ``site_renorm`` is a separate, whiten-only factor which folds the
+        calibration-fit per-site RMS scalar into ``W``.
         """
+        if mode not in NORMALIZATION_MODES:
+            raise ValueError(f"mode must be one of {NORMALIZATION_MODES}, got {mode!r}")
+        if site_renorm and mode != "whiten":
+            raise ValueError("site_renorm is defined only for mode='whiten'")
         if self.n < 2:
-            raise ValueError("whitener needs at least 2 tokens")
-        mean = (self.sum / self.n).cpu()
-        cov = self.outer.cpu() / self.n - torch.einsum("sd,se->sde", mean, mean)
-        d = mean.shape[1]
-        ridge = cov.diagonal(dim1=1, dim2=2).mean(dim=1) * ridge_scale  # [S]
-        W = torch.zeros_like(cov)
-        eigs = torch.zeros(mean.shape[0], d, dtype=torch.float64)
-        for s in range(mean.shape[0]):
-            e, V = torch.linalg.eigh(cov[s] + ridge[s] * torch.eye(d, dtype=torch.float64))
-            eigs[s] = e
-            W[s] = (V * e.clamp_min(1e-12).rsqrt()) @ V.T
+            raise ValueError("normalization fit needs at least 2 tokens")
+        fitted_mean = (self.sum / self.n).cpu()
+        cov = self.outer.cpu() / self.n - torch.einsum(
+            "sd,se->sde", fitted_mean, fitted_mean
+        )
+        n_sites, d = fitted_mean.shape
+        eye = torch.eye(d, dtype=torch.float64).expand(n_sites, d, d).clone()
+        cov_eigs = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+
+        if mode == "whiten":
+            mean = fitted_mean
+            ridge = cov.diagonal(dim1=1, dim2=2).mean(dim=1) * ridge_scale
+            W = torch.zeros_like(cov)
+            eigs = torch.zeros(n_sites, d, dtype=torch.float64)
+            for s in range(n_sites):
+                e, V = torch.linalg.eigh(cov[s] + ridge[s] * eye[s])
+                eigs[s] = e
+                W[s] = (V * e.clamp_min(1e-12).rsqrt()) @ V.T
+        elif mode == "scalar":
+            mean = fitted_mean
+            ridge = torch.zeros(n_sites, dtype=torch.float64)
+            eigs = cov_eigs
+            rms = cov.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12).sqrt()
+            W = eye * rms.reciprocal().view(-1, 1, 1)
+        else:
+            # Raw and LayerNorm stores are deliberately not dataset-centred.
+            # LayerNorm performs token-local centring/scaling in ``apply``.
+            mean = torch.zeros_like(fitted_mean)
+            ridge = torch.zeros(n_sites, dtype=torch.float64)
+            eigs = cov_eigs
+            W = eye
         frozen_meta = dict(meta)
+        frozen_meta["normalization"] = mode
+        frozen_meta["normalization_fit_tokens"] = self.n
+        frozen_meta["layer_norm_eps"] = 1e-5
         if site_renorm:
             retained = ((eigs - ridge[:, None]) / eigs).clamp_min(0.0).mean(1)
             scalars = retained.clamp_min(1e-12).rsqrt()
@@ -125,7 +158,7 @@ class WhitenerAccumulator:
 
 @dataclass
 class Whitener:
-    """Frozen per-site whitening map x̃^s = W_s (x^s − μ_s)."""
+    """Frozen activation transform (legacy name retained for checkpoints)."""
 
     mean: torch.Tensor  # [S, d] fp32
     W: torch.Tensor  # [S, d, d] fp32
@@ -136,12 +169,20 @@ class Whitener:
     meta: dict = field(default_factory=dict)
 
     @property
+    def mode(self) -> str:
+        return str(self.meta.get("normalization", "whiten"))
+
+    @property
     def hash(self) -> str:
-        """sha256 over μ, W, ridge, sites, and the source manifest."""
+        """sha256 over every transform-defining field and source manifest."""
         h = hashlib.sha256()
-        for t in (self.mean, self.W, self.ridge):
+        for t in (self.mean, self.W, self.ridge, self.eigenvalues):
             h.update(t.contiguous().to(torch.float32).numpy().tobytes())
-        h.update(json.dumps([self.sites, self.meta], sort_keys=True).encode())
+        h.update(
+            json.dumps(
+                [self.sites, self.n_fit_tokens, self.meta], sort_keys=True
+            ).encode()
+        )
         return h.hexdigest()
 
     def site_rms_scalars(self) -> torch.Tensor:
@@ -155,7 +196,7 @@ class Whitener:
         directional rogue-dim suppression kept, equal total site power
         restored. Returns [S] fp32.
         """
-        if self.meta.get("site_rms_renorm_folded"):
+        if self.mode != "whiten" or self.meta.get("site_rms_renorm_folded"):
             return torch.ones(len(self.sites), dtype=torch.float32)
         e = self.eigenvalues.double()
         lam = self.ridge.double().unsqueeze(1)
@@ -163,15 +204,23 @@ class Whitener:
         return retained.clamp_min(1e-12).rsqrt().float()
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [n, S, d] raw -> whitened, computed in fp32."""
+        """x: [n, S, d] raw -> configured normalized coordinates in fp32."""
         if x.dtype in FORBIDDEN_DTYPES:
             raise TypeError("fp16 is forbidden in the harvest/store path")
+        if self.mode == "layer":
+            return torch.nn.functional.layer_norm(
+                x.float(),
+                (x.shape[-1],),
+                eps=float(self.meta.get("layer_norm_eps", 1e-5)),
+            )
         mean = self.mean.to(x.device)
         W = self.W.to(x.device)
         return torch.einsum("sde,nse->nsd", W, x.float() - mean)
 
     def unapply(self, xw: torch.Tensor) -> torch.Tensor:
-        """Whitened -> raw (fp32): x = W^{-1} x̃ + μ. Export egress only."""
+        """Invert a fixed linear transform; token LayerNorm is non-invertible."""
+        if self.mode == "layer":
+            raise ValueError("token-wise LayerNorm is not invertible")
         Winv = torch.linalg.inv(self.W.double()).float().to(xw.device)
         return torch.einsum("sde,nse->nsd", Winv, xw.float()) + self.mean.to(xw.device)
 
@@ -329,33 +378,59 @@ def prefetch_batches(
     exceptions are re-raised at the consumption point. This overlaps shard
     reads with GPU steps.
 
-    If the consumer abandons the generator early (e.g. total_steps hit),
-    the worker thread parks on a full queue holding ~depth batches + one
-    shard until process exit — acceptable for one-training-per-process
-    scripts, not for long-lived services.
+    Total lookahead is the queue depth plus the producer's current item (and
+    any shard held by the source iterator), not exactly ``depth`` resident
+    batches. Closing or abandoning the returned generator sets a cancellation
+    event, closes the source iterator when supported, and prevents a producer
+    from remaining parked on a full queue.
     """
     import queue
     import threading
 
+    if depth <= 0:
+        raise ValueError("prefetch depth must be positive")
     q: queue.Queue = queue.Queue(maxsize=depth)
     end = object()
+    stop = threading.Event()
+
+    def deliver(item: object) -> bool:
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def worker() -> None:
         try:
             for x in it:
-                q.put(x)
-            q.put(end)
+                if not deliver(x):
+                    return
+            deliver(end)
         except BaseException as e:  # noqa: BLE001 — re-raised consumer-side
-            q.put(e)
+            deliver(e)
+        finally:
+            # Generator close must run in the producer thread. Calling it
+            # consumer-side while the producer is inside ``next`` raises
+            # ``ValueError: generator already executing``.
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()
 
-    threading.Thread(target=worker, daemon=True).start()
-    while True:
-        item = q.get()
-        if item is end:
-            return
-        if isinstance(item, BaseException):
-            raise item
-        yield item
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = q.get()
+            if item is end:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
 
 
 class StoreReader:

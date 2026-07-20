@@ -90,6 +90,47 @@ def test_production_whitener_folds_site_renorm_once():
     assert torch.equal(w.site_rms_scalars(), torch.ones(S))
 
 
+@pytest.mark.parametrize("mode", ["none", "scalar", "layer", "whiten"])
+def test_phase05_normalization_modes(mode):
+    batches, _ = gaussian_batches(n_batches=8)
+    acc = WhitenerAccumulator(S, D)
+    for x in batches:
+        acc.update(x)
+    w = acc.finalize(
+        sites=list(range(S)), meta={"campaign": "phase05-test"},
+        ridge_scale=1e-3, mode=mode,
+    )
+    x = torch.cat(batches)
+    y = w.apply(x)
+    assert w.mode == mode
+    assert torch.isfinite(y).all()
+    if mode == "none":
+        assert torch.equal(y, x.float())
+    elif mode == "scalar":
+        assert y.mean(dim=0).abs().max() < 0.08
+        assert torch.allclose(
+            y.pow(2).mean(dim=(0, 2)), torch.ones(S), atol=0.08
+        )
+    elif mode == "layer":
+        assert y.mean(dim=-1).abs().max() < 1e-5
+        assert torch.allclose(y.pow(2).mean(dim=-1), torch.ones(y.shape[:2]), atol=1e-4)
+        with pytest.raises(ValueError, match="not invertible"):
+            w.unapply(y[:2])
+    else:
+        assert y.mean(dim=0).abs().max() < 0.08
+
+
+def test_site_renorm_only_valid_with_whitening():
+    batches, _ = gaussian_batches(n_batches=2)
+    acc = WhitenerAccumulator(S, D)
+    for x in batches:
+        acc.update(x)
+    with pytest.raises(ValueError, match="only for mode='whiten'"):
+        acc.finalize(
+            sites=list(range(S)), meta={}, mode="scalar", site_renorm=True
+        )
+
+
 def test_whitener_roundtrip_and_hash(tmp_path):
     batches, _ = gaussian_batches(n_batches=5)
     w = fit_whitener(batches)
@@ -100,6 +141,24 @@ def test_whitener_roundtrip_and_hash(tmp_path):
     w2 = Whitener.load(tmp_path / "w.pt")
     assert w2.hash == w.hash
     assert torch.equal(w2.W, w.W)
+
+
+def test_transform_hash_covers_eigenvalues_and_fit_count():
+    batches, _ = gaussian_batches(n_batches=3)
+    w = fit_whitener(batches)
+    altered_eigs = Whitener(
+        mean=w.mean, W=w.W, ridge=w.ridge,
+        eigenvalues=w.eigenvalues.clone(), sites=w.sites,
+        n_fit_tokens=w.n_fit_tokens, meta=dict(w.meta),
+    )
+    altered_eigs.eigenvalues[0, 0] += 1
+    assert altered_eigs.hash != w.hash
+    altered_n = Whitener(
+        mean=w.mean, W=w.W, ridge=w.ridge,
+        eigenvalues=w.eigenvalues, sites=w.sites,
+        n_fit_tokens=w.n_fit_tokens + 1, meta=dict(w.meta),
+    )
+    assert altered_n.hash != w.hash
 
 
 def test_whitener_rejects_fp16():
@@ -262,6 +321,26 @@ def test_prefetch_preserves_order_and_reraises(tmp_path):
     next(it)
     with pytest.raises(RuntimeError, match="worker died"):
         next(it)
+
+
+def test_prefetch_close_cancels_early_exit():
+    import threading
+
+    from block_crosscoder_experiment.store import prefetch_batches
+
+    source_closed = threading.Event()
+
+    def forever():
+        try:
+            while True:
+                yield torch.zeros(1)
+        finally:
+            source_closed.set()
+
+    it = prefetch_batches(forever(), depth=1)
+    next(it)
+    it.close()
+    assert source_closed.wait(timeout=2.0)
 
 
 def test_merged_manifest_reads_across_splits(tmp_path):

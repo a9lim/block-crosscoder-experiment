@@ -67,7 +67,9 @@ def _load_model(root: Path, device: str) -> tuple[BlockCrosscoder, dict, dict]:
         n_sites=mc["n_sites"],
         d_model=mc["d_model"],
         k=mc["k"],
-        lambda_rank=mc.get("lambda_rank", 0.0),
+        lambda_regularizer=mc.get(
+            "lambda_regularizer", mc.get("lambda_rank", 0.0)
+        ),
         eig_floor=mc.get("eig_floor", 1e-6),
         sv_eps=mc.get("sv_eps", 1e-8),
         seed=mc.get("seed", report.get("seed", 0)),
@@ -425,7 +427,9 @@ def main() -> None:
                 "b": b,
                 "k": float(mc["k"]),
                 "seed": report.get("seed"),
-                "lambda_rank": report.get("lam", mc.get("lambda_rank")),
+                "lambda_regularizer": report.get(
+                    "lam", mc.get("lambda_regularizer", mc.get("lambda_rank"))
+                ),
                 "lr": report.get("lr"),
                 "epochs": report.get("epochs"),
                 "optimizer_tokens": int(report.get("total_steps", 0) * 4096),
@@ -449,6 +453,7 @@ def main() -> None:
             active = all_active[rows, column]
             operational = codes * active[:, None]
             n_classes = MANIFOLD_SPECS[family].fit_count or len(FAMILIES[family])
+            decoder_frames = model.D[:, block].detach().float().cpu().numpy()
 
             def evaluate(eval_fold: int) -> dict:
                 train = folds == 0
@@ -472,8 +477,7 @@ def main() -> None:
                     operational[evaluate_on], labels[evaluate_on], n_classes
                 )
                 site_metrics = []
-                decoder = model.D[:, block].detach().float().cpu().numpy()
-                for site, frame in zip(meta["sites"], decoder):
+                for site, frame in zip(meta["sites"], decoder_frames):
                     fit = fit_cycle_harmonic(train_mu @ frame)
                     site_metrics.append({
                         "site": int(site),

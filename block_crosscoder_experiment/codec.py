@@ -37,7 +37,7 @@ Pipeline, per model:
 6. **Amplitude bits/token**: q * b * k_t — each selected block carries
    the obligation to transmit b coordinates (finding 12); the scalar
    arm pays q * l_t for its own realized l_t (R14).
-7. **Distortion**: whitened FVU through the quantized codes, per site
+7. **Distortion**: declared-coordinate FVU through the quantized codes, per site
    and pooled, centering by the CALIB-fit per-site mean (no eval-fit
    parameters anywhere).
 8. **Uncertainty** (R18): bootstrap over stored SEQUENCES (contiguous
@@ -47,7 +47,8 @@ Pipeline, per model:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -96,6 +97,51 @@ class Codec:
         t = ((z_can - lo) / span).clamp(0.0, 1.0)
         return lo + torch.round(t * levels) / levels * span
 
+    def save(self, path: str | Path) -> None:
+        """Atomically serialize every calibration-fit codec parameter."""
+        payload = {
+            "format_version": 1,
+            "spec": asdict(self.spec),
+            "included": self.included,
+            "rotation": self.rotation,
+            "lo": self.lo,
+            "hi": self.hi,
+            "count_log2p": self.count_log2p,
+            "bernoulli_log2p": self.bernoulli_log2p,
+            "bernoulli_log2q": self.bernoulli_log2q,
+            "calib_events": self.calib_events,
+            "calib_tokens": self.calib_tokens,
+            "calib_mean": self.calib_mean,
+            "meta": self.meta,
+        }
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp)
+        tmp.replace(path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Codec":
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if payload.get("format_version") != 1:
+            raise ValueError(f"unsupported codec format in {path}")
+        spec_dict = dict(payload["spec"])
+        spec_dict["qs"] = tuple(spec_dict["qs"])
+        return cls(
+            spec=CodecSpec(**spec_dict),
+            included=payload["included"],
+            rotation=payload["rotation"],
+            lo=payload["lo"],
+            hi=payload["hi"],
+            count_log2p=payload["count_log2p"],
+            bernoulli_log2p=payload["bernoulli_log2p"],
+            bernoulli_log2q=payload["bernoulli_log2q"],
+            calib_events=payload["calib_events"],
+            calib_tokens=int(payload["calib_tokens"]),
+            calib_mean=payload["calib_mean"],
+            meta=dict(payload["meta"]),
+        )
+
 
 def _log2_binom(n: int, k: torch.Tensor) -> torch.Tensor:
     """log2 C(n, k), elementwise over integer tensor k (values > n clamp)."""
@@ -118,7 +164,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
 
     ev_codes: list[torch.Tensor] = []
     ev_ids: list[torch.Tensor] = []
-    count_hist = torch.zeros(0, dtype=torch.long)
+    ev_tokens: list[torch.Tensor] = []
     block_events = torch.zeros(G, dtype=torch.long)
     mean_acc = torch.zeros(S, d, dtype=torch.float64)
     n_tokens = 0
@@ -128,22 +174,39 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
         out = model(x, mode="threshold")
         mask = out.mask
         z_sel = out.z_selected
+        nz = mask.nonzero()
         ev_codes.append(z_sel[mask].float().cpu())
-        ev_ids.append(mask.nonzero()[:, 1].to(torch.int32).cpu())
-        counts = mask.sum(dim=1).cpu()
-        m = int(counts.max()) if counts.numel() else 0
-        if m + 1 > count_hist.numel():
-            grown = torch.zeros(m + 1, dtype=torch.long)
-            grown[: count_hist.numel()] = count_hist
-            count_hist = grown
-        count_hist += torch.bincount(counts, minlength=count_hist.numel())
+        ev_ids.append(nz[:, 1].to(torch.int32).cpu())
+        ev_tokens.append((nz[:, 0] + n_tokens).to(torch.int32).cpu())
         block_events += mask.sum(dim=0).cpu()
         mean_acc += x.double().sum(dim=0).cpu()
         n_tokens += x.shape[0]
 
     codes = torch.cat(ev_codes) if ev_codes else torch.zeros(0, b)
     ids = torch.cat(ev_ids).long() if ev_ids else torch.zeros(0, dtype=torch.long)
+    token_ids = (
+        torch.cat(ev_tokens).long() if ev_tokens else torch.zeros(0, dtype=torch.long)
+    )
+    # torch.cat allocates consolidated storage; release the per-batch tensors
+    # before the orientation/quantile pass so production calibration does not
+    # retain a second copy of every event.
+    ev_codes.clear()
+    ev_ids.clear()
+    ev_tokens.clear()
     included = block_events >= spec.floor
+
+    # The deployed support is stripped of excluded blocks. Fit its count
+    # model after the floor is known; fitting raw counts and pricing stripped
+    # counts assigns bits to events the codec cannot transmit.
+    if included.any():
+        kept_tokens = token_ids[included[ids]]
+        included_counts = torch.bincount(kept_tokens, minlength=n_tokens)
+        count_hist = torch.bincount(included_counts)
+        del kept_tokens
+    else:
+        included_counts = torch.zeros(n_tokens, dtype=torch.long)
+        count_hist = torch.tensor([n_tokens], dtype=torch.long)
+    del included_counts, token_ids
 
     # Canonical orientation: batched second moments via index_add, eigh
     # descending, sign so the active-mean projection is >= 0.
@@ -181,10 +244,14 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
 
     # Count model: add-one smoothing over [0, K_max].
     k_max_obs = int(count_hist.nonzero().max()) if count_hist.sum() else 0
-    K_max = 2 * k_max_obs + 8
-    smoothed = torch.ones(K_max + 1, dtype=torch.float64)
-    smoothed[: count_hist.numel()] += count_hist.double()
-    count_log2p = torch.log2(smoothed / smoothed.sum())
+    if included.any():
+        K_max = 2 * k_max_obs + 8
+        smoothed = torch.ones(K_max + 1, dtype=torch.float64)
+        smoothed[: count_hist.numel()] += count_hist.double()
+        count_log2p = torch.log2(smoothed / smoothed.sum())
+    else:
+        # Empty support has one possible count and requires no count code.
+        count_log2p = torch.zeros(1, dtype=torch.float64)
 
     # Bernoulli support-entropy sensitivity model.
     p_hat = (block_events.double() + 1.0) / (n_tokens + 2.0)
@@ -232,7 +299,7 @@ def evaluate_rd(
     inc = codec.included.to(device)
     R = codec.rotation.to(device)
     mu = codec.calib_mean.to(device).float()  # [S, d] calib-fit centering
-    log2_1mq_total = float(codec.bernoulli_log2q.double().sum())
+    log2_1mq_total = float(codec.bernoulli_log2q[codec.included].double().sum())
 
     rows_err = {q: [] for q in spec.qs}  # per-row sq err (pooled over sites)
     rows_err_site = {q: [] for q in spec.qs}  # per-row [S]
@@ -279,13 +346,21 @@ def evaluate_rd(
         counts = mask.sum(dim=1)
 
         # Rates (support enumerative + Bernoulli sensitivity), per token.
-        sup_bits = (
-            -codec.log2_count_prob(counts.cpu()).double()
-            + _log2_binom(codec.n_included, counts.cpu())
-        )
-        act_p = (codec.bernoulli_log2p.to(device) * mask.float()).sum(dim=1).double()
-        act_q = (codec.bernoulli_log2q.to(device) * mask.float()).sum(dim=1).double()
-        bern_bits = -(act_p.cpu() + (log2_1mq_total - act_q.cpu()))
+        if codec.n_included:
+            sup_bits = (
+                -codec.log2_count_prob(counts.cpu()).double()
+                + _log2_binom(codec.n_included, counts.cpu())
+            )
+            act_p = (
+                codec.bernoulli_log2p.to(device) * mask.float()
+            ).sum(dim=1).double()
+            act_q = (
+                codec.bernoulli_log2q.to(device) * mask.float()
+            ).sum(dim=1).double()
+            bern_bits = -(act_p.cpu() + (log2_1mq_total - act_q.cpu()))
+        else:
+            sup_bits = torch.zeros(x.shape[0], dtype=torch.float64)
+            bern_bits = torch.zeros(x.shape[0], dtype=torch.float64)
 
         err_site = {}
         for q in spec.qs:

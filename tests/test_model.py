@@ -11,6 +11,7 @@ from block_crosscoder_experiment.model import (
     BSCConfig,
     batch_topk_mask,
     bsc_loss,
+    token_topk_mask,
 )
 
 CFG = BSCConfig(n_blocks=16, block_dim=4, n_sites=4, d_model=32, k=3, seed=0)
@@ -71,6 +72,96 @@ def test_batchtopk_exact_count_and_variable_per_token(device):
     assert int(frac.sum().item()) == round(0.8 * B)
 
 
+def test_token_topk_exact_per_token_count(device):
+    scores = torch.rand(64, CFG.n_blocks, device=device)
+    mask = token_topk_mask(scores, 3)
+    assert torch.equal(mask.sum(dim=1), torch.full((64,), 3, device=device))
+
+
+def test_encoder_bias_breaks_antipodal_support(device):
+    model = make_model(device, encoder_bias=True, selection="token_topk")
+    with torch.no_grad():
+        model.a.normal_(mean=0.5, std=0.1)
+    x = whitened_batch(device, n=64)
+    assert not torch.allclose(model.scores(model.encode(x)), model.scores(model.encode(-x)))
+
+
+def test_tied_grassmannian_uses_single_gamma(device):
+    model = make_model(device, encoder_mode="tied")
+    assert model.E is None and model.log_gamma.shape == ()
+    x = whitened_batch(device, n=8)
+    expected = torch.einsum("bsd,sgkd->bgk", x, model.D) * model.log_gamma.exp()
+    assert torch.allclose(model.encode(x), expected, atol=1e-5)
+
+
+def test_relu_dense_crosscoder_bridge(device):
+    model = make_model(
+        device, block_dim=1, code_activation="relu", selection="dense",
+        regularizer="crosscoder_l1", lambda_regularizer=1e-4, encoder_bias=True,
+        decoder_constraint="frobenius",
+    )
+    x = whitened_batch(device, n=32)
+    out = model(x)
+    assert (out.z >= 0).all()
+    assert torch.equal(out.mask, out.scores > 0)
+    parts = bsc_loss(out, x, model)
+    assert parts["regularizer"] >= 0
+
+
+def test_decoder_weighted_batchtopk_score_matches_minder(device):
+    model = make_model(
+        device, block_dim=1, code_activation="relu",
+        selection_score="decoder_weighted", decoder_constraint="free",
+    )
+    x = whitened_batch(device, n=32)
+    z = model.encode(x)
+    expected = z.squeeze(-1) * model.D.float().norm(dim=-1).squeeze(-1).sum(dim=0)
+    assert torch.allclose(model.scores(z), expected.to(z.dtype), atol=1e-5)
+
+
+def test_group_lasso_bridge_has_positive_learned_threshold(device):
+    model = make_model(
+        device, selection="dense", code_activation="group_soft_threshold",
+        decoder_constraint="free", regularizer="group_l21",
+        lambda_regularizer=1e-3,
+        encoder_bias=True,
+    )
+    x = whitened_batch(device, n=32)
+    out = model(x)
+    assert torch.nn.functional.softplus(model.log_threshold).min() > 0
+    assert torch.equal(out.mask, out.scores > 0)
+    parts = bsc_loss(out, x, model)
+    parts["total"].backward()
+    assert model.log_threshold.grad is not None
+
+
+def test_free_decoder_projection_is_noop(device):
+    model = make_model(device, decoder_constraint="free")
+    before = model.D.detach().clone()
+    assert model.project_decoder_() == 0
+    assert torch.equal(model.D, before)
+
+
+def test_frobenius_decoder_projection(device):
+    model = make_model(device, decoder_constraint="frobenius")
+    with torch.no_grad():
+        model.D.mul_(5)
+    hits = model.project_decoder_()
+    norms = model.D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()
+    assert hits > 0 and norms.max() <= 1 + 1e-5
+
+
+def test_map_nuclear_regularizer(device):
+    model = make_model(
+        device, regularizer="map_nuclear", lambda_regularizer=1e-3
+    )
+    x = whitened_batch(device, n=32)
+    parts = bsc_loss(model(x), x, model)
+    assert parts["regularizer"] > 0
+    parts["total"].backward()
+    assert model.E.grad is not None
+
+
 def test_gradient_only_through_selected(device):
     model = make_model(device)
     x = whitened_batch(device, n=64)
@@ -92,6 +183,15 @@ def test_threshold_mode_requires_calibration(device):
     model.theta.fill_(model.scores(model.encode(x)).median())
     out = model(x, mode="threshold")
     assert out.mask.any() and not out.mask.all()
+
+
+def test_fixed_threshold_training_selector_has_variable_counts(device):
+    model = make_model(device, selection="threshold")
+    x = whitened_batch(device, n=128)
+    model.fit_threshold_([x], target_avg_blocks=CFG.k, method="exact")
+    out = model(x)
+    assert abs(float(out.mask.float().sum(dim=1).mean()) - CFG.k) < 0.1
+    assert out.mask.sum(dim=1).min() != out.mask.sum(dim=1).max()
 
 
 def test_init_tied_and_score_comparability(device):
@@ -116,11 +216,25 @@ def planted_lowrank_batch(device, n=1024, rank=8, seed=3):
     return x.to(device)
 
 
+def test_exact_k_planted_model_matches_fel_support():
+    from block_crosscoder_experiment.synthetic import (
+        BlockSpec,
+        ExactKPlantedModel,
+    )
+
+    truth = ExactKPlantedModel(
+        [BlockSpec(rank=1, frequency=0.25) for _ in range(8)],
+        n_sites=1, d_model=16, block_dim=2, active_per_sample=2,
+    )
+    batch = truth.sample(128, seed=3)
+    assert torch.equal(batch.active.sum(dim=1), torch.full((128,), 2))
+
+
 def test_train_smoke_loss_decreases(device):
     """Full ordering on tiny data: optimizer step -> retract -> next step.
     Loss must fall and the constraint must hold at every step."""
     torch.manual_seed(0)
-    model = make_model(device, lambda_rank=1e-3)
+    model = make_model(device, lambda_regularizer=1e-3)
     x = planted_lowrank_batch(device)
     opt = torch.optim.Adam(
         [

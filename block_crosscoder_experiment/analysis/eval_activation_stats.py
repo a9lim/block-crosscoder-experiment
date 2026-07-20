@@ -8,6 +8,9 @@ against each run's calibrated theta) and accumulates, per block:
   - zz[G,b,b]            second moment of the selected code (fired tokens)
                          -> code anisotropy; the Phase-(-1) packing flag is
                          a strongly split spectrum with ~50/50 share
+  - z_sum[G,b]           first moment of the selected code, required to
+                         separate conditional mean from within-feature
+                         covariance (``zz - z_sum z_sum^T / count``)
   - site_energy[G,S]     contribution energy ||D_g^s^T z_g||^2 over fired
                          tokens (the manifold-export "share" statistic),
                          computed at the end as tr(D_g^s D_g^s^T · zz_g) —
@@ -54,12 +57,15 @@ def load_model(root: Path, device: str) -> tuple[BlockCrosscoder, dict]:
 def run_stats(name: str, root: Path, device: str, out_dir: Path,
               batch: int, renorm_scalars: torch.Tensor, store: Path) -> None:
     model, report = load_model(root, device)
+    if not bool(torch.isfinite(model.theta)):
+        raise ValueError(f"{root} has no finite calibration threshold")
     cfg = model.cfg
     G, b, S = cfg.n_blocks, cfg.block_dim, cfg.n_sites
     reader = StoreReader(store, "eval")
 
     fire = torch.zeros(G, dtype=torch.float64, device=device)
     score_sum = torch.zeros(G, dtype=torch.float64, device=device)
+    z_sum = torch.zeros(G, b, dtype=torch.float64, device=device)
     zz = torch.zeros(G, b, b, dtype=torch.float64, device=device)
     coact = torch.zeros(G, G, dtype=torch.float32, device=device)
     l0_hist = torch.zeros(MAX_L0_BIN + 1, dtype=torch.float64, device=device)
@@ -81,6 +87,7 @@ def run_stats(name: str, root: Path, device: str, out_dir: Path,
         fm = mask.float()
         fire += fm.sum(0).double()
         score_sum += (p * fm).sum(0).double()
+        z_sum += zsel.sum(0).double()
         zz += torch.einsum("ngb,ngc->gbc", zsel, zsel).double()
         coact += fm.T @ fm
         l0 = mask.sum(1).clamp(max=MAX_L0_BIN)
@@ -96,7 +103,10 @@ def run_stats(name: str, root: Path, device: str, out_dir: Path,
         out_dir / f"evalstats_{name}.npz",
         fire_count=fire.cpu().numpy(),
         score_sum=score_sum.cpu().numpy(),
-        zz=zz.cpu().numpy().astype(np.float32),
+        # Preserve fp64 here: centered covariance subtracts two potentially
+        # close quantities, and these arrays are tiny beside coact.
+        z_sum=z_sum.cpu().numpy(),
+        zz=zz.cpu().numpy(),
         site_energy=site_energy.cpu().numpy().astype(np.float32),
         coact=coact.cpu().numpy(),
         l0_hist=l0_hist.cpu().numpy(),
