@@ -21,6 +21,11 @@ def main() -> None:
         "--store", type=Path,
         default=Path("/data/stores/bcc-phase09/gemma3_1b_6site_fineweb"),
     )
+    parser.add_argument(
+        "--splits", nargs="+", default=None,
+        help="verify only these whitened splits (checksums, no raw "
+        "round-trip); default: the full 0.9-store protocol",
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     print(f"config: store={args.store} device={args.device}", flush=True)
@@ -31,6 +36,20 @@ def main() -> None:
 
     whitener = Whitener.load(args.store / "whitener.pt")
     print(f"whitener hash {whitener.hash[:16]}…", flush=True)
+    if args.splits is not None:
+        for split in args.splits:
+            reader = StoreReader(
+                args.store, split, expected_whitener_hash=whitener.hash
+            )
+            t0 = time.time()
+            n = reader.verify()
+            dt = time.time() - t0
+            gb = n * len(reader.manifest["sites"]) * reader.d_model * 2 / 1e9
+            print(f"  {split}: {n:,} tokens ({gb:,.0f} GB, "
+                  f"{len(reader.manifest['shards'])} shards) verified in "
+                  f"{dt:.0f}s ({gb / max(dt, 1e-9):.2f} GB/s)", flush=True)
+        print("store verified", flush=True)
+        return
     readers = {}
     for split, expected in (
         ("calibration", whitener.hash),
