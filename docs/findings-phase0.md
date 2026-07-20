@@ -331,6 +331,29 @@ freshness-conservative reading feared. The epochs-renorm cell
 new program-best checkpoint and the promoted winner
 (`data/phase0/winner.json`).
 
+**Showcase re-derivation at 24M** (mechanical mega-block gates over
+both winner arms, α = 0.01; `data/phase0/showcase_blocks.json`,
+figures regenerated from it). Five families qualify, and the gauge
+split is structured: **renorm holds the cyclic and geographic
+manifolds, primary holds the ordered number line.** Renorm-side:
+month b595 (8/12 top-1, ring 10/12 at the permutation floor), weekday
+b862 (7/7, ring p = 2.8e-3), country b1781 (34/48, geo R² 0.354 at
+the floor; block-level LOO lat 0.234 / lon 0.104 — modestly narrower
+top-1 margins than the 12M pilot's 10/12 and 36/48). Primary-side:
+cardinal b2146 (16/20, ρ = 0.653, p = 2.5e-3) and **ordinal b382
+newly qualified** (14/20, ρ = 0.647, p = 2.3e-3). The near-misses are
+instructive: the renorm arm's cardinal consolidates (14/20) but
+misses the order gate at p = 0.012, while the primary arm's month
+collapses outright (2/12) — so C3's breadth claim sharpens rather
+than merely reproduces: renorm is still the only arm capturing both
+calendar families, but the ordered number line is now the primary
+gauge's exclusive. Separately, **block identity persisted under
+same-seed retraining**: b595, b862, b1781, and b2146 — all four pilot
+showcase indices — were re-elected by fresh 24M runs from the same
+init (only ordinal's b382 is new), refining C3's "identity is
+init-determined" from an observation about init lottery to a
+stability property under 2× budget change at fixed init.
+
 ---
 
 ## Hypothesis status after Phase 0

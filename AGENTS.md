@@ -35,7 +35,9 @@ one-shot scripts live in `scripts/archive/` with a rename map);
 
 Phase 0 complete except closeout: **tranche 6 done** (epochs-vs-fresh:
 budget does the work, fresh ≈ epochs within 0.0013; findings §C10;
-winner promoted to the 24M-token renorm epochs cell, FVU 0.3997),
+winner promoted to the 24M-token renorm epochs cell, FVU 0.3997;
+canonical figures regenerated from it — 5 showcase families qualify:
+renorm month/weekday/country, primary cardinal/ordinal, §C10),
 **tranche 7 tail** (whitener stability at 5M, bf16 tail stats,
 checksum drill), **tranche 5** (guarded lr recovery, last — the
 re-ratification bar is a9's). **Phase 1 store commit waits only on

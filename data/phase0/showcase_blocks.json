@@ -1,0 +1,537 @@
+{
+  "_derived_from": {
+    "winner": "bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1",
+    "tests": "/data/runs/bcc-analysis/bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1/zoo_block_tests.json",
+    "alpha": 0.01
+  },
+  "families": {
+    "cardinal": {
+      "arm": "primary",
+      "block": 2146,
+      "top1_claimed": 16,
+      "n_classes": 20,
+      "distinct_top1": 4,
+      "order": {
+        "kind": "line",
+        "spearman": 0.653,
+        "perm_p": 0.0024998750062496873
+      },
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "arms": {
+        "winner": {
+          "block": 3194,
+          "top1_claimed": 14,
+          "n_classes": 20,
+          "distinct_top1": 4,
+          "order": {
+            "kind": "line",
+            "spearman": 0.552,
+            "perm_p": 0.012449377531123443
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 2146,
+          "top1_claimed": 16,
+          "n_classes": 20,
+          "distinct_top1": 4,
+          "order": {
+            "kind": "line",
+            "spearman": 0.653,
+            "perm_p": 0.0024998750062496873
+          },
+          "consolidated": true,
+          "ordered": true,
+          "qualified": true
+        }
+      }
+    },
+    "color": {
+      "arm": "winner",
+      "block": 2483,
+      "top1_claimed": 4,
+      "n_classes": 11,
+      "distinct_top1": 7,
+      "order": {
+        "kind": "ring",
+        "hits": 4,
+        "max": 6,
+        "top_plane_var": 0.981,
+        "perm_p": 0.16849157542122895
+      },
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 2483,
+          "top1_claimed": 4,
+          "n_classes": 11,
+          "distinct_top1": 7,
+          "order": {
+            "kind": "ring",
+            "hits": 4,
+            "max": 6,
+            "top_plane_var": 0.981,
+            "perm_p": 0.16849157542122895
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 208,
+          "top1_claimed": 7,
+          "n_classes": 11,
+          "distinct_top1": 4,
+          "order": {
+            "kind": "ring",
+            "hits": 2,
+            "max": 6,
+            "top_plane_var": 0.942,
+            "perm_p": 0.751662416879156
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "compass": {
+      "arm": "primary",
+      "block": 127,
+      "top1_claimed": 4,
+      "n_classes": 4,
+      "distinct_top1": 1,
+      "order": {
+        "kind": "ring",
+        "hits": 2,
+        "max": 4,
+        "top_plane_var": 0.998,
+        "perm_p": 1.0
+      },
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 2295,
+          "top1_claimed": 3,
+          "n_classes": 4,
+          "distinct_top1": 2,
+          "order": {
+            "kind": "ring",
+            "hits": 2,
+            "max": 4,
+            "top_plane_var": 0.997,
+            "perm_p": 1.0
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 127,
+          "top1_claimed": 4,
+          "n_classes": 4,
+          "distinct_top1": 1,
+          "order": {
+            "kind": "ring",
+            "hits": 2,
+            "max": 4,
+            "top_plane_var": 0.998,
+            "perm_p": 1.0
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "country": {
+      "arm": "winner",
+      "block": 1781,
+      "top1_claimed": 34,
+      "n_classes": 48,
+      "distinct_top1": 14,
+      "order": {
+        "kind": "geo",
+        "r2": 0.354,
+        "n_classes": 48,
+        "perm_p": 4.999750012499375e-05
+      },
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "arms": {
+        "winner": {
+          "block": 1781,
+          "top1_claimed": 34,
+          "n_classes": 48,
+          "distinct_top1": 14,
+          "order": {
+            "kind": "geo",
+            "r2": 0.354,
+            "n_classes": 48,
+            "perm_p": 4.999750012499375e-05
+          },
+          "consolidated": true,
+          "ordered": true,
+          "qualified": true
+        },
+        "primary": {
+          "block": 1273,
+          "top1_claimed": 21,
+          "n_classes": 48,
+          "distinct_top1": 24,
+          "order": {
+            "kind": "geo",
+            "r2": 0.162,
+            "n_classes": 48,
+            "perm_p": 0.044547772611369434
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "digit": {
+      "arm": "primary",
+      "block": 1018,
+      "top1_claimed": 2,
+      "n_classes": 10,
+      "distinct_top1": 9,
+      "order": {
+        "kind": "line",
+        "spearman": 0.733,
+        "perm_p": 0.021248937553122346
+      },
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 636,
+          "top1_claimed": 1,
+          "n_classes": 10,
+          "distinct_top1": 10,
+          "order": {
+            "kind": "line",
+            "spearman": 0.6,
+            "perm_p": 0.07169641517924104
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 1018,
+          "top1_claimed": 2,
+          "n_classes": 10,
+          "distinct_top1": 9,
+          "order": {
+            "kind": "line",
+            "spearman": 0.733,
+            "perm_p": 0.021248937553122346
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "element": {
+      "arm": "primary",
+      "block": 3709,
+      "top1_claimed": 6,
+      "n_classes": 27,
+      "distinct_top1": 15,
+      "order": {
+        "kind": "line",
+        "spearman": 0.297,
+        "perm_p": 0.1320433978301085
+      },
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 1282,
+          "top1_claimed": 17,
+          "n_classes": 27,
+          "distinct_top1": 10,
+          "order": {
+            "kind": "line",
+            "spearman": 0.07,
+            "perm_p": 0.7314134293285336
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 3709,
+          "top1_claimed": 6,
+          "n_classes": 27,
+          "distinct_top1": 15,
+          "order": {
+            "kind": "line",
+            "spearman": 0.297,
+            "perm_p": 0.1320433978301085
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "month": {
+      "arm": "winner",
+      "block": 595,
+      "top1_claimed": 8,
+      "n_classes": 12,
+      "distinct_top1": 3,
+      "order": {
+        "kind": "ring",
+        "hits": 10,
+        "max": 12,
+        "top_plane_var": 0.883,
+        "perm_p": 4.999750012499375e-05
+      },
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "arms": {
+        "winner": {
+          "block": 595,
+          "top1_claimed": 8,
+          "n_classes": 12,
+          "distinct_top1": 3,
+          "order": {
+            "kind": "ring",
+            "hits": 10,
+            "max": 12,
+            "top_plane_var": 0.883,
+            "perm_p": 4.999750012499375e-05
+          },
+          "consolidated": true,
+          "ordered": true,
+          "qualified": true
+        },
+        "primary": {
+          "block": 1270,
+          "top1_claimed": 2,
+          "n_classes": 12,
+          "distinct_top1": 6,
+          "order": {
+            "kind": "ring",
+            "hits": 5,
+            "max": 12,
+            "top_plane_var": 0.975,
+            "perm_p": 0.04774761261936903
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "ordinal": {
+      "arm": "primary",
+      "block": 382,
+      "top1_claimed": 14,
+      "n_classes": 20,
+      "distinct_top1": 6,
+      "order": {
+        "kind": "line",
+        "spearman": 0.647,
+        "perm_p": 0.0022498875056247186
+      },
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "arms": {
+        "winner": {
+          "block": 1393,
+          "top1_claimed": 10,
+          "n_classes": 20,
+          "distinct_top1": 6,
+          "order": {
+            "kind": "line",
+            "spearman": 0.038,
+            "perm_p": 0.872606369681516
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 382,
+          "top1_claimed": 14,
+          "n_classes": 20,
+          "distinct_top1": 6,
+          "order": {
+            "kind": "line",
+            "spearman": 0.647,
+            "perm_p": 0.0022498875056247186
+          },
+          "consolidated": true,
+          "ordered": true,
+          "qualified": true
+        }
+      }
+    },
+    "planet": {
+      "arm": "winner",
+      "block": 1698,
+      "top1_claimed": 6,
+      "n_classes": 9,
+      "distinct_top1": 4,
+      "order": {
+        "kind": "line",
+        "spearman": 0.117,
+        "perm_p": 0.7801609919504024
+      },
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 1698,
+          "top1_claimed": 6,
+          "n_classes": 9,
+          "distinct_top1": 4,
+          "order": {
+            "kind": "line",
+            "spearman": 0.117,
+            "perm_p": 0.7801609919504024
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 2465,
+          "top1_claimed": 6,
+          "n_classes": 9,
+          "distinct_top1": 4,
+          "order": {
+            "kind": "line",
+            "spearman": 0.05,
+            "perm_p": 0.9169541522923854
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "season": {
+      "arm": "winner",
+      "block": 2716,
+      "top1_claimed": 2,
+      "n_classes": 4,
+      "distinct_top1": 3,
+      "order": {
+        "kind": "ring",
+        "hits": 4,
+        "max": 4,
+        "top_plane_var": 0.985,
+        "perm_p": 0.3336833158342083
+      },
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "arms": {
+        "winner": {
+          "block": 2716,
+          "top1_claimed": 2,
+          "n_classes": 4,
+          "distinct_top1": 3,
+          "order": {
+            "kind": "ring",
+            "hits": 4,
+            "max": 4,
+            "top_plane_var": 0.985,
+            "perm_p": 0.3336833158342083
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        },
+        "primary": {
+          "block": 1270,
+          "top1_claimed": 2,
+          "n_classes": 4,
+          "distinct_top1": 2,
+          "order": {
+            "kind": "ring",
+            "hits": 2,
+            "max": 4,
+            "top_plane_var": 0.983,
+            "perm_p": 1.0
+          },
+          "consolidated": false,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    },
+    "weekday": {
+      "arm": "winner",
+      "block": 862,
+      "top1_claimed": 7,
+      "n_classes": 7,
+      "distinct_top1": 1,
+      "order": {
+        "kind": "ring",
+        "hits": 7,
+        "max": 7,
+        "top_plane_var": 0.973,
+        "perm_p": 0.0027498625068746564
+      },
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "arms": {
+        "winner": {
+          "block": 862,
+          "top1_claimed": 7,
+          "n_classes": 7,
+          "distinct_top1": 1,
+          "order": {
+            "kind": "ring",
+            "hits": 7,
+            "max": 7,
+            "top_plane_var": 0.973,
+            "perm_p": 0.0027498625068746564
+          },
+          "consolidated": true,
+          "ordered": true,
+          "qualified": true
+        },
+        "primary": {
+          "block": 2982,
+          "top1_claimed": 7,
+          "n_classes": 7,
+          "distinct_top1": 1,
+          "order": {
+            "kind": "ring",
+            "hits": 3,
+            "max": 7,
+            "top_plane_var": 0.943,
+            "perm_p": 0.4301784910754462
+          },
+          "consolidated": true,
+          "ordered": false,
+          "qualified": false
+        }
+      }
+    }
+  }
+}
