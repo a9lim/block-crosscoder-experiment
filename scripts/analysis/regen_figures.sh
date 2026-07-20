@@ -51,7 +51,7 @@ EOF
   #    ~8M scanned tokens, per-class cap keeps the concat in host RAM.
   python scripts/analysis/probe_calendar.py --device cuda \
     --model "$MODEL" --store "$STORE" --out "$ADIR" --tag "" \
-    --families weekday month year ordinal cardinal digit season compass \
+    --families weekday month ordinal cardinal digit season compass \
                color country element planet \
     --per-class-cap 600 --runs
 
