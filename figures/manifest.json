@@ -1,0 +1,202 @@
+{
+  "winner": {
+    "run_name": "bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1",
+    "ckpt": "/data/runs/bcc-phase099/bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1/latest.pt",
+    "counterpart_primary": "/data/runs/bcc-phase099/bsc_lam0.001_seed0_G4096_k32_ep4_guard_rcap1",
+    "host": "jobe",
+    "arm": "bsc",
+    "site_renorm": true,
+    "site_renorm_folded": false,
+    "site_renorm_scalars": [
+      4.9814,
+      5.3197,
+      4.9289,
+      3.6428,
+      2.6511,
+      2.2413,
+      2.0583,
+      1.8617
+    ],
+    "site_renorm_scalars_source": "pilot 2M-token whitener fit used to train this checkpoint; production refits on its calibration slice",
+    "n_blocks": 4096,
+    "block_dim": 4,
+    "k": 32,
+    "lam": 0.001,
+    "lr": 0.0003,
+    "sites": [
+      9,
+      12,
+      15,
+      18,
+      21,
+      24,
+      27,
+      30
+    ],
+    "optimizer_tokens": 24000000,
+    "epochs": 4,
+    "train_split": "train",
+    "fvu_pooled_topk": 0.3997,
+    "store": "/data/stores/bcc-pilot4b/gemma3_4b_8site_fineweb",
+    "model": "google/gemma-3-4b-pt",
+    "date": "2026-07-19",
+    "notes": "Tranche-6 epochs cell (6M train split x 4 epochs, full v2.4 stack: guard + streaming theta + rcap 1.0; zero guard events, dead frac 0.0). Beat the 0.9.6 pilot winner (0.4154 at 12M tokens) and the fresh-token 12m_renorm cell (0.4098, spike-marred). Block identities (b595 month, b862 weekday, b1781 atlas) belong to the superseded pilot run - re-derive capture maps before reusing block indices."
+  },
+  "artifact_dir": "data/analysis/current",
+  "families": {
+    "cardinal": {
+      "block": 3194,
+      "top1_claimed": 14,
+      "n_classes": 20,
+      "order": "|rho| 0.552, permutation p=0.0124",
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "cardinal/frames.html",
+        "cardinal/flow.html",
+        "cardinal/stream.html"
+      ]
+    },
+    "color": {
+      "block": 2483,
+      "top1_claimed": 4,
+      "n_classes": 11,
+      "order": "ring 4/6, permutation p=0.168",
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "color/frames.html",
+        "color/flow.html",
+        "color/stream.html"
+      ]
+    },
+    "compass": {
+      "block": 2295,
+      "top1_claimed": 3,
+      "n_classes": 4,
+      "order": "ring 2/4, permutation p=1",
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "compass/frames.html",
+        "compass/flow.html",
+        "compass/stream.html"
+      ]
+    },
+    "country": {
+      "block": 1781,
+      "top1_claimed": 34,
+      "n_classes": 48,
+      "order": "geo R\u00b2 0.354, permutation p=5e-05",
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "files": [
+        "country/frames.html",
+        "country/flow.html",
+        "country/stream.html"
+      ]
+    },
+    "digit": {
+      "block": 636,
+      "top1_claimed": 1,
+      "n_classes": 10,
+      "order": "|rho| 0.600, permutation p=0.0717",
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "digit/frames.html",
+        "digit/flow.html",
+        "digit/stream.html"
+      ]
+    },
+    "element": {
+      "block": 1282,
+      "top1_claimed": 17,
+      "n_classes": 27,
+      "order": "|rho| 0.070, permutation p=0.731",
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "element/frames.html",
+        "element/flow.html",
+        "element/stream.html"
+      ]
+    },
+    "month": {
+      "block": 595,
+      "top1_claimed": 8,
+      "n_classes": 12,
+      "order": "ring 10/12, permutation p=5e-05",
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "files": [
+        "month/frames.html",
+        "month/flow.html",
+        "month/stream.html"
+      ]
+    },
+    "ordinal": {
+      "block": 1393,
+      "top1_claimed": 10,
+      "n_classes": 20,
+      "order": "|rho| 0.038, permutation p=0.873",
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "ordinal/frames.html",
+        "ordinal/flow.html",
+        "ordinal/stream.html"
+      ]
+    },
+    "planet": {
+      "block": 1698,
+      "top1_claimed": 6,
+      "n_classes": 9,
+      "order": "|rho| 0.117, permutation p=0.78",
+      "consolidated": true,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "planet/frames.html",
+        "planet/flow.html",
+        "planet/stream.html"
+      ]
+    },
+    "season": {
+      "block": 2716,
+      "top1_claimed": 2,
+      "n_classes": 4,
+      "order": "ring 4/4, permutation p=0.334",
+      "consolidated": false,
+      "ordered": false,
+      "qualified": false,
+      "files": [
+        "season/frames.html",
+        "season/flow.html",
+        "season/stream.html"
+      ]
+    },
+    "weekday": {
+      "block": 862,
+      "top1_claimed": 7,
+      "n_classes": 7,
+      "order": "ring 7/7, permutation p=0.00275",
+      "consolidated": true,
+      "ordered": true,
+      "qualified": true,
+      "files": [
+        "weekday/frames.html",
+        "weekday/flow.html",
+        "weekday/stream.html"
+      ]
+    }
+  }
+}

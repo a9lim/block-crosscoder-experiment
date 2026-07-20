@@ -70,6 +70,26 @@ def test_site_rms_scalars_restore_unit_power():
     assert torch.allclose(power, torch.ones(S), atol=0.02)
 
 
+def test_production_whitener_folds_site_renorm_once():
+    gen = torch.Generator().manual_seed(8)
+    x = torch.randn(20_000, S, D, generator=gen)
+    decay = torch.stack(
+        [torch.arange(1, D + 1).float() ** (-(s + 1) / 2) for s in range(S)]
+    )
+    x = x * decay.view(1, S, D)
+    acc = WhitenerAccumulator(S, D)
+    acc.update(x)
+    w = acc.finalize(
+        sites=list(range(S)), meta={"campaign": "test"},
+        ridge_scale=1.0, site_renorm=True,
+    )
+    power = w.apply(x).pow(2).mean(dim=(0, 2))
+    assert torch.allclose(power, torch.ones(S), atol=0.02)
+    assert w.meta["site_rms_renorm_folded"] is True
+    assert len(w.meta["site_rms_scalars"]) == S
+    assert torch.equal(w.site_rms_scalars(), torch.ones(S))
+
+
 def test_whitener_roundtrip_and_hash(tmp_path):
     batches, _ = gaussian_batches(n_batches=5)
     w = fit_whitener(batches)

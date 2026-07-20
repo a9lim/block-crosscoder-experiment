@@ -1,9 +1,7 @@
-"""Block-sparse crosscoders: unsupervised cross-layer manifold discovery.
+"""Block-sparse crosscoders and their controlled evaluation stack.
 
-Phased experiment (see docs/design.md, v2.2 frozen). Modules land phase by
-phase: gram/model are the Phase −1 core; Phase 0 blockification, Phase 0.5
-cross-layer coherence, Phase 1 the BSC trainer + scalar baseline follow;
-Phase 2's import bridge lands in saklas.
+See ``docs/design.md`` for the normative architecture and Phase-1 protocol.
+The post-publication consumer bridge lands in saklas, not this package.
 """
 
 from .gram import (

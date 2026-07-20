@@ -79,15 +79,14 @@ class TrainConfig:
     retract_every: int = 1  # >1 is the documented throughput ablation (P16)
     optimizer: str = "auto"  # "adamw8bit" (CUDA) | "adamw" | "auto"
     forward_dtype: str = "bf16"  # "bf16" (production) | "fp32" (exact/dev)
-    # AuxK (P8; s_aux/alpha/window/threshold are Phase -1/0.9 calibration
-    # items — SASA's values are the starting spec).
+    # AuxK follows the validated SASA-style recovery path.
     aux_variant: str = "sasa"
     s_aux: int = 256
     alpha_aux: float = 1.0  # SASA lambda_aux; the Fel arm overrides to 1/s_aux
     dead_threshold: float = 1e-4
     dead_window_batches: int = 100
     dead_horizon_batches: int = 500
-    # Loss-spike guard (E2, runbook-phase099 tranche 1): batch-skip with
+    # Loss-spike guard: batch-skip with
     # corroboration. Trigger = grad_norm > guard_factor x trailing median
     # AND rec > guard_loss_factor x trailing median, medians over the last
     # guard_window ACCEPTED steps (unarmed until the window fills). A
@@ -96,13 +95,13 @@ class TrainConfig:
     # always skips. More than guard_max_consecutive skips in a row raises:
     # a run that needs sustained skipping is not at a stable operating
     # point, and the guard must not censor that evidence (skip rate is a
-    # reported gate, runbook tranche 1).
+    # reported run gate).
     guard: bool = False
     guard_factor: float = 20.0
     guard_loss_factor: float = 5.0
     guard_window: int = 50
     guard_max_consecutive: int = 5
-    # AuxK cap candidates (E3; mechanism pinned at Phase-1 config freeze).
+    # AuxK caps; the production CLI pins the gradient-ratio cap at 1.0.
     # aux_frac_cap: revived blocks/step <= ceil(frac x live dead-set size)
     # (dead-set variants only — fel has no dead set). aux_ratio_cap:
     # rescale alpha so the aux gradient norm never exceeds ratio x the

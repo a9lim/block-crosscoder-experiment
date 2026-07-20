@@ -143,7 +143,7 @@ def test_train_smoke_loss_decreases(device):
     assert all(torch.isfinite(torch.tensor(losses)))
 
 
-# -- E1 streaming theta quantile (runbook-phase099 tranche 1) ----------------
+# -- streaming theta quantile ------------------------------------------------
 
 
 def test_streaming_quantile_matches_exact_kthvalue(device):

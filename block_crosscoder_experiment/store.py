@@ -86,8 +86,13 @@ class WhitenerAccumulator:
         sites: Sequence[int],
         meta: dict,
         ridge_scale: float = DEFAULT_RIDGE_SCALE,
+        site_renorm: bool = False,
     ) -> "Whitener":
-        """Eigendecompose in fp64 (on CPU) and freeze W_s = (Σ+λI)^{-1/2}."""
+        """Fit and freeze the transform in fp64 on CPU.
+
+        ``site_renorm=True`` folds the calibration-fit site RMS scalar into
+        ``W``. Production stores require it; old pilot stores remain readable.
+        """
         if self.n < 2:
             raise ValueError("whitener needs at least 2 tokens")
         mean = (self.sum / self.n).cpu()
@@ -100,6 +105,13 @@ class WhitenerAccumulator:
             e, V = torch.linalg.eigh(cov[s] + ridge[s] * torch.eye(d, dtype=torch.float64))
             eigs[s] = e
             W[s] = (V * e.clamp_min(1e-12).rsqrt()) @ V.T
+        frozen_meta = dict(meta)
+        if site_renorm:
+            retained = ((eigs - ridge[:, None]) / eigs).clamp_min(0.0).mean(1)
+            scalars = retained.clamp_min(1e-12).rsqrt()
+            W *= scalars[:, None, None]
+            frozen_meta["site_rms_renorm_folded"] = True
+            frozen_meta["site_rms_scalars"] = scalars.tolist()
         return Whitener(
             mean=mean.float(),
             W=W.float(),
@@ -107,7 +119,7 @@ class WhitenerAccumulator:
             eigenvalues=eigs.float(),
             sites=tuple(int(s) for s in sites),
             n_fit_tokens=self.n,
-            meta=dict(meta),
+            meta=frozen_meta,
         )
 
 
@@ -133,13 +145,18 @@ class Whitener:
         return h.hexdigest()
 
     def site_rms_scalars(self) -> torch.Tensor:
-        """Per-site scalar RMS renormalization after shrinkage whitening
-        (F7 decision arm, design v2.3.2): the whitened per-dim variance
+        """Additional site-RMS scaling required at load time.
+
+        Production transforms already fold the scalar into ``W`` and return
+        ones here. Pilot transforms derive the compatibility scaling from the
+        shrinkage spectrum: the whitened per-dim variance
         prediction is (e_j − λ_s)/e_j for e = eig(Σ+λI), so scaling site s
         by 1/sqrt(mean_j retained_j) restores ~unit mean per-dim power —
         directional rogue-dim suppression kept, equal total site power
         restored. Returns [S] fp32.
         """
+        if self.meta.get("site_rms_renorm_folded"):
+            return torch.ones(len(self.sites), dtype=torch.float32)
         e = self.eigenvalues.double()
         lam = self.ridge.double().unsqueeze(1)
         retained = ((e - lam) / e).clamp_min(0.0).mean(dim=1)
@@ -306,11 +323,10 @@ class ShardWriter:
 def prefetch_batches(
     it: Iterator[torch.Tensor], depth: int = 4
 ) -> Iterator[torch.Tensor]:
-    """E5 (runbook-phase099 tranche 1): drive an I/O-bound batch iterator
+    """Drive an I/O-bound batch iterator
     from a daemon thread, holding up to ``depth`` batches ahead of the
     consumer. Order-preserving, so determinism is untouched; worker
-    exceptions are re-raised at the consumption point. The 0.9 rehearsal
-    measured 55-70% data-wait on the training loop — this overlaps shard
+    exceptions are re-raised at the consumption point. This overlaps shard
     reads with GPU steps.
 
     If the consumer abandons the generator early (e.g. total_steps hit),
@@ -376,7 +392,7 @@ class StoreReader:
             )
         self.n_tokens = self.manifest["n_tokens"]
         stored_sites = list(self.manifest["sites"])
-        # E4 site-subset view (runbook-phase099 tranche 1): `sites` selects a
+        # The site-subset view selects a
         # subset of the stored site axis by layer number, sliced AFTER shard
         # load so generator consumption (shard order, buffer permutations)
         # is byte-identical to the full-width read at the same seed — the

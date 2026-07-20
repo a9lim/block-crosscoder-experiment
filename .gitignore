@@ -1,11 +1,21 @@
-# Data + figures are regenerated artifacts; keep them out of git.
+# Ignore heavy regeneration inputs; commit compact evidence and canonical figures.
 references/**
 !references/.gitkeep
 !references/refs.yaml
 data/**
 !data/.gitkeep
+!data/evidence/
+!data/evidence/**
+!data/showcase.json
+!data/winner.json
 figures/**
-!figures/.gitkeep
+!figures/README.md
+!figures/index.html
+!figures/manifest.json
+!figures/*/
+!figures/*/*.html
+!figures/*/*.js
+!figures/*/*.png
 
 # Python
 __pycache__/

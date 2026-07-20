@@ -210,7 +210,10 @@ def core_zoo() -> tuple[list[BlockSpec], int]:
 
 def decoy_zoo(n_sites: int) -> tuple[list[BlockSpec], int]:
     f = 1.0 / 6.0
-    one_hot = lambda s: tuple(1.0 if i == s else 0.0 for i in range(n_sites))
+
+    def one_hot(s: int) -> tuple[float, ...]:
+        return tuple(1.0 if i == s else 0.0 for i in range(n_sites))
+
     specs = [
         BlockSpec(rank=1, frequency=f, scale=2.0),
         BlockSpec(rank=2, frequency=f, spectrum=(2.4, 1.6)),

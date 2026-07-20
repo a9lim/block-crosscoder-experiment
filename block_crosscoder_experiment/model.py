@@ -32,7 +32,7 @@ __all__ = [
 
 
 class StreamingScoreQuantile:
-    """Bounded-memory pooled-score quantile (E1, runbook-phase099).
+    """Bounded-memory pooled-score quantile for full-split calibration.
 
     A fixed log-spaced histogram over the selection-score range: scores
     are non-negative block norms, so bins span [lo, hi] geometrically
@@ -251,14 +251,13 @@ class BlockCrosscoder(nn.Module):
 
         method="exact": kthvalue over host-accumulated scores (not
         torch.quantile, which caps at ~16M elements). At G=4096 the
-        pooled score matrix is ~8.6 GB for the 0.9 calibration split and
-        cannot sit next to the model on a 24 GB card (0.9.5 dead-arm
-        OOM); at pilot scale the scalar arm OOM'd 61 GB host RAM even at
-        64 batches. Kept as the validation reference.
+        pooled score matrix is already ~8.6 GB at a modest pilot slice and
+        cannot sit next to the model on a 24 GB card; the scalar pilot arm
+        also exhausted 61 GB host RAM. Kept as the validation reference.
 
         method="streaming": bounded-memory log-histogram quantile
-        (E1, runbook-phase099 tranche 1) — the Phase-1 production path,
-        mandatory for the 13M-token calibration split, any G >= 8192
+        — the production path, mandatory for the 13M-token calibration
+        split, any G >= 8192
         config, and the scalar production arm. Deterministic
         (batch-order independent, int64 counts); resolution ~3e-5
         relative in theta. Validation gate vs exact:

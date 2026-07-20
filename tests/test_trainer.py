@@ -2,7 +2,7 @@
 sync, dead tracking, AuxK revival (the synthetic dead-encoder revival test
 from the pilot spec, exercised early), checkpoint/resume, and threshold
 calibration. The CUDA-only test verifies the ordering against the actual
-8-bit-Adam implementation (pulled forward from Phase 0.9)."""
+8-bit-Adam implementation."""
 
 import pytest
 import torch
@@ -258,7 +258,7 @@ def test_adamw8bit_retraction_ordering():
     assert all(torch.isfinite(p).all() for p in trainer.master.parameters())
 
 
-# -- E2 spike guard (runbook-phase099 tranche 1) -----------------------------
+# -- loss-spike guard --------------------------------------------------------
 
 
 def _warm_guarded_trainer(device, *, window=10, max_consecutive=3, **overrides):

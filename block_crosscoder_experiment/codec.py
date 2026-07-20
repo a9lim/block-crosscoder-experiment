@@ -1,5 +1,4 @@
-"""The preregistered rate–distortion codec (design §Rate–distortion
-protocol; runbook-phase099 tranche 3).
+"""The frozen rate–distortion codec specified in ``docs/design.md``.
 
 Everything here is fit on the CALIBRATION split and frozen before the
 eval split is touched (R15). Selection runs in threshold mode — the

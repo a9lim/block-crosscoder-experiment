@@ -1,494 +1,362 @@
 # Block-sparse crosscoders: Phase 0 findings
 
-*The pilot program, 2026-07-15 → 07-19, condensed. Every claim links
-its primary source in [`archive/`](archive/README.md); the design and
-the Phase-1 plan live in [`design.md`](design.md). Status: complete;
-tranche 5 deferred (§Open items).*
+*Pilot program, 2026-07-15 through 2026-07-19. This is the authoritative
+scientific account of Phase 0; [`design.md`](design.md) is the normative
+forward plan. Compact machine-readable evidence lives in
+[`data/evidence/`](../data/evidence/).*
 
 ## Abstract
 
-A **block-sparse crosscoder (BSC)** is dictionary learning whose
-atomic unit is a *b*-dimensional subspace with **one shared code
-across depth**: G blocks, per-site decoder frames, BatchTopK selection
-on exact contribution energy under a Gram constraint
-(Σ_s D_g^s D_g^sᵀ = I_b). It occupies the empty {block} × {cross-site}
-cell of the sparse-dictionary literature's 2×2. Phase 0 built the
-architecture, validated it on synthetic ground truth, and ran it on
-gemma-3-1b and gemma-3-4b pilot stores. Findings: (1) the
-architecture's premise — concept subspaces whose *frames rotate with
-depth while the code persists* — is directly observable in gemma
-before any training; (2) the ring structure that motivates subspace
-units exists in scalar SAE dictionaries but sits **below every
-clustering threshold**, so post-hoc blockification cannot reach it —
-native block training can, and does: trained BSCs capture the month
-ring, the cardinal number line, and a world-atlas map **as single
-blocks** with code geometry at the permutation floor; (3) on the
-honest rate–distortion axis, cross-site code tying is a **7.8–7.9×
-rate reduction at zero distortion cost**, the tying × blocking
-interaction is positive, and the site-renormalized BSC **strictly
-dominates the matched scalar frontier everywhere they overlap**
-(~390 → ~1,600 bits/token) — the matched-L0 "block tax" inverts once
-support bits are priced; (4) the production training stack is settled,
-bit-deterministic, and its failure modes are partitioned exactly
-between three independent mechanisms. Phase 1 — the full-size BSC on a
-53M-token store — waits only on hardware.
+A block-sparse crosscoder (BSC) learns a sparse dictionary whose atomic unit
+is a multidimensional subspace: one block code is shared across model depth
+and decoded through a different frame at every site. It fills the previously
+open {block} × {cross-site} cell of the sparse-dictionary literature's 2×2.
 
----
+Phase 0 established four results. First, Gemma already contains the object
+the architecture assumes: concept coordinates correspond linearly across
+depth even while their decoder frames rotate to chance alignment. Second,
+the month ring exists in a 65k scalar SAE but below every clustering
+threshold, so post-hoc blockification cannot reach it; native block training
+can, and captures rings, number lines, and a geographic map as individual
+blocks. Third, the combination earns its structure on an honest
+rate–distortion axis. Cross-site tying cuts rate by 7.8–7.9× at no distortion
+cost, the tying × blocking interaction is positive, and the site-renormalized
+BSC strictly dominates the matched scalar frontier throughout their shared
+pilot range. Fourth, the production training and harvest stack is now
+specified by measured failure modes rather than defaults. Phase 1 is blocked
+only on installation of the dedicated 4 TB NVMe.
 
-## C1. The shared-code premise holds in gemma before any training
+## 1. The experiment
 
-*(Cross-layer coherence probe on pretrained gemma-scope SAEs, layers
-9/17/22/29 of gemma-3-4b, paired 4M-token stream —
-[`archive/findings-phase05-cross-layer.md`](archive/findings-phase05-cross-layer.md).)*
+The motivating literature is a 2×2:
 
-Month-family codes correspond **linearly across depths** while the
-frames that carry them rotate to chance alignment: held-out
-cross-layer code-map R² reaches 0.83–0.90 across the 9↔22↔29 triangle
-(CCA ≥ 0.96 for 9↔22) while raw decoder-subspace principal angles sit
-at their random-subspace null (p ≈ 0.33–0.52). One pair (22→29) also
-span-matches (p = 0.001). **Frames rotate, the code persists** — the
-exact object a shared code + per-site frames parametrizes, observed
-in the wild before a single BSC gradient step.
-
-The same probe rewrote the depth story: activation-space calendar
-rings live *early* (layer 9: weekday circular score 0.981, decoder
-adjacency |r| 0.886), layer 22 is the ring-visibility *minimum*, and
-layer 17's dictionary undersplits both families — the origin of the
-standing rule **never judge structure through a single site's
-dictionary**, and the reason the production site list brackets depth
-from 26% to 88% (layers 9–30).
-
-## C2. The structure exists, but post-hoc discovery cannot reach it
-
-*(Positive control + discovery runs at 16k/65k —
-[`archive/findings-phase0-control.md`](archive/findings-phase0-control.md),
-[`archive/findings-phase0-gemma.md`](archive/findings-phase0-gemma.md).)*
-
-The pipeline replicates Engels' weekday/month/year rings on the exact
-GPT-2 SAE Engels used (all three families at the permutation floor
-p = 0.005), so its nulls are interpretable. On gemma-scope-2-4b layer
-22, discovery is **null at both 16k and 65k**: no clustering branch
-ever surfaces a multi-member ring candidate (BH-flagged: none), and
-the skeleton features are τ=0.5 graph singletons. But the month ring
-**exists decoder-side at 65k** — 12/12 distinct top-1 features whose
-decoder vectors are cyclically ordered (adjacency p = 1.5e-4,
-Fisher–Lee angle order p = 3.5e-4) at max adjacent cosine **0.32**,
-structurally below every cosine-clustering threshold. A bonus layer-9
-run nulls identically, so the gap is depth-general.
-
-This is H1's sharpened form and the project's motivation in one
-sentence: *the ring rides in the dictionary at cosines no post-hoc
-method can cluster, so reaching it requires learning the block
-jointly* — which is what a BSC does.
-
-## C3. A trained BSC captures concept manifolds as single blocks
-
-*(1b interim analysis + 4b pilot probes —
-[`archive/findings-interim-artifact-analysis.md`](archive/findings-interim-artifact-analysis.md),
-[`archive/findings-phase096-pilot4b.md`](archive/findings-phase096-pilot4b.md),
-[`archive/findings-phase096-tier-a.md`](archive/findings-phase096-tier-a.md).)*
-
-- **The month ring, 1b** (block 23 of the calibration winner): fires
-  on 53% of month tokens vs 0.2% background; 12/12
-  calendar-adjacent class means in its top code plane (97% of
-  class-mean variance, p < 5e-5, split-half stable); the block's
-  rotating per-site frames hold the ring at **all six sites**,
-  including depths where the raw stream's top plane has lost it.
-- **At 4b** (12M optimizer tokens): the renorm arm's b595 claims
-  10/12 months with code ring 10/12 at the permutation floor *and*
-  weekday 7/7 at the floor — the only arm capturing both calendar
-  families. The primary arm's b2146 captures the **cardinal number
-  line** (17/20 top-1, code order rho 0.90 at the floor); digits
-  fully individuate (one block per digit); renorm binds numbers
-  **across notation** (3/third, 4/fourth, 6/sixth, 7/seventh
-  same-block). The renorm arm's b1781 is an **atlas block**: 36/48
-  countries top-1 with latitude/longitude LOO-decodable from its
-  4-dim code (lat 0.34 / lon 0.15, p = 1e-3).
-- **The matched scalar baseline carries the same information without
-  unit-level individuation**: month top-1 features collapse to 4
-  distinct (1b) / 7 (4b), weekday to a single feature — the
-  information is present as a population code but no unit is the
-  manifold.
-
-Two structural caveats are part of the claim, not qualifications of
-it. **Capture and order are different statistics**: single-block
-consolidation is near-universal at sufficient budget (every 1b
-seed ≥ 11/12 top-1), but calendar *order* inside the block is a seed
-lottery (ring 12/7/10/2/3/12 across six seeds), and block identity is
-init-determined. And **consolidation-without-order is a failure
-signature** — a destroyed dictionary produced a mega-block claiming
-all 12 months with ring 6/12, and a *healthy* run claimed weekday 7/7
-top-1 with ring 2/7 — hence the standing **mega-block rule**: top-1
-capture is never read without ring order and FVU beside it.
-
-## C4. Cross-site tying is a ~7.9× rate cut at zero distortion cost
-
-*(Single-site R-D placement with exact eval-split weights —
-[`archive/findings-phase099-tranche1.md`](archive/findings-phase099-tranche1.md);
-figure [`../figures/phase0/rd_tying.png`](../figures/phase0/rd_tying.png).)*
-
-The factorial's single-site cells (8 independent per-site models,
-exactly parameter- and rate-matched) price what the shared code buys.
-Reconstructing all 8 sites with independent per-site models costs, at
-q=4: **block side 6,031 bits/token vs the joint BSC's 772.7 (7.8×);
-scalar side 12,509 vs the joint crosscoder's 1,588 (7.9×)**. Pooled
-with exact eval-split sq_tot weights, the joint block model
-**strictly dominates** its 8-model control in the whitened gauge
-(0.4360 @ 772.7 vs 0.4559 @ 6,031) and exactly ties it in the renorm
-gauge (0.4207 = 0.4207) — tying is distortion-free in both gauges.
-One support set and one amplitude vector serve all eight depths; the
-support-bit amortization that funds this is measured at **4.08×**
-joint (261 vs 1,067 support bits/token) and replicates *inside* the
-single-site cells (246 vs 1,051 per site — 4.26×).
-
-## C5. The R-D frontier: renorm strictly dominates scalar everywhere they overlap
-
-*(Preregistered codec + λ=0 frontier, k ∈ {16, 32, 64} × three arms —
-[`archive/findings-phase099-tranche1.md`](archive/findings-phase099-tranche1.md);
-figure [`../figures/phase0/rd_frontier.png`](../figures/phase0/rd_frontier.png).)*
-
-At matched latent-L0 the scalar arm "wins" FVU by 0.047 — the
-apparent block tax. Priced at matched **bits** through the
-preregistered codec (canonical orientation, calibration-quantile
-clipped uniform quantizer, frozen count model, realized counts,
-sequence bootstrap), the story inverts:
-
-| region (q=4) | block arm | scalar arm | verdict |
-|---|---|---|---|
-| ~390 bits | renorm k16: 0.4869 @ 390.7 | *(none — needs k≈6)* | blocks extend the frontier into the ultra-cheap region |
-| ~770–820 | renorm k32: 0.4207 @ 770.5 | scalar k16: 0.4306 @ 822.0 | **renorm strictly dominates** |
-| ~1.5 kbit | renorm k64: 0.3660 @ 1491.6 | scalar k32: 0.3718 @ 1588.4 | **renorm strictly dominates** (CIs disjoint) |
-| ~2.9 kbit | *(none — needs k=128)* | scalar k64: 0.3249 @ 2900 | open at the expensive end |
-
-Quantization is nearly transparent (q=6 reproduces unquantized FVU to
-the third decimal; q=4 costs +0.004–0.005), the count model is
-non-load-bearing (Bernoulli within ~5%), R-D positions are seed-stable
-(spreads at or below CI width), and the renorm-over-primary gap is
-k-stable (−0.015 to −0.021 FVU at identical rates). This is the H3
-*preview* (pilot store, 12M optimizer tokens); the 24M-token winner
-already moves the k32 point to **0.4053 @ 771.2** (C10), and Phase 1's
-frontier at production budget is the verdict.
-
-## C6. The 2×2 factorial: the tying × blocking interaction is positive
-
-*(Both single-site cells trained config-only at exact per-site
-matching — [`archive/findings-phase099-tranche1.md`](archive/findings-phase099-tranche1.md).)*
-
-| pooled FVU (topk) | cross-site (tied code) | single-site | tying effect |
-|---|---|---|---|
-| **block** (4096×b4, k32) | **0.4299** | 0.4497 | −0.0198 |
-| **scalar** (16384×b1, k128) | **0.3682** | 0.3768 | −0.0086 |
-
-Tying helps in *both* geometries (the shared code pools selection
-signal across depth; it is not a constraint being paid for), and it
-helps blocks **~2.3× more** — interaction term **+0.011 pooled FVU**,
-replicating across 3 seeds (0.0198/0.0195/0.0193). The literature 2×2
-that the project set out to fill is thereby not just filled but
-*measured*: the combination earns more than the sum of its parts.
-
-## C7. The gauge result: shrinkage whitening tilts, renorm restores
-
-*(F7 lineage: fidelity audit → 0.9.5 arm → 4b pilot → factorial +
-placement — [`archive/design-review-2026-07-17-fidelity.md`](archive/design-review-2026-07-17-fidelity.md),
-[`archive/findings-phase099-tranche1.md`](archive/findings-phase099-tranche1.md).)*
-
-The shrinkage whitener retains ~6% of per-dimension variance at
-shallow sites vs ~29–32% deep, so the equal-per-dimension
-reconstruction loss silently weights deep sites several times
-heavier. Measured exactly on the 4b eval split: whitened-gauge
-per-site sq_tot weights run **0.033 → 0.275** (site 30 alone carries
-27% of pooled sq_tot; sites 9/12/15 together < 11%), while
-**site-renorm weights are uniform to ±2%**. Three independent
-evidence lines designate renorm:
-
-1. **Fair-allocation control**: both single-site families' per-site
-   FVU profiles land on the joint renorm profile at **r = 0.984**
-   (vs r ≈ 0.4 against primary) — every fairly-allocated model shows
-   the same intrinsic difficulty ordering; only raw-whitened joint
-   training deviates.
-2. **R-D dominance** (C5) plus the pooled-FVU win at the operating
-   point (0.4154 vs 0.4299).
-3. **Capture breadth** (C3): renorm is the only arm capturing both
-   calendar families at 4b, and the cross-notation number binding is
-   renorm-side.
-
-The two arms are **different gauges of the same manifolds** — paired
-token code maps between them beat the within-class permutation floor
-for every captured family (cardinal R² 0.62, span cosine 0.80), and
-block identity persists across the renorm toggle at shared init (both
-arms' b1018 is the same '197x' block). Cost worn openly: renorm's
-stability edge is lower (destroyed at lr 6e-4 where primary
-recovered) — covered by the guard at the pinned 3e-4.
-
-## C8. The stream carries far more captured-manifold supply than calendars
-
-*(Exploratory catalog, explicitly non-gate:
-[`archive/findings-phase096-pilot4b.md`](archive/findings-phase096-pilot4b.md).)*
-
-- **Number lines are depth-pervasive and straighten with depth**
-  (ordinal Spearman |rho| along PC1: 0.91 → 0.99 by layer 24;
-  spacing linear, not logarithmic).
-- **The Gurnee–Tegmark world map rides at every site** (country
-  LOO lat R² 0.57–0.66 at every depth; longitude washes out at L30;
-  zero continent clustering).
-- **A mid-stack shear zone** (frame-rotation trough at L18–L21, 0.71
-  vs 0.84/0.91 flanks) through which stream manifolds rotate hardest;
-  captured blocks' frames track their manifold's rotation at
-  r ≥ 0.92. Cross-depth frame coherence doubles as a training-health
-  signature (destroyed runs decohere).
-- **Uncaptured supply**: the planet sun-distance line exists
-  in-stream (|rho| ≤ 0.88) with no block consolidating it at pilot
-  budget; color shows a stable non-hue-wheel geometry; element order
-  dips through the shear zone.
-- **Packing cliques** (Jaccard > 0.9 co-firing blocks) are converged
-  optima, not noise — at 4b they tile one early context-detector
-  subspace (renorm's decodes as citation/date scaffold); Phase −1
-  showed block width is a packing budget and merging *improves* with
-  convergence. Near-50/50 share splits + degraded code-R² is the
-  packing flag.
-
-**These families (calendar, zoo, atlas) are burned as selection
-criteria** — three analysis passes tuned on them; all confirmatory
-capture claims route through the sealed six-family panel
-(runbook-phase099 tranche 0, opened only at Phase-1 config freeze).
-
-## C9. The training stack is settled and its failure modes partitioned
-
-*(Phase −1 battery, 0.9 rehearsal, 0.9.5/0.9.6 calibration, 0.9.9
-engineering campaign — full lineage in
-[`archive/`](archive/README.md); the pinned stack table is
-[`design.md §Settled parameters`](design.md).)*
-
-- **4b training is bit-deterministic across runs** (8-bit Adam + CUDA
-  included) — spike sites exactly reproducible, regression suites and
-  forensics exact.
-- **The failure-mode partition is exact, three mechanisms, no
-  overlap**: operating-point instability → the **guard refuses** the
-  run (> 5 consecutive skips); poison batches (the step-1600 event is
-  batch-locked across three divergent trajectories) → the **guard
-  skips** them; the SASA AuxK revival cascade (s_aux=256 slam
-  amplifying to ~100% of the gradient, *self-defeating* — it re-kills
-  its own revivals) → the **aux-ratio-cap 1.0 defuses** it (peak
-  gradients crushed 100×+: 107.9→0.52, 527.7→2.53, 220,670→36.9;
-  final dead 3.08%→0.098%; bit-inert on healthy trajectories). The
-  cap does not rescue bad operating points — that separation is the
-  point.
-- **Zero guard events at lr 3e-4 across every campaign run**; the 1b
-  optimum (1.2e-3) is catastrophically unstable at 4b — scale
-  transfer of optimizer points is *not* assumed anywhere anymore.
-- **θ calibration streams** (log-histogram quantile over the full 13M
-  calib split; the 61 GB OOM case now runs in 19.5 GB and full-split θ
-  is *closer* to target k), **prefetch 4** cuts data-wait 30%→12%,
-  and the codec is validated end-to-end (C5).
-- **Store/harvest facts**: 40,960 bytes/token exactly; the 53M-token
-  production store is 2.171 TB (fits the 4 TB NVMe at ~45% headroom);
-  harvest ≈ 3 GPU-hours at 5,000 tok/s; writer 205 MB/s; whitener
-  drift on a +6M extension uniformly below the pilot's own held-out
-  baseline; fp16 banned everywhere in the harvest path; healthy dead
-  band at G=4096 is 0.1–0.15%.
-
-## C10. Epochs vs fresh data: the optimizer-token budget does the work
-
-*(Tranche 6, four cells at matched 24M optimizer tokens on the full
-pinned stack — k=32, λ=1e-3, lr 3e-4 cosine, guard + streaming θ +
-rcap 1.0, seed 0, 5856–5858 steps; codec passes q ∈ {4, 6, 8};
-payloads `data/phase0/t6_*.json`, run reports on jobe under
-`/data/runs/bcc-phase099`.)*
-
-| pooled FVU (topk) | primary | renorm |
+| | one site | sites tied by one code |
 |---|---|---|
-| 12M-token anchor (6M × 2ep) | 0.4299 | 0.4154 |
-| **6M unique × 4 epochs** | 0.4102 | **0.3997** |
-| **12M unique × 2 epochs** | 0.4089 | 0.4098 † |
+| scalar unit | SAE | scalar crosscoder |
+| subspace unit | block-sparse featurizer | **block-sparse crosscoder** |
 
-Three clean cells give the verdict: **at this scale the optimizer-token
-budget is what matters; data freshness is a refinement at the edge of
-noise.** Doubling the budget by *epochs* buys −0.0197 (primary) /
-−0.0157 (renorm); switching those repeats to *fresh* tokens adds only
-−0.0013 more (primary, 0.4102 → 0.4089). The k16 bonus point agrees
-(epochs doubling: 0.502 → 0.4832, −0.019).
+The BSC has `G` blocks of width `b`. For site `s`, block `g` has encoder
+`E_g^s`, decoder frame `D_g^s`, and one shared code
 
-† The fourth cell is not a clean read: the renorm×fresh run hit a
-guarded loss-spike cluster at steps 2676–2687 (one skipped step, rec
-loss transiently 2.8×, six near-misses; skip-rate 0.017% — within the
-≤ 0.1% gate) and finished 0.0101 *behind* its epochs counterpart. The
-same-order primary run over the same 12M store had zero guard events,
-so "fresh data is worse in the renorm gauge" and "this run ate a
-spike" are confounded; we do not read a freshness penalty from it.
+`z_g = Σ_s E_g^s x̃^s`.
 
-The codec confirms at the rate axis: the epochs-renorm cell reaches
-**0.4053 @ 771.2 bits/token** (q=4; 0.4003 @ 1026.3 at q=6), moving
-the C5 frontier point down 0.0154 at unchanged rate versus the
-12M-token champion (0.4207 @ 770.5). All four cells' support bits sit
-at 261–265 bits/token — support cost is budget-invariant; the entire
-improvement arrives as amplitude fidelity.
+Its concatenated decoder frame obeys
 
-Phase-1 consequence: the 53M-token production store at 2 epochs sits
-comfortably inside the regime where repeats and fresh tokens are
-near-equivalent, so store size is not the binding constraint the
-freshness-conservative reading feared. The epochs-renorm cell
-(`bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1`, 0.3997) is the
-new program-best checkpoint and the promoted winner
-(`data/phase0/winner.json`).
+`Σ_s D_g^s D_g^{sT} = I_b`.
 
-**Showcase re-derivation at 24M** (mechanical mega-block gates over
-both winner arms, α = 0.01; `data/phase0/showcase_blocks.json`,
-figures regenerated from it). Five families qualify, and the gauge
-split is structured: **renorm holds the cyclic and geographic
-manifolds, primary holds the ordered number line.** Renorm-side:
-month b595 (8/12 top-1, ring 10/12 at the permutation floor), weekday
-b862 (7/7, ring p = 2.8e-3), country b1781 (34/48, geo R² 0.354 at
-the floor; block-level LOO lat 0.234 / lon 0.104 — modestly narrower
-top-1 margins than the 12M pilot's 10/12 and 36/48). Primary-side:
-cardinal b2146 (16/20, ρ = 0.653, p = 2.5e-3) and **ordinal b382
-newly qualified** (14/20, ρ = 0.647, p = 2.3e-3). The near-misses are
-instructive: the renorm arm's cardinal consolidates (14/20) but
-misses the order gate at p = 0.012, while the primary arm's month
-collapses outright (2/12) — so C3's breadth claim sharpens rather
-than merely reproduces: renorm is still the only arm capturing both
-calendar families, but the ordered number line is now the primary
-gauge's exclusive. Separately, **block identity persisted under
-same-seed retraining**: b595, b862, b1781, and b2146 — all four pilot
-showcase indices — were re-elected by fresh 24M runs from the same
-init (only ordinal's b382 is new), refining C3's "identity is
-init-determined" from an observation about init lottery to a
-stability property under 2× budget change at fixed init.
+The constraint fixes the scale gauge, reduces the remaining within-block
+gauge to an orthogonal rotation, and makes `||z_g||²` the exact isolated
+contribution energy of the block. Training selects blocks by that energy;
+site-specific frames decide how the same code appears at each depth.
 
----
+Phase 0 combined five forms of evidence:
 
-## C11. Production-harvest derisk: the whitener question is closed
+1. synthetic ground-truth recovery and null controls;
+2. post-hoc discovery in released GPT-2 and Gemma SAEs;
+3. cross-layer paired-token tests before BSC training;
+4. trained 1b and 4b BSC, scalar, and single-site factorial cells;
+5. a preregistered activation codec and production-harvest drills.
 
-*(Tranche 7: one streaming 5M-token validation pass on jobe — fresh
-fineweb-edu tokens starting 16,846 rows (~17.2M tokens) deep,
-disjoint from all pilot and extension consumption — plus checksum
-and resume drills. Payload `data/phase0/t7_whitener.json`; tools
-`validate_whitener.py`, `drill_store_resume.py`,
-`verify_store.py --splits`.)*
+The known calendar, number, color, geographic, element, and planet families
+were inspected repeatedly. They are therefore descriptive probes, not
+confirmatory endpoints. Phase-1 confirmation uses the still-sealed panel in
+the design.
 
-Four production questions, four answers.
+## 2. The target exists, and scalar post-hoc discovery misses it
 
-**1. A 2M-token whitener calibration slice is adequate; more is
-noise.** Nested prefix fits against the 5M reference converge as
-~1/√n and depth-graded: at 2M, rel ΔW ≤ 1.1% for L9–L21, 2.3%/2.8%
-at L27/L30 (Δμ ≤ 0.5% everywhere). But the functional metric — D9
-held-out whitened-spectrum deviation on 200k fresh tokens — is
-**flat in fit size**: L30 reads 0.069 / 0.072 / 0.075 / 0.076 /
-0.076 across 0.5/1/2/2.5/5M fits. Estimation error stops mattering
-below 500k tokens; what remains at late sites is a floor set by the
-data, not the fit.
+### Shared coordinates survive rotating frames
 
-**2. Whitener staleness is negligible — the pilot's "drift" was
-mostly floor.** On the *same* held-out slice ~22M tokens deep, the
-frozen 2M pilot whitener (fit at stream position 0–2M) scores within
-3–13% relative of a fresh 5M whitener fit on the adjacent tokens,
-and within 4% at the late sites that motivated the check (L30:
-0.0787 vs 0.0762). In W-space the pilot does sit ~30% farther from
-the 5M reference than same-region independent 1M fits (0.053 vs
-~0.041 at L30, despite 2× the tokens) — slow stream drift in W is
-real and measurable — but the held-out metric says it is
-functionally irrelevant. A caveat cuts the other way: 200k held-out
-tokens is ~196 contexts, and the same pilot whitener scored 0.053
-(L30) on the extension's held-out slice ~11M deep vs 0.079 here —
-slice-to-slice variance of the metric itself exceeds the
-pilot-vs-fresh gap, so absolute floor levels conflate local
-nonstationarity with document-sampling variance; only same-slice
-comparisons are decisive, and that comparison is closed.
+Across Gemma Scope SAEs at layers 9, 17, 22, and 29 of Gemma 3 4B, held-out
+linear maps between month-family coordinates reach `R² = 0.83–0.90` across
+the 9↔22↔29 triangle; CCA is at least 0.96 for 9↔22. The corresponding
+raw decoder subspaces lie at their random-subspace principal-angle null
+(`p ≈ 0.33–0.52`), except one 22↔29 span match (`p = 0.001`). The code
+persists while the frame rotates.
 
-**3. The F7 renorm gauge is slice-stable to ~1%.** Scalars from the
-5M fit run [4.997, 5.356, 4.947, 3.634, 2.647, 2.232, 2.045, 1.851]
-(L9→L30); the pilot's differ by ≤ 0.7% at every site; five
-independent 1M fits give CV ≤ 1.13% (worst at L18) and max rel dev
-vs 5M ≤ 1.8%. The gauge can be frozen at calibration and reused
-across the production store without re-estimation.
+Depth is not monotone. Activation-space calendar rings are strongest early
+(layer-9 weekday circular score 0.981; decoder adjacency `|r| = 0.886`),
+layer 22 is a visibility minimum, and layer 17 undersplits both calendar
+families. A single site's dictionary is therefore not an adequate verdict on
+cross-depth structure.
 
-**4. The whitened-bf16 store format is validated with quantified
-tails — and the fp16 ban gets its numbers.** Raw activations hit
-abs-max 103k–240k across sites: every site overflows fp16's 65,504.
-Channel 443 is the top-magnitude channel at all eight sites (1666
-second through the mid-depths), and it exceeds 10k on essentially
-*every* token from L12 on (exceedance rate exactly 1/2560 of
-values). At the fp16 limit the picture is stark: since only channel
-443 crosses 65,504 (site-wise #2 maxima are all < 10k), the
-exceedance rates convert directly to token fractions — **channel 443
-alone overflows fp16 on 43% of tokens at L27 and 82% at L30** (0.1–
-0.3% of tokens at L9–L24). This is not rare-tail overflow; the
-mega-channel is typically out of fp16 range at late depth. Whitening
-tames it completely: whitened abs-max ≤ 27.3 across sites, with
-**zero** values beyond 32 in ~13.3e9 values per site. bf16
-quantization error is uniform: mean rel err 0.14%, max 0.39% (the
-half-ULP bound) — two orders below model FVU.
+### The ring lies below the clustering scale
 
-**Harvest mechanics.** Checksum drill: the 6M-token extension split
-(246 GB, 40 shards) verified clean in 396 s (0.62 GB/s, sha256-bound)
-→ a full-store verify at production scale costs ~1 h. Resume drill
-(synthetic scratch through the real `ShardWriter`): a mid-write kill
-leaves atomically-renamed complete shards plus a quarantinable
-`.tmp`; the manifest rebuilds from self-describing shard headers
-after a contiguity check, and full checksums pass. The resume rule:
-relaunch writes a **new split** with skip-rows ≥ original +
-ceil(recovered/1022) + margin, then merges manifests (the
-extend-store pattern) — a fresh writer restarts shard numbering at
-0, so in-place append collides. Throughput: this pass streamed 5,557
-tok/s without writes; the extension harvest sustained ~5,000 tok/s
-at 205 MB/s written → the 53M-token / 2.171 TB production harvest
-forecasts at **~3 h**, plus ~1 h verify.
+The discovery pipeline first replicated the Engels weekday, month, and year
+rings on the same GPT-2 SAE artifact, all at the permutation floor
+(`p = 0.005`). Its Gemma null is therefore interpretable.
 
-Phase-1 consequence: nothing in the harvest path blocks or needs
-re-design; the store commit waits only on the 4 TB NVMe.
+At Gemma Scope 4B layer 22, no decoder-cosine or activation-dependence branch
+at width 16k or 65k surfaced a multi-member ring candidate; the supervised
+month skeleton consists of graph singletons at a cosine threshold of 0.5.
+Yet at 65k the twelve months map to twelve distinct top-1 features whose
+decoder vectors are cyclically ordered (adjacency `p = 1.5e-4`, Fisher–Lee
+angle order `p = 3.5e-4`) while maximum adjacent cosine is only 0.32. The
+month ring is present, but structurally below the scale at which post-hoc
+clustering can bind it. Layer 9 gives the same discovery null.
 
----
+This sharpens the original hypothesis: the artifact exists; the proposed
+post-hoc route to it does not. Native block training is not merely a cleaner
+representation of an SAE cluster. It reaches structure that clustering never
+forms.
 
-## Hypothesis status after Phase 0
+## 3. Native block training individuates manifolds
 
-| | statement | status |
-|---|---|---|
-| **H1** | rings exist, findable by post-hoc blockification of an SAE | **split verdict, sharpened**: the ring exists decoder-side (p ≈ 1e-4) but post-hoc discovery is structurally null at every probed depth — the positive artifact statement stands, the "findable post-hoc" clause is refuted, and native block training demonstrably reaches what clustering cannot (C2, C3) |
-| **H2** | cross-layer subspace + position correspondence | **passed pre-training** (C1); the trained-BSC form (shared-code evals) is Phase-1 confirmatory |
-| **H3** | blocks earn their parameters on the R-D axis | **preview strongly positive** (C4–C6): renorm dominates the scalar frontier in the full overlap region; verdict at Phase-1 scale |
-| **H4** | depth-resolved effective-span geometry | instruments validated (contribution spectra, truncation ablations, shear-zone tracking); confirmatory numbers are Phase 1's |
-| **H5** | manifold-level model diffing | untouched (Phase 3 stub; deferred) |
+The first trained 1B BSC contained a month block that fired on 53% of month
+tokens and 0.2% of background tokens. Its twelve class means formed a ring in
+one code plane holding 97% of class-mean variance (`p < 5e-5`), stable under a
+split-half test and re-embedded by all six site frames.
 
-## Standing rules (binding on all future evals)
+At 4B and 12M optimizer tokens, the renormalized arm was the only arm to
+capture both calendar families: month block b595 claimed 10/12 months with
+ring order 10/12 at the permutation floor, and weekday block b862 claimed and
+ordered 7/7. The primary arm's b2146 captured a cardinal number line
+(17/20 top-1, Spearman `ρ = 0.90`, permutation floor). Digits individuated
+one per block, while the renormalized dictionary sometimes bound notation
+variants such as `3/third` and `7/seventh`. Renormalized b1781 captured 36/48
+countries; its four-dimensional code linearly decoded latitude and longitude.
 
-1. **Mega-block rule**: top-1 capture is never read without ring
-   order and FVU beside it (C3).
-2. **Burned families**: calendar/zoo/atlas are descriptive only;
-   confirmatory capture goes through the sealed panel (C8).
-3. **Norm-CV is never a ring detector by itself** — soft phase-splits
-   score ≈ 0.22 and perfectly captured rings under budget slack score
-   0.17–0.43; ring evidence is span-level and gate-conditional
-   (Phase −1 §2.3).
-4. **Contribution-energy shares, never Frobenius** — parked frame
-   capacity poisons Frobenius readouts (Phase −1 §2.5); the Gram
-   constraint makes decoder spectra *frame capacity*, not used
-   dimension.
-5. **Capitalization filtering for token-class probes** (the May
-   contamination lesson: uncapitalized 'may' is 88% modal).
-6. **Verify the effective config in the report artifact**
-   (`battery_config` / `model_cfg`), not the intended CLI (two silent
-   config-shadowing incidents caught this way).
-7. **Never judge structure through a single site's dictionary** (C1's
-   layer-17 cautionary tale).
+The matched scalar model contains much of the same population information
+without unit-level individuation: month top-1 identities collapse to four
+features at 1B and seven at 4B, while weekday collapses to one.
 
-## Open items
+Two caveats define the claim:
 
-- **Tranche 5** (guarded lr recovery, {4.5e-4, 6e-4} renorm-first):
-  **deferred** (a9, 2026-07-19) — Phase 1 proceeds at the ratified
-  3e-4; spec and re-ratification bar preserved in runbook §Tranche 5.
-- **Frontier ends**: block k128 (does scalar's 2.9 kbit lead
-  survive?), scalar k≈6–8 (can scalar reach the 390-bit region?).
-- **A renormed joint scalar cell** would close the one gauge
-  asymmetry in C4's scalar-side comparison (one 30-min slot).
-- **Phase 1 store commit**: waits only on the 4 TB NVMe install.
+- consolidation and internal order are distinct. Sufficiently trained 1B
+  seeds almost always consolidate months, but ring order ranged from 2/12 to
+  12/12. Block identity is initialization-dependent;
+- a mega-block can claim an entire family without representing its topology.
+  One destroyed run claimed 12/12 months but ordered only 6/12; a healthy run
+  claimed 7/7 weekdays but ordered 2/7.
+
+Consequently no capture fraction is interpreted without its order statistic
+and model FVU. The generated [figure catalog](../figures/README.md) applies
+this rule mechanically, including for families that fail.
+
+## 4. The combination earns its parameters
+
+### Tying is distortion-free and rate-efficient
+
+The full factorial trained eight independent single-site block models and
+eight scalar SAEs with exactly matched per-site tensors and rates. At `q=4`,
+reconstructing all eight sites independently costs 6,031 bits/token for the
+block cells versus 772.7 for one joint BSC (7.8×), and 12,509 versus 1,588
+for the scalar cells (7.9×). Joint support costs fall from 1,067 to 261
+bits/token on the block side and from 1,051 to 246 per site in the replicated
+single-site comparison.
+
+Using exact eval-split squared-energy weights, the tied block model improves
+on its single-site control in the shrinkage-whitened gauge (FVU 0.4360 versus
+0.4559) and ties it exactly in the site-renormalized gauge (0.4207 in both).
+Cross-site tying therefore imposes no measured distortion cost.
+
+The causal interaction is positive:
+
+| pooled top-k FVU | shared code | one model per site | tying gain |
+|---|---:|---:|---:|
+| block (`4096×b4`, `k=32`) | **0.4299** | 0.4497 | −0.0198 |
+| scalar (`16384×b1`, `k=128`) | **0.3682** | 0.3768 | −0.0086 |
+
+Tying helps both model classes and helps the block model about 2.3× more:
+the interaction is `+0.011` pooled FVU and replicates across three seeds.
+
+### Rate–distortion reverses the apparent block tax
+
+At matched latent L0, the scalar arm leads by 0.047 FVU. That comparison
+prices a block's four coefficients but ignores its cheaper support. Under the
+declared codec—canonical block orientation, calibration-fit clipping,
+componentwise quantization, frozen count model, enumerative support bits,
+realized per-token counts, and sequence bootstrap—the verdict reverses:
+
+| q=4 region | site-renormalized BSC | scalar | result |
+|---|---:|---:|---|
+| ~390 bits | 0.4869 @ 390.7 (`k=16`) | no point | blocks extend the frontier |
+| ~800 bits | **0.4207 @ 770.5** (`k=32`) | 0.4306 @ 822.0 (`k=16`) | BSC dominates |
+| ~1.5 kbit | **0.3660 @ 1491.6** (`k=64`) | 0.3718 @ 1588.4 (`k=32`) | BSC dominates; CIs disjoint |
+| ~2.9 kbit | no `k=128` point | 0.3249 @ 2900 (`k=64`) | open frontier end |
+
+Quantization is nearly transparent: `q=6` reproduces unquantized FVU to the
+third decimal, and `q=4` costs roughly 0.004–0.005. A Bernoulli support model
+lands within about 5% of the frozen empirical count model. The result is not
+an entropy-model trick.
+
+See [rate–distortion](../figures/summary/rate-distortion.png) and
+[tying rate](../figures/summary/tying-rate.png).
+
+## 5. Gauge, budget, and geometry
+
+### Site renormalization repairs a real allocation tilt
+
+The shrinkage whitener retains roughly 6% of per-dimension variance at
+shallow sites and 29–32% deep. Under equal per-dimension reconstruction loss,
+site 30 alone carries 27.5% of pooled squared energy while sites 9, 12, and
+15 together carry less than 11%. A scalar RMS renormalization after shrinkage
+whitening makes site weights uniform to about ±2% without giving up
+directional outlier suppression.
+
+Three independent observations designate this gauge:
+
+1. both single-site families' per-site FVU profiles correlate `r = 0.984`
+   with the joint renormalized profile, versus about 0.4 with the bare gauge;
+2. the renormalized BSC wins pooled FVU and the shared R–D frontier;
+3. it is the only 12M-token arm capturing both calendar families and it binds
+   several number notations across form.
+
+The two gauges still learn corresponding manifolds: cross-arm code maps and
+span overlaps beat permutation controls for every captured family. The cost
+is a narrower optimizer-stability margin, which the pinned learning rate and
+loss-spike guard address.
+
+### Optimizer-token budget matters more than freshness
+
+Four cells matched at 24M optimizer tokens separate repeated epochs from
+fresh examples:
+
+| pooled top-k FVU | primary | site-renormalized |
+|---|---:|---:|
+| 6M unique × 2 epochs | 0.4299 | 0.4154 |
+| 6M unique × 4 epochs | 0.4102 | **0.3997** |
+| 12M unique × 2 epochs | 0.4089 | 0.4098† |
+
+Doubling the optimizer budget improves FVU by 0.016–0.020. Replacing repeats
+with fresh tokens adds only 0.0013 in the clean primary comparison. The
+renormalized fresh cell is not a clean freshness read: it encountered a
+guarded spike cluster and one skipped batch (0.017% skip rate, below the
+0.1% gate). We do not infer a freshness penalty from it.
+
+The promoted winner is the clean epoch-renormalized cell at FVU 0.3997. Its
+`q=4` point is 0.4053 at 771.2 bits/token, a 0.0154 improvement at unchanged
+rate over the 12M-token champion. Support cost stays at 261–265 bits/token;
+the improvement is amplitude fidelity.
+
+At this winner, the winner arm itself qualifies three descriptive families:
+month b595 (8/12 top-1, ring 10/12, permutation floor), weekday b862 (7/7,
+`p = 0.0028`), and country b1781 (34/48, geographic `R² = 0.354`,
+permutation floor). The matched primary counterpart qualifies cardinal b2146
+and ordinal b382. Thus the earlier gauge split persists: the renormalized
+winner holds cyclic and geographic structure; the primary gauge holds the
+ordered number lines. The uniform figure zoo intentionally uses the promoted
+winner only and marks primary-only successes as winner-arm failures.
+
+### The stream contains more manifold supply than the dictionary captures
+
+Ordinal class means form a depth-pervasive line that straightens to
+`|ρ| = 0.99` by layer 24. Country means linearly decode latitude at every
+site (`R² = 0.57–0.66`), while longitude weakens by layer 30 and countries do
+not cluster by continent. Planet distance is visible in-stream
+(`|ρ| ≤ 0.88`) without reliable winner-block order; color is stable but
+not a hue wheel; element order weakens through the middle sites.
+
+Across these families, frame rotation has a trough around layers 18–21
+(about 0.71 versus 0.84/0.91 on the flanks). Captured block frames track the
+stream's rotation at `r ≥ 0.92`; destroyed runs lose this coherence. The
+mid-stack shear is therefore descriptive geometry and a useful health
+diagnostic, not yet a confirmatory claim.
+
+Co-firing block cliques are also real optima, not training noise. Independent
+sub-width features can pack losslessly into one width-four block and free
+both a block and a support event. Near-even contribution-energy splits plus
+degraded code correspondence are the packing signature. Decoder Frobenius
+norms cannot diagnose use because the Gram constraint forces every frame to
+retain width-four capacity.
+
+## 6. Training and harvest are production-ready
+
+Gemma 3 4B training is bit-deterministic across repeated runs, including
+8-bit Adam. That made the three failure classes separable:
+
+- an unstable operating point triggers more than five consecutive guarded
+  skips and is refused;
+- a poison batch triggers a corroborated one-batch skip (the step-1600 event
+  is batch-locked across three divergent trajectories);
+- a SASA-style AuxK cascade amplifies the revival gradient until it re-kills
+  its own revivals; an auxiliary/main gradient-ratio cap of 1.0 suppresses
+  peaks by more than 100× and restores healthy dead fractions without
+  changing clean trajectories bit-for-bit.
+
+The pinned `3e-4` cosine point had zero guard events across the campaign.
+The 1B optimum at `1.2e-3` is catastrophically unstable at 4B, so optimizer
+points are never transferred across model scale without calibration.
+
+The remaining production mechanics have measured margins:
+
+- streaming threshold fitting uses 19.5 GB on the 61 GB host and reaches
+  average active-block count within 0.0043 of the exact target;
+- prefetch 4 reduces measured data-wait from 30% to 12%;
+- the store costs exactly 40,960 bytes/token; 53M tokens require 2.171 TB;
+- a 2M-token whitener fit is already beyond the functional estimation floor;
+  the site-renorm scalars are slice-stable to about 1%;
+- raw late-layer channel 443 exceeds fp16 range on 43% of layer-27 tokens and
+  82% of layer-30 tokens. Whitened values stay below 27.3 with zero values
+  above 32 in about 13.3 billion values per site; bf16 mean relative error is
+  0.14%. fp16 is therefore banned throughout harvest and storage;
+- the 246 GB extension verified at 0.62 GB/s, implying about one hour for the
+  production checksum pass. Atomic-shard recovery and manifest rebuild
+  passed an interrupted-write drill;
+- harvest sustains about 5,000 tokens/s and 205 MB/s written, forecasting
+  roughly three hours for the full store plus verification.
+
+No scientific or engineering question in the harvest path remains open. The
+production store waits only on hardware.
+
+## 7. Limits and binding interpretation rules
+
+The pilot R–D result is strong evidence, not the Phase-1 headline verdict.
+The expensive block frontier end (`k=128`), ultra-cheap scalar end
+(`k≈6–8`), and a renormalized scalar tying control remain useful optional
+points. Effective-span claims also await the full contribution-spectrum,
+rank-truncation, shared-code, and sample-power battery at production scale.
+
+These rules bind all future analysis:
+
+1. **Mega-block rule:** report top-1 capture only with topology/order and FVU.
+2. **Burned families:** calendar, number, color, atlas, element, and planet
+   probes are descriptive; config selection uses aggregate endpoints and the
+   sealed panel.
+3. **No stream-side sealed-panel checks:** availability is part of the one
+   eventual unsealing.
+4. **Norm concentration is not ring evidence:** rings are span-level and
+   gate-conditional.
+5. **Contribution energy, not Frobenius capacity:** parked decoder directions
+   make frame norms a misleading use statistic.
+6. **Capitalization filters are semantic controls:** uncapitalized `may` was
+   88% modal; country and planet homographs have the same problem.
+7. **Trust effective artifacts, not intended CLI:** verify `model_cfg` or
+   `battery_config`; two silent shadowing incidents were caught this way.
+8. **Never infer the cross-depth story from one site's dictionary.**
+
+## 8. Hypothesis status and conclusion
+
+| hypothesis | Phase-0 status |
+|---|---|
+| H1: token-level rings exist and post-hoc SAE blockification can find them | **split:** the ring exists at `p≈1e-4`; post-hoc discovery is structurally null; native blocks reach it |
+| H2: subspaces persist while frames rotate and positions correspond | **passed before training** (`R² = 0.83–0.90`); trained shared-code validity remains a Phase-1 endpoint |
+| H3: blocks earn their parameters on activation R–D | **strong pilot preview:** strict dominance throughout the shared range; production frontier is the verdict |
+| H4: effective span localizes structure over depth | instrumentation validated; production contribution spectra and truncations pending |
+| H5: manifold-level model diffing | deferred to the post-publication cross-model phase |
+
+Phase 0 changed the project from an architectural conjecture into a measured
+production plan. The shared-code premise holds before training; native blocks
+recover structure scalar clustering cannot bind; tying and blocking have a
+positive interaction; and the honest bit axis favors the BSC throughout the
+pilot overlap. Phase 1 now asks whether those effects persist at the full
+store and whether the learned blocks pass strict shared-code and effective-
+span tests.
 
 ## Provenance
 
-Primary sources, verbatim, in [`archive/`](archive/README.md) — the
-design reviews (4 rounds, ~80 findings), ten findings documents, and
-the frozen design v2.4 whose decision log records every ratification
-(a9: strict capture-as-written gate semantics; λ=1e-3; lr 3e-4 cosine
-at 4b; site list 9–30; F7 renorm; aux-ratio-cap 1.0; the 0.9.9
-charter and its purge authorizations). Compact committed evidence:
-`data/phase0/` (R-D payloads, exact eval weights, single-site
-placement, SAE-era provenance, the Phase −1 battery report). The
-current best checkpoint is always `data/phase0/winner.json`.
+The pre-cleanup repository at Git commit
+`ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e` contains the verbatim campaign
+chronology, review finding IDs, frozen design v2.4, ladder-era runbooks, and
+one-shot scripts. This rewrite supersedes them as the working-tree authority;
+the commit is the exact historical record when raw chronology is needed.
+
+The durable machine-independent evidence is now consolidated in
+[`data/evidence/`](../data/evidence/): synthetic recovery, SAE provenance,
+cross-layer geometry, factorial cells, seed replications, single-site
+placement, R–D payloads, the four optimizer-budget cells, and whitener/harvest
+validation. [`data/winner.json`](../data/winner.json) points to the current
+checkpoint; [`data/showcase.json`](../data/showcase.json) records the
+two-gauge descriptive election. Heavy probe artifacts and checkpoints remain
+under `/data/runs/` on jobe. The obsolete 1B and SAE activation stores were
+purged with a9's 2026-07-18 authorization; `/data/runs/` and the 4B pilot
+store are retained because they back current figures and codec validation.

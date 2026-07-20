@@ -10,7 +10,9 @@ authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
     "transformer-experiments>=0.1,<0.2",
     "datasets",
+    "matplotlib",
     "numpy",
+    "plotly",
     "sae-lens",
     "saklas>=1.4.6",
     "scikit-learn",
@@ -20,6 +22,9 @@ dependencies = [
     #   pip install -e ../../saklas
     #   pip install -e .
 ]
+
+[project.scripts]
+bsc = "block_crosscoder_experiment.cli:main"
 
 [build-system]
 requires = ["hatchling"]

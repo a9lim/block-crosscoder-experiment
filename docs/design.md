@@ -1,271 +1,500 @@
-# block-crosscoder-experiment — design v3.0
+# Block-sparse crosscoders: authoritative design
 
-**A block-sparse crosscoder (BSC) — dictionary learning whose atomic
-unit is a subspace, with one shared code across layers.** The
-literature is a 2×2, {scalar, block} × {single-site, cross-site},
-whose fourth cell was empty as of 2026-07-15. Phase 0 (the pilot
-program) filled it on gemma and measured that the combination earns
-its parameters: the tying × blocking interaction is positive, and the
-site-renormalized BSC strictly dominates the matched scalar frontier
-on the honest rate–distortion axis everywhere they overlap. The
-condensed evidence is [`findings-phase0.md`](findings-phase0.md);
-the literature digest is
-[`research/block-sparse-crosscoders-2026-07.md`](research/block-sparse-crosscoders-2026-07.md).
+*Version 4.0, 2026-07-19. This document is self-contained and normative. It
+supersedes every Phase-0 design, review, and runbook. Completed evidence is
+summarized in [`findings-phase0.md`](findings-phase0.md); the literature
+position is [`literature.md`](literature.md).*
 
-**This document is the forward-facing design**: the settled
-architecture and parameters, what remains open, and Phase 1 — the
-production run. Its ancestor (v1 → v2.4, four adversarial review
-rounds, the full decision log) is preserved verbatim at
-[`archive/design-v2.4.md`](archive/design-v2.4.md); bracketed
-references like (R13) or (F7) index findings in the archived reviews.
-Where this document is silent, v2.4 governs.
+## 1. Objective and current state
 
-*Provenance: v3.0, 2026-07-19 — the post-Phase-0 rewrite (a9-directed
-restructure). No frozen surface changed; the pinned stack, gates, and
-protocol below are v2.4's, re-organized around Phase 1.*
+A block-sparse crosscoder (BSC) learns sparse multidimensional features with
+one code shared across sites and a distinct decoder frame at every site. It
+occupies the {block} × {cross-site} cell of the dictionary-learning 2×2:
 
-## Hypotheses
-
-- **H1 (rings exist).** Gemma carries irreducible multi-dimensional
-  token-level features. *Phase-0 verdict: sharpened split — the month
-  ring exists decoder-side in a 65k SAE (p ≈ 1e-4) below every
-  clustering threshold, so post-hoc blockification cannot reach it;
-  trained BSCs capture it as single blocks.*
-- **H2 (cross-layer coherence).** Subspaces persist across depth
-  while frames rotate, and paired tokens occupy corresponding
-  positions. *Passed pre-training (code-map R² 0.83–0.90); the
-  trained-BSC form routes through the shared-code evals in Phase 1.*
-- **H3 (blocks earn their parameters).** The BSC's held-out
-  rate–distortion frontier dominates a matched scalar crosscoder's.
-  *Pilot preview strongly positive (renorm dominates across
-  ~390–1,600 bits); Phase 1 at 38M tokens is the verdict.*
-- **H4 (depth-resolved geometry).** Per-block per-site effective
-  linear span dimension localizes where structured geometry lives.
-  *Instruments validated; confirmatory numbers are Phase 1's.*
-- **H5 (manifold-level diffing).** Sites = layers × models answers
-  provenance questions. *Deferred — Phase 3 stub.*
-
-Gates are decision heuristics with demonstrated power, not
-falsifications: every null is reported against the positive controls
-and synthetic recovery that calibrate it. A mostly-rank-1 verdict at
-Phase 1 is a publishable corroboration of the flattening line.
-
-## Architecture (settled)
-
-The full algebra with derivations is archive/design-v2.4
-§Architecture spec; this is the operative summary.
-
-**Coordinates.** All model mathematics lives in whitened per-site
-coordinates. Per site: shrinkage whitener W_s = (Σ_s + λ_s I)^{-1/2}
-fit on a dedicated 5M-token slice (fp64 accumulation, TF32 off),
-frozen and hashed into every shard; ridge = mean eigenvalue
-(saklas `LayerWhitener` convention). The store holds whitened bf16;
-**fp16 is banned everywhere in the harvest path** (gemma-3 late-layer
-channels overflow it). **Gauge: site-renorm (F7, designated)** — a
-per-site scalar RMS renormalization after shrinkage whitening,
-folded into W_s and the whitener hash at the production harvest,
-restoring equal total site power (the bare shrinkage whitener leaves
-an ~8× deep tilt in pooled sq_tot; findings C7).
-
-**Model.** G blocks of width b; per site encoder E_g^s and decoder
-D_g^s; encode z_g = Σ_s E_g^s x̃^s; **Gram constraint
-Σ_s D_g^s D_g^sᵀ = I_b** enforced by fp32-master retraction after
-every optimizer step (batched b×b eigh, λ_min floored at 1e-6,
-post-cast residual logged). The one constraint kills the scale gauge,
-reduces within-block gauge to O(b), makes ‖z_g‖² the block's exact
-contribution energy, and structurally blocks the decoder death
-spiral. **Selection**: BatchTopK over blocks by ‖z_g‖ (training);
-fixed threshold θ at inference, fit on the calibration split by
-streaming log-histogram quantile and serialized with the codec.
-**Loss**: L = L_rec + λ·R_rank + α·L_aux, reductions pinned (mean
-over tokens/sites/dims; R_rank = per-site nuclear norm on the fixed
-spectrum budget, normalized to [0, √S−1]; squared error). **Init**:
-Gaussian + one retraction; E = Dᵀ at init; encoder scale
-norm-calibrated. **Decoder weight decay 0** (retraction undoes it);
-encoder decay 0 (measured no-op).
-
-**Baseline.** The matched scalar crosscoder is the b=1
-Gram-constrained special case of this architecture (signed latents,
-energy selection) — G·b latents, matched training-average L0
-(E[ℓ] = b·E[k]), identical everything else, cold start both. The
-primary H3 comparison runs both at λ=0.
-
-**Known limits, worn openly.** Decoder spectra are frame capacity,
-not used dimension — rank claims come only from code-anchored
-readouts (contribution second moment, truncation ablations). Block
-width is a packing budget: sub-width co-active features pack
-losslessly into one block as a *converged optimum* (signature:
-full span overlap, ≈50/50 contribution-energy split, degraded
-code-R² — the packing flag). Perfect co-activation is observationally
-equivalent to a block; the coherence battery certifies only that
-*curved* structure is never hallucinated. The per-site nuclear
-penalty prefers site-exclusivity; the Phase −1 quantitative veto
-bounds it (admissible λ = {3e-4, 1e-3}).
-
-**Shared-code validity.** Mandatory on every trained BSC:
-site-dropout encoding (raw + calibrated), leave-one-site-out,
-cross-site code agreement (CCA / Procrustes-R², rotation-invariant).
-Blocks that fail are "correlated bundles," never shared manifolds.
-
-## Settled parameters
-
-### The Phase-1 pinned training stack (v2.4, a9-ratified 2026-07-18/19)
-
-| component | pinned value | evidence (findings-phase0 / archive) |
+| | one site | shared across sites |
 |---|---|---|
-| model / sites | gemma-3-4b, residual-post layers **(9, 12, 15, 18, 21, 24, 27, 30)** | site list ratified 07-18; brackets the early stream (C1) |
-| config | **G=4096 × b=4, k=32** (16,384 latents, ~671M params, ~9 GB train VRAM) | pilot config; G=8192 is the stretch decision (open, below) |
-| optimizer | **lr 3e-4 cosine**, 1k-step warmup, enc-wd 0, 8-bit Adam, batch 4096, fp32 master + retraction | 1.2e-3 destroys at 4b, 6e-4 marginal; zero guard events at 3e-4 across every campaign run |
-| λ | **1e-3** (largest admissible; H3/frontier comparisons at λ=0) | Phase −1 veto + λ ~free at 4b (Δ ≤ 0.0002 both gauges) |
-| gauge | **site-renorm** | three independent lines (C7) |
-| AuxK | SASA C.1 + **aux-ratio-cap 1.0** | bit-inert healthy; defuses the cascade 100×+; restores functional revival (C9) |
-| loss-spike guard | **mandatory**: grad > 20× AND rec > 5× trailing accepted-median (window 50); skip advances scheduler; > 5 consecutive → refuse; **skip-rate ≤ 0.1% is a run gate** | exact failure-mode partition (C9); the guard must never make an unstable lr look stable |
-| θ | streaming log-histogram quantile over the **full 13M calib split** | full-split θ closer to target k; 19.5 GB on the old 61 GB OOM case |
-| data path | store-reader prefetch 4; site-subset view for single-site cells | data-wait 30% → 12% |
-| seeds | 2 confirmatory at the operating points | 4b FVU endpoint seed-deterministic (spreads ≤ 0.0009); seed risk lives in capture metrics → sealed panel |
-| eval | threshold-mode primary, realized counts; codec q ∈ {4, 6}; bf16 shadow | q=6 transparent; count model non-load-bearing |
+| scalar | SAE | scalar crosscoder |
+| block | block-sparse featurizer | **BSC** |
 
-Standing 4b facts: training is **bit-deterministic across runs**;
-healthy dead band at G=4096 ≈ 0.1–0.15%; support amortization ≈ 4×
-across k; store costs 40,960 bytes/token exactly.
+Phase 0 passed the architecture, instrument, factorial, rate–distortion, and
+harvest-readiness gates. The promoted pilot checkpoint is
+[`data/winner.json`](../data/winner.json): Gemma 3 4B, `G=4096`, `b=4`,
+`k=32`, site-renormalized gauge, 24M optimizer tokens, pooled top-k FVU
+0.3997. Phase 1 trains the production dictionary on a 53M-token, 2.171 TB
+store. Its only external blocker is installation of the purchased 4 TB NVMe
+in jobe. Record the mount point here and in the workspace root `AGENTS.md`
+before harvesting.
 
-### Parameters left to settle
+The research hypotheses are:
 
-- **Tranche 5 — the lr point, last look** (guarded ladder {4.5e-4,
-  6e-4} renorm-first, no 9e-4). Re-opening 3e-4 is an a9 decision
-  against the runbook's six-condition bar (replication, predeclared
-  aggregate endpoint, dead/skip tolerances, revival parity,
-  sealed-panel ≥ control, step-1600 clean). Until met, 3e-4 stands.
-- **G=8192 stretch**: deferred to a production-store decision. Not
-  tame at 1b (3.6% dead, 36× the healthy band); needs the streaming-θ
-  path (landed) and a dead-dynamics look at 4b before commitment.
-- **Epochs vs fresh data** — **settled** (tranche 6, 2026-07-19,
-  findings §C10): at matched 24M optimizer tokens, fresh tokens beat
-  epochs by only 0.0013 pooled FVU in the clean primary comparison;
-  the budget itself buys −0.016 to −0.020 per doubling. Phase-1
-  consequence: if the 38M budget ever binds, store passes are a
-  near-free substitute for unique tokens; consolidation-vs-budget is
-  a non-issue at this scale. (The renorm×fresh cell was spike-marred
-  — one guarded skip — and is not read; see §C10.)
-- **Frontier ends** (optional, cheap): block k=128 (the ≥2.9 kbit
-  region), scalar k≈6–8 (the ultra-cheap region), one renormed joint
-  scalar cell (gauge symmetry in the tying comparison).
-- **Sealed-panel unsealing** happens at Phase-1 config freeze — one
-  unsealing, consumed deliberately (runbook-phase099 §Tranche 0; the
-  panel and its fixtures stay blind until then).
+- **H1:** language models contain irreducible multidimensional token-level
+  features. Phase 0 found the month ring below scalar-SAE clustering scale
+  and captured it with a native BSC;
+- **H2:** feature coordinates persist across depth while frames rotate.
+  Paired-token maps passed before training; trained shared-code validity is a
+  Phase-1 endpoint;
+- **H3:** blocks earn their four amplitudes on held-out activation
+  rate–distortion. The pilot result is strongly positive; Phase 1 is the
+  headline verdict;
+- **H4:** contribution-anchored effective linear span localizes structure
+  over depth. The readouts are validated; confirmatory histograms and
+  truncations belong to Phase 1;
+- **H5:** sites extended to layers × models permit manifold-level model
+  diffing. This is deferred to the post-publication cross-model phase.
 
-## Phase 1 — the production run
+Gates are decision rules with demonstrated power, not logical
+falsifications. Every null is reported with its positive controls, synthetic
+recovery envelope, and sample-power limits.
 
-**Store commit** (waits only on the 4 TB NVMe install):
+## 2. Normative interpretation rules
 
-1. Mount the NVMe; record the mount point here and in the workspace
-   AGENTS.md.
-2. Harvest 53M tokens ≈ **2.171 TB** (38M train + 2M eval + 13M
-   calibration), 8 sites, whitened bf16, seq 1024, FineWeb-Edu with
-   pinned manifest + HF revision, BOS/pos-0/1 dropped. The 5M-token
-   whitener slice is harvested first (never stored); **the renorm
-   scalars fold into W_s and the hash**. Measured expectations:
-   ≈ 3 GPU-hours at 5,000 tok/s, writer 205 MB/s, ≥15% free-space
-   floor with byte-exact pre-write abort checks.
-3. Shard integrity: whitener hash in every header, content checksums,
-   non-zero/finiteness audits, a retained raw shard for round-trip
-   verification. Sequential buffered shuffle only (no token-random
-   mmap); 2–8 GiB shards, [token, site, d] bf16.
-4. The D13 exact-config pilot is **discharged** (0.9.6 tier B passed
-   at 3e-4); the store-commit gate is the harvest-integrity checklist
-   plus one resumed-checkpoint smoke run from the new store.
+These are part of the method, not reporting preferences:
 
-**Run matrix** (staged; the 4b headline runs are not a search):
+1. **The sealed panel stays sealed.** Do not set `BCC_PANEL_UNSEALED`, build
+   tokenizer maps, or run stream-side availability checks before the Phase-1
+   config freeze or an explicit a9 unsealing.
+2. **Known families are burned.** Calendar, number, color, country, element,
+   and planet probes are descriptive only and may not select a config.
+3. **Mega-block rule.** Top-1 family capture is never read without topology
+   or order and run FVU beside it.
+4. **Norm CV is not a ring detector.** Ring evidence is span-level,
+   permutation-calibrated, and conditional on the candidate gate.
+5. **Contribution-energy shares, never Frobenius shares, measure use.** The
+   Gram constraint forces parked decoder capacity.
+6. **Token-class probes apply semantic capitalization filters.** The `May`
+   and lowercase `may` contamination is the canonical failure case.
+7. **Verify the effective report artifact.** `model_cfg` and
+   `battery_config` outrank intended CLI flags.
+8. **No single-site dictionary verdict is promoted to a depth story.**
+9. **Every null is publishable.** Do not tune until a desired structure
+   appears; phases gate the next experiment.
 
-- Headline: **renorm BSC** at the pinned stack, 2 seeds; **b=1
-  scalar baseline** matched, 2 seeds, λ=0 both for H3.
-- λ=0 frontier k ∈ {16, 32, 64} both arms (1 seed each; positions
-  are seed-stable at CI width) for the production R-D figure.
-- Secondary: primary-gauge arm (1 seed) for the gauge-comparison
-  line; λ ∈ {0, 3e-4} arm on renorm (the admissible-set lower arm).
-- Escalation path if rare-feature starvation shows (dead fraction
-  high or held-out FVU still falling at epoch end): interleaved
-  harvest+train streaming for ≥100M tokens — and the baseline
-  retrains on the identical extended manifest (R25).
+## 3. Coordinates and activation store
 
-**Eval battery** (every trained model):
+### 3.1 Sites and whitening
 
-- Pooled + per-site FVU (threshold mode, realized counts, bf16
-  shadow); learning curves at store fractions 25/50/100% (R24 sample
-  power discipline).
-- The preregistered R-D codec (canonical orientation, calib-quantile
-  clipping, frozen count model, enumerative support bits, sequence
-  bootstrap) — the H3 verdict is frontier dominance over the shared
-  region under this declared codec.
-- Shared-code evals (site-dropout raw + calibrated,
-  leave-one-site-out, CCA/Procrustes) — the H5-style stories are told
-  only over blocks that pass.
-- H4 readouts: contribution-spectrum histograms with full spectra,
-  λ-sensitivity, 2-seed stability at block *and* global-subspace
-  level (principal angles), rank-r truncation ablations as the final
-  arbiter.
-- **Sealed-panel capture score at unsealing** (the confirmatory
-  capture readout); known-family consolidation probes as descriptive
-  monitoring only (burned families; mega-block rule).
-- Standing monitors: dead-fraction trajectory against the Phase −1
-  recovery-vs-frequency calibration (clean to f=0.01 at 10M tokens),
-  skip-rate gate, Gram residual, θ drift, packing-clique census.
+Production sites are residual-post layers `(9, 12, 15, 18, 21, 24, 27,
+30)` of `google/gemma-3-4b-pt`. All encoding, selection, reconstruction,
+regularization, and rank readout occurs in per-site transformed coordinates.
 
-**Gates.** H3 in either direction is informative. Proceed toward
-export (Phase 2) iff blocks resolve multi-dimensional, coherent,
-*and* pass the shared-code evals. Rank claims are stated conditional
-on demonstrated sample power.
+For site `s`, fit mean `μ_s` and covariance `Σ_s` on a dedicated
+calibration prefix, disjoint from train and eval. The transform is
 
-## Phase 2/3 — stubs (post-publication)
+`W_s = (Σ_s + λ_s I)^(-1/2)`,
 
-Deliberately deferred until the Phase-0/1 research is written up
-(a9, 2026-07-19). **Phase 2 (export bridge)**: a discovered block
-exports as a multi-layer manifold artifact (per-site truncated SVD of
-whitened D_g^s, contribution-energy `share`, packing flag on
-near-50/50 splits); the import lands in the consumer runtime (saklas)
-as a manifold-folder source, not here. **Phase 3 (cross-model BSC)**:
-sites = layers × models at constant site budget; paired forwards on
-identical raw sequences; corpus mix and per-model init pairing pinned
-at that phase's freeze; Minder-style causal diffing is the H5
-toolkit. Both inherit their full specs from archive/design-v2.4
-§Phases when reactivated. Causal intervention/steering demos are
-likewise deferred (a9, 2026-07-18).
+where `λ_s` is the mean covariance eigenvalue, matching the saklas
+`LayerWhitener` convention. This is **shrinkage whitening**, not full
+whitening: its held-out target spectrum is `σ/(σ+λ)`, not identity.
+Covariance sufficient statistics accumulate in fp64 with TF32 disabled;
+the eight eigendecompositions run in fp64.
 
-## Out of scope
+After shrinkage whitening, multiply each site by one scalar so its total RMS
+power matches the other sites. The scalar is estimated on the calibration
+slice and folded into `W_s`; it is not a train-time option. The Phase-0
+winner records its exact pilot scalars in `data/winner.json`. Production
+uses the fresh calibration fit. Phase-0 validation found pilot versus fresh
+5M scalars within 0.7% and independent-slice CV at most 1.13%.
 
-Cross-architecture token alignment; sphere/exotic topologies;
-weakly-causal crosscoder variants; steering-quality tuning of
-exports; quantized activation storage for primary runs (int8 codec
-admissible only after a paired-tolerance pilot); b ∈ {2, 8}
-(a rank-4 ceiling is a design choice, not a discovery).
+Freeze and hash the complete transform: model revision, layers, source
+manifest, `μ_s`, shrinkage ridge, RMS scalar, and `W_s`. Every shard header
+carries the hash; mismatches are fatal. Any refit requires reharvest or an
+explicit, validated migration.
 
-## Risks
+**fp16 is prohibited throughout harvest and storage.** Raw Gemma late-layer
+channels routinely exceed 65,504. Model forwards use bf16, whitening and
+statistics use fp32/fp64 as specified, and the store holds transformed bf16.
+A small raw shard is retained for round-trip validation.
 
-Structurally designed out: gauge-vacuous rank penalty,
-selection-proxy error, decoder death spiral (Gram constraint); rogue
-dims (whitened everything); fp16 overflow (banned); pipeline-failure
-nulls (Phase −1 harness + positive control + rehearsals, all passed).
-Empirically mitigated, monitored: shrinkage/decoupling artifacts
-(BatchTopK + blockwise Latent Scaling); AuxK cascade (ratio cap);
-optimizer instability (guard + skip-rate gate). Instrumented:
-site-concentration pressure (λ-veto + λ=0 control), rank-histogram
-circularity (truncation ablations), multi-view leakage (site-dropout
-matrix), packing (coherence + BH + the share signature), store
-overfit (held-out gap + escalation path). Honestly open: the block
-prior may mismatch language (b=4 is a hypothesis; H3/H4 informative
-under the null); the novelty claim survived a 13-source full-text
-sweep in its narrow form, with the older multi-view/group-sparse
-dictionary literature still the largest owed read before external
-claims.
+### 3.2 Store layout and I/O
 
-## Settled decisions (condensed record)
+Harvest FineWeb-Edu with a pinned dataset revision and explicit source
+manifest. Use sequence length 1024; drop BOS and positions 0/1. Harvest the
+whitener slice first and do not store it. Then write:
 
-Full log with rationale: archive/design-v2.4 §Decision log.
+| split | tokens | bytes |
+|---|---:|---:|
+| train | 38M | 1.557 TB |
+| eval | 2M | 81.9 GB |
+| calibration | 13M | 532.5 GB |
+| **total** | **53M** | **2.171 TB** |
 
-| date | decision |
+The exact layout is `[token, site, d_model]` bf16: 40,960 bytes/token.
+Shards are 2–8 GiB, sequence-contiguous, atomically renamed, self-describing,
+and checksummed. Enforce a byte-exact pre-write capacity check and at least
+15% free-space floor. Audit non-zero and finite values at write time; verify
+all checksums after harvest.
+
+Token-random mmap is forbidden. Sequentially read contiguous chunks into a
+32k–128k-token shuffle buffer, shuffle shards per epoch and samples within the
+buffer, and prefetch four pinned batches without reordering or swallowing
+exceptions. Record the permutation seed and share it across matched models.
+Eval and calibration stream from disk; neither is host-RAM-resident.
+
+Interrupted harvest recovery never appends through a fresh writer. Recover
+complete atomic shards, quarantine `.tmp`, verify contiguity, then relaunch a
+new split past the recovered corpus offset and merge manifests. A new writer
+restarts shard numbering at zero and would collide in place.
+
+## 4. Model and optimization
+
+### 4.1 BSC parameterization
+
+For `G` blocks of width `b` and sites `s=1..S`, block `g` has encoder
+`E_g^s ∈ R^(b×d)`, decoder frame `D_g^s ∈ R^(b×d)`, and each site has
+decoder bias `c^s`. For transformed activation `x̃^s`:
+
+- encode: `z_g = Σ_s E_g^s x̃^s`;
+- select by `p_g = ||z_g||_2`;
+- decode: `x̂̃^s = c^s + Σ_(g active) D_g^{sT} z_g`.
+
+Every block obeys the concatenated Gram constraint
+
+`Σ_s D_g^s D_g^{sT} = I_b`.
+
+After each optimizer step on fp32 master weights, compute the block Gram,
+floor eigenvalues at `1e-6`, left-multiply every site frame by its inverse
+square root, regenerate the bf16 forward copy, and log post-cast Gram
+residuals and floor hits. The order is optimizer → fp32 retraction → bf16
+copy → residual. Decoder weight decay is zero because retraction would
+undo uniform shrinkage; encoder decay is also zero at the pinned point.
+
+The constraint removes the coefficient/decoder scale gauge, reduces the
+within-block `GL(b)` gauge to `O(b)`, fixes every concatenated frame at rank
+`b`, prevents decoder collapse, and makes `||z_g||²` exactly the block's
+isolated total decoder-output energy. It does not make that energy a marginal
+loss reduction; blocks can overlap and cancel.
+
+### 4.2 Selection and inference threshold
+
+Training uses BatchTopK over block norms, retaining `k×B` block activations
+over a batch of `B` tokens. Counts per token may vary. Inference uses one
+fixed global threshold `θ`, fit on the entire calibration split to the target
+average count with a bounded-memory streaming log-histogram quantile.
+Serialize `θ` with the codec. The training EMA of selected-score minima is a
+diagnostic only; it is history-dependent and never the inference threshold.
+
+### 4.3 Loss and rank pressure
+
+The objective is
+
+`L = L_rec + λ_rank R_rank + α L_aux`,
+
+with squared reconstruction error averaged over tokens, sites, and
+dimensions. The normalized per-site nuclear penalty is
+
+`R_rank = mean_g [(Σ_s ||D_g^s||_* - b) / b]`.
+
+Under the Gram constraint it ranges from 0 for site-exclusive directions to
+`√S-1` for a flat shared frame. It can reshape the fixed spectrum budget but
+cannot scale it away. Its residual bias toward site exclusivity is real. The
+synthetic flat-profile veto admitted `λ_rank ∈ {3e-4, 1e-3}` and rejected
+`3e-3`; `1e-3` is the primary structured arm. All architecture-fair H3
+frontiers compare BSC and scalar at `λ_rank=0`.
+
+Decoder singular values are **frame capacity**, not used dimension. Rank
+claims use code-anchored contribution moments and reconstruction ablations.
+
+### 4.4 Dead blocks, initialization, and guard
+
+Initialize decoder frames Gaussian, retract once, set encoders from the
+decoder transpose, and norm-calibrate encoder scale so initial scores are
+comparable. Use the SASA C.1-style frequency-dead approximation: re-encode a
+detached residual through dead blocks only, selecting the highest residual-
+energy auxiliary blocks. Cap the auxiliary/main gradient norm ratio at 1.0.
+Block resampling remains off by default.
+
+The mandatory loss-spike guard compares the current step against the median
+of 50 accepted steps. Trigger only when gradient norm exceeds 20× **and**
+reconstruction loss exceeds 5× the reference, or on non-finite state. Skip
+the batch, advance the scheduler, snapshot batch identity and component
+norms, and continue. More than five consecutive skips refuses the run. Total
+skip rate above 0.1% fails the run. The guard is an instrument, not permission
+to operate at an unstable learning rate.
+
+## 5. Matched models and the production stack
+
+The scalar baseline is the signed `b=1` special case with concatenated
+decoder norm one, `G×b` latents, identical sites, data, whitening, parameter
+count, optimizer, and cold start. Match training-average coefficient count:
+`E[ℓ_t] = b E[k_t]`; eval prices each model's realized counts. This is an
+internally controlled baseline, not a published ReLU-crosscoder convention.
+
+The single-site controls delete code tying without changing per-site tensor
+shapes: eight independent `S=1` block models and eight scalar SAEs. At one
+site, RMS renormalization is a global loss scale, so controls train at unit
+scale and compare by per-site FVU and the R–D plane.
+
+### Pinned Phase-1 stack
+
+| component | value |
 |---|---|
-| 07-15/16 | Gram-constrained decoders over SASA product penalty; disk-backed whitened bf16 store on a dedicated 4 TB NVMe; BatchTopK not L1; R-D framing for H3; calibration-fit θ |
-| 07-16 | Phase −1 passed under strict capture-as-written (a9); **λ=1e-3 primary** (veto admissible {3e-4, 1e-3}); SASA C.1 AuxK; packing economics accepted |
-| 07-17 | site band 25–90% (early stream in); shrinkage-whitener honesty + F7 question opened; 1b optimizer optimum 1.2e-3 (superseded at 4b) |
-| 07-18 | **4b lr 3e-4 cosine** (1.2e-3 destroys at 4b); **site list (9…30)**; **F7 renorm designated**; AuxK cap + spike guard required; 0.9.9 campaign chartered; burned families + sealed panel; stores purged (a9 authorization) |
-| 07-19 | **aux-ratio-cap 1.0 ratified**; guard/θ/prefetch mandatory; interaction +0.011; renorm frontier dominance; tying 7.8–7.9× distortion-free; stack pinned as v2.4; repo restructured, design rewritten as v3.0 |
+| model/sites | Gemma 3 4B; residual-post 9, 12, 15, 18, 21, 24, 27, 30 |
+| primary BSC | `G=4096`, `b=4`, `k=32` (~671M params, ~9 GB train VRAM) |
+| optimizer | AdamW, 8-bit moments, fp32 masters, bf16 forward, `lr=3e-4`, 1k linear warmup, cosine decay, `β=(0.9,0.999)`, batch 4096 |
+| regularizer | `λ_rank=1e-3`; H3/frontiers at zero |
+| coordinate gauge | shrinkage whitening plus site RMS renormalization |
+| dead-block path | SASA C.1 approximation, auxiliary ratio cap 1.0 |
+| guard | 20× gradient and 5× reconstruction trigger; >5 consecutive refuses; skip rate ≤0.1% |
+| inference | full-calibration streaming `θ`; threshold mode primary; realized counts |
+| data path | sequential buffered shuffle, prefetch 4 |
+| epochs | 2 over 38M train tokens; repeats are acceptable if budget binds |
+| seeds | 2 confirmatory seeds at headline operating points |
+| codec | `q ∈ {4,6}` primary; bf16 shadow in top-k and threshold modes |
+
+Training on 4B is bit-deterministic across repeated runs. The healthy dead
+band at `G=4096` is roughly 0.1–0.15%. `G=8192` is not a silent stretch:
+Phase-0 dead dynamics reached 3.6%, so it requires an explicit decision after
+a short production-store diagnostic.
+
+## 6. Evaluation protocol
+
+### 6.1 Split discipline and activation codec
+
+Train fits weights only. Calibration fits `θ`, canonical code orientation,
+quantizer ranges, count model, and site-only code maps. Eval is untouched
+until scoring. The 13M-token calibration split supplies about 100k active
+examples to an average block at `k/G ≈ 0.78%`; blocks below a predeclared
+active-count floor are excluded from codec comparisons and counted.
+
+For each block, rotate the active calibration codes to diagonalize their
+second moment in descending order. Freeze that canonical orientation. In the
+canonical frame, fit 0.1%/99.9% clipping quantiles per coordinate and a
+`2^q`-level uniform quantizer; saturation outside the interval is part of the
+codec.
+
+For a BSC token with `k_t` active blocks, charge
+
+`-log2 P(k_t) + log2 C(G,k_t) + q b k_t` bits.
+
+For a scalar token with `ℓ_t` active latents, replace `G,k_t,bk_t` by
+`Gb,ℓ_t,ℓ_t`. Fit and freeze `P(count)` on calibration. Report a
+usage-aware support-entropy sensitivity analysis beside the declared
+enumerative code, but do not change the headline codec after seeing eval.
+
+Distortion is transformed-coordinate FVU per site and pooled with exact eval
+squared-energy weights. Compare full `(k,q)` frontiers at `λ_rank=0`, over
+their shared rate region. Bootstrap sequences, not tokens, and display seeds
+separately.
+
+### 6.2 Shared-code validity
+
+A summed encoder can exploit multi-view correlation without learning a
+shared coordinate. Every trained BSC therefore reports:
+
+- single-site encoding to all-site reconstruction, as an `(input site,
+  output site)` FVU matrix;
+- the same matrix after a calibration-fit per-(block, site) linear map from
+  site-only code to full code;
+- leave-one-site-out reconstruction;
+- canonical correlations and Procrustes `R²` between site-only codes.
+
+Raw site-only encoding is not expected to match a code whose estimate was
+distributed over sites; the calibrated result separates that benign scaling
+from a coordinate failure. Blocks that fail are **correlated bundles**, not
+shared manifolds. No Phase-2/3 story is told over them.
+
+### 6.3 Effective linear span
+
+Report full spectra for three estimators:
+
+1. decoder spectrum: capacity only, with participation ratio and 95%-energy
+   rank;
+2. contribution second moment
+   `D_g^{sT} E[z_g z_g^T | active] D_g^s`, including the conditional mean;
+3. centered contribution covariance, measuring within-feature position.
+
+Include only blocks with at least 10k eval activations in headline
+histograms; count the rest. Report the zero-regularizer control,
+regularizer sensitivity, two-seed stability both at block level and global
+recovered-subspace level, and rank-`r` decoder/code truncation ablations.
+Truncation FVU is the final arbiter. Curvature requires separate topology
+tests; rank alone is never ring evidence.
+
+### 6.4 Capture and the sealed panel
+
+Known-family probes run only as descriptive monitoring and always apply the
+mega-block rule. The confirmatory panel was pinned without tokenizer or
+stream checks:
+
+| family | pinned classes | topology and statistic |
+|---|---:|---|
+| zodiac | 12 | cyclic adjacency, 20k permutations |
+| single-word US states | 40 before tokenizer filtering | geographic LOO latitude/longitude |
+| military ranks | 8 | ordered line, Spearman along PC1 |
+| SI prefixes | 10 | exponent/log line |
+| size adjectives | 7 | ordered line |
+| alphabet excluding A and I | 24 | alphabet-position line |
+
+Zodiac, states, ranks, and letters are capitalization-only. Known polysemy
+was accepted at pin time and is not patched after inspection. The fixtures
+live in `block_crosscoder_experiment.discovery.sealed_panel`; building a
+label map requires `BCC_PANEL_UNSEALED=1`.
+
+The panel opens once at Phase-1 config freeze. An earlier opening is allowed
+only by an explicit a9 decision for learning-rate re-ratification and consumes
+the one unsealing; it is not repeated at freeze. Availability is itself an
+outcome, hence the prohibition on pre-unsealing tokenizer and stream checks.
+
+## 7. Phase-1 execution
+
+### 7.1 Store commit gate
+
+1. Install and mount the 4 TB NVMe; record its path here and in workspace
+   guidance; verify live capacity.
+2. Harvest the 5M-token statistics prefix, validate the transform, freeze its
+   hash, and forecast exact bytes.
+3. Harvest all three splits with the pinned manifest; retain a raw shard.
+4. Run non-zero/finiteness, header/hash, content-checksum, split-contiguity,
+   bf16-error, and raw round-trip checks.
+5. Resume one checkpoint smoke run from the new store. No concurrent
+   checkpoint loads while training: restoring fp32 masters and Adam beside a
+   training residency OOMs the 24 GB GPU.
+
+### 7.2 Run matrix
+
+The 4B headline runs are not a search:
+
+- site-renormalized BSC at the pinned stack, two seeds;
+- matched signed scalar crosscoder, two seeds, with both headline H3 models
+  at `λ_rank=0`;
+- zero-regularizer frontiers at `k ∈ {16,32,64}`, one seed per off-point;
+- one primary-gauge BSC seed for gauge comparison;
+- site-renormalized BSC at `λ_rank ∈ {0,3e-4}` as lower regularizer arms.
+
+Optional frontier closure is `k=128` for the BSC, scalar `k≈6–8`, and one
+site-renormalized scalar joint cell. These do not delay the headline matrix.
+
+### 7.3 Reports and gates
+
+Every run reports pooled and per-site top-k/threshold FVU, realized counts,
+bf16 shadow, learning curves at 25/50/100% of the store, R–D points, dead and
+skip trajectories, Gram residual, `θ` drift, data-wait fraction, packing
+census, and the applicable shared-code/effective-span battery.
+
+H3 is the production frontier comparison over the shared declared-codec
+range. Either direction is informative. Proceed to Phase 2 only if at least
+one block is multidimensional under contribution/truncation readouts,
+coherent under topology/null controls, and passes shared-code validity.
+State any mostly-rank-one verdict conditional on the observed
+recovery-vs-frequency and store-fraction power.
+
+If dead fraction remains high or held-out FVU is still falling at epoch end,
+escalate to interleaved harvest/train streaming for at least 100M tokens. The
+scalar baseline must retrain on the identical extended manifest and order;
+never compare an escalated BSC to an un-escalated baseline.
+
+## 8. Reserved decisions and recovery bars
+
+Reserved to a9: learning-rate re-ratification, sealed-panel unsealing, store
+purges, gate-semantics changes, and the `G=8192` production decision.
+
+The Phase-1 learning rate remains `3e-4`. If recovery is ever reopened, the
+only ladder is site-renormalized `{3e-4 control, 4.5e-4, 6e-4}` with guard and
+auxiliary cap active; there is no `9e-4` arm. A primary-gauge arm joins only
+after renorm identifies a plausible point. One reduced-peak flat schedule is
+optional; a warmup-length arm is allowed only after `4.5e-4` demonstrates
+headroom.
+
+Changing the pinned point requires all six conditions:
+
+1. replication across two or three seeds;
+2. improvement on a predeclared aggregate endpoint (pooled FVU or R–D at
+   fixed `q`), never descriptive ring order;
+3. dead and skip rates within the pinned gates;
+4. rare-feature revival parity on the synthetic battery;
+5. sealed-panel score at least the `3e-4` control, consuming the one
+   unsealing if used before freeze;
+6. the known step-1600 poison batch passes without a guard trigger in an
+   otherwise healthy dictionary.
+
+Absent all six and an explicit a9 ruling, `3e-4` stands.
+
+## 9. Post-publication phases
+
+### Phase 2: saklas export bridge
+
+Deferred until the Phase-0/1 research is published. The producer remains
+this experiment; the consumer import lands in saklas.
+
+For a block that passes shared-code and coherence gates, export a multi-layer
+manifold folder. At each site, take a truncated SVD of the **transformed-
+coordinate** frame and retain the basis, singular values, and the right
+factor mapping the shared block code into the retained site coordinates.
+Preserve the full coordinate map; never export a bare span and later derive
+node positions in an unrelated gauge.
+
+Translate through the explicit seam between the harvest-fit training
+transform and saklas's consumer-side transform. They are not interchangeable.
+Export per-site `share` from contribution energy, not decoder Frobenius norm.
+Flag near-even packed contributions before assigning a manifold label.
+Origin, residual scale, density modes, and max-activating-context labels are
+separate estimators with separate validation; a successful runtime import
+does not validate their naturalness.
+
+The output contract is a manifold folder (`manifold.json` plus per-model
+safetensors). Causal steering is a later validation, not a knob used to
+select the discovery dictionary.
+
+### Phase 3: cross-model BSC
+
+Use sites = layers × models at constant total site budget, initially four
+layers each from Gemma base and instruct. Run paired forwards on identical
+raw sequences and exploit the shared tokenizer; render chat data
+template-free on both models and report template-token distribution gaps.
+
+At config freeze, pin two choices before looking at results:
+
+- a web + chat corpus mixture, because chat-specific manifolds are
+  underpowered on FineWeb-Edu alone;
+- paired versus independent per-model initialization. The default is paired
+  encoder/decoder initialization, matching the diffing prior; independent
+  initialization is the declared ablation.
+
+Model-difference claims require the same shared-code gates within each model.
+The causal battery patches selected block contributions from base to instruct
+through decoder differences and measures output KL against None, All, and
+reconstruction-error baselines. Report full-response and early-token KL,
+sequence-level confidence intervals, template-token stratification, and
+semantically matched nonactivating controls.
+
+Blockwise Latent Scaling is fit on held-out data as one `b×b` ridge- or
+Procrustes-constrained map per block/model/site, using leave-one-block-out and
+reconstruction targets. Validate it first on planted shared, exclusive,
+shrunk, and decoupled blocks. Dedicated-feature crosscoders and their
+model-stitching/steering checks are the scalar comparison point.
+Cross-architecture diffing waits on token alignment; document pooling would
+answer a different question and does not substitute for token alignment.
+
+## 10. Risks and excluded scope
+
+Designed out: scale-vacuous rank pressure, selection-score proxy error, and
+decoder death spiral through the Gram constraint; rogue-dimension bait
+through transformed coordinates; fp16 overflow through the dtype ban;
+pipeline-null ambiguity through synthetic and positive controls.
+
+Mitigated but monitored: shrinkage/decoupling artifacts (BatchTopK and
+blockwise Latent Scaling), auxiliary cascades (ratio cap), optimizer
+instability (guard plus skip-rate gate), site concentration (flat-profile
+veto plus zero-regularizer control), circular rank claims (truncation),
+multi-view leakage (site-dropout matrices), packing (coherence and
+contribution splits), and finite-store overfit (held-out gap and escalation).
+
+Honestly open: width four may not match language's natural block prior;
+`G=8192` may starve; the production frontier may narrow or reverse; the
+narrow novelty claim still needs the older coupled/group-sparse
+dictionary-learning literature before external publication.
+
+Out of scope for the current program: cross-architecture token alignment,
+exotic topology priors, weakly causal crosscoder variants, steering-quality
+tuning, and widths two/eight. Quantized activation storage is admissible only
+after a paired bf16-versus-quantized pilot matches R–D, block matching,
+count/dead distributions, contribution spectra, and shared-code diagnostics
+across two seeds.
+
+## Provenance
+
+The complete verbatim Phase-0 design lineage, four adversarial reviews,
+campaign runbooks, and chronological findings remain recoverable at Git
+commit `ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e`. Version 4.0 absorbs every
+still-operative contract into this file and removes review-ID indirection;
+when history and this document differ, this document governs.

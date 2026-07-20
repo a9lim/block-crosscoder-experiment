@@ -1,125 +1,139 @@
 # AGENTS.md
 
-Research repo: **block-sparse crosscoders (BSC)** — dictionary
-learning whose unit is a *subspace* with one shared code across
-layers, filling the {block} × {cross-site} cell of the literature's
-2×2 on gemma. Not a library — phased experiments with explicit
-go/no-go gates. Naming: **Phase 0** = the completed pilot program
-(2026-07-15 → 07-19; internally it used a −1 → 0.9.9 ladder — its
-one-shot scripts live in `scripts/archive/` with a rename map);
-**Phase 1** = the production run. Live tools are phase-neutral:
-`train_bsc.py`, `train_single_site.py`, `harvest_store.py`,
-`extend_store.py`, `verify_store.py`, `validate_{codec,theta,revival}.py`,
-`run_battery.py`, `sweep_{bundle,capture}.py`; analysis probes are
-`scripts/analysis/probe_*.py`, figures `fig_*.py`, regenerated via
-`regen_figures.sh` from the winner pointer.
+Research repository for **block-sparse crosscoders (BSCs)**: sparse
+dictionary learning whose unit is a subspace with one code shared across
+layers. This is a phased experiment with explicit go/no-go gates, not a
+general-purpose library.
+
+**Phase 0** is the completed pilot program (2026-07-15 through 2026-07-19).
+Its internal −1→0.9.9 ladder is historical; do not reintroduce ladder
+names into live code. **Phase 1** is the production Gemma 3 4B run.
 
 ## Read first
 
-- [`docs/findings-phase0.md`](docs/findings-phase0.md) — what Phase 0
-  established, paper-shaped (claims C1–C10, H1–H5 status, standing
-  rules). Read before re-deriving any result.
-- [`docs/design.md`](docs/design.md) (v3.0) — the forward design:
-  settled architecture + pinned training stack, open parameters, the
-  Phase-1 plan. Where it is silent,
-  [`docs/archive/design-v2.4.md`](docs/archive/design-v2.4.md)
-  governs (full algebra, gates, decision log).
-- [`docs/archive/`](docs/archive/README.md) — verbatim primary
-  sources. Read the relevant one before re-litigating a settled
-  choice.
-- [`docs/runbook-phase099.md`](docs/runbook-phase099.md) — still
-  live: the sealed probe panel (tranche 0) and the open closeout
-  tranches (5, 6, 7). Archives when the campaign closes.
+- [`docs/findings-phase0.md`](docs/findings-phase0.md): the authoritative,
+  paper-shaped pilot result and binding interpretation rules. Read it before
+  re-deriving a result.
+- [`docs/design.md`](docs/design.md): the complete normative architecture,
+  codec, store, sealed-panel, Phase-1, recovery, and post-publication design.
+  No archived document governs where it is silent.
+- [`docs/literature.md`](docs/literature.md): intellectual lineage, narrow
+  novelty scope, thirteen-source ledger, and owed external sweep.
+- [`figures/README.md`](figures/README.md): the current winner-scoped figure
+  inventory and qualification status.
+
+The verbatim Phase-0 chronology, old design/reviews, runbooks, and one-shot
+scripts remain recoverable at Git commit
+`ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e`; they are not working-tree
+authority.
 
 ## Status (2026-07-19)
 
-Phase 0 complete except closeout: **tranche 6 done** (epochs-vs-fresh:
-budget does the work, fresh ≈ epochs within 0.0013; findings §C10;
-winner promoted to the 24M-token renorm epochs cell, FVU 0.3997;
-canonical figures regenerated from it — 5 showcase families qualify:
-renorm month/weekday/country, primary cardinal/ordinal, §C10),
-**tranche 7 done** (2M whitener adequate — held-out dev flat in fit
-size; F7 gauge slice-stable ≤ 1%; fp16 ban quantified, whitened bf16
-validated; drills passed, ~3 h production-harvest forecast; findings
-§C11), **tranche 5 deferred** (a9 2026-07-19 — lr stays at the
-ratified 3e-4 for Phase 1; the ladder spec stays in the runbook if
-recovery is ever revisited). **Phase 1 store commit waits only on
-the 4 TB NVMe install** (record its mount point here and in the
-workspace root when live). Training stack pinned and a9-ratified
-(design v3 §Settled parameters): lr 3e-4 cosine, λ=1e-3, site-renorm
-gauge, SASA C.1 + aux-ratio-cap 1.0, mandatory loss-spike guard with
-skip-rate ≤ 0.1% as a run gate, streaming full-split θ, prefetch 4.
-The current best checkpoint is `data/phase0/winner.json` — the
-dynamic pointer figure regeneration reads (block identities are
-checkpoint-specific: `derive_showcase.py` re-derives them per winner).
+Phase 0 is complete. At matched 24M optimizer tokens, optimizer budget does
+the work and fresh data changes the clean comparison by only 0.0013 FVU. The
+promoted site-renormalized epoch cell reaches 0.3997 pooled FVU. The current
+winner arm qualifies month, weekday, and country; its matched primary-gauge
+counterpart qualifies cardinal and ordinal. A 2M-token whitener is adequate,
+site-renorm scalars are stable to roughly 1%, whitened bf16 is validated,
+resume/checksum drills passed, and production harvest forecasts at about
+three hours plus one hour verification.
 
-## Standing rules (binding)
+Phase 1 waits only on installation of the purchased 4 TB NVMe in jobe.
+Record its mount point in this file, `docs/design.md`, and the workspace-root
+`AGENTS.md` before harvest. The pinned stack is `lr=3e-4` cosine,
+`λ=1e-3`, site-renormalized shrinkage whitening, SASA C.1-style AuxK with
+gradient-ratio cap 1.0, mandatory spike guard with skip rate at most 0.1%,
+full-split streaming threshold fitting, and prefetch 4.
 
-- **Sealed panel stays sealed**: the six-family probe panel
-  (runbook §Tranche 0) opens only at Phase-1 config freeze or by an
-  explicit a9 unsealing. Never set `BCC_PANEL_UNSEALED`; no
-  stream-side availability checks either.
-- **Burned families**: calendar/zoo/atlas are descriptive probes
-  only, never selection criteria — three analysis passes tuned on
-  them. Confirmatory capture routes through the sealed panel.
-- **Mega-block rule**: top-1 capture is never read without ring
-  order and FVU beside it (healthy runs produce
-  consolidation-without-order too).
-- **Norm-CV is never a ring detector by itself** — ring evidence is
-  span-level and gate-conditional.
-- **Contribution-energy shares, never Frobenius** — decoder spectra
-  are frame capacity, not used dimension.
-- **Capitalization filtering for token-class probes** (the May
-  lesson: lowercase 'may' is 88% modal).
-- **Verify the effective config in the report artifact**
-  (`battery_config` / `model_cfg`), never trust the intended CLI —
-  two silent config-shadowing incidents.
-- **Never judge structure through a single site's dictionary**
-  (the layer-17 cautionary tale).
-- A null result is informative at every gate; don't chase a
-  positive. Phase discipline: each phase gates the next.
-- Reserved to a9: lr re-ratification (tranche-5 bar), panel
-  unsealing, store purges, gate-semantics rulings.
+[`data/winner.json`](data/winner.json) is the only current checkpoint
+pointer. Block identities are checkpoint-specific and must be derived from
+winner artifacts. [`data/showcase.json`](data/showcase.json) records the
+two-gauge Phase-0 election; do not hard-code it into current figures.
 
-## The saklas seam (post-publication)
+## Binding rules
 
-This experiment is a producer; saklas is the consumer (manifold
-folder contract). **Deferred until the Phase-0/1 research is
-published** (a9, 2026-07-19) — the Phase-2 import bridge lands in the
-saklas repo, not here. Consumer-side machinery still imported where
-useful (`LayerWhitener` convention, model loading); develop against a
-local saklas via `pip install -e ../../saklas` when needed. Do not
-import sibling experiments (workspace rule).
+- **Sealed panel stays sealed.** Never set `BCC_PANEL_UNSEALED`, build its
+  tokenizer maps, or scan stream availability before Phase-1 config freeze
+  or an explicit a9 unsealing.
+- **Burned families are descriptive.** Calendar, number, color, atlas,
+  element, and planet probes never select a config.
+- **Mega-block rule.** Top-1 capture is never read without topology/order and
+  run FVU beside it. Consolidation without order occurs in healthy runs.
+- **Norm CV never proves a ring.** Ring evidence is span-level and
+  permutation-calibrated.
+- **Contribution energy measures use; Frobenius measures capacity.**
+- **Capitalization is semantic filtering.** Lowercase `may` is the canonical
+  contamination case.
+- **Trust effective artifacts.** Verify `model_cfg` or `battery_config`, not
+  intended CLI arguments.
+- **Never infer depth from one site's dictionary.**
+- **Nulls are informative.** Do not chase positive structure across gates.
+- Reserved to a9: learning-rate re-ratification, panel unsealing, store
+  purges, `G=8192`, and gate-semantics rulings.
 
-## Conventions
+## Code and commands
 
-- Workspace rules apply: shared base Python 3.12, plain `python`, no
-  venvs, no `uv`. Install the workspace root once, then this package
-  editable.
-- Results and run logs: `data/analysis/` and `logs/` are regenerated
-  artifacts, out of git; committed compact evidence lives in
-  `data/phase0/`; findings prose goes to `docs/`. Figures are
-  regenerated from the winner pointer into `figures/phase0/`
-  (`scripts/analysis/winner.py`); force-add (`git add -f`) the
-  canonical set — `figures/**` is gitignored.
+All implementations live inside `block_crosscoder_experiment/`. The unified
+entry point is `bsc`; do not recreate a parallel `scripts/` package.
+
+```bash
+bsc --help
+bsc harvest --help
+bsc train --help
+bsc train-single-site --help
+bsc verify-store --help
+bsc validate-codec --help
+bsc capture-zoo --help
+bsc probe-families --help
+bsc extract-geometry --help
+bsc refresh-analysis --help
+```
+
+`block_crosscoder_experiment/discovery/` owns SAE discovery, topology/null
+tests, and the sealed panel. `analysis/` owns the family registry, probes,
+winner-scoped extraction, and figures. `cli/` owns operational entry points.
+Core model/trainer/store/codec modules remain at package root.
+
+The canonical figure contract is one consolidated index plus exactly three
+winner-arm diagnostics per zoo family:
+
+```text
+figures/<family>/{frames,flow,stream}.html
+figures/summary/*.png
+figures/index.html
+```
+
+Every family page must stamp winner run, block, top-1 count, order statistic,
+qualification, and FVU. An unqualified candidate is a diagnostic, not a
+captured manifold. HTMLs share `figures/assets/plotly.min.js`; never embed a
+fresh Plotly runtime in every file.
+
+## Data and repository conventions
+
+- Use plain shared Python 3.12; no project venv and no `uv`. Install the
+  workspace root once and this package editable.
+- `data/evidence/` is committed compact evidence. `data/analysis/` and
+  `logs/` are ignored regenerated artifacts. `data/winner.json` and
+  `data/showcase.json` are committed control pointers.
+- Current figure artifacts and their manifest are committed. Run
+  `bsc refresh-analysis` on jobe after promoting a winner; use `bsc figures`
+  only for a render-only pass over existing compact artifacts.
+- The Phase-2 consumer bridge is deferred until publication and lands in
+  saklas, not here. Do not import sibling experiments. Local saklas
+  development may use `python -m pip install -e ../../saklas`.
 
 ## Hardware
 
-- **Training on the 4090 (`ssh jobe`), harvest + analysis on the M5
-  Max (MPS)** — activations and checkpoints are portable.
-- **MPS async-OOM discipline**: long unsynced MPS loops need periodic
-  `torch.mps.synchronize()` + zero-row guards; never trust an
-  all-zeros block on MPS.
-- **fp16 is banned in the harvest/store path** (gemma-3 late-layer
-  channels overflow it); whitened bf16 store, fp32 stats.
-- **No concurrent checkpoint loads with training on jobe**:
-  `Trainer.load_checkpoint` restores fp32 master + Adam (~8–9 GB)
-  next to a ~15 GB training residency — 23.5 GB OOMs. Eval/codec
-  passes run strictly after training drains.
-- Store discipline: disk-backed whitened store, sequential buffered
-  shuffling only, whitener hash in every shard header. Store facts:
-  40,960 B/token; pilot store 348 GB + 6M extension on `/data`;
-  production 2.171 TB on the 4 TB NVMe (purchased, not yet
-  installed). Host RAM 61 GB — streaming θ is mandatory.
-- Phase-1 primary config G=4096 × b=4 × 8 sites (~671M params, ~9 GB
-  train VRAM, 8-bit Adam); G=8192 stretch is an open decision.
+- Training and the production harvest run on jobe's RTX 4090. Mac MPS is
+  appropriate for smaller harvest/analysis. Long MPS loops need periodic
+  `torch.mps.synchronize()` and zero-row guards.
+- fp16 is banned in harvest and store; use raw-model bf16, transformed bf16
+  storage, and fp32/fp64 statistics as designed.
+- Never load checkpoints concurrently with training on jobe. Restoring fp32
+  masters and Adam beside the training residency reaches the 24 GB limit.
+- Sequential buffered store reads only; no token-random mmap. Every shard
+  carries the frozen transform hash.
+- Exact store rate is 40,960 bytes/token. Production is 2.171 TB. Host RAM is
+  61 GB, so calibration and eval must stream.
+- Primary config is `G=4096 × b=4 × 8 sites`, about 671M parameters and
+  about 9 GB train VRAM with 8-bit Adam. `G=8192` remains reserved.

@@ -4,7 +4,7 @@ checkable without any tokenizer run or scan."""
 
 import pytest
 
-from block_crosscoder_experiment.phase0 import sealed_panel as sp
+from block_crosscoder_experiment.discovery import sealed_panel as sp
 
 
 def test_seal_blocks_label_maps(monkeypatch):

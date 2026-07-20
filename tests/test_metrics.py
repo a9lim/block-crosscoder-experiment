@@ -2,8 +2,6 @@
 must be invisible to every readout), Procrustes exactness, and an
 end-to-end trained recovery — the pipeline finds what was planted."""
 
-import math
-
 import torch
 
 from block_crosscoder_experiment.metrics import (
@@ -32,7 +30,6 @@ def random_orthogonal(n, seed=0):
 def test_spans_and_spectra_gauge_invariant():
     """A joint O(b) on (D_g, z_g) — the exact residual gauge — leaves
     used spans and contribution spectra unchanged."""
-    gen = torch.Generator().manual_seed(0)
     truth = PlantedModel(
         [BlockSpec(rank=2, frequency=0.5, geometry="shell")],
         n_sites=S,
