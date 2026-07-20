@@ -32,6 +32,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
         "block_crosscoder_experiment.cli.sweep_capture",
         "sweep synthetic capture conditions",
     ),
+    "sweep-manifolds": (
+        "block_crosscoder_experiment.cli.sweep_manifolds",
+        "run the pre-NVMe real-manifold tuning screen",
+    ),
     "validate-codec": (
         "block_crosscoder_experiment.cli.validate_codec",
         "validate the rate-distortion codec",
@@ -51,6 +55,18 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "probe-families": (
         "block_crosscoder_experiment.analysis.probe_families",
         "evaluate descriptive family capture",
+    ),
+    "eval-manifolds": (
+        "block_crosscoder_experiment.analysis.eval_manifolds",
+        "score held-out operational manifold fidelity",
+    ),
+    "eval-stream-manifolds": (
+        "block_crosscoder_experiment.analysis.eval_stream_manifolds",
+        "gate tuning rings on held-out source-model geometry",
+    ),
+    "eval-manifold-sweep": (
+        "block_crosscoder_experiment.cli.eval_manifold_sweep",
+        "evaluate every completed manifold-sweep cell",
     ),
     "probe-crossarm": (
         "block_crosscoder_experiment.analysis.probe_crossarm",

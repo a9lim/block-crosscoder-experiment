@@ -41,7 +41,17 @@ def main() -> None:
         "--blocks", type=int, default=G,
         help="block count G (production default: 4096)",
     )
+    parser.add_argument(
+        "--block-dim", type=int, default=B_DIM,
+        help="block width b (production default: 4); width sweeps should state "
+        "which latent, coefficient, density, and rate quantities are matched",
+    )
     parser.add_argument("--k", type=float, default=K)
+    parser.add_argument(
+        "--warmup-steps", type=int, default=1000,
+        help="linear warmup length (production default: 1000); exposed so "
+        "short diagnostics do not silently spend most of training in warmup",
+    )
     parser.add_argument(
         "--site-renorm", action="store_true",
         help="compatibility path for shrinkage-only pilot stores; production "
@@ -142,7 +152,8 @@ def main() -> None:
 
     if args.arm == "bsc":
         model_cfg = BSCConfig(
-            n_blocks=args.blocks, block_dim=B_DIM, n_sites=n_sites, d_model=d_model,
+            n_blocks=args.blocks, block_dim=args.block_dim,
+            n_sites=n_sites, d_model=d_model,
             k=args.k, lambda_rank=args.lam, seed=args.seed,
         )
     else:
@@ -150,8 +161,9 @@ def main() -> None:
             raise SystemExit("scalar baseline runs at lambda=0 (design: at b=1 "
                              "the nuclear term is not a rank penalty)")
         model_cfg = BSCConfig(
-            n_blocks=args.blocks * B_DIM, block_dim=1, n_sites=n_sites, d_model=d_model,
-            k=args.k * B_DIM,  # matched training-average L0: E[l] = b*E[k]
+            n_blocks=args.blocks * args.block_dim, block_dim=1,
+            n_sites=n_sites, d_model=d_model,
+            k=args.k * args.block_dim,  # matched L0: E[l] = b*E[k]
             lambda_rank=0.0, seed=args.seed,
         )
 
@@ -166,8 +178,12 @@ def main() -> None:
         tag += f"_wd{args.encoder_wd:g}"
     if args.blocks != G:
         tag += f"_G{args.blocks}"
+    if args.block_dim != B_DIM:
+        tag += f"_b{args.block_dim}"
     if args.k != K:
         tag += f"_k{args.k:g}"
+    if args.warmup_steps != 1000:
+        tag += f"_warm{args.warmup_steps}"
     if args.site_renorm or folded_site_renorm:
         tag += "_renorm"
     if args.epochs != EPOCHS:
@@ -199,6 +215,7 @@ def main() -> None:
 
     train_cfg = TrainConfig(
         total_steps=total_steps, lr=args.lr, schedule=args.schedule,
+        warmup_steps=args.warmup_steps,
         encoder_weight_decay=args.encoder_wd, log_every=10,
         guard=args.guard, guard_factor=args.guard_factor,
         guard_loss_factor=args.guard_loss_factor,
@@ -358,6 +375,7 @@ def main() -> None:
         "epochs": args.epochs,
         "calib_batches": n_calib_batches,
         "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
         "schedule": args.schedule,
         "encoder_wd": args.encoder_wd,
         "site_renorm": bool(args.site_renorm or folded_site_renorm),

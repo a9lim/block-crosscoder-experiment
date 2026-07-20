@@ -26,6 +26,13 @@ import torch
 # Safe batch count for cusolver's batched symmetric eigensolvers
 # (empirical ceiling sits between 24576 and 32768 on CUDA 12.8).
 _EIGH_MAX_BATCH = 16384
+# G8192/b4 fits the 4090 for forward/backward but the unconstrained einsum
+# planner requests an additional ~2.5 GiB workspace during retraction. Chunk
+# over blocks so temporary memory scales with this constant, not the dictionary.
+_GRAM_BLOCK_CHUNK = 512
+_RETRACT_UNCHUNKED_MAX = 4096
+_SPECTRUM_BLOCK_CHUNK = 256
+_SPECTRUM_UNCHUNKED_MAX = 4096
 
 __all__ = [
     "block_gram",
@@ -43,7 +50,19 @@ def block_gram(D: torch.Tensor) -> torch.Tensor:
 
     D: [S, G, b, d]  ->  M: [G, b, b]
     """
-    return torch.einsum("sgbd,sgcd->gbc", D, D)
+    if D.shape[1] <= _GRAM_BLOCK_CHUNK:
+        return torch.einsum("sgbd,sgcd->gbc", D, D)
+    return torch.cat(
+        [
+            torch.einsum(
+                "sgbd,sgcd->gbc",
+                D[:, start : start + _GRAM_BLOCK_CHUNK],
+                D[:, start : start + _GRAM_BLOCK_CHUNK],
+            )
+            for start in range(0, D.shape[1], _GRAM_BLOCK_CHUNK)
+        ],
+        dim=0,
+    )
 
 
 def gram_residual(D: torch.Tensor) -> torch.Tensor:
@@ -71,12 +90,23 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
     """
     if D.dtype != torch.float32:
         raise TypeError(f"retraction operates on fp32 master weights, got {D.dtype}")
-    M = block_gram(D)  # [G, b, b]
-    evals, evecs = torch.linalg.eigh(M)
-    floor_hits = int((evals < eig_floor).sum().item())
-    evals = evals.clamp_min(eig_floor)
-    inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
-    D.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, D))
+    floor_hits = 0
+    chunk_size = (
+        D.shape[1]
+        if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
+    )
+    for start in range(0, D.shape[1], chunk_size):
+        chunk = D[:, start : start + chunk_size]
+        M = torch.einsum("sgbd,sgcd->gbc", chunk, chunk)
+        evals, evecs = torch.linalg.eigh(M)
+        floor_hits += int((evals < eig_floor).sum().item())
+        evals = evals.clamp_min(eig_floor)
+        inv_sqrt = (
+            evecs
+            @ torch.diag_embed(evals.rsqrt())
+            @ evecs.transpose(-1, -2)
+        )
+        chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
     return floor_hits
 
 
@@ -90,6 +120,21 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
 
     D: [S, G, b, d]  ->  [S, G, b]
     """
+    if D.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
+        chunks = []
+        for start in range(0, D.shape[1], _SPECTRUM_BLOCK_CHUNK):
+            block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK]
+            gram = torch.einsum("sgbd,sgcd->sgbc", block, block).float()
+            flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
+            # CUDA's batched solver reserves roughly 256 KiB per 4x4 matrix;
+            # with optimizer state resident that dominates the actual 1 MiB
+            # tensor. The exact CPU eigensolve has tiny storage, and autograd
+            # carries its gradient back through the device copy.
+            evals = torch.linalg.eigvalsh(flat.cpu()).to(D.device)
+            evals = evals.reshape(gram.shape[:-1])
+            chunks.append(evals)
+        return (torch.cat(chunks, dim=1).clamp_min(0.0) + eps).sqrt()
+
     gram_s = torch.einsum("sgbd,sgcd->sgbc", D, D).float()
     # cusolver's batched syev rejects large batch counts (measured on
     # CUDA 12.8 / 4090: S*G = 24576 passes, 32768 fails with

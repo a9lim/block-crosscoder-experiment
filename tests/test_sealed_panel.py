@@ -12,7 +12,7 @@ def test_seal_blocks_label_maps(monkeypatch):
     with pytest.raises(sp.PanelSealedError, match="SEALED"):
         sp.assert_unsealed()
     with pytest.raises(sp.PanelSealedError):
-        sp.build_sealed_label_map(object(), "zodiac")
+        sp.build_sealed_label_map(object(), "rank")
 
 
 def test_fixtures_well_formed():
@@ -23,7 +23,8 @@ def test_fixtures_well_formed():
         assert len(vals) == len(sp.SEALED_FAMILIES[fam])
         assert vals == sorted(vals), f"{fam} order values must be monotone"
     assert set(sp.STATE_COORDS) == set(sp.SEALED_FAMILIES["us_state"])
-    assert len(sp.SEALED_FAMILIES["zodiac"]) == 12
+    assert "zodiac" not in sp.SEALED_FAMILIES
+    assert len(sp.RELEASED_DEVELOPMENT_FAMILIES["zodiac"]) == 12
     assert "A" not in sp.SEALED_FAMILIES["alphabet"]
     assert "I" not in sp.SEALED_FAMILIES["alphabet"]
 

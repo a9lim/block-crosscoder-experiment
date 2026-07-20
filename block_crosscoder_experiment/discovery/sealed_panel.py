@@ -1,4 +1,4 @@
-"""The Phase-1 confirmatory panel — DO NOT SCAN BEFORE UNSEALING.
+"""The remaining Phase-1 confirmatory panel — DO NOT SCAN BEFORE UNSEALING.
 
 Six concept families preregistered blind (a9-ratified 2026-07-18): fixtures
 written from world knowledge only, with
@@ -7,6 +7,11 @@ The panel exists so at least one capture readout is untouched by every
 tuning decision — the calendar/zoo/atlas families are burned as selection
 criteria (three analysis passes deep), and this panel is the confirmatory
 replacement.
+
+On 2026-07-19 a9 explicitly released ``zodiac`` from the panel for manifold
+tuning. Its fixture remains here as an audit record, but it now belongs to
+the burned development targets and is never confirmatory. The other five
+families remain structurally sealed.
 
 SEAL CONDITION: label maps may only be built (and any scan run) after the
 Phase-1 config freeze, or under the single a9-authorized pre-freeze
@@ -34,6 +39,7 @@ __all__ = [
     "SEALED_CAP_ONLY",
     "SEALED_KINDS",
     "SEALED_ORDER_VALUES",
+    "RELEASED_DEVELOPMENT_FAMILIES",
     "STATE_COORDS",
     "assert_unsealed",
     "build_sealed_label_map",
@@ -106,7 +112,6 @@ ALPHABET = [c for c in "BCDEFGHJKLMNOPQRSTUVWXYZ"]
 ALPHABET_POSITIONS = [float(ord(c) - ord("A") + 1) for c in ALPHABET]
 
 SEALED_FAMILIES: dict[str, list[str]] = {
-    "zodiac": ZODIAC,
     "us_state": US_STATES,
     "rank": MILITARY_RANKS,
     "si_prefix": SI_PREFIXES,
@@ -114,17 +119,21 @@ SEALED_FAMILIES: dict[str, list[str]] = {
     "alphabet": ALPHABET,
 }
 
-SEALED_CAP_ONLY = {"zodiac", "us_state", "rank", "alphabet"}
+SEALED_CAP_ONLY = {"us_state", "rank", "alphabet"}
 
 # Metric kind per family (the standing zoo_block_tests machinery).
 SEALED_KINDS: dict[str, str] = {
-    "zodiac": "ring",        # C=12, adjacency + 20k-perm null
     "us_state": "geo",       # LOO lat/lon decode vs STATE_COORDS
     "rank": "linear",        # Spearman rho along PC1
     "si_prefix": "linear",   # rho on SI_EXPONENTS (log-line by construction)
     "size_adj": "linear",
     "alphabet": "linear",    # rho on ALPHABET_POSITIONS
 }
+
+# Explicitly consumed by the 2026-07-19 tuning campaign. Keeping this beside
+# the sealed fixtures makes the provenance and loss of confirmatory status
+# impossible to erase accidentally.
+RELEASED_DEVELOPMENT_FAMILIES: dict[str, list[str]] = {"zodiac": ZODIAC}
 
 # Non-contiguous order values where class index != order value.
 SEALED_ORDER_VALUES: dict[str, list[float]] = {

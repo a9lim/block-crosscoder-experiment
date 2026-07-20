@@ -147,7 +147,14 @@ class DeadTracker:
 
     def update(self, mask: torch.Tensor) -> None:
         """mask: [B, G] bool from the training forward."""
-        self.counts[self.ptr] = mask.sum(dim=0).float()
+        # The one-shot CUDA reduction requests a ~256 MiB workspace at
+        # B=4096,G=8192, enough to cross the 4090 ceiling after optimizer
+        # state is resident. Row chunks preserve the exact integer count in
+        # fp32 (B is tiny relative to its exact range) with bounded workspace.
+        total = torch.zeros(mask.shape[1], device=mask.device)
+        for start in range(0, mask.shape[0], 256):
+            total.add_(mask[start : start + 256].sum(dim=0, dtype=torch.float32))
+        self.counts[self.ptr].copy_(total)
         self.tokens[self.ptr] = mask.shape[0]
         self.ptr = (self.ptr + 1) % self.counts.shape[0]
         self.filled = min(self.filled + 1, self.counts.shape[0])
@@ -208,7 +215,6 @@ def aux_loss(
     The residual is frozen (no gradient through it) in every variant.
     Returns None when the variant has nothing to train on this step.
     """
-    residual = (x - out.xhat).detach()
     B, G = out.scores.shape
 
     if variant == "fel":
@@ -228,6 +234,8 @@ def aux_loss(
         keep = min(s_aux, n_dead)
         if keep <= 0:
             return None
+    residual = (x - out.xhat).detach()
+    if variant != "fel":
         z_aux = model.encode(residual) * dead.view(1, -1, 1)
         p = model.scores(z_aux).masked_fill(~dead.view(1, -1), float("-inf"))
 

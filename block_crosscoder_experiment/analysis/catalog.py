@@ -1,9 +1,10 @@
-"""One registry for labeled probes and the descriptive manifold zoo.
+"""Registries for labeled probes, the figure zoo, and tuning manifolds.
 
 Only single-token surface forms participate: multi-token spellings do not
-identify one residual-stream position. The zoo is descriptive evidence and
-must never be used for model selection; confirmatory capture uses the sealed
-panel in :mod:`block_crosscoder_experiment.discovery.sealed_panel`.
+identify one residual-stream position. The figure zoo is descriptive evidence.
+The smaller tuning registry contains explicitly burned development targets;
+confirmatory capture uses the still-sealed remainder in
+:mod:`block_crosscoder_experiment.discovery.sealed_panel`.
 """
 
 from __future__ import annotations
@@ -12,10 +13,14 @@ from dataclasses import dataclass
 
 import torch
 
+from block_crosscoder_experiment.discovery.sealed_panel import ZODIAC
+
 __all__ = [
     "CAP_ONLY",
     "FAMILIES",
     "FamilySpec",
+    "MANIFOLD_SPECS",
+    "TUNING",
     "ZOO",
     "ZOO_FAMILIES",
     "build_label_map",
@@ -98,11 +103,12 @@ FAMILIES: dict[str, list[str]] = {
     "country": COUNTRIES,
     "element": ELEMENTS,
     "planet": PLANETS,
+    "zodiac": ZODIAC,
 }
 
 # Families whose lowercase surface forms are *different words*
 # (turkey the bird, china the porcelain, mercury the metal).
-CAP_ONLY = {"country", "planet"}
+CAP_ONLY = {"country", "planet", "zodiac"}
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,14 @@ ZOO: dict[str, FamilySpec] = {
     "weekday": FamilySpec("ring", tuple(WEEKDAYS)),
 }
 ZOO_FAMILIES = tuple(ZOO)
+
+# Explicit development targets may be optimized but never promoted back into
+# the confirmatory panel. Keep this separate from ZOO so releasing zodiac
+# does not silently expand the canonical figure manifest.
+TUNING: dict[str, FamilySpec] = {
+    "zodiac": FamilySpec("ring", tuple(ZODIAC)),
+}
+MANIFOLD_SPECS: dict[str, FamilySpec] = {**ZOO, **TUNING}
 
 
 def surface_forms(word: str, cap_only: bool = False) -> list[str]:

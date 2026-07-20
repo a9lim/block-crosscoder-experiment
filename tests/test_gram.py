@@ -8,6 +8,8 @@ import math
 import pytest
 import torch
 
+import block_crosscoder_experiment.gram as gram_module
+
 from block_crosscoder_experiment.gram import (
     block_gram,
     gram_residual,
@@ -153,3 +155,25 @@ def test_block_gram_matches_naive(device):
     g = 3
     naive = torch.stack([D[s, g] @ D[s, g].T for s in range(S)]).sum(dim=0)
     assert torch.allclose(M[g], naive, atol=1e-5)
+
+
+def test_chunked_gram_and_retraction_match(monkeypatch, device):
+    D = random_stack(device, seed=9)
+    expected = torch.einsum("sgbd,sgcd->gbc", D, D)
+    monkeypatch.setattr(gram_module, "_GRAM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "_RETRACT_UNCHUNKED_MAX", 0)
+    assert torch.allclose(block_gram(D), expected, atol=1e-5)
+    retract_(D)
+    assert gram_residual(D).max().item() < 1e-5
+
+
+def test_chunked_site_spectrum_matches_and_has_grad(monkeypatch, device):
+    D = random_stack(device, seed=10)
+    expected = site_singular_values(D)
+    monkeypatch.setattr(gram_module, "_SPECTRUM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "_SPECTRUM_UNCHUNKED_MAX", 0)
+    D.requires_grad_(True)
+    actual = site_singular_values(D)
+    assert torch.allclose(actual, expected, atol=1e-5)
+    actual.sum().backward()
+    assert D.grad is not None and torch.isfinite(D.grad).all()
