@@ -36,6 +36,20 @@ def cell_grid() -> dict[str, dict]:
             G=4096, b=4, k=32, lr=3e-4, schedule="linear_fifth",
             diagnostic_steps=1800,
         ),
+        # Follow-up interaction surface after linear k32 and cosine k40/48/64
+        # emerged as complementary geometry controls.
+        "linear_k40": dict(
+            G=4096, b=4, k=40, lr=3e-4, schedule="linear_fifth",
+            diagnostic_steps=1800,
+        ),
+        "linear_k48": dict(
+            G=4096, b=4, k=48, lr=3e-4, schedule="linear_fifth",
+            diagnostic_steps=1800,
+        ),
+        "linear_k64": dict(
+            G=4096, b=4, k=64, lr=3e-4, schedule="linear_fifth",
+            diagnostic_steps=1800,
+        ),
         # Honest lambda=1e-3 k sweep (the surviving off-points are lambda=0).
         "k16": dict(G=4096, b=4, k=16, lr=3e-4),
         "k24": dict(G=4096, b=4, k=24, lr=3e-4),

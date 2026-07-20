@@ -192,6 +192,9 @@ then Pareto cells are retrained at 24M. The existing 12M and 24M
 | `lr5e-4` | 4096 | 4 | 32 | 5e-4 | stability-edge map |
 | `lr5.5e-4` | 4096 | 4 | 32 | 5.5e-4 | last rung below known damage |
 | `linear3e-4` | 4096 | 4 | 32 | 3e-4 | linear-last-fifth schedule |
+| `linear_k40` | 4096 | 4 | 40 | 3e-4 | schedule × k interaction |
+| `linear_k48` | 4096 | 4 | 48 | 3e-4 | schedule × k interaction |
+| `linear_k64` | 4096 | 4 | 64 | 3e-4 | high-k ring-rescue test |
 | `k16` | 4096 | 4 | 16 | 3e-4 | fair structured k sweep |
 | `k24` | 4096 | 4 | 24 | 3e-4 | refine below the center |
 | `k40` | 4096 | 4 | 40 | 3e-4 | refine above the center |
@@ -225,6 +228,14 @@ The five elevated-LR cells and the schedule control stop first at step 1800,
 beyond warmup and the known
 step-1600 stressor. G8192 cells stop first at step 500 for memory and early
 dead-dynamics inspection. The campaign runner resumes only surviving cells.
+
+The first 12M screen identified a real schedule × sparsity interaction worth
+isolating before any 24M finalist run. `linear3e-4` was the best balanced
+calendar cell, cosine `k40` had the strongest weekday centroid geometry, and
+cosine `k64` achieved the best FVU while collapsing weekday roundness. The
+three follow-up cells `linear_k{40,48,64}` change only `k` under the
+linear-last-fifth schedule. Existing cosine cells are the matched controls;
+no LR, width, gauge, penalty, or seed axis is reopened.
 
 ## Stage 3: finalists
 

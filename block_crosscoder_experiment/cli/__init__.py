@@ -96,6 +96,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
         "block_crosscoder_experiment.analysis.figures",
         "regenerate the winner-scoped figure catalog",
     ),
+    "fig-sweep-frames": (
+        "block_crosscoder_experiment.analysis.render_sweep_frames",
+        "render temporary split-B sweep frame figures",
+    ),
     "fig-capture": (
         "block_crosscoder_experiment.analysis.fig_capture",
         "regenerate global capture and allocation summaries",

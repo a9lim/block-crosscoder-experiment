@@ -8,6 +8,7 @@ from block_crosscoder_experiment.cli.sweep_manifolds import (
     _cell_fingerprint,
     _diagnostic_health,
     _verify_or_initialize_fingerprint,
+    cell_grid,
 )
 
 
@@ -94,3 +95,15 @@ def test_fingerprint_initializes_empty_cell_and_verifies_exact_match(tmp_path):
         _verify_or_initialize_fingerprint(
             path, {"epochs": 4, "G": 4096}, dry_run=False
         )
+
+
+def test_linear_high_k_cells_change_only_schedule_and_k():
+    grid = cell_grid()
+    for k in (40, 48, 64):
+        cell = grid[f"linear_k{k}"]
+        assert cell["G"] == 4096
+        assert cell["b"] == 4
+        assert cell["k"] == k
+        assert cell["lr"] == 3e-4
+        assert cell["schedule"] == "linear_fifth"
+        assert cell["diagnostic_steps"] == 1800
