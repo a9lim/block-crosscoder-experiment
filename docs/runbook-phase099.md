@@ -208,6 +208,10 @@ capture is reported descriptively, never selected on.
 
 ## Tranche 5 — targeted lr recovery (guarded, demoted to after tranches 1–3)
 
+**Deferred** (a9, 2026-07-19): not run in Phase 0. The lr stays at
+the ratified 3e-4 for Phase 1. The spec below is preserved verbatim
+in case recovery is revisited; the re-ratification bar is unchanged.
+
 Renorm-first ladder {3e-4 control, 4.5e-4, 6e-4} with guard + AuxK cap
 active; **no 9e-4** (well inside the demonstrated unstable regime;
 running it mostly tests whether the guard can censor a bad optimizer).
@@ -274,6 +278,9 @@ Original spec:
 
 ## Deferred (explicit)
 
+- **Tranche 5 lr recovery ladder** — a9 2026-07-19: deferred, not
+  run in Phase 0; Phase 1 proceeds at the ratified 3e-4. Spec and
+  re-ratification bar preserved in §Tranche 5.
 - **Causal intervention / steering demo** — a9 2026-07-18: not
   necessary yet. Noted as the consult's top qualitative-addition pick;
   revisit at Phase 2 (whose export remains "proves the pipe").

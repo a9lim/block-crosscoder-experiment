@@ -41,8 +41,9 @@ renorm month/weekday/country, primary cardinal/ordinal, §C10),
 **tranche 7 done** (2M whitener adequate — held-out dev flat in fit
 size; F7 gauge slice-stable ≤ 1%; fp16 ban quantified, whitened bf16
 validated; drills passed, ~3 h production-harvest forecast; findings
-§C11), **tranche 5** (guarded lr recovery, last — the
-re-ratification bar is a9's). **Phase 1 store commit waits only on
+§C11), **tranche 5 deferred** (a9 2026-07-19 — lr stays at the
+ratified 3e-4 for Phase 1; the ladder spec stays in the runbook if
+recovery is ever revisited). **Phase 1 store commit waits only on
 the 4 TB NVMe install** (record its mount point here and in the
 workspace root when live). Training stack pinned and a9-ratified
 (design v3 §Settled parameters): lr 3e-4 cosine, λ=1e-3, site-renorm

@@ -2,8 +2,8 @@
 
 *The pilot program, 2026-07-15 → 07-19, condensed. Every claim links
 its primary source in [`archive/`](archive/README.md); the design and
-the Phase-1 plan live in [`design.md`](design.md). Status: complete
-except tranche 5 (§Open items).*
+the Phase-1 plan live in [`design.md`](design.md). Status: complete;
+tranche 5 deferred (§Open items).*
 
 ## Abstract
 
@@ -473,8 +473,8 @@ re-design; the store commit waits only on the 4 TB NVMe.
 ## Open items
 
 - **Tranche 5** (guarded lr recovery, {4.5e-4, 6e-4} renorm-first):
-  last, judged against the complete endpoint battery; re-ratification
-  bar is a9's (runbook §Tranche 5).
+  **deferred** (a9, 2026-07-19) — Phase 1 proceeds at the ratified
+  3e-4; spec and re-ratification bar preserved in runbook §Tranche 5.
 - **Frontier ends**: block k128 (does scalar's 2.9 kbit lead
   survive?), scalar k≈6–8 (can scalar reach the 390-bit region?).
 - **A renormed joint scalar cell** would close the one gauge
