@@ -3,7 +3,7 @@
 *The pilot program, 2026-07-15 → 07-19, condensed. Every claim links
 its primary source in [`archive/`](archive/README.md); the design and
 the Phase-1 plan live in [`design.md`](design.md). Status: complete
-except two closeout tranches (§Open items).*
+except tranche 5 (§Open items).*
 
 ## Abstract
 
@@ -356,6 +356,88 @@ stability property under 2× budget change at fixed init.
 
 ---
 
+## C11. Production-harvest derisk: the whitener question is closed
+
+*(Tranche 7: one streaming 5M-token validation pass on jobe — fresh
+fineweb-edu tokens starting 16,846 rows (~17.2M tokens) deep,
+disjoint from all pilot and extension consumption — plus checksum
+and resume drills. Payload `data/phase0/t7_whitener.json`; tools
+`validate_whitener.py`, `drill_store_resume.py`,
+`verify_store.py --splits`.)*
+
+Four production questions, four answers.
+
+**1. A 2M-token whitener calibration slice is adequate; more is
+noise.** Nested prefix fits against the 5M reference converge as
+~1/√n and depth-graded: at 2M, rel ΔW ≤ 1.1% for L9–L21, 2.3%/2.8%
+at L27/L30 (Δμ ≤ 0.5% everywhere). But the functional metric — D9
+held-out whitened-spectrum deviation on 200k fresh tokens — is
+**flat in fit size**: L30 reads 0.069 / 0.072 / 0.075 / 0.076 /
+0.076 across 0.5/1/2/2.5/5M fits. Estimation error stops mattering
+below 500k tokens; what remains at late sites is a floor set by the
+data, not the fit.
+
+**2. Whitener staleness is negligible — the pilot's "drift" was
+mostly floor.** On the *same* held-out slice ~22M tokens deep, the
+frozen 2M pilot whitener (fit at stream position 0–2M) scores within
+3–13% relative of a fresh 5M whitener fit on the adjacent tokens,
+and within 4% at the late sites that motivated the check (L30:
+0.0787 vs 0.0762). In W-space the pilot does sit ~30% farther from
+the 5M reference than same-region independent 1M fits (0.053 vs
+~0.041 at L30, despite 2× the tokens) — slow stream drift in W is
+real and measurable — but the held-out metric says it is
+functionally irrelevant. A caveat cuts the other way: 200k held-out
+tokens is ~196 contexts, and the same pilot whitener scored 0.053
+(L30) on the extension's held-out slice ~11M deep vs 0.079 here —
+slice-to-slice variance of the metric itself exceeds the
+pilot-vs-fresh gap, so absolute floor levels conflate local
+nonstationarity with document-sampling variance; only same-slice
+comparisons are decisive, and that comparison is closed.
+
+**3. The F7 renorm gauge is slice-stable to ~1%.** Scalars from the
+5M fit run [4.997, 5.356, 4.947, 3.634, 2.647, 2.232, 2.045, 1.851]
+(L9→L30); the pilot's differ by ≤ 0.7% at every site; five
+independent 1M fits give CV ≤ 1.13% (worst at L18) and max rel dev
+vs 5M ≤ 1.8%. The gauge can be frozen at calibration and reused
+across the production store without re-estimation.
+
+**4. The whitened-bf16 store format is validated with quantified
+tails — and the fp16 ban gets its numbers.** Raw activations hit
+abs-max 103k–240k across sites: every site overflows fp16's 65,504.
+Channel 443 is the top-magnitude channel at all eight sites (1666
+second through the mid-depths), and it exceeds 10k on essentially
+*every* token from L12 on (exceedance rate exactly 1/2560 of
+values). At the fp16 limit the picture is stark: since only channel
+443 crosses 65,504 (site-wise #2 maxima are all < 10k), the
+exceedance rates convert directly to token fractions — **channel 443
+alone overflows fp16 on 43% of tokens at L27 and 82% at L30** (0.1–
+0.3% of tokens at L9–L24). This is not rare-tail overflow; the
+mega-channel is typically out of fp16 range at late depth. Whitening
+tames it completely: whitened abs-max ≤ 27.3 across sites, with
+**zero** values beyond 32 in ~13.3e9 values per site. bf16
+quantization error is uniform: mean rel err 0.14%, max 0.39% (the
+half-ULP bound) — two orders below model FVU.
+
+**Harvest mechanics.** Checksum drill: the 6M-token extension split
+(246 GB, 40 shards) verified clean in 396 s (0.62 GB/s, sha256-bound)
+→ a full-store verify at production scale costs ~1 h. Resume drill
+(synthetic scratch through the real `ShardWriter`): a mid-write kill
+leaves atomically-renamed complete shards plus a quarantinable
+`.tmp`; the manifest rebuilds from self-describing shard headers
+after a contiguity check, and full checksums pass. The resume rule:
+relaunch writes a **new split** with skip-rows ≥ original +
+ceil(recovered/1022) + margin, then merges manifests (the
+extend-store pattern) — a fresh writer restarts shard numbering at
+0, so in-place append collides. Throughput: this pass streamed 5,557
+tok/s without writes; the extension harvest sustained ~5,000 tok/s
+at 205 MB/s written → the 53M-token / 2.171 TB production harvest
+forecasts at **~3 h**, plus ~1 h verify.
+
+Phase-1 consequence: nothing in the harvest path blocks or needs
+re-design; the store commit waits only on the 4 TB NVMe.
+
+---
+
 ## Hypothesis status after Phase 0
 
 | | statement | status |
@@ -390,9 +472,6 @@ stability property under 2× budget change at fixed init.
 
 ## Open items
 
-- **Tranche 7 tail**: whitener stability at the 5M production slice,
-  late-layer bf16 tail stats, renorm-scalar stability across
-  independent slices, store checksum drill (deferred for I/O quiet).
 - **Tranche 5** (guarded lr recovery, {4.5e-4, 6e-4} renorm-first):
   last, judged against the complete endpoint battery; re-ratification
   bar is a9's (runbook §Tranche 5).

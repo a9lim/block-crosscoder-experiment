@@ -245,6 +245,22 @@ rides along as exploratory description on a burned family.
 
 ## Tranche 7 — production-harvest derisk (no store required)
 
+**Done 2026-07-19** — findings §C11, payload
+`data/phase0/t7_whitener.json`; tools `validate_whitener.py`,
+`drill_store_resume.py`, `verify_store.py --splits`. Verdicts: 2M
+whitener adequate (held-out D9 flat in fit size 0.5M→5M — late-site
+deviation is a data floor, not estimation error; frozen pilot within
+4% of a fresh local 5M fit at late sites on the same held-out
+slice); F7 scalars slice-stable (pilot vs 5M ≤ 0.7%, indep-1M CV
+≤ 1.13%); fp16 ban quantified (channel 443 alone overflows fp16 on
+43%/82% of tokens at L27/L30; whitened abs-max ≤ 27.3, zero > 32 in
+~13.3e9 values/site; bf16 rel err mean 0.14%); checksum drill 246 GB
+in 396 s (0.62 GB/s → ~1 h full-store verify); resume drill passed
+(new-split + manifest-merge rule); production harvest forecast ~3 h
+at ~5,000 tok/s / 205 MB/s.
+
+Original spec:
+
 - Whitener stability vs slice size up to the planned 5M production
   slice (streaming covariance accumulation, nothing stored) — the
   pilot's depth-graded drift (L27 0.026 / L30 0.031 at 2M) is the

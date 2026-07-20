@@ -38,8 +38,10 @@ budget does the work, fresh ≈ epochs within 0.0013; findings §C10;
 winner promoted to the 24M-token renorm epochs cell, FVU 0.3997;
 canonical figures regenerated from it — 5 showcase families qualify:
 renorm month/weekday/country, primary cardinal/ordinal, §C10),
-**tranche 7 tail** (whitener stability at 5M, bf16 tail stats,
-checksum drill), **tranche 5** (guarded lr recovery, last — the
+**tranche 7 done** (2M whitener adequate — held-out dev flat in fit
+size; F7 gauge slice-stable ≤ 1%; fp16 ban quantified, whitened bf16
+validated; drills passed, ~3 h production-harvest forecast; findings
+§C11), **tranche 5** (guarded lr recovery, last — the
 re-ratification bar is a9's). **Phase 1 store commit waits only on
 the 4 TB NVMe install** (record its mount point here and in the
 workspace root when live). Training stack pinned and a9-ratified
