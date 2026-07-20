@@ -1,9 +1,9 @@
 # Block-sparse crosscoders: authoritative design
 
-*Version 4.0, 2026-07-19. This document is self-contained and normative. It
-supersedes every Phase-0 design, review, and runbook. Completed evidence is
-summarized in [`findings-phase0.md`](findings-phase0.md); the literature
-position is [`literature.md`](literature.md).*
+*Version 4.0, 2026-07-19. This document is self-contained and normative.
+Completed evidence is summarized in
+[`findings-phase0.md`](findings-phase0.md); the literature position is
+[`literature.md`](literature.md).*
 
 ## 1. Objective and current state
 
@@ -14,7 +14,7 @@ occupies the {block} × {cross-site} cell of the dictionary-learning 2×2:
 | | one site | shared across sites |
 |---|---|---|
 | scalar | SAE | scalar crosscoder |
-| block | block-sparse featurizer | **BSC** |
+| block | block-sparse featurizer | **block-sparse crosscoder** |
 
 Phase 0 passed the architecture, instrument, factorial, rate–distortion, and
 harvest-readiness gates. The promoted pilot checkpoint is
@@ -46,32 +46,9 @@ Gates are decision rules with demonstrated power, not logical
 falsifications. Every null is reported with its positive controls, synthetic
 recovery envelope, and sample-power limits.
 
-## 2. Normative interpretation rules
+## 2. Coordinates and activation store
 
-These are part of the method, not reporting preferences:
-
-1. **The sealed panel stays sealed.** Do not set `BCC_PANEL_UNSEALED`, build
-   tokenizer maps, or run stream-side availability checks before the Phase-1
-   config freeze or an explicit a9 unsealing.
-2. **Known families are burned.** Calendar, number, color, country, element,
-   and planet probes are descriptive only and may not select a config.
-3. **Mega-block rule.** Top-1 family capture is never read without topology
-   or order and run FVU beside it.
-4. **Norm CV is not a ring detector.** Ring evidence is span-level,
-   permutation-calibrated, and conditional on the candidate gate.
-5. **Contribution-energy shares, never Frobenius shares, measure use.** The
-   Gram constraint forces parked decoder capacity.
-6. **Token-class probes apply semantic capitalization filters.** The `May`
-   and lowercase `may` contamination is the canonical failure case.
-7. **Verify the effective report artifact.** `model_cfg` and
-   `battery_config` outrank intended CLI flags.
-8. **No single-site dictionary verdict is promoted to a depth story.**
-9. **Every null is publishable.** Do not tune until a desired structure
-   appears; phases gate the next experiment.
-
-## 3. Coordinates and activation store
-
-### 3.1 Sites and whitening
+### 2.1 Sites and whitening
 
 Production sites are residual-post layers `(9, 12, 15, 18, 21, 24, 27,
 30)` of `google/gemma-3-4b-pt`. All encoding, selection, reconstruction,
@@ -105,7 +82,7 @@ channels routinely exceed 65,504. Model forwards use bf16, whitening and
 statistics use fp32/fp64 as specified, and the store holds transformed bf16.
 A small raw shard is retained for round-trip validation.
 
-### 3.2 Store layout and I/O
+### 2.2 Store layout and I/O
 
 Harvest FineWeb-Edu with a pinned dataset revision and explicit source
 manifest. Use sequence length 1024; drop BOS and positions 0/1. Harvest the
@@ -135,9 +112,9 @@ complete atomic shards, quarantine `.tmp`, verify contiguity, then relaunch a
 new split past the recovered corpus offset and merge manifests. A new writer
 restarts shard numbering at zero and would collide in place.
 
-## 4. Model and optimization
+## 3. Model and optimization
 
-### 4.1 BSC parameterization
+### 3.1 BSC parameterization
 
 For `G` blocks of width `b` and sites `s=1..S`, block `g` has encoder
 `E_g^s ∈ R^(b×d)`, decoder frame `D_g^s ∈ R^(b×d)`, and each site has
@@ -164,7 +141,7 @@ within-block `GL(b)` gauge to `O(b)`, fixes every concatenated frame at rank
 isolated total decoder-output energy. It does not make that energy a marginal
 loss reduction; blocks can overlap and cancel.
 
-### 4.2 Selection and inference threshold
+### 3.2 Selection and inference threshold
 
 Training uses BatchTopK over block norms, retaining `k×B` block activations
 over a batch of `B` tokens. Counts per token may vary. Inference uses one
@@ -173,7 +150,7 @@ average count with a bounded-memory streaming log-histogram quantile.
 Serialize `θ` with the codec. The training EMA of selected-score minima is a
 diagnostic only; it is history-dependent and never the inference threshold.
 
-### 4.3 Loss and rank pressure
+### 3.3 Loss and rank pressure
 
 The objective is
 
@@ -194,7 +171,7 @@ frontiers compare BSC and scalar at `λ_rank=0`.
 Decoder singular values are **frame capacity**, not used dimension. Rank
 claims use code-anchored contribution moments and reconstruction ablations.
 
-### 4.4 Dead blocks, initialization, and guard
+### 3.4 Dead blocks, initialization, and guard
 
 Initialize decoder frames Gaussian, retract once, set encoders from the
 decoder transpose, and norm-calibrate encoder scale so initial scores are
@@ -211,7 +188,7 @@ norms, and continue. More than five consecutive skips refuses the run. Total
 skip rate above 0.1% fails the run. The guard is an instrument, not permission
 to operate at an unstable learning rate.
 
-## 5. Matched models and the production stack
+## 4. Matched models and the production stack
 
 The scalar baseline is the signed `b=1` special case with concatenated
 decoder norm one, `G×b` latents, identical sites, data, whitening, parameter
@@ -246,9 +223,9 @@ band at `G=4096` is roughly 0.1–0.15%. `G=8192` is not a silent stretch:
 Phase-0 dead dynamics reached 3.6%, so it requires an explicit decision after
 a short production-store diagnostic.
 
-## 6. Evaluation protocol
+## 5. Evaluation protocol
 
-### 6.1 Split discipline and activation codec
+### 5.1 Split discipline and activation codec
 
 Train fits weights only. Calibration fits `θ`, canonical code orientation,
 quantizer ranges, count model, and site-only code maps. Eval is untouched
@@ -276,7 +253,7 @@ squared-energy weights. Compare full `(k,q)` frontiers at `λ_rank=0`, over
 their shared rate region. Bootstrap sequences, not tokens, and display seeds
 separately.
 
-### 6.2 Shared-code validity
+### 5.2 Shared-code validity
 
 A summed encoder can exploit multi-view correlation without learning a
 shared coordinate. Every trained BSC therefore reports:
@@ -293,7 +270,7 @@ distributed over sites; the calibrated result separates that benign scaling
 from a coordinate failure. Blocks that fail are **correlated bundles**, not
 shared manifolds. No Phase-2/3 story is told over them.
 
-### 6.3 Effective linear span
+### 5.3 Effective linear span
 
 Report full spectra for three estimators:
 
@@ -310,34 +287,9 @@ recovered-subspace level, and rank-`r` decoder/code truncation ablations.
 Truncation FVU is the final arbiter. Curvature requires separate topology
 tests; rank alone is never ring evidence.
 
-### 6.4 Capture and the sealed panel
+## 6. Phase-1 execution
 
-Known-family probes run only as descriptive monitoring and always apply the
-mega-block rule. The confirmatory panel was pinned without tokenizer or
-stream checks:
-
-| family | pinned classes | topology and statistic |
-|---|---:|---|
-| zodiac | 12 | cyclic adjacency, 20k permutations |
-| single-word US states | 40 before tokenizer filtering | geographic LOO latitude/longitude |
-| military ranks | 8 | ordered line, Spearman along PC1 |
-| SI prefixes | 10 | exponent/log line |
-| size adjectives | 7 | ordered line |
-| alphabet excluding A and I | 24 | alphabet-position line |
-
-Zodiac, states, ranks, and letters are capitalization-only. Known polysemy
-was accepted at pin time and is not patched after inspection. The fixtures
-live in `block_crosscoder_experiment.discovery.sealed_panel`; building a
-label map requires `BCC_PANEL_UNSEALED=1`.
-
-The panel opens once at Phase-1 config freeze. An earlier opening is allowed
-only by an explicit a9 decision for learning-rate re-ratification and consumes
-the one unsealing; it is not repeated at freeze. Availability is itself an
-outcome, hence the prohibition on pre-unsealing tokenizer and stream checks.
-
-## 7. Phase-1 execution
-
-### 7.1 Store commit gate
+### 6.1 Store commit gate
 
 1. Install and mount the 4 TB NVMe; record its path here and in workspace
    guidance; verify live capacity.
@@ -350,7 +302,7 @@ outcome, hence the prohibition on pre-unsealing tokenizer and stream checks.
    checkpoint loads while training: restoring fp32 masters and Adam beside a
    training residency OOMs the 24 GB GPU.
 
-### 7.2 Run matrix
+### 6.2 Run matrix
 
 The 4B headline runs are not a search:
 
@@ -364,7 +316,7 @@ The 4B headline runs are not a search:
 Optional frontier closure is `k=128` for the BSC, scalar `k≈6–8`, and one
 site-renormalized scalar joint cell. These do not delay the headline matrix.
 
-### 7.3 Reports and gates
+### 6.3 Reports and gates
 
 Every run reports pooled and per-site top-k/threshold FVU, realized counts,
 bf16 shadow, learning curves at 25/50/100% of the store, R–D points, dead and
@@ -382,119 +334,3 @@ If dead fraction remains high or held-out FVU is still falling at epoch end,
 escalate to interleaved harvest/train streaming for at least 100M tokens. The
 scalar baseline must retrain on the identical extended manifest and order;
 never compare an escalated BSC to an un-escalated baseline.
-
-## 8. Reserved decisions and recovery bars
-
-Reserved to a9: learning-rate re-ratification, sealed-panel unsealing, store
-purges, gate-semantics changes, and the `G=8192` production decision.
-
-The Phase-1 learning rate remains `3e-4`. If recovery is ever reopened, the
-only ladder is site-renormalized `{3e-4 control, 4.5e-4, 6e-4}` with guard and
-auxiliary cap active; there is no `9e-4` arm. A primary-gauge arm joins only
-after renorm identifies a plausible point. One reduced-peak flat schedule is
-optional; a warmup-length arm is allowed only after `4.5e-4` demonstrates
-headroom.
-
-Changing the pinned point requires all six conditions:
-
-1. replication across two or three seeds;
-2. improvement on a predeclared aggregate endpoint (pooled FVU or R–D at
-   fixed `q`), never descriptive ring order;
-3. dead and skip rates within the pinned gates;
-4. rare-feature revival parity on the synthetic battery;
-5. sealed-panel score at least the `3e-4` control, consuming the one
-   unsealing if used before freeze;
-6. the known step-1600 poison batch passes without a guard trigger in an
-   otherwise healthy dictionary.
-
-Absent all six and an explicit a9 ruling, `3e-4` stands.
-
-## 9. Post-publication phases
-
-### Phase 2: saklas export bridge
-
-Deferred until the Phase-0/1 research is published. The producer remains
-this experiment; the consumer import lands in saklas.
-
-For a block that passes shared-code and coherence gates, export a multi-layer
-manifold folder. At each site, take a truncated SVD of the **transformed-
-coordinate** frame and retain the basis, singular values, and the right
-factor mapping the shared block code into the retained site coordinates.
-Preserve the full coordinate map; never export a bare span and later derive
-node positions in an unrelated gauge.
-
-Translate through the explicit seam between the harvest-fit training
-transform and saklas's consumer-side transform. They are not interchangeable.
-Export per-site `share` from contribution energy, not decoder Frobenius norm.
-Flag near-even packed contributions before assigning a manifold label.
-Origin, residual scale, density modes, and max-activating-context labels are
-separate estimators with separate validation; a successful runtime import
-does not validate their naturalness.
-
-The output contract is a manifold folder (`manifold.json` plus per-model
-safetensors). Causal steering is a later validation, not a knob used to
-select the discovery dictionary.
-
-### Phase 3: cross-model BSC
-
-Use sites = layers × models at constant total site budget, initially four
-layers each from Gemma base and instruct. Run paired forwards on identical
-raw sequences and exploit the shared tokenizer; render chat data
-template-free on both models and report template-token distribution gaps.
-
-At config freeze, pin two choices before looking at results:
-
-- a web + chat corpus mixture, because chat-specific manifolds are
-  underpowered on FineWeb-Edu alone;
-- paired versus independent per-model initialization. The default is paired
-  encoder/decoder initialization, matching the diffing prior; independent
-  initialization is the declared ablation.
-
-Model-difference claims require the same shared-code gates within each model.
-The causal battery patches selected block contributions from base to instruct
-through decoder differences and measures output KL against None, All, and
-reconstruction-error baselines. Report full-response and early-token KL,
-sequence-level confidence intervals, template-token stratification, and
-semantically matched nonactivating controls.
-
-Blockwise Latent Scaling is fit on held-out data as one `b×b` ridge- or
-Procrustes-constrained map per block/model/site, using leave-one-block-out and
-reconstruction targets. Validate it first on planted shared, exclusive,
-shrunk, and decoupled blocks. Dedicated-feature crosscoders and their
-model-stitching/steering checks are the scalar comparison point.
-Cross-architecture diffing waits on token alignment; document pooling would
-answer a different question and does not substitute for token alignment.
-
-## 10. Risks and excluded scope
-
-Designed out: scale-vacuous rank pressure, selection-score proxy error, and
-decoder death spiral through the Gram constraint; rogue-dimension bait
-through transformed coordinates; fp16 overflow through the dtype ban;
-pipeline-null ambiguity through synthetic and positive controls.
-
-Mitigated but monitored: shrinkage/decoupling artifacts (BatchTopK and
-blockwise Latent Scaling), auxiliary cascades (ratio cap), optimizer
-instability (guard plus skip-rate gate), site concentration (flat-profile
-veto plus zero-regularizer control), circular rank claims (truncation),
-multi-view leakage (site-dropout matrices), packing (coherence and
-contribution splits), and finite-store overfit (held-out gap and escalation).
-
-Honestly open: width four may not match language's natural block prior;
-`G=8192` may starve; the production frontier may narrow or reverse; the
-narrow novelty claim still needs the older coupled/group-sparse
-dictionary-learning literature before external publication.
-
-Out of scope for the current program: cross-architecture token alignment,
-exotic topology priors, weakly causal crosscoder variants, steering-quality
-tuning, and widths two/eight. Quantized activation storage is admissible only
-after a paired bf16-versus-quantized pilot matches R–D, block matching,
-count/dead distributions, contribution spectra, and shared-code diagnostics
-across two seeds.
-
-## Provenance
-
-The complete verbatim Phase-0 design lineage, four adversarial reviews,
-campaign runbooks, and chronological findings remain recoverable at Git
-commit `ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e`. Version 4.0 absorbs every
-still-operative contract into this file and removes review-ID indirection;
-when history and this document differ, this document governs.

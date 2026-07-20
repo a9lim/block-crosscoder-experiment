@@ -6,26 +6,16 @@ layers. This is a phased experiment with explicit go/no-go gates, not a
 general-purpose library.
 
 **Phase 0** is the completed pilot program (2026-07-15 through 2026-07-19).
-Its internal −1→0.9.9 ladder is historical; do not reintroduce ladder
-names into live code. **Phase 1** is the production Gemma 3 4B run.
+**Phase 1** is the production Gemma 3 4B run.
 
 ## Read first
 
 - [`docs/findings-phase0.md`](docs/findings-phase0.md): the authoritative,
-  paper-shaped pilot result and binding interpretation rules. Read it before
-  re-deriving a result.
-- [`docs/design.md`](docs/design.md): the complete normative architecture,
-  codec, store, sealed-panel, Phase-1, recovery, and post-publication design.
-  No archived document governs where it is silent.
-- [`docs/literature.md`](docs/literature.md): intellectual lineage, narrow
-  novelty scope, thirteen-source ledger, and owed external sweep.
+  pilot result.
+- [`docs/design.md`](docs/design.md): the complete normative architecture.
+- [`docs/literature.md`](docs/literature.md): intellectual lineage.
 - [`figures/README.md`](figures/README.md): the current winner-scoped figure
   inventory and qualification status.
-
-The verbatim Phase-0 chronology, old design/reviews, runbooks, and one-shot
-scripts remain recoverable at Git commit
-`ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e`; they are not working-tree
-authority.
 
 ## Status (2026-07-19)
 
@@ -50,27 +40,6 @@ pointer. Block identities are checkpoint-specific and must be derived from
 winner artifacts. [`data/showcase.json`](data/showcase.json) records the
 two-gauge Phase-0 election; do not hard-code it into current figures.
 
-## Binding rules
-
-- **Sealed panel stays sealed.** Never set `BCC_PANEL_UNSEALED`, build its
-  tokenizer maps, or scan stream availability before Phase-1 config freeze
-  or an explicit a9 unsealing.
-- **Burned families are descriptive.** Calendar, number, color, atlas,
-  element, and planet probes never select a config.
-- **Mega-block rule.** Top-1 capture is never read without topology/order and
-  run FVU beside it. Consolidation without order occurs in healthy runs.
-- **Norm CV never proves a ring.** Ring evidence is span-level and
-  permutation-calibrated.
-- **Contribution energy measures use; Frobenius measures capacity.**
-- **Capitalization is semantic filtering.** Lowercase `may` is the canonical
-  contamination case.
-- **Trust effective artifacts.** Verify `model_cfg` or `battery_config`, not
-  intended CLI arguments.
-- **Never infer depth from one site's dictionary.**
-- **Nulls are informative.** Do not chase positive structure across gates.
-- Reserved to a9: learning-rate re-ratification, panel unsealing, store
-  purges, `G=8192`, and gate-semantics rulings.
-
 ## Code and commands
 
 All implementations live inside `block_crosscoder_experiment/`. The unified
@@ -94,11 +63,11 @@ tests, and the sealed panel. `analysis/` owns the family registry, probes,
 winner-scoped extraction, and figures. `cli/` owns operational entry points.
 Core model/trainer/store/codec modules remain at package root.
 
-The canonical figure contract is one consolidated index plus exactly three
+The canonical figure contract is one consolidated index plus exactly four
 winner-arm diagnostics per zoo family:
 
 ```text
-figures/<family>/{frames,flow,stream}.html
+figures/<family>/{frames,flow,stream,code}.html
 figures/summary/*.png
 figures/index.html
 ```

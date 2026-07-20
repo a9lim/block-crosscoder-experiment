@@ -26,9 +26,14 @@ def test_committed_figure_catalog_is_complete_and_shared_runtime():
             f"{family}/frames.html",
             f"{family}/flow.html",
             f"{family}/stream.html",
+            f"{family}/code.html",
         ]
         for relative in entry["files"]:
             page = (FIGURES_DIR / relative).read_text()
             assert 'src="../assets/plotly.min.js"' in page
             assert "pooled FVU" in page
             assert "selection endpoint" in page
+        code_page = (FIGURES_DIR / family / "code.html").read_text()
+        assert "shared code" in code_page
+        assert "One class mean per point" in code_page
+        assert "between-class code-mean variance" in code_page

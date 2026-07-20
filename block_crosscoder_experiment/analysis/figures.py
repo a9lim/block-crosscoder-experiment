@@ -1,6 +1,6 @@
 """Generate the canonical, winner-scoped figure catalog.
 
-Each descriptive zoo family gets exactly three views:
+Each descriptive zoo family gets exactly four views:
 
 ``stream.html``
     Raw shrinkage-whitened class means across the eight sites.
@@ -9,6 +9,9 @@ Each descriptive zoo family gets exactly three views:
 ``flow.html``
     That frame-space geometry in one fixed joint-PCA gauge, so its motion
     through depth is visible without a per-site refit.
+``code.html``
+    One class mean per point in the winner block's shared four-dimensional
+    code, reduced once to three principal components across classes.
 
 The zoo is burned descriptive evidence. Every page therefore carries the
 winner FVU, block identity, top-1 capture, ordering statistic, and
@@ -29,9 +32,11 @@ from scipy.stats import spearmanr
 
 from .artifacts import FIGURES_DIR, analysis_dir, load_winner
 from .catalog import FamilySpec, ZOO, ZOO_FAMILIES
-from .style import INK, INK2, SURFACE, cyclic_colors
+from .probe_families import CAP_FAMILIES
+from .style import CAT, INK, INK2, SURFACE, cyclic_colors
 
 Z_STEP = 1.2
+FAMILY_VIEWS = ("frames", "flow", "stream", "code")
 
 
 def _procrustes(reference: np.ndarray, moving: np.ndarray) -> np.ndarray:
@@ -292,6 +297,124 @@ def _flow_figure(
     return fig
 
 
+def _code_class_means(
+    codes_npz,
+    family: str,
+    block: int,
+    n_classes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the exact shared-code class means used by the order tests."""
+
+    meta = json.loads(str(codes_npz["meta"]))
+    families = list(meta["families"])
+    if family not in families:
+        raise ValueError(f"winner code dump is missing family {family}")
+    blocks = codes_npz["blocks"].tolist()
+    if block not in blocks:
+        raise ValueError(f"winner code dump is missing {family} block b{block}")
+
+    mask = codes_npz["fam"] == families.index(family)
+    if family in CAP_FAMILIES:
+        mask &= codes_npz["is_cap"]
+    class_ids = codes_npz["cls"][mask]
+    codes = codes_npz["z_sel"][mask, blocks.index(block)].astype(np.float32)
+    counts = np.bincount(class_ids, minlength=n_classes)[:n_classes]
+    if np.any(counts == 0):
+        missing = np.flatnonzero(counts == 0).tolist()
+        raise ValueError(f"{family} has no shared-code samples for classes {missing}")
+    means = np.stack(
+        [codes[class_ids == class_index].mean(0) for class_index in range(n_classes)]
+    )
+    return means, counts
+
+
+def _code_figure(
+    code_means: np.ndarray,
+    class_counts: np.ndarray,
+    spec: FamilySpec,
+    title: str,
+    subtitle: tuple[str, str],
+) -> go.Figure:
+    """Render one pan-layer shared-code centroid per semantic class."""
+
+    centered = code_means - code_means.mean(0, keepdims=True)
+    _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
+    components = min(3, vt.shape[0])
+    projected = centered @ vt[:components].T
+    if components < 3:
+        projected = np.pad(projected, ((0, 0), (0, 3 - components)))
+    total_variance = max((singular_values**2).sum(), 1e-12)
+    explained = singular_values[:components] ** 2 / total_variance
+    if components < 3:
+        explained = np.pad(explained, (0, 3 - components))
+    variance = float(explained.sum())
+    colors = cyclic_colors(len(spec.labels))
+    marker_colors: str | list[str] = CAT[0] if spec.topology == "cloud" else colors
+    fig = go.Figure()
+
+    path = _path(spec)
+    if path:
+        fig.add_trace(
+            go.Scatter3d(
+                x=projected[path, 0],
+                y=projected[path, 1],
+                z=projected[path, 2],
+                mode="lines",
+                line={"color": INK2, "width": 4},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    show_text = len(spec.labels) <= 20
+    hovertext = [
+        f"{label}<br>n={int(count):,}<br>"
+        f"PC1 {point[0]:.3f}<br>PC2 {point[1]:.3f}<br>PC3 {point[2]:.3f}"
+        for label, count, point in zip(spec.labels, class_counts, projected)
+    ]
+    fig.add_trace(
+        go.Scatter3d(
+            x=projected[:, 0],
+            y=projected[:, 1],
+            z=projected[:, 2],
+            mode="markers+text" if show_text else "markers",
+            marker={
+                "size": 7,
+                "color": marker_colors,
+                "line": {"color": INK2, "width": 1},
+            },
+            text=list(spec.labels) if show_text else None,
+            textposition="top center",
+            textfont={"size": 10, "color": INK2},
+            hovertext=hovertext,
+            hovertemplate="%{hovertext}<extra></extra>",
+            showlegend=False,
+        )
+    )
+
+    fig.update_layout(
+        title=(
+            f"{html.escape(title)}<br><sup>{html.escape(subtitle[0])}</sup>"
+            f"<br><sup>{html.escape(subtitle[1])} One class mean per point; "
+            f"3 PCs retain {variance:.1%} of between-class code-mean variance."
+            "</sup>"
+        ),
+        height=760,
+        width=1060,
+        paper_bgcolor=SURFACE,
+        font={"family": "system-ui, sans-serif", "color": INK},
+        scene={
+            "xaxis_title": f"shared-code PC1 · {explained[0]:.1%}",
+            "yaxis_title": f"shared-code PC2 · {explained[1]:.1%}",
+            "zaxis_title": f"shared-code PC3 · {explained[2]:.1%}",
+            "aspectmode": "cube",
+            "camera": {"eye": {"x": 1.6, "y": 1.4, "z": 1.0}},
+        },
+        margin={"t": 125},
+    )
+    return fig
+
+
 def _write_figure(fig: go.Figure, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(
@@ -310,7 +433,7 @@ def _write_catalog(out: Path, manifest: dict) -> None:
         entry = families[family]
         links = " · ".join(
             f'<a href="{family}/{view}.html">{view}</a>'
-            for view in ("frames", "flow", "stream")
+            for view in FAMILY_VIEWS
         )
         rows.append(
             f"<tr><td><strong>{html.escape(family)}</strong></td>"
@@ -323,7 +446,7 @@ def _write_catalog(out: Path, manifest: dict) -> None:
             f"{entry['n_classes']} | {entry['order']} | "
             f"{'yes' if entry['qualified'] else 'no'} | "
             f"[frames]({family}/frames.html) · [flow]({family}/flow.html) "
-            f"· [stream]({family}/stream.html) |"
+            f"· [stream]({family}/stream.html) · [code]({family}/code.html) |"
         )
 
     summaries = sorted((out / "summary").glob("*.png"))
@@ -371,12 +494,16 @@ def generate(
     winner = load_winner()
     means_npz = np.load(artifact_dir / "zoo_means.npz")
     frames_npz = np.load(artifact_dir / "frames_winner.npz")
+    codes_npz = np.load(artifact_dir / "zoo_codes_winner.npz")
     tests = json.loads((artifact_dir / "zoo_block_tests.json").read_text())["winner"]
     frame_meta = json.loads(str(frames_npz["meta"]))
+    code_meta = json.loads(str(codes_npz["meta"]))
     frame_run = Path(frame_meta["run"]).name
-    if frame_run != winner["run_name"]:
+    code_run = Path(code_meta["run"]).name
+    if frame_run != winner["run_name"] or code_run != winner["run_name"]:
         raise ValueError(
-            f"frames belong to {frame_run}, not promoted winner {winner['run_name']}"
+            "figure artifacts do not belong to the promoted winner: "
+            f"frames={frame_run}, codes={code_run}, winner={winner['run_name']}"
         )
 
     sites = list(winner["sites"])
@@ -420,6 +547,9 @@ def generate(
                 for site in range(len(sites))
             ]
         )
+        code_means, class_counts = _code_class_means(
+            codes_npz, family, block, len(spec.labels)
+        )
         subtitle = _subtitle(family, entry, tests["fvu_pooled"], len(spec.labels))
         metric = (
             "1st harmonic"
@@ -461,6 +591,16 @@ def generate(
             ),
             family_out / "flow.html",
         )
+        _write_figure(
+            _code_figure(
+                code_means,
+                class_counts,
+                spec,
+                f"{family}: winner block b{block}'s shared code",
+                subtitle,
+            ),
+            family_out / "code.html",
+        )
         state = _status(entry, len(spec.labels))
         manifest["families"][family] = {
             "block": block,
@@ -472,9 +612,10 @@ def generate(
                 f"{family}/frames.html",
                 f"{family}/flow.html",
                 f"{family}/stream.html",
+                f"{family}/code.html",
             ],
         }
-        print(f"{family}: b{block} -> frames, flow, stream", flush=True)
+        print(f"{family}: b{block} -> frames, flow, stream, code", flush=True)
 
     _write_catalog(out, manifest)
     return manifest

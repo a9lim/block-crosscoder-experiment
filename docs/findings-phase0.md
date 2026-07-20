@@ -298,33 +298,7 @@ The remaining production mechanics have measured margins:
 No scientific or engineering question in the harvest path remains open. The
 production store waits only on hardware.
 
-## 7. Limits and binding interpretation rules
-
-The pilot R–D result is strong evidence, not the Phase-1 headline verdict.
-The expensive block frontier end (`k=128`), ultra-cheap scalar end
-(`k≈6–8`), and a renormalized scalar tying control remain useful optional
-points. Effective-span claims also await the full contribution-spectrum,
-rank-truncation, shared-code, and sample-power battery at production scale.
-
-These rules bind all future analysis:
-
-1. **Mega-block rule:** report top-1 capture only with topology/order and FVU.
-2. **Burned families:** calendar, number, color, atlas, element, and planet
-   probes are descriptive; config selection uses aggregate endpoints and the
-   sealed panel.
-3. **No stream-side sealed-panel checks:** availability is part of the one
-   eventual unsealing.
-4. **Norm concentration is not ring evidence:** rings are span-level and
-   gate-conditional.
-5. **Contribution energy, not Frobenius capacity:** parked decoder directions
-   make frame norms a misleading use statistic.
-6. **Capitalization filters are semantic controls:** uncapitalized `may` was
-   88% modal; country and planet homographs have the same problem.
-7. **Trust effective artifacts, not intended CLI:** verify `model_cfg` or
-   `battery_config`; two silent shadowing incidents were caught this way.
-8. **Never infer the cross-depth story from one site's dictionary.**
-
-## 8. Hypothesis status and conclusion
+## 7. Hypothesis status and conclusion
 
 | hypothesis | Phase-0 status |
 |---|---|
@@ -341,22 +315,3 @@ positive interaction; and the honest bit axis favors the BSC throughout the
 pilot overlap. Phase 1 now asks whether those effects persist at the full
 store and whether the learned blocks pass strict shared-code and effective-
 span tests.
-
-## Provenance
-
-The pre-cleanup repository at Git commit
-`ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e` contains the verbatim campaign
-chronology, review finding IDs, frozen design v2.4, ladder-era runbooks, and
-one-shot scripts. This rewrite supersedes them as the working-tree authority;
-the commit is the exact historical record when raw chronology is needed.
-
-The durable machine-independent evidence is now consolidated in
-[`data/evidence/`](../data/evidence/): synthetic recovery, SAE provenance,
-cross-layer geometry, factorial cells, seed replications, single-site
-placement, R–D payloads, the four optimizer-budget cells, and whitener/harvest
-validation. [`data/winner.json`](../data/winner.json) points to the current
-checkpoint; [`data/showcase.json`](../data/showcase.json) records the
-two-gauge descriptive election. Heavy probe artifacts and checkpoints remain
-under `/data/runs/` on jobe. The obsolete 1B and SAE activation stores were
-purged with a9's 2026-07-18 authorization; `/data/runs/` and the 4B pilot
-store are retained because they back current figures and codec validation.

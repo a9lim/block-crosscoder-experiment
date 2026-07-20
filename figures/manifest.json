@@ -55,7 +55,8 @@
       "files": [
         "cardinal/frames.html",
         "cardinal/flow.html",
-        "cardinal/stream.html"
+        "cardinal/stream.html",
+        "cardinal/code.html"
       ]
     },
     "color": {
@@ -69,7 +70,8 @@
       "files": [
         "color/frames.html",
         "color/flow.html",
-        "color/stream.html"
+        "color/stream.html",
+        "color/code.html"
       ]
     },
     "compass": {
@@ -83,7 +85,8 @@
       "files": [
         "compass/frames.html",
         "compass/flow.html",
-        "compass/stream.html"
+        "compass/stream.html",
+        "compass/code.html"
       ]
     },
     "country": {
@@ -97,7 +100,8 @@
       "files": [
         "country/frames.html",
         "country/flow.html",
-        "country/stream.html"
+        "country/stream.html",
+        "country/code.html"
       ]
     },
     "digit": {
@@ -111,7 +115,8 @@
       "files": [
         "digit/frames.html",
         "digit/flow.html",
-        "digit/stream.html"
+        "digit/stream.html",
+        "digit/code.html"
       ]
     },
     "element": {
@@ -125,7 +130,8 @@
       "files": [
         "element/frames.html",
         "element/flow.html",
-        "element/stream.html"
+        "element/stream.html",
+        "element/code.html"
       ]
     },
     "month": {
@@ -139,7 +145,8 @@
       "files": [
         "month/frames.html",
         "month/flow.html",
-        "month/stream.html"
+        "month/stream.html",
+        "month/code.html"
       ]
     },
     "ordinal": {
@@ -153,7 +160,8 @@
       "files": [
         "ordinal/frames.html",
         "ordinal/flow.html",
-        "ordinal/stream.html"
+        "ordinal/stream.html",
+        "ordinal/code.html"
       ]
     },
     "planet": {
@@ -167,7 +175,8 @@
       "files": [
         "planet/frames.html",
         "planet/flow.html",
-        "planet/stream.html"
+        "planet/stream.html",
+        "planet/code.html"
       ]
     },
     "season": {
@@ -181,7 +190,8 @@
       "files": [
         "season/frames.html",
         "season/flow.html",
-        "season/stream.html"
+        "season/stream.html",
+        "season/code.html"
       ]
     },
     "weekday": {
@@ -195,7 +205,8 @@
       "files": [
         "weekday/frames.html",
         "weekday/flow.html",
-        "weekday/stream.html"
+        "weekday/stream.html",
+        "weekday/code.html"
       ]
     }
   }
