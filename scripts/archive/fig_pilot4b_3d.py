@@ -7,20 +7,19 @@ geometry untouched), same-class connectors across depths.
 
 Views:
   - stream: month/weekday class means of the raw whitened stream at the
-    8 sites, first-harmonic (calendar-Fourier) planes, with faint
+    8 pilot sites, first-harmonic (calendar-Fourier) planes, with faint
     per-token clouds
-  - frames: the same tokens seen through the captured blocks' per-site
-    decoder frames (identities from showcase_blocks.json, never
-    hardcoded — see derive_showcase.py)
-  - zoo: any family means extracted from the combined family-probe npz
-    (`zoo_means.npz`) — cyclic families get harmonic planes, linear
-    families PCA planes with Spearman order along PC1
+  - frames: the same tokens seen through b595's / b862's per-site
+    decoder frames (the captured block's view of the manifold)
+  - zoo: any family means extracted from a generalized-probe npz
+    (`zoo_means_pilot4b.npz`) — cyclic families get harmonic planes,
+    linear families PCA planes with Spearman order along PC1
 
 Viz gauge: class-mean planes are RMS-normalized per depth (shape, not
 scale, is the cross-depth comparison; the honest per-depth scale story
 is the allocation/whitener figure set).
 
-  python scripts/analysis/fig_zoo_3d.py
+  python scripts/analysis/fig_pilot4b_3d.py
 """
 
 from __future__ import annotations
@@ -32,13 +31,11 @@ import numpy as np
 import plotly.graph_objects as go
 
 import _style as st
-from probe_ring_consolidation import MONTHS, WEEKDAYS
-from winner import analysis_dir, block_codes_path, figures_dir, load_showcase, load_winner
+from tier_a_ring_tests import MONTHS, WEEKDAYS
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 ZSTEP = 1.2
 
 FAMILY_LABELS = {
@@ -194,18 +191,17 @@ def token_clouds(a, c, planes, per_depth: int = 500):
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    show = load_showcase(W)
-    za = np.load(DATA / "calendar_probe_acts.npz")
-    act_families = json.loads(str(za["meta"]))["families"]
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    zc = np.load(
+        DATA / "block_codes_bsc_lam0.001_seed0_G4096_k32_renorm_pilot4b.npz")
+    is_cap = zc["is_cap"]
+    blocks = zc["blocks"].tolist()
 
-    # -- stream + captured-frame views (calendar families) ---------------
-    for family in ("month", "weekday"):
-        e = show["families"].get(family)
+    # -- stream views ----------------------------------------------------
+    for family, fi, block in (("month", 1, 595), ("weekday", 0, 862)):
         labels = FAMILY_LABELS[family]
         C = len(labels)
-        fi = act_families.index(family)
-        zc = np.load(block_codes_path(e["arm"] if e else "winner", W))
-        means, a, c = cap_means(za, zc["is_cap"], fi, C)
+        means, a, c = cap_means(za, is_cap, fi, C)
         planes = stack_planes(means, cyclic=True)
         fig = stack_figure(
             planes, labels,
@@ -213,15 +209,10 @@ def main() -> None:
             f"stream,<br>first-harmonic planes, consecutive depths "
             f"Procrustes-aligned (viz gauge)",
             "1st harmonic", clouds=token_clouds(a, c, planes))
-        fig.write_html(OUT / f"stream_{family}_3d.html",
+        fig.write_html(OUT / f"p4b_stream_{family}_3d.html",
                        include_plotlyjs=True)
 
-        if e is None or not e["qualified"]:
-            print(f"{family}: stream written; frames skipped "
-                  f"(capture unqualified)", flush=True)
-            continue
-        block = e["block"]
-        blocks = zc["blocks"].tolist()
+        # -- the captured block's view (frames) --------------------------
         frames = zc["frames"][:, blocks.index(block)]  # [S, b, d]
         proj_means = np.stack(
             [[(a[c == k, s] @ frames[s].T).mean(0) for k in range(C)]
@@ -230,23 +221,27 @@ def main() -> None:
         fig = stack_figure(
             fplanes, labels,
             f"The same {family} tokens through b{block}'s rotating per-site "
-            f"frames<br>({e['arm']} arm — the captured block's view)",
+            f"frames<br>(renorm arm — the captured block's view)",
             "1st harmonic")
-        fig.write_html(OUT / f"{family}_frames_3d.html",
+        fig.write_html(OUT / f"p4b_b{block}_frames_3d.html",
                        include_plotlyjs=True)
         print(f"{family}: stream + b{block} frames written", flush=True)
 
-    # -- zoo stream views (means extracted from the family probe) --------
+    # -- zoo stream views (means extracted from the zoo probes) ----------
     from block_crosscoder_experiment.phase0.labels import FAMILIES
 
-    zoo = DATA / "zoo_means.npz"
-    if zoo.exists():
+    zoos = [p for p in (DATA / "zoo_means_zoo4b.npz",
+                        DATA / "zoo_means_atlas4b.npz",
+                        DATA / "zoo_means_pilot4b.npz") if p.exists()]
+    seen = set()
+    for zoo in zoos:
         zm = np.load(zoo)
         families = json.loads(str(zm["meta"]))["families"]
         for family in families:
             key = f"{family}_means"
-            if key not in zm:
+            if key not in zm or family in seen:
                 continue
+            seen.add(family)
             means = zm[key].transpose(1, 0, 2)  # [C,S,d] -> [S,C,d]
             labels = FAMILY_LABELS.get(family, FAMILIES[family])
             cyc = family in CYCLIC
@@ -265,10 +260,10 @@ def main() -> None:
                    "PCA planes (Spearman order along PC1)"),
                 "1st harmonic" if cyc or family == "color" else "|rho|",
                 ring_idx=ring_idx)
-            fig.write_html(OUT / f"zoo_{family}_3d.html",
+            fig.write_html(OUT / f"p4b_zoo_{family}_3d.html",
                            include_plotlyjs=True)
             print(f"zoo {family}: written", flush=True)
-    else:
+    if not zoos:
         print("no zoo means npz yet — zoo views skipped")
 
 

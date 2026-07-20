@@ -14,33 +14,28 @@ One figure answers "what did the dictionary learn": rank-1 codes on the
 right-bottom, planar ring/line manifolds on the top shelf, the clique
 tiling pinned at (1,1), and the depth story in color.
 
-Winner-scoped: names come from showcase_blocks.json (qualified families
-only) and cliques are computed from the eval co-activation stats; the
-pilot's hand-curated catalog version is scripts/archive/fig_pilot4b_atlas.py.
-
   python scripts/analysis/fig_bsc_atlas.py
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import _style as st
-from fig_geometry import cliques
-from winner import analysis_dir, figures_dir, load_showcase, load_winner
+from _names import CLIQUES, NAMES
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 BARS = "▁▂▃▄▅▆▇█"
 
-ARMS = {  # showcase arm key -> (display, evalstats, geometry)
-    "primary": ("primary", "evalstats_primary.npz", "geometry_primary.npz"),
-    "winner": ("renorm (winner)", "evalstats_winner.npz",
-               "geometry_winner.npz"),
+ARMS = {
+    "primary": ("evalstats_pilot.npz", "geometry_pilot.npz"),
+    "renorm": ("evalstats_pilot_renorm.npz", "geometry_pilot_renorm.npz"),
 }
 
 
@@ -58,7 +53,7 @@ def sparkline(v: np.ndarray) -> str:
                    for x in v)
 
 
-def arm_panel(fig, col, arm, label, ev_file, geo_file, names):
+def arm_panel(fig, col, arm, ev_file, geo_file):
     ev = np.load(DATA / ev_file)
     geo = np.load(DATA / geo_file)
     evals = np.linalg.eigvalsh(ev["zz"].astype(np.float64))[:, ::-1]
@@ -71,10 +66,9 @@ def arm_panel(fig, col, arm, label, ev_file, geo_file, names):
     senergy = ev["site_energy"]   # [G, S] eval-split activation energy
     peak = share.argmax(1)
     sane = (freq >= 1e-4) & (freq <= 0.05)
-    comps, _ = cliques(ev)
-    clique = {b for c in comps for b in c}
+    names = NAMES[arm]
+    clique = set(CLIQUES[arm])
     cols = depth_colors()
-    arm = label
 
     def card(g: int) -> str:
         nm = names.get(g)
@@ -126,19 +120,11 @@ def arm_panel(fig, col, arm, label, ev_file, geo_file, names):
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    show = load_showcase(W)
-    names_by_arm: dict[str, dict[int, str]] = {a: {} for a in ARMS}
-    for family, e in show["families"].items():
-        for arm, pe in e.get("arms", {}).items():
-            if arm in names_by_arm and pe["qualified"]:
-                names_by_arm[arm][pe["block"]] = family
     fig = make_subplots(
         rows=1, cols=2, shared_yaxes=True,
-        subplot_titles=[f"{label} arm" for label, _, _ in ARMS.values()],
-        horizontal_spacing=0.04)
-    for col, (arm, (label, ev_file, geo_file)) in enumerate(ARMS.items(), 1):
-        arm_panel(fig, col, arm, label, ev_file, geo_file,
-                  names_by_arm[arm])
+        subplot_titles=[f"{a} arm" for a in ARMS], horizontal_spacing=0.04)
+    for col, (arm, (ev_file, geo_file)) in enumerate(ARMS.items(), 1):
+        arm_panel(fig, col, arm, ev_file, geo_file)
     cols = depth_colors()
     for i, L in enumerate(SITES):
         fig.add_trace(go.Scatter(
@@ -150,7 +136,7 @@ def main() -> None:
                "ratio (1 = rank-1 code, 4 = isotropic); y: top-2 eigenvalue "
                "mass (1 = planar); color: depth of decoder-energy peak; "
                "size: firing frequency; ×: clique member; outlined+labeled: "
-               "qualified showcase capture</sup>"),
+               "named in the findings</sup>"),
         height=680, width=1400, paper_bgcolor=st.SURFACE,
         plot_bgcolor=st.SURFACE,
         font=dict(family="system-ui, sans-serif", color=st.INK),
@@ -163,7 +149,7 @@ def main() -> None:
     fig.update_layout(yaxis=dict(title="top-2 eigenvalue mass",
                                  gridcolor=st.GRID, range=[0.45, 1.02]),
                       yaxis2=dict(gridcolor=st.GRID, range=[0.45, 1.02]))
-    fig.write_html(OUT / "atlas.html", include_plotlyjs=True)
+    fig.write_html(OUT / "p4b_atlas.html", include_plotlyjs=True)
     print("atlas written", flush=True)
 
 

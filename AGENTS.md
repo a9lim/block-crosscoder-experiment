@@ -33,8 +33,9 @@ one-shot scripts live in `scripts/archive/` with a rename map);
 
 ## Status (2026-07-19)
 
-Phase 0 complete except closeout: **tranche 6** (epochs-vs-fresh
-factorial, 4 cells at matched 24M optimizer tokens, running),
+Phase 0 complete except closeout: **tranche 6 done** (epochs-vs-fresh:
+budget does the work, fresh ≈ epochs within 0.0013; findings §C10;
+winner promoted to the 24M-token renorm epochs cell, FVU 0.3997),
 **tranche 7 tail** (whitener stability at 5M, bf16 tail stats,
 checksum drill), **tranche 5** (guarded lr recovery, last — the
 re-ratification bar is a9's). **Phase 1 store commit waits only on
@@ -44,7 +45,8 @@ workspace root when live). Training stack pinned and a9-ratified
 gauge, SASA C.1 + aux-ratio-cap 1.0, mandatory loss-spike guard with
 skip-rate ≤ 0.1% as a run gate, streaming full-split θ, prefetch 4.
 The current best checkpoint is `data/phase0/winner.json` — the
-dynamic pointer figure regeneration reads.
+dynamic pointer figure regeneration reads (block identities are
+checkpoint-specific: `derive_showcase.py` re-derives them per winner).
 
 ## Standing rules (binding)
 

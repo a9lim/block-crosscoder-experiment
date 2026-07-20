@@ -3,7 +3,7 @@
 The explainer figure for what a block-sparse crosscoder unit *is*. Two
 linked 3D scenes per flagship block:
 
-  left  — THE SHARED CODE: every labeled token's b-dim block code z_g,
+  left  — THE SHARED CODE: every labeled token's 4-dim block code z_g,
           scattered in the block's code PCA basis (one point per token,
           regardless of depth — the code is the depth-invariant object),
           class means threaded in class order (ring loop / line path).
@@ -18,12 +18,10 @@ linked 3D scenes per flagship block:
 
 The ghost/stream in-plane radius ratio is honest amplitude: the
 fraction of the stream manifold's class displacement this one block
-reconstructs (renorm-arm decodes are un-rescaled by the store's
-site-RMS scalars first).
+reconstructs (renorm decodes are un-rescaled by the store's site-RMS
+scalars first).
 
-Flagship blocks: the month ring and the cardinal line, each through the
-arm elected in showcase_blocks.json (derive_showcase.py) — skipped with
-a note if unqualified.
+Blocks: b595 (month ring, renorm arm), b2146 (cardinal line, primary).
 
   python scripts/analysis/fig_block_anatomy_3d.py
 """
@@ -31,6 +29,7 @@ a note if unqualified.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
@@ -38,14 +37,12 @@ from plotly.subplots import make_subplots
 
 import _style as st
 from _names import SITE_RENORM_SCALARS
-from fig_zoo_3d import (FAMILY_LABELS, harmonic_basis, pca_basis,
-                        procrustes_2d)
-from winner import analysis_dir, block_codes_path, figures_dir, load_showcase, load_winner
+from fig_pilot4b_3d import (FAMILY_LABELS, harmonic_basis, pca_basis,
+                            procrustes_2d)
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 ZSTEP = 1.2
 
 
@@ -102,7 +99,7 @@ def anatomy_figure(z_tok, cls_tok, mean_stack, ghost_stack, labels, cyclic,
     C = len(labels)
     fig = make_subplots(
         rows=1, cols=2, specs=[[{"type": "scene"}, {"type": "scene"}]],
-        subplot_titles=("the one shared code (b-dim, all depths at once)",
+        subplot_titles=("the one shared code (4-dim, all depths at once)",
                         "eight rotating frames re-embed it at every depth"),
         horizontal_spacing=0.02,
     )
@@ -192,25 +189,13 @@ def anatomy_figure(z_tok, cls_tok, mean_stack, ghost_stack, labels, cyclic,
     return fig
 
 
-def elected(show: dict, family: str) -> tuple[str, int] | None:
-    e = show["families"].get(family)
-    if e is None or not e["qualified"]:
-        print(f"{family} anatomy skipped — capture not qualified", flush=True)
-        return None
-    return e["arm"], e["block"]
-
-
-def month_anatomy(show) -> None:
-    sc = elected(show, "month")
-    if sc is None:
-        return
-    arm, block = sc
-    za = np.load(DATA / "calendar_probe_acts.npz")
-    fams = json.loads(str(za["meta"]))["families"]
-    bc = np.load(block_codes_path(arm, W))
-    geo = np.load(DATA / f"geometry_{arm}.npz")
-    bix = bc["blocks"].tolist().index(block)
-    m = (za["fam"] == fams.index("month")) & bc["is_cap"]
+def month_b595():
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    bc = np.load(
+        DATA / "block_codes_bsc_lam0.001_seed0_G4096_k32_renorm_pilot4b.npz")
+    geo = np.load(DATA / "geometry_pilot_renorm.npz")
+    bix = bc["blocks"].tolist().index(595)
+    m = (za["fam"] == 1) & bc["is_cap"]
     acts, cls = za["acts"][m], za["cls"][m]
     z_tok = bc["z_sel"][m][:, bix].astype(np.float32)
     frames = bc["frames"][:, bix]  # [S, b, d]
@@ -218,63 +203,55 @@ def month_anatomy(show) -> None:
     zbar = np.stack([z_tok[cls == k].mean(0) for k in range(C)])
     mean_stack = np.stack([[acts[cls == k, s].mean(0) for k in range(C)]
                            for s in range(len(SITES))])
-    # renorm-arm decode lives in scalar-rescaled whitened space; undo it
-    rescale = SITE_RENORM_SCALARS if arm == "winner" and W["site_renorm"] \
-        else np.ones(len(SITES))
+    # renorm decode lives in scalar-rescaled whitened space; undo per site
     ghost_stack = np.stack(
-        [(zbar @ frames[s]) / rescale[s] for s in range(len(SITES))])
-    share = geo["share"][block]
+        [(zbar @ frames[s]) / SITE_RENORM_SCALARS[s]
+         for s in range(len(SITES))])
+    share = geo["share"][595]
     fig = anatomy_figure(
         z_tok, cls, mean_stack, ghost_stack, FAMILY_LABELS["month"], True,
         share,
-        f"Anatomy of a BSC block — b{block}, the month ring ({arm} arm): "
+        "Anatomy of a BSC block — b595, the month ring (renorm arm): "
         "one 4-dim code shared across depth,<br>per-site decoder frames "
         "re-embedding it into the stream's own rotating manifold planes",
         st.cyclic_colors(12))
-    fig.write_html(OUT / "anatomy_month.html", include_plotlyjs=True)
-    print(f"b{block} month anatomy written", flush=True)
+    fig.write_html(OUT / "p4b_anatomy_b595_month.html", include_plotlyjs=True)
+    print("b595 anatomy written", flush=True)
 
 
-def cardinal_anatomy(show) -> None:
-    sc = elected(show, "cardinal")
-    if sc is None:
-        return
-    arm, block = sc
-    zm = np.load(DATA / "zoo_means.npz")
-    zc = np.load(DATA / f"zoo_codes_{arm}.npz")
-    fr = np.load(DATA / f"frames_{arm}.npz")
-    geo = np.load(DATA / f"geometry_{arm}.npz")
+def cardinal_b2146():
+    zm = np.load(DATA / "zoo_means_zoo4b.npz")
+    zc = np.load(DATA / "zoo_codes_primary_zoo4b.npz")
+    fr = np.load(DATA / "frames_pilot_primary.npz")
+    geo = np.load(DATA / "geometry_pilot.npz")
     families = json.loads(str(zc["meta"]))["families"]
     fi = families.index("cardinal")
-    bix_c = zc["blocks"].tolist().index(block)
-    bix_f = fr["blocks"].tolist().index(block)
+    bix_c = zc["blocks"].tolist().index(2146)
+    bix_f = fr["blocks"].tolist().index(2146)
     m = zc["fam"] == fi
     cls = zc["cls"][m]
     z_tok = zc["z_sel"][m][:, bix_c].astype(np.float32)
     frames = fr["frames"][:, bix_f]
     C = 20
     zbar = np.stack([z_tok[cls == k].mean(0) if (cls == k).any()
-                     else np.zeros(z_tok.shape[1]) for k in range(C)])
+                     else np.zeros(4) for k in range(C)])
     mean_stack = zm["cardinal_means"].transpose(1, 0, 2)  # [S, C, d]
-    rescale = SITE_RENORM_SCALARS if arm == "winner" and W["site_renorm"] \
-        else np.ones(len(SITES))
-    ghost_stack = np.stack(
-        [(zbar @ frames[s]) / rescale[s] for s in range(len(SITES))])
-    share = geo["share"][block]
+    ghost_stack = np.stack([zbar @ frames[s] for s in range(len(SITES))])
+    share = geo["share"][2146]
     fig = anatomy_figure(
         z_tok, cls, mean_stack, ghost_stack, FAMILY_LABELS["cardinal"],
         False, share,
-        f"Anatomy of a BSC block — b{block}, the cardinal number-line "
-        f"({arm} arm): one 4-dim code shared across depth,<br>per-site "
+        "Anatomy of a BSC block — b2146, the cardinal number-line "
+        "(primary arm): one 4-dim code shared across depth,<br>per-site "
         "decoder frames re-embedding it into the stream's own manifold "
         "planes",
         seq_colors(20))
-    fig.write_html(OUT / "anatomy_cardinal.html", include_plotlyjs=True)
-    print(f"b{block} cardinal anatomy written", flush=True)
+    fig.write_html(OUT / "p4b_anatomy_b2146_cardinal.html",
+                   include_plotlyjs=True)
+    print("b2146 anatomy written", flush=True)
 
 
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
-    show = load_showcase(W)
-    month_anatomy(show)
-    cardinal_anatomy(show)
+    month_b595()
+    cardinal_b2146()

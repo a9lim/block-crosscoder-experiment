@@ -17,9 +17,10 @@ probe (identical 82k tokens through both checkpoints):
    block decoder subspaces, against the dictionary-wide null read from
    the geometry npz.
 
-  python scripts/analysis/crossarm_tests.py \
-      --frames-primary data/analysis/frames_pilot_primary.npz \
-      --frames-renorm data/analysis/frames_pilot_renorm.npz
+Winner-scoped: reads zoo_block_tests.json + zoo_codes_{winner,primary}.npz
+from the winner analysis dir (probe_families with --runs winner=... primary=...).
+
+  python scripts/analysis/probe_crossarm.py
 """
 
 from __future__ import annotations
@@ -30,8 +31,9 @@ from pathlib import Path
 
 import numpy as np
 
-DATA = Path("data/analysis")
-FAMS = ["weekday", "month", "ordinal", "cardinal", "digit", "season", "compass"]
+from winner import analysis_dir
+
+DATA = analysis_dir()
 CAP_FAMS = {"weekday", "month"}  # calendar families are cap-restricted
 N_PERM = 2000
 TRAIN_FRAC = 0.8
@@ -88,27 +90,28 @@ def span_alignment(fp: np.ndarray, fr: np.ndarray) -> list[list[float]]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--frames-primary", type=Path,
-                    default=DATA / "frames_pilot_primary.npz")
+                    default=DATA / "frames_primary.npz")
     ap.add_argument("--frames-renorm", type=Path,
-                    default=DATA / "frames_pilot_renorm.npz")
+                    default=DATA / "frames_winner.npz")
     ap.add_argument("--geometry", type=Path,
-                    default=DATA / "geometry_pilot.npz",
+                    default=DATA / "geometry_primary.npz",
                     help="dictionary-wide null scale for span alignment")
-    ap.add_argument("--out", type=Path, default=DATA / "crossarm_pilot4b.json")
+    ap.add_argument("--out", type=Path, default=DATA / "crossarm.json")
     args = ap.parse_args()
 
-    zt = json.load(open(DATA / "zoo_block_tests_zoo4b.json"))
-    zp = np.load(DATA / "zoo_codes_primary_zoo4b.npz")
-    zr = np.load(DATA / "zoo_codes_renorm_zoo4b.npz")
+    zt = json.load(open(DATA / "zoo_block_tests.json"))
+    zp = np.load(DATA / "zoo_codes_primary.npz")
+    zr = np.load(DATA / "zoo_codes_winner.npz")
     assert np.array_equal(zp["token_ids"], zr["token_ids"])
     pb, rb = zp["blocks"].tolist(), zr["blocks"].tolist()
     fam, cls, is_cap = zp["fam"], zp["cls"], zp["is_cap"]
+    fams = json.loads(str(zp["meta"]))["families"]
     rng = np.random.default_rng(0)
 
     report: dict = {"pairs": {}}
-    for fi, name in enumerate(FAMS):
+    for fi, name in enumerate(fams):
         bp = zt["primary"].get(name, {}).get("best_block")
-        br = zt["renorm"].get(name, {}).get("best_block")
+        br = zt["winner"].get(name, {}).get("best_block")
         if bp is None or br is None or bp not in pb or br not in rb:
             continue
         m = fam == fi

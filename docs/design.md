@@ -139,9 +139,14 @@ across k; store costs 40,960 bytes/token exactly.
 - **G=8192 stretch**: deferred to a production-store decision. Not
   tame at 1b (3.6% dead, 36× the healthy band); needs the streaming-θ
   path (landed) and a dead-dynamics look at 4b before commitment.
-- **Epochs vs fresh data** (tranche 6, landing 2026-07-19): informs
-  whether Phase 1 should prefer store passes or unique tokens if the
-  38M budget ever binds; also the consolidation-vs-budget question.
+- **Epochs vs fresh data** — **settled** (tranche 6, 2026-07-19,
+  findings §C10): at matched 24M optimizer tokens, fresh tokens beat
+  epochs by only 0.0013 pooled FVU in the clean primary comparison;
+  the budget itself buys −0.016 to −0.020 per doubling. Phase-1
+  consequence: if the 38M budget ever binds, store passes are a
+  near-free substitute for unique tokens; consolidation-vs-budget is
+  a non-issue at this scale. (The renorm×fresh cell was spike-marred
+  — one guarded skip — and is not read; see §C10.)
 - **Frontier ends** (optional, cheap): block k=128 (the ≥2.9 kbit
   region), scalar k≈6–8 (the ultra-cheap region), one renormed joint
   scalar cell (gauge symmetry in the tying comparison).

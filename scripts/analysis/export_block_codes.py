@@ -94,7 +94,8 @@ def main() -> None:
         sel: set[int] = set()
         cms = {}
         overall = p_lab[is_cap].mean(0) + 1e-9
-        for fi, C in ((1, 12), (0, 7)):
+        for fi, C in ((meta["families"].index("month"), 12),
+                      (meta["families"].index("weekday"), 7)):
             m = (fam == fi) & is_cap
             cm = np.stack([p_lab[m & (cls == k)].mean(0) for k in range(C)])
             cms[fi] = cm

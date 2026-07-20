@@ -1,42 +1,39 @@
-"""3D geometry views for the winner (plotly HTML), geometry-pass set.
+"""3D geometry views for the 4b pilot (plotly HTML), geometry-pass set.
 
-  geo_share_3d.html      per-block depth-energy share surface,
-                         primary vs renorm (winner) side by side
-  month_flow_3d.html     month class means in ONE fixed joint-PCA
-  cardinal_flow_3d.html  basis across all depths (no per-depth
-                         refit, no Procrustes): the manifold's
-                         actual drift/rotation through the stack,
-                         the component the aligned stacks gauge away
-  crossarm_cardinal_3d.html
-                         the cardinal line seen through both arms'
-                         capturing blocks (identities from
-                         showcase_blocks.json), per-depth planes,
-                         arms overlaid after a per-depth cross-arm
-                         Procrustes
+  p4b_geo_share_3d.html      per-block depth-energy share surface,
+                             primary vs renorm side by side
+  p4b_month_flow_3d.html     month class means in ONE fixed joint-PCA
+  p4b_cardinal_flow_3d.html  basis across all depths (no per-depth
+                             refit, no Procrustes): the manifold's
+                             actual drift/rotation through the stack,
+                             the component the aligned stacks gauge away
+  p4b_crossarm_cardinal_3d.html
+                             the cardinal line seen through b2146
+                             (primary) and b3194 (renorm) frames,
+                             per-depth planes, arms overlaid after a
+                             per-depth cross-arm Procrustes
 
 Viz-gauge honesty: whitened bases differ per site, so the fixed joint
 basis (like the Procrustes alignment of the stack figures) is a
 visualization gauge, not a claim of a shared coordinate system; the
-audited numbers live in crossarm.json / geometry_summary.json.
+audited numbers live in crossarm_pilot4b.json / geometry4b_summary.json.
 
-  python scripts/analysis/fig_geometry_3d.py
+  python scripts/analysis/fig_geometry4b_3d.py
 """
 
 from __future__ import annotations
 
-import json
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import _style as st
-from winner import analysis_dir, block_codes_path, figures_dir, load_showcase, load_winner
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 S = len(SITES)
 MONTHS = st.MONTHS
 CARDINALS = ["one", "two", "three", "four", "five", "six", "seven",
@@ -48,9 +45,9 @@ CARDINALS = ["one", "two", "three", "four", "five", "six", "seven",
 def share_surface() -> None:
     fig = make_subplots(
         rows=1, cols=2, specs=[[{"type": "surface"}] * 2],
-        subplot_titles=("primary", "renorm (winner)"),
+        subplot_titles=("primary", "renorm (F7)"),
         horizontal_spacing=0.02)
-    for col, name in ((1, "geometry_primary"), (2, "geometry_winner")):
+    for col, name in ((1, "geometry_pilot"), (2, "geometry_pilot_renorm")):
         share = np.load(DATA / f"{name}.npz")["share"]
         order = np.argsort(share @ np.arange(S))
         fig.add_trace(go.Surface(
@@ -69,10 +66,10 @@ def share_surface() -> None:
         )})
     fig.update_layout(
         title="Per-block depth-energy allocation (Gram rows sum to 1): "
-              "primary's deep tilt vs renorm's plateau",
+              "the L30 cliff vs renorm's plateau",
         height=640, width=1200, paper_bgcolor=st.SURFACE,
         font=dict(family="system-ui, sans-serif", color=st.INK))
-    fig.write_html(OUT / "geo_share_3d.html", include_plotlyjs=True)
+    fig.write_html(OUT / "p4b_geo_share_3d.html", include_plotlyjs=True)
     print("share 3d written", flush=True)
 
 
@@ -82,10 +79,10 @@ def month_means_cap() -> np.ndarray:
     The zoo means npz applies no capitalization filter and May's first-N
     cap is 88% modal 'may' — unusable for month geometry (2026-07-18).
     """
-    za = np.load(DATA / "calendar_probe_acts.npz")
-    zc = np.load(block_codes_path("winner", W))
-    fams = json.loads(str(za["meta"]))["families"]
-    m = (za["fam"] == fams.index("month")) & zc["is_cap"]
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    zc = np.load(
+        DATA / "block_codes_bsc_lam0.001_seed0_G4096_k32_renorm_pilot4b.npz")
+    m = (za["fam"] == 1) & zc["is_cap"]
     a, c = za["acts"][m], za["cls"][m]
     return np.stack([a[c == k].mean(0) for k in range(12)], 1)
 
@@ -94,7 +91,7 @@ def flow(family: str, means_key: str, labels: list[str]) -> None:
     if family == "month":
         M = month_means_cap().astype(np.float64)
     else:
-        zm = np.load(DATA / "zoo_means.npz")
+        zm = np.load(DATA / "zoo_means_zoo4b.npz")
         M = zm[means_key].transpose(1, 0, 2).astype(np.float64)  # [S, C, d]
     C = M.shape[1]
     Mc = M - M.mean(1, keepdims=True)          # center per site
@@ -126,13 +123,13 @@ def flow(family: str, means_key: str, labels: list[str]) -> None:
         title=f"The {family} manifold drifting through gemma-3-4b depth — "
               f"one fixed joint-PCA basis, no per-depth refit "
               f"(viz gauge; {var3:.0%} of class-mean variance). "
-              f"Marker size grows with depth L{SITES[0]}-L{SITES[-1]}.",
+              f"Marker size grows with depth L9-L30.",
         height=720, width=980, paper_bgcolor=st.SURFACE,
         font=dict(family="system-ui, sans-serif", color=st.INK),
         scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3",
                    camera=dict(eye=dict(x=1.6, y=1.4, z=1.0))),
     )
-    fig.write_html(OUT / f"{family}_flow_3d.html", include_plotlyjs=True)
+    fig.write_html(OUT / f"p4b_{family}_flow_3d.html", include_plotlyjs=True)
     print(f"{family} flow 3d written", flush=True)
 
 
@@ -141,21 +138,13 @@ def procrustes_2d(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return U @ Vt
 
 
-def crossarm_cardinal(show: dict) -> None:
-    e = show["families"].get("cardinal")
-    arms = e.get("arms", {}) if e else {}
-    if not (arms.get("primary", {}).get("qualified")
-            and arms.get("winner", {}).get("qualified")):
-        print("crossarm cardinal 3d skipped — cardinal capture not "
-              "qualified in both arms", flush=True)
-        return
-    bp, bw = arms["primary"]["block"], arms["winner"]["block"]
-    zm = np.load(DATA / "zoo_means.npz")
+def crossarm_cardinal() -> None:
+    zm = np.load(DATA / "zoo_means_zoo4b.npz")
     M = zm["cardinal_means"].transpose(1, 0, 2).astype(np.float64)
-    fp = np.load(DATA / "frames_primary.npz")
-    fr = np.load(DATA / "frames_winner.npz")
-    Fp = fp["frames"][:, fp["blocks"].tolist().index(bp)]  # [S, b, d]
-    Fr = fr["frames"][:, fr["blocks"].tolist().index(bw)]
+    fp = np.load(DATA / "frames_pilot_primary.npz")
+    fr = np.load(DATA / "frames_pilot_renorm.npz")
+    Fp = fp["frames"][:, fp["blocks"].tolist().index(2146)]  # [S, 4, d]
+    Fr = fr["frames"][:, fr["blocks"].tolist().index(3194)]
     C = M.shape[1]
     colors = st.cyclic_colors(C)
     zstep = 1.2
@@ -164,7 +153,7 @@ def crossarm_cardinal(show: dict) -> None:
     for s in range(S):
         planes = []
         for F in (Fp, Fr):
-            Y = (M[s] - M[s].mean(0)) @ F[s].T          # [C, b] block code
+            Y = (M[s] - M[s].mean(0)) @ F[s].T          # [C, 4] block code
             _, _, Vt = np.linalg.svd(Y, full_matrices=False)
             Q = Y @ Vt[:2].T
             Q /= max(np.sqrt((Q**2).mean()), 1e-9)      # per-depth RMS gauge
@@ -188,14 +177,14 @@ def crossarm_cardinal(show: dict) -> None:
             line=dict(color=st.INK2, width=3),
             text=CARDINALS if s == S - 1 else None,
             textfont=dict(size=8, color=st.INK2),
-            name=f"L{SITES[s]} primary b{bp}" if s == 0 else None,
+            name=f"L{SITES[s]} primary b2146" if s == 0 else None,
             showlegend=(s == 0)))
         fig.add_trace(go.Scatter3d(
             x=planes[1][:, 0], y=planes[1][:, 1], z=z0,
             mode="lines+markers",
             marker=dict(size=4, color=colors, symbol="diamond-open"),
             line=dict(color="rgba(82,81,78,0.55)", width=2, dash="dot"),
-            name=f"renorm b{bw}" if s == 0 else None,
+            name="renorm b3194" if s == 0 else None,
             showlegend=(s == 0)))
     fig.update_layout(
         title="The cardinal number-line through both arms' capturing "
@@ -209,18 +198,17 @@ def crossarm_cardinal(show: dict) -> None:
                        tickvals=[s * zstep for s in range(S)]),
             camera=dict(eye=dict(x=1.7, y=1.5, z=0.9))),
     )
-    fig.write_html(OUT / "crossarm_cardinal_3d.html",
+    fig.write_html(OUT / "p4b_crossarm_cardinal_3d.html",
                    include_plotlyjs=True)
     print("crossarm cardinal 3d written", flush=True)
 
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    show = load_showcase(W)
     share_surface()
     flow("month", "month_means", MONTHS)
     flow("cardinal", "cardinal_means", CARDINALS)
-    crossarm_cardinal(show)
+    crossarm_cardinal()
 
 
 if __name__ == "__main__":

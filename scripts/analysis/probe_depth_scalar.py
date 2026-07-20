@@ -31,7 +31,7 @@ import torch
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.store import Whitener
 
-from tier_a_ring_tests import MONTHS, WEEKDAYS, perm_p, ring_stats
+from probe_ring_consolidation import MONTHS, WEEKDAYS, perm_p, ring_stats
 
 
 def main() -> None:
@@ -65,7 +65,8 @@ def main() -> None:
     results: dict = {"depth": {}, "scalar": {}}
 
     # --- depth availability: raw whitened stream, per site ---
-    for fi, family, names in ((1, "month", MONTHS), (0, "weekday", WEEKDAYS)):
+    for family, names in (("month", MONTHS), ("weekday", WEEKDAYS)):
+        fi = meta["families"].index(family)
         m = (fam == fi) & is_cap
         C = len(names)
         a = za["acts"][m]
@@ -115,7 +116,8 @@ def main() -> None:
         entry: dict = {"config": mc, "lr": report.get("lr"),
                        "fvu_pooled": report["eval"]["topk"]["fvu_pooled"]}
         overall = p_lab[is_cap].mean(0) + 1e-9
-        for fi, family, names in ((1, "month", MONTHS), (0, "weekday", WEEKDAYS)):
+        for family, names in (("month", MONTHS), ("weekday", WEEKDAYS)):
+            fi = meta["families"].index(family)
             m = (fam == fi) & is_cap
             C = len(names)
             cm = np.stack([p_lab[m & (cls == k)].mean(0) for k in range(C)])

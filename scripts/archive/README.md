@@ -38,6 +38,21 @@ The five `fig_*`/`extract_*` scripts archived alongside
 they are superseded by the winner-pointer regeneration pass
 (`scripts/analysis/regen_figures.sh`), not renamed.
 
+**Pilot-era showcase figures, verbatim.** When the live `fig_*` set was
+rewired to the dynamic winner pointer (2026-07-19 evening), the
+pilot-campaign versions — hardcoded run names, hand-curated block
+identities (b595/b862/b2146/…), and the pilot-only panels (lr-cliff
+instability traces, the 8-run capture lottery, scalar/destroyed-arm
+comparisons, the `_names.py` identity/oddball catalog) — were preserved
+here under their original names: `fig_pilot4b.py`, `fig_pilot4b_3d.py`,
+`fig_geometry4b.py`, `fig_geometry4b_3d.py`, `fig_pilot4b_atlas.py`,
+`fig_pilot4b_anatomy_3d.py`, `fig_worldmap4b_3d.py`. They regenerate the
+figures cited in the archived findings docs against the pilot artifacts
+(`data/analysis/*_pilot4b*`, `/data/runs/bcc-pilot4b` checkpoints); the
+live scripts regenerate the canonical set from whatever
+`data/phase0/winner.json` points at, with block identities derived per
+checkpoint (`derive_showcase.py`).
+
 `run_phase099_tranche6.sh` ran the epochs-vs-fresh factorial on
 2026-07-19 from the pre-restructure layout (jobe pulled the rename
 only after it drained).

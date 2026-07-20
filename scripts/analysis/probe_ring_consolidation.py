@@ -135,7 +135,8 @@ def main() -> None:
                        "lr": report.get("lr"),
                        "site_renorm": bool(report.get("site_renorm")),
                        "fvu_pooled": report["eval"]["topk"]["fvu_pooled"]}
-        for fi, family, names in ((1, "month", MONTHS), (0, "weekday", WEEKDAYS)):
+        for family, names in (("month", MONTHS), ("weekday", WEEKDAYS)):
+            fi = meta["families"].index(family)
             m = (fam == fi) & is_cap
             C = len(names)
             cm = np.stack([p_lab[m & (cls == k)].mean(0) for k in range(C)])

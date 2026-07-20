@@ -3,8 +3,7 @@
 *The pilot program, 2026-07-15 → 07-19, condensed. Every claim links
 its primary source in [`archive/`](archive/README.md); the design and
 the Phase-1 plan live in [`design.md`](design.md). Status: complete
-except the epochs-vs-fresh factorial (§C10, landing 2026-07-19) and
-two closeout tranches (§Open items).*
+except two closeout tranches (§Open items).*
 
 ## Abstract
 
@@ -166,8 +165,9 @@ the third decimal; q=4 costs +0.004–0.005), the count model is
 non-load-bearing (Bernoulli within ~5%), R-D positions are seed-stable
 (spreads at or below CI width), and the renorm-over-primary gap is
 k-stable (−0.015 to −0.021 FVU at identical rates). This is the H3
-*preview* (pilot store, 12M optimizer tokens); Phase 1's frontier at
-38M is the verdict.
+*preview* (pilot store, 12M optimizer tokens); the 24M-token winner
+already moves the k32 point to **0.4053 @ 771.2** (C10), and Phase 1's
+frontier at production budget is the verdict.
 
 ## C6. The 2×2 factorial: the tying × blocking interaction is positive
 
@@ -287,14 +287,49 @@ engineering campaign — full lineage in
   baseline; fp16 banned everywhere in the harvest path; healthy dead
   band at G=4096 is 0.1–0.15%.
 
-## C10. Epochs vs fresh data *(landing 2026-07-19 evening)*
+## C10. Epochs vs fresh data: the optimizer-token budget does the work
 
-The token-budget factorial — {6M unique × 4 epochs} vs {12M unique ×
-2 epochs} × {primary, renorm} at matched 24M optimizer tokens on the
-full pinned stack — is running as this document is written. Bonus
-point already banked: at k16, doubling epochs on the same 6M tokens
-buys −0.019 pooled FVU (0.502 → 0.4832). *This section is updated
-when the four cells land.*
+*(Tranche 6, four cells at matched 24M optimizer tokens on the full
+pinned stack — k=32, λ=1e-3, lr 3e-4 cosine, guard + streaming θ +
+rcap 1.0, seed 0, 5856–5858 steps; codec passes q ∈ {4, 6, 8};
+payloads `data/phase0/t6_*.json`, run reports on jobe under
+`/data/runs/bcc-phase099`.)*
+
+| pooled FVU (topk) | primary | renorm |
+|---|---|---|
+| 12M-token anchor (6M × 2ep) | 0.4299 | 0.4154 |
+| **6M unique × 4 epochs** | 0.4102 | **0.3997** |
+| **12M unique × 2 epochs** | 0.4089 | 0.4098 † |
+
+Three clean cells give the verdict: **at this scale the optimizer-token
+budget is what matters; data freshness is a refinement at the edge of
+noise.** Doubling the budget by *epochs* buys −0.0197 (primary) /
+−0.0157 (renorm); switching those repeats to *fresh* tokens adds only
+−0.0013 more (primary, 0.4102 → 0.4089). The k16 bonus point agrees
+(epochs doubling: 0.502 → 0.4832, −0.019).
+
+† The fourth cell is not a clean read: the renorm×fresh run hit a
+guarded loss-spike cluster at steps 2676–2687 (one skipped step, rec
+loss transiently 2.8×, six near-misses; skip-rate 0.017% — within the
+≤ 0.1% gate) and finished 0.0101 *behind* its epochs counterpart. The
+same-order primary run over the same 12M store had zero guard events,
+so "fresh data is worse in the renorm gauge" and "this run ate a
+spike" are confounded; we do not read a freshness penalty from it.
+
+The codec confirms at the rate axis: the epochs-renorm cell reaches
+**0.4053 @ 771.2 bits/token** (q=4; 0.4003 @ 1026.3 at q=6), moving
+the C5 frontier point down 0.0154 at unchanged rate versus the
+12M-token champion (0.4207 @ 770.5). All four cells' support bits sit
+at 261–265 bits/token — support cost is budget-invariant; the entire
+improvement arrives as amplitude fidelity.
+
+Phase-1 consequence: the 53M-token production store at 2 epochs sits
+comfortably inside the regime where repeats and fresh tokens are
+near-equivalent, so store size is not the binding constraint the
+freshness-conservative reading feared. The epochs-renorm cell
+(`bsc_lam0.001_seed0_G4096_k32_renorm_ep4_guard_rcap1`, 0.3997) is the
+new program-best checkpoint and the promoted winner
+(`data/phase0/winner.json`).
 
 ---
 
@@ -332,7 +367,6 @@ when the four cells land.*
 
 ## Open items
 
-- **Tranche 6 verdict** (C10) — running.
 - **Tranche 7 tail**: whitener stability at the 5M production slice,
   late-layer bf16 tail stats, renorm-scalar stability across
   independent slices, store checksum drill (deferred for I/O quiet).

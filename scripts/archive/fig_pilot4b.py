@@ -1,21 +1,15 @@
-"""Winner showcase: capture maps, calendar rings, allocation (2D set).
+"""Figures for the 0.9.6 tier-B 4b pilot (run on the Mac).
 
-Regenerates the calendar-family panels of the canonical figure set from
-the current winner (data/phase0/winner.json) and its matched primary-
-gauge counterpart. Block identities come from showcase_blocks.json
-(derive_showcase.py) — never hardcoded; a family whose capture fails the
-qualification gate is skipped with a note.
+Inputs (mirrored to data/analysis/ from jobe):
+  ring_tests_pilot4b.json, depth_scalar_pilot4b.json,
+  block_codes_<run>_pilot4b.npz, calendar_probe_acts_pilot4b.npz,
+  pilot4b_steps/<run>.jsonl + .report.json
 
-Inputs (winner analysis dir, produced by the regen driver on jobe):
-  calendar_probe_acts.npz, block_codes_<run>.npz,
-  ring_tests.json, depth_scalar.json
-plus the two run dirs' report.json (allocation panel).
+Outputs figures/pilot4b/*.png plus computed frame-projection ring stats
+in data/analysis/fig_pilot4b_summary.json (numbers cited in
+docs/findings-phase096-pilot4b.md come from here).
 
-Outputs figures/phase0/*.png and capture_summary.json beside the inputs.
-Historical pilot-campaign panels (lr-cliff instability, the 8-run
-capture lottery) live verbatim in scripts/archive/fig_pilot4b.py.
-
-  python scripts/analysis/fig_capture.py
+  python scripts/analysis/fig_pilot4b.py
 """
 
 from __future__ import annotations
@@ -27,23 +21,33 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import _style as st
-from probe_ring_consolidation import MONTHS, WEEKDAYS, perm_p, ring_stats
-from winner import analysis_dir, block_codes_path, figures_dir, load_showcase, load_winner
+from tier_a_ring_tests import MONTHS, WEEKDAYS, perm_p, ring_stats
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+STEPS = DATA / "pilot4b_steps"
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 SITE_RAMP = [plt.cm.Blues(x) for x in np.linspace(0.35, 0.95, len(SITES))]
+
+BSC_RUNS = {
+    "primary 3e-4": "bsc_lam0.001_seed0_G4096_k32",
+    "seed 1, 3e-4": "bsc_lam0.001_seed1_G4096_k32",
+    "renorm 3e-4": "bsc_lam0.001_seed0_G4096_k32_renorm",
+    "6e-4 (spiked)": "bsc_lam0.001_seed0_lr0.0006_G4096_k32",
+    "6e-4 renorm (destr.)": "bsc_lam0.001_seed0_lr0.0006_G4096_k32_renorm",
+    "1.2e-3 (destr.)": "bsc_lam0.001_seed0_lr0.0012_G4096_k32",
+}
+SCALAR_RUNS = {
+    "scalar 3e-4": "scalar_lam0_seed0_G4096_k32",
+    "scalar 6e-4 (spiked)": "scalar_lam0_seed0_lr0.0006_G4096_k32",
+}
 MONTH_WHEEL = [plt.cm.twilight(x) for x in np.linspace(0.04, 0.96, 12)]
 DAY_WHEEL = [plt.cm.twilight(x) for x in np.linspace(0.04, 0.96, 7)]
 SUMMARY: dict = {}
 
-ARMS = {  # display label -> (ring_tests key, run dir)
-    "renorm (winner)": (W["run_name"], Path(W["ckpt"]).parent),
-    "primary": (Path(W["counterpart_primary"]).name,
-                Path(W["counterpart_primary"])),
-}
+
+def codes_npz(run: str):
+    return np.load(DATA / f"block_codes_{run}_pilot4b.npz")
 
 
 def fig_ring_depth(depth) -> None:
@@ -62,13 +66,15 @@ def fig_ring_depth(depth) -> None:
     ax.set_title("Both calendar rings ride the 4b stream across the site list\n"
                  "(raw whitened class-mean top plane; month fades only late)")
     ax.legend(loc="lower left")
-    fig.savefig(OUT / "ring_depth.png")
+    fig.savefig(OUT / "p4b_ring_depth.png")
     plt.close(fig)
 
 
-def fig_capture_maps(rings) -> None:
-    rows = [(label, rings[key]["month"]["top1_map"])
-            for label, (key, _) in ARMS.items() if key in rings]
+def fig_capture_maps(rings, scal) -> None:
+    rows = [(label, rings[run]["month"]["top1_map"])
+            for label, run in BSC_RUNS.items() if run in rings]
+    rows += [(label, scal["scalar"][run]["month"]["top1_map"])
+             for label, run in SCALAR_RUNS.items() if run in scal["scalar"]]
     ids = [[m[mo] for mo in MONTHS] for _, m in rows]
     from collections import Counter
 
@@ -95,26 +101,68 @@ def fig_capture_maps(rings) -> None:
         ax.spines[side].set_visible(False)
     ax.tick_params(length=0)
     ax.set_title("Which unit claims each month (top-1 by class-mean score)\n"
-                 "winner + matched primary counterpart; one color per "
-                 "recurring unit")
-    fig.savefig(OUT / "capture_maps.png")
+                 "one shared color per recurring unit — capture is a lottery, "
+                 "and the destroyed run's single block claims everything")
+    fig.savefig(OUT / "p4b_capture_maps.png")
+    plt.close(fig)
+
+
+def fig_instability() -> None:
+    show = {
+        "3e-4 (clean)": ("bsc_lam0.001_seed0_G4096_k32", st.CAT[0]),
+        "6e-4": ("bsc_lam0.001_seed0_lr0.0006_G4096_k32", st.CAT[3]),
+        "6e-4 renorm": ("bsc_lam0.001_seed0_lr0.0006_G4096_k32_renorm",
+                        st.CAT[5]),
+        "1.2e-3": ("bsc_lam0.001_seed0_lr0.0012_G4096_k32", st.CAT[7]),
+    }
+    panels = [("rec", "recon loss", "log"),
+              ("grad_norm", "main grad norm", "log"),
+              ("grad_norm_aux", "AuxK grad norm", "log"),
+              ("dead_frac_window", "dead fraction (window)", "linear")]
+    fig, axes = plt.subplots(4, 1, figsize=(7.6, 9.2), sharex=True)
+    for label, (run, color) in show.items():
+        rows = [json.loads(l) for l in (STEPS / f"{run}.jsonl").open()]
+        steps = [r["step"] for r in rows]
+        for ax, (key, _, _) in zip(axes, panels):
+            y = np.array([r.get(key, np.nan) for r in rows], dtype=float)
+            ax.plot(steps, np.where(y <= 0, np.nan, y) if key != panels[3][0]
+                    else y, color=color, lw=1.4,
+                    label=label if ax is axes[0] else None)
+    for ax, (_, name, scale) in zip(axes, panels):
+        ax.set_yscale(scale)
+        ax.set_ylabel(name)
+        ax.axvline(1000, color=st.MUTED, lw=0.8, ls=":", zorder=0)
+    axes[0].annotate("warmup peak", xy=(1000, axes[0].get_ylim()[1]),
+                     xytext=(4, -10), textcoords="offset points",
+                     fontsize=8.5, color=st.MUTED)
+    axes[0].legend(loc="upper right", fontsize=8.5)
+    axes[-1].set_xlabel("step")
+    axes[0].set_title("The warmup-peak instability: main-loss spike seeds it,\n"
+                      "the AuxK revival cascade amplifies it — absent at 3e-4")
+    fig.savefig(OUT / "p4b_instability.png")
     plt.close(fig)
 
 
 def fig_allocation() -> None:
+    show = {
+        "BSC 3e-4": ("bsc_lam0.001_seed0_G4096_k32", st.CAT[0], "-"),
+        "BSC seed 1": ("bsc_lam0.001_seed1_G4096_k32", st.CAT[0], "--"),
+        "BSC renorm": ("bsc_lam0.001_seed0_G4096_k32_renorm", st.CAT[5], "-"),
+        "scalar": ("scalar_lam0_seed0_G4096_k32", st.CAT[3], "-"),
+    }
     fig, ax = plt.subplots(figsize=(7.4, 4.4))
     x = np.arange(len(SITES))
-    for (label, (_, root)), color in zip(ARMS.items(), (st.CAT[5], st.CAT[0])):
-        rep = json.loads((root / "report.json").read_text())
+    for label, (run, color, ls) in show.items():
+        rep = json.loads((STEPS / f"{run}.report.json").read_text())
         fvu = rep["eval"]["topk"]["fvu_per_site"]
-        ax.plot(x, fvu, "o-", color=color, label=label)
+        ax.plot(x, fvu, "o", ls=ls, color=color, label=label)
     ax.set_xticks(x, [f"L{s}" for s in SITES])
     ax.set_xlabel("site (gemma-3-4b layer)")
     ax.set_ylabel("eval FVU (top-k mode)")
-    ax.set_title("The F7 allocation split at the winner's budget:\n"
-                 "renorm spends its capacity shallow, primary deep")
+    ax.set_title("The F7 allocation reversal replicates at 4b:\n"
+                 "renorm spends its capacity shallow, baseline deep")
     ax.legend(loc="upper left", fontsize=9)
-    fig.savefig(OUT / "allocation.png")
+    fig.savefig(OUT / "p4b_allocation.png")
     plt.close(fig)
 
 
@@ -149,56 +197,45 @@ def _code_plane(ax, z_sel, block_ix, mask, c, names, wheel, title):
     return hits, p
 
 
-def _showcase_block(show: dict, family: str) -> tuple[str, int] | None:
-    e = show["families"].get(family)
-    if e is None or not e["qualified"]:
-        why = "absent" if e is None else (
-            f"unqualified (top1 {e['top1_claimed']}/{e['n_classes']}, "
-            f"p {e['order']['perm_p']:.2e})")
-        print(f"  {family}: skipped — {why}")
-        return None
-    return e["arm"], e["block"]
+def fig_code_planes() -> None:
+    z = codes_npz(BSC_RUNS["renorm 3e-4"])
+    acts_meta = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    fam, cls = acts_meta["fam"], acts_meta["cls"]
+    is_cap = z["is_cap"]
+    blocks = z["blocks"].tolist()
+
+    fig, ax = plt.subplots(figsize=(6.4, 6.0))
+    m = (fam == 1) & is_cap
+    _code_plane(ax, z["z_sel"], blocks.index(595), m, cls[m], MONTHS,
+                MONTH_WHEEL, "renorm b595 — the month manifold at 4b\n"
+                "(class means + labeled tokens in the code plane)")
+    fig.savefig(OUT / "p4b_b595_ring.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6.4, 6.0))
+    m = (fam == 0) & is_cap
+    _code_plane(ax, z["z_sel"], blocks.index(862), m, cls[m], WEEKDAYS,
+                DAY_WHEEL, "renorm b862 — the weekday ring at 4b")
+    fig.savefig(OUT / "p4b_weekday_ring.png")
+    plt.close(fig)
 
 
-def fig_code_planes(show) -> None:
-    za = np.load(DATA / "calendar_probe_acts.npz")
+def fig_ring_in_frames(depth) -> None:
+    z = codes_npz(BSC_RUNS["renorm 3e-4"])
+    blocks = z["blocks"].tolist()
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
     fam, cls = za["fam"], za["cls"]
-    for family, fi, names, wheel, fname in (
-            ("month", 1, MONTHS, MONTH_WHEEL, "month_ring.png"),
-            ("weekday", 0, WEEKDAYS, DAY_WHEEL, "weekday_ring.png")):
-        sc = _showcase_block(show, family)
-        if sc is None:
-            continue
-        arm, block = sc
-        z = np.load(block_codes_path(arm, W))
-        blocks = z["blocks"].tolist()
-        m = (fam == fi) & z["is_cap"]
-        fig, ax = plt.subplots(figsize=(6.4, 6.0))
-        _code_plane(ax, z["z_sel"], blocks.index(block), m, cls[m], names,
-                    wheel, f"{arm} b{block} — the {family} manifold\n"
-                    "(class means + labeled tokens in the code plane)")
-        fig.savefig(OUT / fname)
-        plt.close(fig)
-
-
-def fig_ring_in_frames(depth, show) -> None:
-    za = np.load(DATA / "calendar_probe_acts.npz")
-    fam, cls = za["fam"], za["cls"]
+    is_cap = z["is_cap"]
     acts = za["acts"]
 
     fig, ax = plt.subplots(figsize=(7.4, 4.4))
     x = np.arange(len(SITES))
     SUMMARY["ring_in_frames"] = {}
-    for family, fi, names, color in (("month", 1, MONTHS, st.CAT[0]),
-                                     ("weekday", 0, WEEKDAYS, st.CAT[3])):
-        sc = _showcase_block(show, family)
-        if sc is None:
-            continue
-        arm, block = sc
-        z = np.load(block_codes_path(arm, W))
-        blocks = z["blocks"].tolist()
+    for family, names, block, color in (
+            ("month", MONTHS, 595, st.CAT[0]),
+            ("weekday", WEEKDAYS, 862, st.CAT[3])):
         C = len(names)
-        m = (fam == fi) & z["is_cap"]
+        m = (fam == (1 if family == "month" else 0)) & is_cap
         a, c = acts[m], cls[m]
         frames = z["frames"][:, blocks.index(block)]  # [S, b, d]
         raw = [e["ring_hits"] for e in depth[family]]
@@ -214,22 +251,22 @@ def fig_ring_in_frames(depth, show) -> None:
         ax.plot(x, fr_hits, "o-", color=color,
                 label=f"{family}: inside b{block}'s frames")
         SUMMARY["ring_in_frames"][family] = {
-            "arm": arm, "block": block, "raw_hits": raw,
-            "frame_hits": fr_hits, "frame_p": fr_p}
+            "block": block, "raw_hits": raw, "frame_hits": fr_hits,
+            "frame_p": fr_p}
     ax.set_xticks(x, [f"L{s}" for s in SITES])
     ax.set_ylim(0, 13)
     ax.set_xlabel("site (gemma-3-4b layer)")
     ax.set_ylabel("adjacent pairs in ring order")
     ax.set_title("Do the captured blocks' rotating frames carry the rings\n"
-                 "at every depth (block-23-style)?")
+                 "at every depth (block-23-style), at pilot budget?")
     ax.legend(loc="lower left", fontsize=8.5)
-    fig.savefig(OUT / "ring_in_frames.png")
+    fig.savefig(OUT / "p4b_ring_in_frames.png")
     plt.close(fig)
 
 
 def fig_depth_planes() -> None:
-    za = np.load(DATA / "calendar_probe_acts.npz")
-    z = np.load(block_codes_path("winner", W))
+    za = np.load(DATA / "calendar_probe_acts_pilot4b.npz")
+    z = codes_npz(BSC_RUNS["renorm 3e-4"])
     fam, cls = za["fam"], za["cls"]
     m = (fam == 1) & z["is_cap"]
     a, c = za["acts"][m], cls[m]
@@ -253,26 +290,27 @@ def fig_depth_planes() -> None:
         ax.set_yticks([])
     fig.suptitle("Month class means in each site's top plane (raw whitened "
                  "stream):\nthe ring is calendar-ordered nearly everywhere, "
-                 "loosening late", y=1.0)
-    fig.savefig(OUT / "depth_planes.png")
+                 "loosening at L27/L30", y=1.0)
+    fig.savefig(OUT / "p4b_depth_planes.png")
     plt.close(fig)
 
 
 def main() -> None:
     st.apply()
     OUT.mkdir(parents=True, exist_ok=True)
-    show = load_showcase(W)
-    rings = json.loads((DATA / "ring_tests.json").read_text())
-    depth = json.loads((DATA / "depth_scalar.json").read_text())["depth"]
+    rings = json.loads((DATA / "ring_tests_pilot4b.json").read_text())
+    scal = json.loads((DATA / "depth_scalar_pilot4b.json").read_text())
+    depth = scal["depth"]
 
     fig_ring_depth(depth)
-    fig_capture_maps(rings)
+    fig_capture_maps(rings, scal)
+    fig_instability()
     fig_allocation()
-    fig_code_planes(show)
-    fig_ring_in_frames(depth, show)
+    fig_code_planes()
+    fig_ring_in_frames(depth)
     fig_depth_planes()
 
-    (DATA / "capture_summary.json").write_text(
+    (DATA / "fig_pilot4b_summary.json").write_text(
         json.dumps(SUMMARY, indent=2) + "\n")
     print(json.dumps(SUMMARY, indent=2))
     print(f"-> {OUT}/")

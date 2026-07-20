@@ -18,6 +18,7 @@ the top layer.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
@@ -25,12 +26,10 @@ import plotly.graph_objects as go
 import _style as st
 from _geo import CONTINENT_ORDER, COUNTRY_GEO
 from block_crosscoder_experiment.phase0.labels import COUNTRIES
-from winner import analysis_dir, figures_dir, load_winner
 
-W = load_winner()
-DATA = analysis_dir(W)
-OUT = figures_dir()
-SITES = W["sites"]
+DATA = Path("data/analysis")
+OUT = Path("figures/pilot4b")
+SITES = [9, 12, 15, 18, 21, 24, 27, 30]
 ZSTEP = 1.2
 PREDICTORS = 10
 MIN_COUNT = 5
@@ -111,9 +110,9 @@ def layer_traces(fig, pred, Y, names, conts, zlev, label, show_names,
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    zm = np.load(DATA / "zoo_means.npz")
+    zm = np.load(DATA / "zoo_means_atlas4b.npz")
     tests = json.loads(
-        (DATA / "zoo_block_tests.json").read_text())
+        (DATA / "zoo_block_tests_atlas4b.json").read_text())
     means = zm["country_means"]  # [C, S, d]
     counts = np.array(
         tests[next(iter(tests))]["country"]["class_counts"])
@@ -142,7 +141,7 @@ def main() -> None:
     tickvals = [i * ZSTEP for i in range(len(SITES))]
     for arm in tests:
         entry = tests[arm]["country"]
-        codes_f = DATA / f"zoo_codes_{arm}.npz"
+        codes_f = DATA / f"zoo_codes_{arm}_atlas4b.npz"
         if not codes_f.exists():
             continue
         zc = np.load(codes_f)
@@ -187,7 +186,7 @@ def main() -> None:
         ),
         legend=dict(font=dict(size=10)),
     )
-    fig.write_html(OUT / "worldmap_3d.html", include_plotlyjs=True)
+    fig.write_html(OUT / "p4b_worldmap_3d.html", include_plotlyjs=True)
     for lab, r2, p in stats:
         print(f"{lab}: LOO R2 lat {r2[0]:.3f} lon {r2[1]:.3f} p {p:.4f}",
               flush=True)

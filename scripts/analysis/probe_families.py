@@ -37,7 +37,7 @@ from block_crosscoder_experiment.phase0.labels import FAMILIES
 from block_crosscoder_experiment.store import Whitener
 
 from _geo import COUNTRY_GEO
-from tier_a_ring_tests import perm_p, ring_stats
+from probe_ring_consolidation import perm_p, ring_stats
 
 CAP_FAMILIES = {"weekday", "month"}
 CYCLIC = {"weekday", "month", "season", "compass"}
