@@ -323,8 +323,11 @@ def test_checkpoint_resume_matches(device, tmp_path):
     ckpt = tmp_path / "ckpt.pt"
     trainer.save_checkpoint(ckpt)
 
+    expected_rng_draw = torch.rand(8, device=device)
     continued_records = [trainer.step(x) for x in batches[15:25]]
     resumed_trainer = Trainer.load_checkpoint(ckpt, device=device)
+    actual_rng_draw = torch.rand(8, device=device)
+    assert torch.equal(actual_rng_draw, expected_rng_draw)
     assert resumed_trainer.step_idx == 15
     assert (
         resumed_trainer.history

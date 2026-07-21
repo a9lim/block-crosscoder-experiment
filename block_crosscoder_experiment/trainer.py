@@ -1173,7 +1173,13 @@ class Trainer:
             )
             torch.set_rng_state(rng["torch_cpu"].cpu())
             if torch.cuda.is_available() and rng["torch_cuda"]:
-                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+                # ``map_location=device`` moves these serialized CPU
+                # ByteTensors onto CUDA along with model and optimizer state.
+                # PyTorch's CUDA RNG setter nevertheless requires its state
+                # tensors to reside on the CPU.
+                torch.cuda.set_rng_state_all(
+                    [state.cpu() for state in rng["torch_cuda"]]
+                )
             if torch.backends.mps.is_available() and rng.get("torch_mps") is not None:
                 torch.mps.set_rng_state(rng["torch_mps"].cpu())
         if trainer.fwd is not trainer.master:
