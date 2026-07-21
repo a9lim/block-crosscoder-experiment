@@ -84,15 +84,15 @@ class StreamingScoreQuantile:
         )
         # counts[0] = underflow (<= lo), counts[1..n_bins] = bins,
         # counts[n_bins+1] = overflow (> hi).
-        self.counts = torch.zeros(n_bins + 2, dtype=torch.int64)
+        self.counts = torch.zeros(n_bins + 2, dtype=torch.int64, device=device)
 
     @torch.no_grad()
     def update(self, scores: torch.Tensor) -> None:
         s = scores.detach().flatten().float()
         if not torch.isfinite(s).all():
             raise ValueError("non-finite selection scores in calibration batch")
-        idx = torch.bucketize(s, self.edges.to(s.device), right=False)
-        self.counts += torch.bincount(idx, minlength=self.n_bins + 2).cpu()
+        idx = torch.bucketize(s, self.edges, right=False)
+        self.counts += torch.bincount(idx, minlength=self.n_bins + 2)
 
     def quantile(self, q: float) -> float:
         n = int(self.counts.sum())
@@ -141,7 +141,11 @@ class SignedStreamingScoreQuantile:
         self.edges = torch.cat(
             (-magnitude.flip(0), torch.zeros(1, device=device), magnitude)
         )
-        self.counts = torch.zeros(len(self.edges) + 1, dtype=torch.int64)
+        self.counts = torch.zeros(
+            len(self.edges) + 1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     @torch.no_grad()
     def update(self, scores: torch.Tensor) -> None:
@@ -150,10 +154,10 @@ class SignedStreamingScoreQuantile:
             raise ValueError("non-finite selection scores in calibration batch")
         indices = torch.bucketize(
             values,
-            self.edges.to(values.device),
+            self.edges,
             right=False,
         )
-        self.counts += torch.bincount(indices, minlength=len(self.edges) + 1).cpu()
+        self.counts += torch.bincount(indices, minlength=len(self.edges) + 1)
 
     def quantile(self, q: float) -> float:
         count = int(self.counts.sum())
@@ -497,7 +501,7 @@ def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     remaining = n_keep - strictly_above.sum()
     tied = flat == cutoff
     # Row-major flattening is the declared candidate index for BatchTopK.
-    tie_rank = tied.to(torch.int64).cumsum(dim=0)
+    tie_rank = tied.to(torch.int32).cumsum(dim=0, dtype=torch.int32)
     mask = strictly_above | (tied & (tie_rank <= remaining))
     return mask.view(B, G)
 
@@ -517,7 +521,7 @@ def token_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     remaining = n_keep - strictly_above.sum(dim=1, keepdim=True)
     tied = scores == cutoff
     # Within each token, block index is the declared candidate index.
-    tie_rank = tied.to(torch.int64).cumsum(dim=1)
+    tie_rank = tied.to(torch.int32).cumsum(dim=1, dtype=torch.int32)
     return strictly_above | (tied & (tie_rank <= remaining))
 
 
@@ -565,6 +569,9 @@ class BlockCrosscoder(nn.Module):
             cfg.site_dims, device=D.device
         ).view(cfg.n_sites, 1, 1, 1)
         self.register_buffer("coordinate_mask", coordinate_mask)
+        self._has_padded_coordinates = any(
+            width != cfg.d_model for width in cfg.site_dims
+        )
         D.mul_(coordinate_mask)
         if cfg.identical_site_init:
             if len(set(cfg.site_dims)) != 1:
@@ -677,7 +684,9 @@ class BlockCrosscoder(nn.Module):
         else:
             assert self.D_site is not None and self.D_core is not None
             decoder = torch.einsum("sr,rgbd->sgbd", self.D_site, self.D_core)
-        return decoder * self.coordinate_mask
+        if self._has_padded_coordinates:
+            return decoder * self.coordinate_mask
+        return decoder
 
     def encoder_tensor(self) -> torch.Tensor:
         if self.cfg.site_rank is not None:
@@ -688,12 +697,16 @@ class BlockCrosscoder(nn.Module):
             encoder = self.D * self.log_gamma.exp()
         else:
             encoder = self.E
-        return encoder * self.coordinate_mask
+        if self._has_padded_coordinates:
+            return encoder * self.coordinate_mask
+        return encoder
 
     def _site_observation_mask(
         self,
         x: torch.Tensor,
         observed: torch.Tensor | None = None,
+        *,
+        validate: bool = True,
     ) -> torch.Tensor:
         cfg = self.cfg
         if observed is None:
@@ -706,46 +719,62 @@ class BlockCrosscoder(nn.Module):
                     f"observed must have shape [{x.shape[0]},{cfg.n_sites}]"
                 )
             keep = observed.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
-            if not bool(keep.sum(dim=1).gt(0).all()):
+            if validate and not bool(keep.sum(dim=1).gt(0).all()):
                 raise ValueError("every token must observe at least one site")
         if cfg.encoder_fusion == "source":
             source_observed = keep[:, cfg.source_site : cfg.source_site + 1].clone()
             keep.zero_()
             keep[:, cfg.source_site : cfg.source_site + 1] = source_observed
-        if not bool(keep.sum(dim=1).gt(0).all()):
+        if validate and not bool(keep.sum(dim=1).gt(0).all()):
             raise ValueError("encoder fusion has no observed source site for a token")
         return keep
 
-    def encode(
+    def _encode_with_tensor(
         self,
         x: torch.Tensor,
+        encoder: torch.Tensor,
         *,
         observed: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """x: [B, S, d] -> z: [B, G, b]."""
+        validate_observed: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Encode with an already materialized structured encoder.
+
+        A factorized or tied model otherwise rebuilt its full site tensor once
+        for encoding and again in later forward stages.  Keeping the tensor
+        local to one forward preserves autograd while avoiding those duplicate
+        materializations.
+        """
         cfg = self.cfg
         if x.ndim != 3 or x.shape[1:] != (cfg.n_sites, cfg.d_model):
             raise ValueError(
                 f"expected [B,{cfg.n_sites},{cfg.d_model}], got {tuple(x.shape)}"
             )
-        x = x * self.coordinate_mask[:, 0, 0].to(x.dtype)
+        if self._has_padded_coordinates:
+            x = x * self.coordinate_mask[:, 0, 0].to(x.dtype)
         if cfg.apply_decoder_bias_to_input:
-            # SAELens/SASA's ``apply_b_dec_to_input`` path uses the same
-            # learned decoder bias as the pre-encoder centre.  Gradients flow
-            # through this subtraction exactly as they do in the release.
             x = x - self.c.to(x.dtype).unsqueeze(0)
-        keep = self._site_observation_mask(x, observed)
-        x = x * keep
-        E = self.encoder_tensor()
-        W = E.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)  # view
-        # [S, B, d] @ [S, d, G*b] -> [S, B, G*b], summed over sites.
+        # The dominant real-model path observes every site and uses literal
+        # sum fusion.  Its observation mask is algebraically all ones, so do
+        # not allocate it or stream the complete activation batch through a
+        # no-op multiplication.
+        if observed is None and cfg.encoder_fusion == "sum":
+            keep = None
+        else:
+            keep = self._site_observation_mask(
+                x,
+                observed,
+                validate=validate_observed,
+            )
+            x = x * keep
+        W = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
         per_site = torch.bmm(x.transpose(0, 1), W.transpose(1, 2))
         z = per_site.sum(dim=0)
-        visible_sites = keep.sum(dim=1)
         if cfg.encoder_fusion == "mean":
-            z = z / visible_sites
+            assert keep is not None
+            z = z / keep.sum(dim=1)
         elif cfg.encoder_fusion == "availability_rescaled_sum":
-            z = z * (cfg.n_sites / visible_sites)
+            assert keep is not None
+            z = z * (cfg.n_sites / keep.sum(dim=1))
         z = z.view(-1, cfg.n_blocks, cfg.block_dim)
         if self.a is not None:
             z = z + self.a
@@ -764,6 +793,16 @@ class BlockCrosscoder(nn.Module):
                 else threshold.view(1, -1, 1)
             )
             z = z * torch.relu(1.0 - threshold / norm.clamp_min(1e-12))
+        return z, keep
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """x: [B, S, d] -> z: [B, G, b]."""
+        z, _ = self._encode_with_tensor(x, self.encoder_tensor(), observed=observed)
         return z
 
     def scores(
@@ -772,6 +811,8 @@ class BlockCrosscoder(nn.Module):
         *,
         x: torch.Tensor | None = None,
         observed: torch.Tensor | None = None,
+        _decoder: torch.Tensor | None = None,
+        _observation_keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Configured sparse-event score.
 
@@ -779,9 +820,12 @@ class BlockCrosscoder(nn.Module):
         decoded energy.  Minder's scalar BatchTopK crosscoder instead uses a
         ReLU activation multiplied by the sum of its site decoder norms.
         """
-        score = z.norm(dim=-1)
+        if self.cfg.selection_score in {"code_norm", "decoder_weighted"}:
+            score = z.norm(dim=-1)
         if self.cfg.selection_score == "decoder_weighted":
-            D = self.decoder_tensor().float()
+            D = (
+                self.decoder_tensor() if _decoder is None else _decoder
+            ).float()
             per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
             if self.cfg.decoder_norm_geometry == "sum_l2":
                 site_norms = per_site.sum(dim=0)
@@ -792,7 +836,9 @@ class BlockCrosscoder(nn.Module):
             # Isolated decoded contribution energy. Unlike code_norm this is
             # invariant to reciprocal within-block encoder/decoder gauges, and
             # unlike decoder_weighted it preserves vector-coordinate geometry.
-            D = self.decoder_tensor().float()
+            D = (
+                self.decoder_tensor() if _decoder is None else _decoder
+            ).float()
             gram = torch.einsum("sgbd,sgcd->gbc", D, D)
             energy_sq = torch.einsum("ngb,gbc,ngc->ng", z.float(), gram, z.float())
             score = energy_sq.clamp_min(0).sqrt().to(z.dtype)
@@ -813,10 +859,16 @@ class BlockCrosscoder(nn.Module):
             # coordinates and materialize at most [batch, groups, block], never
             # the prohibitive [batch, groups, sites, d_model] contribution
             # tensor. Hidden clean targets are excluded by ``keep``.
-            keep = self._site_observation_mask(x, observed)
+            keep = (
+                self._site_observation_mask(x, observed)
+                if _observation_keep is None
+                else _observation_keep
+            )
             coordinate_mask = self.coordinate_mask[:, 0, 0].to(x.dtype)
             residual = x * keep * coordinate_mask
-            decoder = self.decoder_tensor().float()
+            decoder = (
+                self.decoder_tensor() if _decoder is None else _decoder
+            ).float()
             code = z.float()
             projected = torch.zeros_like(code)
             energy_sq = torch.zeros(z.shape[:2], dtype=torch.float32, device=z.device)
@@ -888,18 +940,26 @@ class BlockCrosscoder(nn.Module):
         )
 
     def decode(
-        self, z_selected: torch.Tensor, *, add_bias: bool = True
+        self,
+        z_selected: torch.Tensor,
+        *,
+        add_bias: bool = True,
+        _decoder: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """z_selected: [B, G, b] -> xhat: [B, S, d]. AuxK residual
         reconstruction decodes without the bias (add_bias=False)."""
         cfg = self.cfg
-        Wd = self.decoder_tensor().reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
+        decoder = self.decoder_tensor() if _decoder is None else _decoder
+        Wd = decoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
         flat = z_selected.reshape(-1, cfg.n_latents)
         # [B, G*b] @ [S, G*b, d] broadcasts to [S, B, d].
         xhat = torch.matmul(flat, Wd)
         if add_bias and cfg.decoder_bias:
             xhat = xhat + self.c.unsqueeze(1)
-        return xhat.transpose(0, 1) * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
+        xhat = xhat.transpose(0, 1)
+        if self._has_padded_coordinates:
+            xhat = xhat * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
+        return xhat
 
     def forward(
         self,
@@ -908,12 +968,55 @@ class BlockCrosscoder(nn.Module):
         mode: str = "topk",
         observed: torch.Tensor | None = None,
     ) -> BSCOutput:
-        z = self.encode(x, observed=observed)
-        scores = self.scores(z, x=x, observed=observed)
+        out, _, _ = self.forward_with_materialized(
+            x,
+            mode=mode,
+            observed=observed,
+        )
+        return out
+
+    def forward_with_materialized(
+        self,
+        x: torch.Tensor,
+        *,
+        mode: str = "topk",
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+        _decoder: torch.Tensor | None = None,
+        _encoder: torch.Tensor | None = None,
+    ) -> tuple[BSCOutput, torch.Tensor, torch.Tensor]:
+        """Forward plus the exact structured weights used by that pass.
+
+        The trainer consumes these tensors for regularizers, avoiding another
+        full site-axis materialization.  Public callers can continue to use
+        :meth:`forward` and receive the unchanged ``BSCOutput`` contract.
+        """
+        decoder = self.decoder_tensor() if _decoder is None else _decoder
+        if _encoder is None:
+            if self.cfg.encoder_mode == "tied":
+                assert self.log_gamma is not None
+                encoder = decoder * self.log_gamma.exp()
+            else:
+                encoder = self.encoder_tensor()
+        else:
+            encoder = _encoder
+        z, keep = self._encode_with_tensor(
+            x,
+            encoder,
+            observed=observed,
+            validate_observed=validate_observed,
+        )
+        scores = self.scores(
+            z,
+            x=x,
+            observed=observed,
+            _decoder=decoder,
+            _observation_keep=keep,
+        )
         mask = self._select_scores(scores, mode=mode, z=z)
         z_selected = z * mask.unsqueeze(-1)
-        xhat = self.decode(z_selected)
-        return BSCOutput(xhat, z, z_selected, scores, mask)
+        xhat = self.decode(z_selected, _decoder=decoder)
+        return BSCOutput(xhat, z, z_selected, scores, mask), decoder, encoder
 
     # -- init calibration --------------------------------------------------
 
@@ -1030,7 +1133,8 @@ class BlockCrosscoder(nn.Module):
             bad = 0
         else:
             assert self.D is not None
-            self.D.data.mul_(self.coordinate_mask)
+            if self._has_padded_coordinates:
+                self.D.data.mul_(self.coordinate_mask)
             if self.cfg.decoder_constraint == "gram":
                 bad = retract_(self.D.data, eig_floor=self.cfg.eig_floor)
             elif self.cfg.decoder_constraint == "qr":
@@ -1043,15 +1147,18 @@ class BlockCrosscoder(nn.Module):
                 bad = project_latent_rows_(self.D.data)
             else:
                 bad = 0
-            self.D.data.mul_(self.coordinate_mask)
+            if self._has_padded_coordinates:
+                self.D.data.mul_(self.coordinate_mask)
             if self.E is not None:
-                self.E.data.mul_(self.coordinate_mask)
+                if self._has_padded_coordinates:
+                    self.E.data.mul_(self.coordinate_mask)
                 if self.cfg.encoder_constraint == "unit_latent":
                     project_latent_rows_(self.E.data)
-                    self.E.data.mul_(self.coordinate_mask)
+                    if self._has_padded_coordinates:
+                        self.E.data.mul_(self.coordinate_mask)
         if not self.cfg.decoder_bias:
             self.c.data.zero_()
-        else:
+        elif self._has_padded_coordinates:
             self.c.data.mul_(self.coordinate_mask[:, 0, 0])
         return bad
 
@@ -1113,6 +1220,10 @@ def bsc_loss(
     x: torch.Tensor,
     model: BlockCrosscoder,
     observation_mask: torch.Tensor | None = None,
+    *,
+    decoder: torch.Tensor | None = None,
+    encoder: torch.Tensor | None = None,
+    validate_observation_mask: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Pinned reductions so lambda and alpha transfer across configs.
 
@@ -1124,22 +1235,36 @@ def bsc_loss(
     """
     cfg = model.cfg
     coord = model.coordinate_mask[:, 0, 0].to(x.device)
+    all_observed = observation_mask is None
     if observation_mask is None:
-        observed = torch.ones(
-            x.shape[0], cfg.n_sites, dtype=torch.bool, device=x.device
-        )
+        observed = None
     else:
         if observation_mask.shape != (x.shape[0], cfg.n_sites):
             raise ValueError(
                 f"observation_mask must have shape [{x.shape[0]}, {cfg.n_sites}]"
             )
         observed = observation_mask.to(device=x.device, dtype=torch.bool)
-        if not bool(observed.any()):
+        if validate_observation_mask and not bool(observed.any()):
             raise ValueError("observation_mask excludes the entire batch")
 
     def reconstruction(target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        residual = pred.float() - target.float()
+        if model._has_padded_coordinates:
+            residual = residual * coord
+        if all_observed:
+            if cfg.reconstruction_loss == "mean_l2":
+                return residual.norm(dim=-1).sum() / (target.shape[0] * cfg.n_sites)
+            if cfg.reconstruction_loss == "mean_l1":
+                return residual.abs().sum(dim=-1).sum() / (
+                    target.shape[0] * cfg.n_sites
+                )
+            if cfg.reconstruction_loss == "squared_l2":
+                return residual.pow(2).sum() / target.shape[0]
+            denominator = target.shape[0] * sum(cfg.site_dims)
+            return residual.pow(2).sum() / denominator
+        assert observed is not None
         site_mask = observed.to(torch.float32).unsqueeze(-1)
-        residual = (pred.float() - target.float()) * coord * site_mask
+        residual = residual * site_mask
         if cfg.reconstruction_loss == "mean_l2":
             # Released Minder code minimizes the mean Euclidean norm per
             # example/site, not the squared objective written in the papers.
@@ -1157,9 +1282,10 @@ def bsc_loss(
     total = l_rec
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
     if cfg.lambda_regularizer > 0 and cfg.regularizer != "none":
-        D = model.decoder_tensor()
+        D = model.decoder_tensor() if decoder is None else decoder
         if cfg.regularizer == "map_nuclear":
-            reg = map_nuclear_penalty(D, model.encoder_tensor(), eps=cfg.sv_eps)
+            E = model.encoder_tensor() if encoder is None else encoder
+            reg = map_nuclear_penalty(D, E, eps=cfg.sv_eps)
             if cfg.map_nuclear_reduction == "sum_blocks":
                 reg = reg * cfg.n_blocks * cfg.block_dim
         elif cfg.regularizer == "decoder_nuclear":

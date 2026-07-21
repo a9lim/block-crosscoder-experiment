@@ -45,6 +45,7 @@ from block_crosscoder_experiment.codec import (
     CodecSpec,
     decode_batch,
     encode_batch,
+    encode_batch_all_q,
     evaluate_rd,
     fit_codec,
 )
@@ -60,7 +61,12 @@ from block_crosscoder_experiment.phase1 import (
     make_fel_dataset,
     make_ladder_dataset,
 )
-from block_crosscoder_experiment.store import MANIFEST_NAME, StoreReader, Whitener
+from block_crosscoder_experiment.store import (
+    MANIFEST_NAME,
+    StoreReader,
+    Whitener,
+    prefetch_batches,
+)
 from block_crosscoder_experiment.studies import (
     CellSpec,
     Phase,
@@ -2900,13 +2906,40 @@ def _apply_prepared_transform(
     transform: Whitener | None,
 ) -> torch.Tensor:
     if transform is None:
-        return x.float()
+        # Persisted views are already the declared bf16 coordinates.  Keep
+        # their compact dtype until the trainer's nonblocking device transfer.
+        return x
     record = preparation["data"]["normalization"]
     selected = tuple(int(item) for item in record["selected_site_indices"])
-    index = torch.tensor(selected, dtype=torch.long, device=transform.W.device)
-    W = transform.W.index_select(0, index).to(x.device)
-    mean = transform.mean.index_select(0, index).to(x.device)
     mode = transform.mode
+    cache = getattr(transform, "_application_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(transform, "_application_cache", cache)
+    device_key = (x.device.type, x.device.index)
+    key = (selected, device_key)
+    bound = cache.get(key)
+    if bound is None:
+        index = torch.tensor(selected, dtype=torch.long)
+        mean = transform.mean.index_select(0, index).to(x.device)
+        selected_dims = tuple(transform.site_dims[item] for item in selected)
+        coordinate_mask = (
+            torch.arange(x.shape[2], device=x.device).view(1, -1)
+            < torch.tensor(selected_dims, device=x.device).view(-1, 1)
+        )
+        if mode in {"none", "scalar_rms", "sqrt_d"}:
+            operator = torch.diagonal(
+                transform.W,
+                dim1=-2,
+                dim2=-1,
+            ).index_select(0, index).to(x.device)
+        elif mode == "whiten":
+            operator = transform.W.index_select(0, index).to(x.device)
+        else:
+            operator = None
+        bound = (mean, operator, selected_dims, coordinate_mask)
+        cache[key] = bound
+    mean, operator, selected_dims, coordinate_mask = bound
     if mode == "layer":
         result = torch.zeros_like(x, dtype=torch.float32)
         for site, source_site in enumerate(selected):
@@ -2917,13 +2950,12 @@ def _apply_prepared_transform(
                 eps=float(transform.meta.get("layer_norm_eps", 1e-5)),
             )
     elif mode in {"none", "scalar_rms", "sqrt_d"}:
-        result = (x.float() - mean) * torch.diagonal(W, dim1=-2, dim2=-1).unsqueeze(0)
+        assert operator is not None
+        result = (x.float() - mean) * operator.unsqueeze(0)
     else:
-        result = torch.einsum("sde,nse->nsd", W, x.float() - mean)
-    selected_dims = tuple(transform.site_dims[item] for item in selected)
-    for site, dim in enumerate(selected_dims):
-        result[:, site, dim:] = 0
-    return result
+        assert operator is not None
+        result = torch.einsum("sde,nse->nsd", operator, x.float() - mean)
+    return result * coordinate_mask.unsqueeze(0)
 
 
 def _decode_transform(
@@ -3336,6 +3368,7 @@ def _training_batches(
     preparation: Mapping[str, Any],
     *,
     start_token: int,
+    apply_transform: bool = True,
 ) -> Iterator[torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     batch_size = int(ctx.values["optimizer.batch_tokens"])
     target = int(ctx.values["data.train_tokens"])
@@ -3350,7 +3383,7 @@ def _training_batches(
         )
         return
     reader = _store_reader(preparation, "train")
-    transform = _prepared_transform(preparation)
+    transform = _prepared_transform(preparation) if apply_transform else None
     unique_tokens = int(ctx.values["data.unique_tokens"])
     consumed = 0
     raw_stream = reader.shuffled_batches(
@@ -3375,7 +3408,11 @@ def _training_batches(
         if remaining <= 0:
             return
         batch = batch[:remaining]
-        yield _apply_prepared_transform(batch, preparation, transform)
+        yield (
+            _apply_prepared_transform(batch, preparation, transform)
+            if apply_transform
+            else batch
+        )
         consumed += len(batch)
 
 
@@ -4062,22 +4099,56 @@ def _train(
         )
     checkpoint_tokens = max(1, int(ctx.values["runtime.checkpoint_tokens"]))
     next_checkpoint = ((start_token // checkpoint_tokens) + 1) * checkpoint_tokens
-    for batch in _training_batches(ctx, preparation, start_token=start_token):
-        if trainer.step_idx >= trainer.cfg.total_steps:
-            break
-        x, observed = _unpack_training_batch(batch)
-        trainer.step(x, observed=observed)
-        start_token += int(x.shape[0])
-        trainer.data_cursor = {
-            "next_token": start_token,
-            "stream": "train",
-        }
-        if (
-            start_token >= next_checkpoint
-            and trainer.step_idx < trainer.cfg.total_steps
-        ):
-            trainer.save_checkpoint(ctx.progress)
-            next_checkpoint += checkpoint_tokens
+    cuda_transform: Whitener | None = None
+    transform_on_cuda = (
+        device.type == "cuda"
+        and preparation["data"]["kind"] == "real"
+        and preparation["data"].get("normalization", {}).get("application")
+        == "on_the_fly"
+    )
+    if transform_on_cuda:
+        cuda_transform = _prepared_transform(preparation)
+        if cuda_transform is None:
+            raise CellExecutionError("on-the-fly normalization has no frozen transform")
+    training_batches: Iterator = _training_batches(
+        ctx,
+        preparation,
+        start_token=start_token,
+        apply_transform=not transform_on_cuda,
+    )
+    if device.type == "cuda":
+        # Transformation and shard reads remain deterministic CPU work.  Keep
+        # two pinned batches ready so Trainer's nonblocking transfers can run
+        # without putting storage latency on the GPU's critical path.
+        training_batches = prefetch_batches(
+            training_batches,
+            depth=2,
+            pin_memory=True,
+        )
+    try:
+        for batch in training_batches:
+            if trainer.step_idx >= trainer.cfg.total_steps:
+                break
+            x, observed = _unpack_training_batch(batch)
+            if cuda_transform is not None:
+                x = x.to(device=device, non_blocking=True)
+                x = _apply_prepared_transform(x, preparation, cuda_transform)
+            trainer.step(x, observed=observed)
+            start_token += int(x.shape[0])
+            trainer.data_cursor = {
+                "next_token": start_token,
+                "stream": "train",
+            }
+            if (
+                start_token >= next_checkpoint
+                and trainer.step_idx < trainer.cfg.total_steps
+            ):
+                trainer.save_checkpoint(ctx.progress)
+                next_checkpoint += checkpoint_tokens
+    finally:
+        close_batches = getattr(training_batches, "close", None)
+        if close_batches is not None:
+            close_batches()
     if trainer.step_idx != trainer.cfg.total_steps:
         raise CellExecutionError(
             f"training stream ended at step {trainer.step_idx}/{trainer.cfg.total_steps}"
@@ -4965,7 +5036,11 @@ def _evaluate_native_selector(
 
     model = model.to(device).eval()
     sites, width = model.cfg.n_sites, model.cfg.d_model
-    coordinate_mask = model.coordinate_mask[:, 0, 0].to(device).double()
+    coordinate_mask = (
+        model.coordinate_mask[:, 0, 0].to(device).double()
+        if model._has_padded_coordinates
+        else None
+    )
     error = torch.zeros(sites, dtype=torch.float64, device=device)
     total_sum = torch.zeros(sites, width, dtype=torch.float64, device=device)
     total_square = torch.zeros_like(total_sum)
@@ -4983,14 +5058,22 @@ def _evaluate_native_selector(
         x = raw.to(device=device, dtype=torch.float32)
         if not x.numel():
             continue
-        # Evaluation uses a fully observed row stream today, but pass the mask
-        # explicitly so isolated-loss diagnostics exercise the same
-        # observed-site exclusion path as masked training and partial views.
-        observed = torch.ones(x.shape[0], sites, dtype=torch.bool, device=x.device)
+        # Isolated-loss diagnostics explicitly exercise observed-site
+        # exclusion. Other scores use the algebraically identical all-site
+        # fast path without allocating or multiplying by an all-ones mask.
+        observed = (
+            torch.ones(x.shape[0], sites, dtype=torch.bool, device=x.device)
+            if model.cfg.selection_score == "isolated_loss_decrease"
+            else None
+        )
         out = model(x, mode=selection_mode, observed=observed)
-        residual = (x - out.xhat).double() * coordinate_mask
+        residual = (x - out.xhat).double()
+        if coordinate_mask is not None:
+            residual = residual * coordinate_mask
         error += residual.square().sum(dim=(0, 2))
-        masked = x.double() * coordinate_mask
+        masked = x.double()
+        if coordinate_mask is not None:
+            masked = masked * coordinate_mask
         total_sum += masked.sum(dim=0)
         total_square += masked.square().sum(dim=0)
         counts = out.mask.sum(dim=1).cpu()
@@ -5092,6 +5175,9 @@ def _evaluate_native_selector(
 def _apply_saved_real_normalization(
     x: torch.Tensor,
     normalization: Mapping[str, Any],
+    *,
+    mean: torch.Tensor | None = None,
+    operator: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply only normalization bytes carried by the deployable artifact."""
 
@@ -5101,20 +5187,27 @@ def _apply_saved_real_normalization(
     if kind != "frozen_transform":
         raise CellExecutionError("real codec has a non-real normalization payload")
     mode = str(normalization["mode"])
-    mean = normalization["mean"].to(x.device, dtype=torch.float32)
-    centered = x.float() - mean
     if mode == "layer":
-        result = torch.zeros_like(centered)
+        result = torch.zeros_like(x, dtype=torch.float32)
         eps = float(normalization.get("meta", {}).get("layer_norm_eps", 1e-5))
         for site, dim in enumerate(normalization["site_dims"]):
             result[:, site, :dim] = torch.nn.functional.layer_norm(
                 x[:, site, :dim].float(), (int(dim),), eps=eps
             )
         return result
-    W = normalization["W"].to(x.device, dtype=torch.float32)
+    if mean is None:
+        mean = normalization["mean"].to(x.device, dtype=torch.float32)
+    centered = x.float() - mean
+    if operator is None:
+        W = normalization["W"].to(x.device, dtype=torch.float32)
+        operator = (
+            torch.diagonal(W, dim1=-2, dim2=-1)
+            if mode in {"none", "scalar_rms", "sqrt_d"}
+            else W
+        )
     if mode in {"none", "scalar_rms", "sqrt_d"}:
-        return centered * torch.diagonal(W, dim1=-2, dim2=-1).unsqueeze(0)
-    return torch.einsum("sde,nse->nsd", W, centered)
+        return centered * operator.unsqueeze(0)
+    return torch.einsum("sde,nse->nsd", operator, centered)
 
 
 def _invert_saved_real_normalization(
@@ -5123,6 +5216,8 @@ def _invert_saved_real_normalization(
     normalization: Mapping[str, Any],
     *,
     inverse_W: torch.Tensor | None,
+    mean: torch.Tensor | None = None,
+    diagonal: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Invert the serialized transform; raw_source is used only by LayerNorm."""
 
@@ -5132,7 +5227,6 @@ def _invert_saved_real_normalization(
     if kind != "frozen_transform":
         raise CellExecutionError("real codec has a non-real normalization payload")
     mode = str(normalization["mode"])
-    mean = normalization["mean"].to(normalized.device, dtype=torch.float32)
     if mode == "layer":
         result = torch.zeros_like(normalized, dtype=torch.float32)
         eps = float(normalization.get("meta", {}).get("layer_norm_eps", 1e-5))
@@ -5145,9 +5239,12 @@ def _invert_saved_real_normalization(
                 normalized[:, site, :dim].float() * (variance + eps).sqrt() + token_mean
             )
         return result
-    W = normalization["W"].to(normalized.device, dtype=torch.float32)
+    if mean is None:
+        mean = normalization["mean"].to(normalized.device, dtype=torch.float32)
     if mode in {"none", "scalar_rms", "sqrt_d"}:
-        diagonal = torch.diagonal(W, dim1=-2, dim2=-1)
+        if diagonal is None:
+            W = normalization["W"].to(normalized.device, dtype=torch.float32)
+            diagonal = torch.diagonal(W, dim1=-2, dim2=-1)
         return normalized.float() / diagonal.clamp_min(1e-30).unsqueeze(0) + mean
     if inverse_W is None:
         raise CellExecutionError("dense frozen transform inverse was not prepared")
@@ -5550,6 +5647,7 @@ def _load_deployment_schedule_bundle(
     return plans
 
 
+@torch.no_grad()
 def _evaluate_raw_space(
     ctx: _Context,
     preparation: Mapping[str, Any],
@@ -5565,8 +5663,18 @@ def _evaluate_raw_space(
     batch_size = int(ctx.values["optimizer.batch_tokens"])
     device = _device(ctx)
     model = model.to(device).eval()
+    materialized_decoder = model.decoder_tensor()
+    materialized_encoder = (
+        materialized_decoder * model.log_gamma.exp()
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
     sites, width = model.cfg.n_sites, model.cfg.d_model
-    coordinate_mask = model.coordinate_mask[:, 0, 0].to(device).double()
+    coordinate_mask = (
+        model.coordinate_mask[:, 0, 0].to(device).double()
+        if model._has_padded_coordinates
+        else None
+    )
     errors = {
         q: torch.zeros(sites, dtype=torch.float64, device=device) for q in codec.spec.qs
     }
@@ -5581,7 +5689,13 @@ def _evaluate_raw_space(
 
     saved_normalization = deployment["normalization"]
     inverse_W: torch.Tensor | None = None
+    saved_mean_device: torch.Tensor | None = None
+    saved_diagonal_device: torch.Tensor | None = None
+    saved_mean_cpu: torch.Tensor | None = None
+    saved_operator_cpu: torch.Tensor | None = None
     synthetic_normalization: Mapping[str, Any] | None = None
+    synthetic_mean_device: torch.Tensor | None = None
+    synthetic_scale_device: torch.Tensor | None = None
     oracle_layer_inverse = False
     serialized_forward_verified = data["kind"] == "synthetic"
     persisted_view_max_abs_difference = 0.0
@@ -5596,6 +5710,17 @@ def _evaluate_raw_space(
             )
         mode = str(synthetic_normalization["mode"])
         oracle_layer_inverse = synthetic_normalization["kind"] == "token_layer_norm"
+        if not oracle_layer_inverse:
+            synthetic_mean_device = torch.tensor(
+                synthetic_normalization["mean"],
+                device=device,
+                dtype=torch.float32,
+            )
+            synthetic_scale_device = torch.tensor(
+                synthetic_normalization["scale"],
+                device=device,
+                dtype=torch.float32,
+            ).view(1, -1, 1)
         evaluation_dataset = _synthetic_dataset(
             ctx.cell, str(data["evaluation_stream"])
         )
@@ -5631,11 +5756,22 @@ def _evaluate_raw_space(
         )
         if (
             saved_normalization.get("kind") == "frozen_transform"
-            and saved_mode == "whiten"
         ):
-            inverse_W = (
-                torch.linalg.inv(saved_normalization["W"].double()).float().to(device)
-            )
+            saved_mean_cpu = saved_normalization["mean"].to(dtype=torch.float32)
+            saved_mean_device = saved_mean_cpu.to(device=device)
+            saved_W_cpu = saved_normalization["W"].to(dtype=torch.float32)
+            if saved_mode in {"none", "scalar_rms", "sqrt_d"}:
+                saved_operator_cpu = torch.diagonal(
+                    saved_W_cpu, dim1=-2, dim2=-1
+                )
+                saved_diagonal_device = saved_operator_cpu.to(device=device)
+            elif saved_mode == "whiten":
+                saved_operator_cpu = saved_W_cpu
+                inverse_W = (
+                    torch.linalg.inv(saved_W_cpu.double()).float().to(device)
+                )
+            elif saved_mode != "layer":
+                saved_operator_cpu = saved_W_cpu
 
         def paired_stream() -> Iterator[
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -5669,7 +5805,10 @@ def _evaluate_raw_space(
                         "raw activation bytes"
                     )
                 encoder_input = _apply_saved_real_normalization(
-                    x_raw, saved_normalization
+                    x_raw,
+                    saved_normalization,
+                    mean=saved_mean_cpu,
+                    operator=saved_operator_cpu,
                 )
                 if not on_the_fly:
                     difference = float(
@@ -5702,114 +5841,147 @@ def _evaluate_raw_space(
     row_denominators: list[float] = []
     row_errors: dict[int, list[float]] = {q: [] for q in codec.spec.qs}
     tokens = 0
-    for x_normalized, x_raw, row_ids in paired_stream():
-        x_normalized = x_normalized.to(device=device, dtype=torch.float32)
-        x_raw = x_raw.to(device=device, dtype=torch.float32)
-        centered = (x_raw.double() - calibration_mean) * coordinate_mask
-        token_denominator = centered.square().sum(dim=2)
-        denominator += token_denominator.sum(dim=0)
-        token_errors: dict[int, torch.Tensor] = {}
-        for q in codec.spec.qs:
-            packet = encode_batch(model, codec, x_normalized, q=q)
-            normalized_prediction = decode_batch(model, codec, packet).to(device)
-            if data["kind"] == "synthetic":
-                assert synthetic_normalization is not None
-                if synthetic_normalization["kind"] == "token_layer_norm":
-                    raw_prediction = torch.zeros_like(normalized_prediction)
-                    for site, dim in enumerate(model.cfg.site_dims):
-                        values = x_raw[:, site, :dim]
-                        mean = values.mean(dim=-1, keepdim=True)
-                        variance = values.var(dim=-1, correction=0, keepdim=True)
-                        raw_prediction[:, site, :dim] = (
-                            normalized_prediction[:, site, :dim]
-                            * (variance + 1e-5).sqrt()
-                            + mean
+    evaluation_stream: Iterator = paired_stream()
+    if device.type == "cuda":
+        evaluation_stream = prefetch_batches(
+            evaluation_stream,
+            depth=2,
+            pin_memory=True,
+        )
+    try:
+        evaluation_iterator = iter(evaluation_stream)
+        for x_normalized, x_raw, row_ids in evaluation_iterator:
+            x_normalized = x_normalized.to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+            x_raw = x_raw.to(device=device, dtype=torch.float32, non_blocking=True)
+            row_ids = row_ids.to(device=device, non_blocking=True)
+            centered = x_raw.double() - calibration_mean
+            if coordinate_mask is not None:
+                centered = centered * coordinate_mask
+            token_denominator = centered.square().sum(dim=2)
+            denominator += token_denominator.sum(dim=0)
+            _, packets = encode_batch_all_q(
+                model,
+                codec,
+                x_normalized,
+                _decoder=materialized_decoder,
+                _encoder=materialized_encoder,
+            )
+            token_errors: dict[int, torch.Tensor] = {}
+            for q in codec.spec.qs:
+                packet = packets[q]
+                normalized_prediction = decode_batch(
+                    model,
+                    codec,
+                    packet,
+                    _decoder=materialized_decoder,
+                ).to(device)
+                if data["kind"] == "synthetic":
+                    assert synthetic_normalization is not None
+                    if synthetic_normalization["kind"] == "token_layer_norm":
+                        raw_prediction = torch.zeros_like(normalized_prediction)
+                        for site, dim in enumerate(model.cfg.site_dims):
+                            values = x_raw[:, site, :dim]
+                            mean = values.mean(dim=-1, keepdim=True)
+                            variance = values.var(dim=-1, correction=0, keepdim=True)
+                            raw_prediction[:, site, :dim] = (
+                                normalized_prediction[:, site, :dim]
+                                * (variance + 1e-5).sqrt()
+                                + mean
+                            )
+                    else:
+                        assert synthetic_mean_device is not None
+                        assert synthetic_scale_device is not None
+                        raw_prediction = (
+                            normalized_prediction / synthetic_scale_device
+                            + synthetic_mean_device.unsqueeze(0)
                         )
                 else:
-                    mean = torch.tensor(
-                        synthetic_normalization["mean"],
-                        device=device,
-                        dtype=torch.float32,
+                    raw_prediction = _invert_saved_real_normalization(
+                        normalized_prediction,
+                        x_raw,
+                        saved_normalization,
+                        inverse_W=inverse_W,
+                        mean=saved_mean_device,
+                        diagonal=saved_diagonal_device,
                     )
-                    scale = torch.tensor(
-                        synthetic_normalization["scale"],
-                        device=device,
-                        dtype=torch.float32,
-                    ).view(1, -1, 1)
-                    raw_prediction = normalized_prediction / scale + mean.unsqueeze(0)
-            else:
-                raw_prediction = _invert_saved_real_normalization(
-                    normalized_prediction,
-                    x_raw,
-                    saved_normalization,
-                    inverse_W=inverse_W,
+                residual = (x_raw - raw_prediction).double()
+                if coordinate_mask is not None:
+                    residual = residual * coordinate_mask
+                token_error = residual.square().sum(dim=2)
+                token_errors[q] = token_error
+                errors[q] += token_error.sum(dim=0)
+            if time_sharing_plans:
+                horizon = next(iter(time_sharing_plans.values()))["horizon_tokens"]
+                if tokens + len(x_raw) > int(horizon):
+                    raise CellExecutionError(
+                        "raw evaluation exceeds the declared time-sharing horizon"
+                    )
+                token_indices = torch.arange(
+                    tokens,
+                    tokens + len(x_raw),
+                    device=device,
+                    dtype=torch.int64,
                 )
-            residual = (x_raw - raw_prediction).double() * coordinate_mask
-            token_error = residual.square().sum(dim=2)
-            token_errors[q] = token_error
-            errors[q] += token_error.sum(dim=0)
-        if time_sharing_plans:
-            horizon = next(iter(time_sharing_plans.values()))["horizon_tokens"]
-            if tokens + len(x_raw) > int(horizon):
-                raise CellExecutionError(
-                    "raw evaluation exceeds the declared time-sharing horizon"
+                endpoint_errors: dict[str, torch.Tensor] = {
+                    "zero_event_calibration_mean": token_denominator.sum(dim=1)
+                }
+                endpoint_errors.update(
+                    {f"q{q}": token_errors[q].sum(dim=1) for q in codec.spec.qs}
                 )
-            token_indices = torch.arange(
-                tokens,
-                tokens + len(x_raw),
-                device=device,
-                dtype=torch.int64,
-            )
-            endpoint_errors: dict[str, torch.Tensor] = {
-                "zero_event_calibration_mean": token_denominator.sum(dim=1)
-            }
-            endpoint_errors.update(
-                {f"q{q}": token_errors[q].sum(dim=1) for q in codec.spec.qs}
-            )
-            masks: dict[int, torch.Tensor] = {}
-            for key, plan in time_sharing_plans.items():
-                upper_tokens = int(plan["upper_tokens"])
-                mask = masks.get(upper_tokens)
-                if mask is None:
-                    mask = ((token_indices + 1) * upper_tokens) // int(horizon) > (
-                        token_indices * upper_tokens
-                    ) // int(horizon)
-                    masks[upper_tokens] = mask
-                time_sharing_errors[key] += torch.where(
-                    mask,
-                    endpoint_errors[str(plan["upper_name"])],
-                    endpoint_errors[str(plan["lower_name"])],
-                ).sum()
-                time_sharing_evaluation_upper_tokens[key] += int(mask.sum())
+                masks: dict[int, torch.Tensor] = {}
+                for key, plan in time_sharing_plans.items():
+                    upper_tokens = int(plan["upper_tokens"])
+                    mask = masks.get(upper_tokens)
+                    if mask is None:
+                        mask = ((token_indices + 1) * upper_tokens) // int(horizon) > (
+                            token_indices * upper_tokens
+                        ) // int(horizon)
+                        masks[upper_tokens] = mask
+                    time_sharing_errors[key] += torch.where(
+                        mask,
+                        endpoint_errors[str(plan["upper_name"])],
+                        endpoint_errors[str(plan["lower_name"])],
+                    ).sum()
+                    time_sharing_evaluation_upper_tokens[key] += int(mask.sum())
 
-        sequences = row_ids[:, 0].to(device=device, dtype=torch.int64)
-        unique_sequences, inverse = torch.unique_consecutive(
-            sequences, return_inverse=True
-        )
-        grouped_denominator = torch.zeros(
-            len(unique_sequences), sites, dtype=torch.float64, device=device
-        )
-        grouped_denominator.index_add_(0, inverse, token_denominator)
-        grouped_errors: dict[int, torch.Tensor] = {}
-        for q in codec.spec.qs:
-            grouped = torch.zeros_like(grouped_denominator)
-            grouped.index_add_(0, inverse, token_errors[q])
-            grouped_errors[q] = grouped
-        for group, sequence in enumerate(unique_sequences.cpu().tolist()):
-            den_value = float(grouped_denominator[group].sum())
-            err_values = {
-                q: float(grouped_errors[q][group].sum()) for q in codec.spec.qs
+            sequences = row_ids[:, 0].to(dtype=torch.int64)
+            unique_sequences, inverse = torch.unique_consecutive(
+                sequences, return_inverse=True
+            )
+            grouped_denominator = torch.zeros(
+                len(unique_sequences), sites, dtype=torch.float64, device=device
+            )
+            grouped_denominator.index_add_(0, inverse, token_denominator)
+            grouped_errors: dict[int, torch.Tensor] = {}
+            for q in codec.spec.qs:
+                grouped = torch.zeros_like(grouped_denominator)
+                grouped.index_add_(0, inverse, token_errors[q])
+                grouped_errors[q] = grouped
+            sequence_values = unique_sequences.cpu().tolist()
+            denominator_values = grouped_denominator.sum(dim=1).cpu().tolist()
+            error_values = {
+                q: grouped_errors[q].sum(dim=1).cpu().tolist()
+                for q in codec.spec.qs
             }
-            if row_sequences and row_sequences[-1] == int(sequence):
-                row_denominators[-1] += den_value
-                for q in codec.spec.qs:
-                    row_errors[q][-1] += err_values[q]
-            else:
-                row_sequences.append(int(sequence))
-                row_denominators.append(den_value)
-                for q in codec.spec.qs:
-                    row_errors[q].append(err_values[q])
-        tokens += len(x_raw)
+            for group, sequence in enumerate(sequence_values):
+                den_value = denominator_values[group]
+                err_values = {q: error_values[q][group] for q in codec.spec.qs}
+                if row_sequences and row_sequences[-1] == int(sequence):
+                    row_denominators[-1] += den_value
+                    for q in codec.spec.qs:
+                        row_errors[q][-1] += err_values[q]
+                else:
+                    row_sequences.append(int(sequence))
+                    row_denominators.append(den_value)
+                    for q in codec.spec.qs:
+                        row_errors[q].append(err_values[q])
+            tokens += len(x_raw)
+    finally:
+        close_evaluation = getattr(evaluation_stream, "close", None)
+        if close_evaluation is not None:
+            close_evaluation()
     if tokens == 0:
         raise CellExecutionError("raw-space evaluation stream is empty")
     denominator = denominator.clamp_min(1e-30)

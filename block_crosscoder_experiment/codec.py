@@ -53,6 +53,7 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import warnings
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 
@@ -65,6 +66,7 @@ __all__ = [
     "fit_codec",
     "evaluate_rd",
     "encode_batch",
+    "encode_batch_all_q",
     "decode_batch",
 ]
 
@@ -146,6 +148,17 @@ class EncodedBatch:
 
 
 @dataclass
+class _PacketEvents:
+    """Q-independent sparse event stream for a single model output."""
+
+    n_tokens: int
+    counts: torch.Tensor  # [n] int32 CPU
+    block_ids: torch.Tensor  # [events] compact IDs, int32 CPU
+    original_ids: torch.Tensor  # [events] dictionary IDs on model device
+    canonical_codes: torch.Tensor  # [events,b] on model device
+
+
+@dataclass
 class Codec:
     """Frozen codec metadata — everything fit on calibration."""
 
@@ -162,6 +175,12 @@ class Codec:
     calib_tokens: int
     calib_mean: torch.Tensor  # [S, d] fp64 per-site mean (FVU centering)
     meta: dict = field(default_factory=dict)
+    _device_cache: dict[tuple[str, str, torch.dtype], tuple[int, torch.Tensor]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         tensor_fields = {
@@ -348,12 +367,34 @@ class Codec:
     def n_included(self) -> int:
         return int(self.rank_to_block.numel())
 
+    def _tensor_on(
+        self,
+        name: str,
+        device: torch.device | str,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Return one frozen codec tensor, cached on its consumer device."""
+
+        source = getattr(self, name)
+        target_device = torch.device(device)
+        target_dtype = source.dtype if dtype is None else dtype
+        key = (name, str(target_device), target_dtype)
+        cached = self._device_cache.get(key)
+        # Tensor._version changes on in-place mutation, so even diagnostic
+        # callers cannot observe stale cached bytes.
+        if cached is None or cached[0] != source._version:
+            value = source.to(device=target_device, dtype=target_dtype)
+            self._device_cache[key] = (source._version, value)
+            return value
+        return cached[1]
+
     def block_to_rank(self, *, device: torch.device | str = "cpu") -> torch.Tensor:
         mapping = torch.full(
             (self.included.numel(),), -1, dtype=torch.long, device=device
         )
         if self.n_included:
-            mapping[self.rank_to_block.to(device=device, dtype=torch.long)] = (
+            mapping[self._tensor_on("rank_to_block", device, dtype=torch.long)] = (
                 torch.arange(self.n_included, device=device)
             )
         return mapping
@@ -368,7 +409,8 @@ class Codec:
     def quantize(self, z_can: torch.Tensor, q: int) -> torch.Tensor:
         """z_can: [n, G, b] canonical-frame codes -> quantized, same frame."""
         levels = (1 << q) - 1
-        lo, hi = self.lo.to(z_can.device), self.hi.to(z_can.device)
+        lo = self._tensor_on("lo", z_can.device)
+        hi = self._tensor_on("hi", z_can.device)
         span = (hi - lo).clamp_min(1e-12)
         t = ((z_can - lo) / span).clamp(0.0, 1.0)
         return lo + torch.round(t * levels) / levels * span
@@ -376,13 +418,15 @@ class Codec:
     def quantize_indices(self, z_can: torch.Tensor, q: int) -> torch.Tensor:
         """Integer amplitude symbols for an actual round-trip packet."""
         levels = (1 << q) - 1
-        lo, hi = self.lo.to(z_can.device), self.hi.to(z_can.device)
+        lo = self._tensor_on("lo", z_can.device)
+        hi = self._tensor_on("hi", z_can.device)
         span = (hi - lo).clamp_min(1e-12)
         return torch.round(((z_can - lo) / span).clamp(0, 1) * levels).to(torch.int32)
 
     def dequantize_indices(self, symbols: torch.Tensor, q: int) -> torch.Tensor:
         levels = (1 << q) - 1
-        lo, hi = self.lo.to(symbols.device), self.hi.to(symbols.device)
+        lo = self._tensor_on("lo", symbols.device)
+        hi = self._tensor_on("hi", symbols.device)
         return lo + symbols.float() / levels * (hi - lo).clamp_min(1e-12)
 
     def save(self, path: str | Path) -> None:
@@ -473,28 +517,93 @@ def _log2_binom(n: int, k: torch.Tensor) -> torch.Tensor:
     ) / math.log(2.0)
 
 
+def _materialized_model_tensors(
+    model,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not hasattr(model, "decoder_tensor") or not hasattr(
+        model, "forward_with_materialized"
+    ):
+        return None, None
+    decoder = model.decoder_tensor()
+    encoder = (
+        decoder * model.log_gamma.exp()
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    return decoder, encoder
+
+
+def _threshold_forward(
+    model,
+    x: torch.Tensor,
+    decoder: torch.Tensor | None,
+    encoder: torch.Tensor | None,
+):
+    if decoder is None or encoder is None:
+        return model(x, mode="threshold")
+    return model.forward_with_materialized(
+        x,
+        mode="threshold",
+        _decoder=decoder,
+        _encoder=encoder,
+    )[0]
+
+
 @torch.no_grad()
 def _packet_from_output(model, codec: Codec, out, q: int) -> EncodedBatch:
     """Build the one canonical packet representation from a model output."""
-    if q not in codec.spec.qs:
-        raise ValueError(f"q={q} is not in the frozen codec spec")
+    events = _packet_events_from_output(model, codec, out)
+    return _packet_from_events(codec, events, q)
+
+
+@torch.no_grad()
+def _packet_events_from_output(model, codec: Codec, out) -> _PacketEvents:
+    """Extract support and rotate only selected events.
+
+    The previous path rotated and quantized a dense ``[tokens, groups, block]``
+    tensor before discarding almost every entry.  Deployment support is sparse
+    by construction, so all q-independent work is performed on its actual
+    event stream once.
+    """
     device = next(model.parameters()).device
-    included = codec.included.to(device)
+    included = codec._tensor_on("included", device)
     mask = out.mask & included.unsqueeze(0)
     nz = mask.nonzero(as_tuple=False)
-    z_can = torch.einsum(
-        "gij,ngj->ngi", codec.rotation.to(device), out.z_selected * mask.unsqueeze(-1)
+    original_ids = nz[:, 1]
+    selected = out.z_selected[nz[:, 0], original_ids]
+    canonical = torch.einsum(
+        "eij,ej->ei",
+        codec._tensor_on("rotation", device)[original_ids],
+        selected,
     )
-    symbols = codec.quantize_indices(z_can, q)
-    compact_ranks = codec.block_to_rank(device=device)[nz[:, 1]]
-    if bool((compact_ranks < 0).any()):  # pragma: no cover - mask proves this
-        raise ValueError("packet support contains a block outside the rank table")
+    rank_to_block = codec._tensor_on("rank_to_block", device, dtype=torch.long)
+    compact_ranks = torch.searchsorted(rank_to_block, original_ids)
+    return _PacketEvents(
+        n_tokens=out.mask.shape[0],
+        counts=mask.sum(dim=1).to(torch.int32),
+        block_ids=compact_ranks.to(torch.int32),
+        original_ids=original_ids,
+        canonical_codes=canonical,
+    )
+
+
+@torch.no_grad()
+def _packet_from_events(codec: Codec, events: _PacketEvents, q: int) -> EncodedBatch:
+    if q not in codec.spec.qs:
+        raise ValueError(f"q={q} is not in the frozen codec spec")
+    levels = (1 << q) - 1
+    lo = codec._tensor_on("lo", events.canonical_codes.device)[events.original_ids]
+    hi = codec._tensor_on("hi", events.canonical_codes.device)[events.original_ids]
+    span = (hi - lo).clamp_min(1e-12)
+    symbols = torch.round(
+        ((events.canonical_codes - lo) / span).clamp(0, 1) * levels
+    ).to(torch.int32)
     return EncodedBatch(
         q=q,
-        n_tokens=out.mask.shape[0],
-        counts=mask.sum(dim=1).to(torch.int32).cpu(),
-        block_ids=compact_ranks.to(torch.int32).cpu(),
-        amplitude_symbols=symbols[mask].cpu(),
+        n_tokens=events.n_tokens,
+        counts=events.counts,
+        block_ids=events.block_ids,
+        amplitude_symbols=symbols,
     )
 
 
@@ -503,12 +612,40 @@ def encode_batch(model, codec: Codec, x: torch.Tensor, q: int) -> EncodedBatch:
     """Encode a batch into explicit support and integer amplitude symbols."""
     device = next(model.parameters()).device
     x = x.to(device, torch.float32)
-    out = model(x, mode="threshold")
+    decoder, encoder = _materialized_model_tensors(model)
+    out = _threshold_forward(model, x, decoder, encoder)
     return _packet_from_output(model, codec, out, q)
 
 
 @torch.no_grad()
-def decode_batch(model, codec: Codec, packet: EncodedBatch) -> torch.Tensor:
+def encode_batch_all_q(
+    model,
+    codec: Codec,
+    x: torch.Tensor,
+    qs: tuple[int, ...] | None = None,
+    *,
+    _decoder: torch.Tensor | None = None,
+    _encoder: torch.Tensor | None = None,
+) -> tuple[object, dict[int, EncodedBatch]]:
+    """Run threshold inference once and emit every requested integer packet."""
+    device = next(model.parameters()).device
+    x = x.to(device, torch.float32, non_blocking=True)
+    if _decoder is None or _encoder is None:
+        _decoder, _encoder = _materialized_model_tensors(model)
+    out = _threshold_forward(model, x, _decoder, _encoder)
+    events = _packet_events_from_output(model, codec, out)
+    requested = codec.spec.qs if qs is None else tuple(qs)
+    return out, {q: _packet_from_events(codec, events, q) for q in requested}
+
+
+@torch.no_grad()
+def decode_batch(
+    model,
+    codec: Codec,
+    packet: EncodedBatch,
+    *,
+    _decoder: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Decode an explicit packet without access to the source activations."""
     device = next(model.parameters()).device
     G, b = model.cfg.n_blocks, model.cfg.block_dim
@@ -518,11 +655,25 @@ def decode_batch(model, codec: Codec, packet: EncodedBatch) -> torch.Tensor:
         raise ValueError("packet counts must have one entry per token")
     if packet.counts.dtype not in {torch.int32, torch.int64}:
         raise TypeError("packet counts must be an integer tensor")
-    if bool((packet.counts < 0).any()) or bool(
-        (packet.counts > codec.n_included).any()
-    ):
+    packet_devices = {
+        packet.counts.device,
+        packet.block_ids.device,
+        packet.amplitude_symbols.device,
+    }
+    validation_device = (
+        packet.counts.device if len(packet_devices) == 1 else torch.device("cpu")
+    )
+    counts = packet.counts.detach().to(device=validation_device, dtype=torch.long)
+    block_ids = packet.block_ids.detach().to(device=validation_device, dtype=torch.long)
+    amplitude_symbols = packet.amplitude_symbols.detach().to(
+        device=validation_device,
+        dtype=torch.long,
+    )
+    count_sum = counts.sum()
+    valid_count_bounds = (counts >= 0).all() & (counts <= codec.n_included).all()
+    if not bool(valid_count_bounds):
         raise ValueError("packet has an impossible support count")
-    n_events = int(packet.counts.long().sum())
+    n_events = int(count_sum)
     if packet.block_ids.shape != (n_events,):
         raise ValueError("packet block_ids length disagrees with support counts")
     if packet.amplitude_symbols.shape != (n_events, b):
@@ -533,36 +684,94 @@ def decode_batch(model, codec: Codec, packet: EncodedBatch) -> torch.Tensor:
         raise TypeError("packet block_ids must be an integer tensor")
     if packet.amplitude_symbols.dtype not in {torch.int32, torch.int64}:
         raise TypeError("packet amplitude symbols must be integers")
-    if bool((packet.block_ids < 0).any()) or bool(
-        (packet.block_ids >= codec.n_included).any()
-    ):
-        raise ValueError("packet block rank is outside the frozen support alphabet")
     levels = (1 << packet.q) - 1
-    if bool((packet.amplitude_symbols < 0).any()) or bool(
-        (packet.amplitude_symbols > levels).any()
-    ):
-        raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
-    mask = torch.zeros(packet.n_tokens, G, dtype=torch.bool, device=device)
-    rows = torch.repeat_interleave(
-        torch.arange(packet.n_tokens, device=device), packet.counts.to(device).long()
-    )
-    ranks = packet.block_ids.to(device).long()
-    ids = codec.rank_to_block.to(device=device, dtype=torch.long)[ranks]
     if n_events:
         # Each support is a set. Duplicate IDs within one token would be an
-        # ambiguous packet and would silently overwrite an amplitude below.
+        # ambiguous packet. Sort the sparse keys once as part of validation;
+        # CSR then receives canonical column order regardless of wire order.
         starts = torch.repeat_interleave(
-            torch.arange(packet.n_tokens), packet.counts.long()
+            torch.arange(packet.n_tokens, device=validation_device), counts
         )
-        pairs = torch.stack((starts, packet.block_ids.long()), dim=1)
-        if torch.unique(pairs, dim=0).shape[0] != n_events:
-            raise ValueError("packet repeats a block id within one token")
-    mask[rows, ids] = True
-    symbols = torch.zeros(packet.n_tokens, G, b, dtype=torch.int32, device=device)
-    symbols[rows, ids] = packet.amplitude_symbols.to(device)
-    z_can = codec.dequantize_indices(symbols, packet.q) * mask.unsqueeze(-1)
-    z = torch.einsum("gji,ngj->ngi", codec.rotation.to(device), z_can)
-    return model.decode(z)
+        keys = starts * max(1, codec.n_included) + block_ids
+        order = torch.argsort(keys)
+        sorted_keys = keys[order]
+        valid_values = (
+            (block_ids >= 0).all()
+            & (block_ids < codec.n_included).all()
+            & (amplitude_symbols >= 0).all()
+            & (amplitude_symbols <= levels).all()
+        )
+        duplicate = (sorted_keys[1:] == sorted_keys[:-1]).any()
+        if not bool(valid_values & ~duplicate):
+            if bool(duplicate):
+                raise ValueError("packet repeats a block id within one token")
+            if not bool(
+                (block_ids >= 0).all() & (block_ids < codec.n_included).all()
+            ):
+                raise ValueError("packet block rank is outside the frozen support alphabet")
+            raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
+        block_ids = block_ids[order]
+        amplitude_symbols = amplitude_symbols[order]
+    else:
+        valid_values = (
+            (amplitude_symbols >= 0).all() & (amplitude_symbols <= levels).all()
+        )
+        if not bool(valid_values):
+            raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
+
+    # Decode the actual sparse event stream with a CSR x dense product.  This
+    # is algebraically the same block sum as ``model.decode`` but scales with
+    # selected events instead of the full dictionary width.
+    ranks = block_ids.to(device=device, non_blocking=True)
+    ids = codec._tensor_on("rank_to_block", device, dtype=torch.long)[ranks]
+    symbols = amplitude_symbols.to(device=device, non_blocking=True)
+    lo = codec._tensor_on("lo", device)[ids]
+    hi = codec._tensor_on("hi", device)[ids]
+    z_can = lo + symbols.float() / levels * (hi - lo).clamp_min(1e-12)
+    z_events = torch.einsum(
+        "eji,ej->ei",
+        codec._tensor_on("rotation", device)[ids],
+        z_can,
+    )
+    crow = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long, device=device),
+            (counts.to(device=device, non_blocking=True) * b).cumsum(dim=0),
+        )
+    )
+    columns = (
+        ids.unsqueeze(1) * b
+        + torch.arange(b, dtype=torch.long, device=device).unsqueeze(0)
+    ).reshape(-1)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Sparse CSR tensor support is in beta state.*",
+            category=UserWarning,
+        )
+        sparse_code = torch.sparse_csr_tensor(
+            crow,
+            columns,
+            z_events.reshape(-1),
+            size=(packet.n_tokens, G * b),
+            device=device,
+            check_invariants=False,
+        )
+    decoder = model.decoder_tensor() if _decoder is None else _decoder
+    decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
+        G * b,
+        model.cfg.n_sites * model.cfg.d_model,
+    )
+    xhat = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+        packet.n_tokens,
+        model.cfg.n_sites,
+        model.cfg.d_model,
+    )
+    if model.cfg.decoder_bias:
+        xhat = xhat + model.c.unsqueeze(0)
+    if model._has_padded_coordinates:
+        xhat = xhat * model.coordinate_mask[:, 0, 0].to(xhat.dtype)
+    return xhat
 
 
 @torch.no_grad()
@@ -581,10 +790,16 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     n_tokens = 0
     selected_events = 0
     estimated_peak_bytes = 0
+    materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
 
-    for x in batches:
-        x = x.to(device, torch.float32)
-        out = model(x, mode="threshold")
+    for raw_x in batches:
+        x = raw_x.to(device, torch.float32, non_blocking=True)
+        out = _threshold_forward(
+            model,
+            x,
+            materialized_decoder,
+            materialized_encoder,
+        )
         mask = out.mask
         z_sel = out.z_selected
         nz = mask.nonzero()
@@ -603,7 +818,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
         ev_ids.append(nz[:, 1].to(torch.int32).cpu())
         ev_tokens.append((nz[:, 0] + n_tokens).to(torch.int32).cpu())
         block_events += mask.sum(dim=0).cpu()
-        mean_acc += x.double().sum(dim=0).cpu()
+        mean_acc += raw_x.double().sum(dim=0).cpu()
         n_tokens += x.shape[0]
 
     codes = torch.cat(ev_codes) if ev_codes else torch.zeros(0, b)
@@ -737,8 +952,8 @@ def evaluate_rd(
     spec = codec.spec
     b = model.cfg.block_dim
     S = model.cfg.n_sites
-    inc = codec.included.to(device)
-    mu = codec.calib_mean.to(device).float()  # [S, d] calib-fit centering
+    inc = codec._tensor_on("included", device)
+    mu = codec._tensor_on("calib_mean", device, dtype=torch.float32)
     log2_1mq_total = float(codec.bernoulli_log2q[codec.included].double().sum())
 
     rows_err = {q: [] for q in spec.qs}  # per-row sq err (pooled over sites)
@@ -782,6 +997,7 @@ def evaluate_rd(
     sequence_mode: str | None = None
     current_sequence: int | None = None
     fallback_token_offset = 0
+    materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
     for item in batches:
         if isinstance(item, tuple):
             if len(item) != 2:
@@ -814,7 +1030,12 @@ def evaluate_rd(
             )
             fallback_token_offset += x.shape[0]
         x = x.to(device, torch.float32)
-        out = model(x, mode="threshold")
+        out = _threshold_forward(
+            model,
+            x,
+            materialized_decoder,
+            materialized_encoder,
+        )
         raw_mask = out.mask
         mask = raw_mask & inc.unsqueeze(0)
         excluded_events += int((raw_mask & ~inc.unsqueeze(0)).sum())
@@ -828,23 +1049,35 @@ def evaluate_rd(
                 codec.n_included, counts.cpu()
             )
             act_p = (
-                (codec.bernoulli_log2p.to(device) * mask.float()).sum(dim=1).double()
+                (
+                    codec._tensor_on("bernoulli_log2p", device) * mask.float()
+                ).sum(dim=1).double()
             )
             act_q = (
-                (codec.bernoulli_log2q.to(device) * mask.float()).sum(dim=1).double()
+                (
+                    codec._tensor_on("bernoulli_log2q", device) * mask.float()
+                ).sum(dim=1).double()
             )
             bern_bits = -(act_p.cpu() + (log2_1mq_total - act_q.cpu()))
         else:
             sup_bits = torch.zeros(x.shape[0], dtype=torch.float64)
             bern_bits = torch.zeros(x.shape[0], dtype=torch.float64)
 
+        packet_events = _packet_events_from_output(model, codec, out)
+        packets = {
+            q: _packet_from_events(codec, packet_events, q) for q in spec.qs
+        }
         err_site = {}
         for q in spec.qs:
             # Distortion is measured on the same validated integer packet a
             # saved artifact will decode, never on an algebraically similar
             # floating-point shortcut.
-            packet = _packet_from_output(model, codec, out, q)
-            xhat = decode_batch(model, codec, packet)
+            xhat = decode_batch(
+                model,
+                codec,
+                packets[q],
+                _decoder=materialized_decoder,
+            )
             err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
         tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
 

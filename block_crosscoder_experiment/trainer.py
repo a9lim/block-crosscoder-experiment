@@ -295,10 +295,9 @@ class DeadTracker:
         any_fire = accepted.any(dim=0)
         self.tokens_since_fired += len(accepted)
         self.tokens_since_fired[any_fire] = 0
-        if bool(any_fire.any()):
-            reverse_offset = accepted.flip(0).to(torch.int8).argmax(dim=0)
-            positions = self.tokens_seen + len(accepted) - 1 - reverse_offset
-            self.last_fire[any_fire] = positions[any_fire]
+        reverse_offset = accepted.flip(0).to(torch.int8).argmax(dim=0)
+        positions = self.tokens_seen + len(accepted) - 1 - reverse_offset
+        self.last_fire.copy_(torch.where(any_fire, positions, self.last_fire))
         self.tokens_seen += len(accepted)
 
         # Exact SAELens rule: after each forward, increment every scalar
@@ -689,7 +688,22 @@ def _floating_tensors(obj) -> Iterator[torch.Tensor]:
 
 
 def _all_finite(obj) -> bool:
-    return all(bool(torch.isfinite(t).all()) for t in _floating_tensors(obj))
+    tensors = [tensor for tensor in _floating_tensors(obj) if tensor.numel()]
+    if not tensors:
+        return True
+    # Infinity norms are finite exactly when every element is finite, but the
+    # foreach implementation scans each parameter/state list through a small
+    # number of multi-tensor kernels instead of launching isfinite+reduction
+    # separately for every tensor.  Grouping by device preserves generic CPU
+    # use while production takes one host read for its single CUDA device.
+    by_device: dict[torch.device, list[torch.Tensor]] = {}
+    for tensor in tensors:
+        by_device.setdefault(tensor.device, []).append(tensor)
+    for device_tensors in by_device.values():
+        norms = torch._foreach_norm(device_tensors, ord=float("inf"))
+        if not bool(torch.stack([torch.isfinite(norm) for norm in norms]).all()):
+            return False
+    return True
 
 
 def _project_decoder_(model: BlockCrosscoder) -> int:
@@ -815,30 +829,57 @@ class Trainer:
     ) -> dict:
         cfg = self.cfg
         fwd_param = next(self.fwd.parameters())
-        x = x.to(device=fwd_param.device, dtype=fwd_param.dtype)
+        x = x.to(
+            device=fwd_param.device,
+            dtype=fwd_param.dtype,
+            non_blocking=True,
+        )
         if observed is None:
-            observed = torch.ones(
-                x.shape[0],
-                self.master.cfg.n_sites,
-                dtype=torch.bool,
-                device=x.device,
-            )
+            if (
+                cfg.encoder_site_mask_mode == "bernoulli"
+                and cfg.encoder_site_mask_probability == 0.0
+            ):
+                encoder_observed = None
+            else:
+                observed = torch.ones(
+                    x.shape[0],
+                    self.master.cfg.n_sites,
+                    dtype=torch.bool,
+                    device=x.device,
+                )
+                encoder_observed = self._encoder_observation_mask(observed)
         else:
-            observed = observed.to(device=x.device, dtype=torch.bool)
+            observed = observed.to(
+                device=x.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
             if observed.shape != (x.shape[0], self.master.cfg.n_sites):
                 raise ValueError(
                     "observed must have shape "
                     f"[{x.shape[0]}, {self.master.cfg.n_sites}]"
                 )
-        if not bool(observed.any(dim=1).all()):
-            raise ValueError("every token must have at least one true-observed site")
-        encoder_observed = self._encoder_observation_mask(observed)
+            if not bool(observed.any(dim=1).all()):
+                raise ValueError("every token must have at least one true-observed site")
+            encoder_observed = self._encoder_observation_mask(observed)
         log_step = self.step_idx % cfg.log_every == 0
 
-        out = self.fwd(x, observed=encoder_observed)
+        out, decoder, encoder = self.fwd.forward_with_materialized(
+            x,
+            observed=encoder_observed,
+            validate_observed=False,
+        )
         # The target mask is the true data-availability mask, not the stochastic
         # augmentation mask: hidden clean sites remain reconstruction targets.
-        parts = bsc_loss(out, x, self.fwd, observation_mask=observed)
+        parts = bsc_loss(
+            out,
+            x,
+            self.fwd,
+            observation_mask=observed,
+            decoder=decoder,
+            encoder=encoder,
+            validate_observation_mask=False,
+        )
 
         l_aux = None
         if cfg.aux_variant != "none":
@@ -878,58 +919,86 @@ class Trainer:
                 parts["aux"] = l_aux
                 parts["total"] = parts["total"] + alpha * l_aux
 
-        self.opt.zero_grad(set_to_none=True)
-        if self.fwd is not self.master:
+        if self.fwd is self.master:
+            self.opt.zero_grad(set_to_none=True)
+        else:
+            # Retain the bf16 leaf-gradient allocations across steps.  The
+            # fp32 master gradients below are likewise overwritten, so no
+            # master zero-fill is needed before the copy.
             for p in self.fwd.parameters():
-                p.grad = None
+                if p.grad is not None:
+                    p.grad.zero_()
         parts["total"].backward()
 
         if self.fwd is not self.master:
             for m, f in zip(self.master.parameters(), self.fwd.parameters()):
                 if f.grad is None:
+                    m.grad = None
                     continue
                 if m.grad is None:
-                    m.grad = f.grad.detach().float()
-                else:
-                    m.grad.copy_(f.grad.detach())
-        unclipped_grad_norm = math.sqrt(
-            sum(
-                float(p.grad.float().pow(2).sum())
-                for p in self.master.parameters()
-                if p.grad is not None
-            )
-        )
+                    m.grad = torch.empty_like(m)
+                m.grad.copy_(f.grad.detach())
+        parameters = [p for p in self.master.parameters() if p.grad is not None]
+        gradients = [p.grad for p in parameters]
+        if not gradients:
+            raise RuntimeError("training loss produced no parameter gradients")
         if cfg.gradient_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.master.parameters() if p.grad is not None],
+            unclipped_grad_norm_t = torch.nn.utils.clip_grad_norm_(
+                parameters,
                 cfg.gradient_clip_norm,
             )
-        grad_norm = math.sqrt(
-            sum(
-                float(p.grad.float().pow(2).sum())
-                for p in self.master.parameters()
-                if p.grad is not None
+            clip_scale = (
+                cfg.gradient_clip_norm / (unclipped_grad_norm_t + 1e-6)
+            ).clamp(max=1.0)
+            grad_norm_t = unclipped_grad_norm_t * clip_scale
+        else:
+            per_tensor_norms = [torch.linalg.vector_norm(g.float()) for g in gradients]
+            unclipped_grad_norm_t = torch.linalg.vector_norm(
+                torch.stack(per_tensor_norms)
             )
-        )
+            grad_norm_t = unclipped_grad_norm_t
 
-        state_finite = _all_finite(tuple(self.master.parameters())) and _all_finite(
-            self.opt.state
-        )
-        rec_val = float(parts["rec"].detach())
-        if not (
-            math.isfinite(grad_norm)
-            and math.isfinite(rec_val)
-            and math.isfinite(float(parts["total"].detach()))
-            and state_finite
+        if observed is None:
+            keep_fraction_t = torch.ones((), device=x.device, dtype=torch.float32)
+        else:
+            assert encoder_observed is not None
+            keep_fraction_t = encoder_observed.sum() / observed.sum()
+        scalar_names = ["rec", "total", "grad_norm", "unclipped_grad_norm", "keep"]
+        scalar_tensors = [
+            parts["rec"].detach().float(),
+            parts["total"].detach().float(),
+            grad_norm_t.detach().float(),
+            unclipped_grad_norm_t.detach().float(),
+            keep_fraction_t.detach().float(),
+        ]
+        if "regularizer" in parts:
+            scalar_names.append("regularizer")
+            scalar_tensors.append(parts["regularizer"].detach().float())
+        if l_aux is not None:
+            scalar_names.append("aux")
+            scalar_tensors.append(l_aux.detach().float())
+        scalar_values = {
+            name: float(value)
+            for name, value in zip(
+                scalar_names,
+                torch.stack(scalar_tensors).cpu(),
+            )
+        }
+        rec_val = scalar_values["rec"]
+        total_val = scalar_values["total"]
+        grad_norm = scalar_values["grad_norm"]
+        unclipped_grad_norm = scalar_values["unclipped_grad_norm"]
+        keep_fraction = scalar_values["keep"]
+        if not all(
+            math.isfinite(value)
+            for value in (rec_val, total_val, grad_norm, unclipped_grad_norm)
         ):
             raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
 
         # The load-bearing ordering: step on master -> retract master ->
         # regenerate the forward copy -> measure the post-cast residual.
         self.opt.step()
-        if not (
-            _all_finite(tuple(self.master.parameters())) and _all_finite(self.opt.state)
-        ):
+        if not _all_finite((tuple(self.master.parameters()), self.opt.state)):
             self.opt.zero_grad(set_to_none=True)
             raise RuntimeError(
                 "optimizer produced non-finite parameter/state; refusing to "
@@ -940,9 +1009,10 @@ class Trainer:
         # ``step_idx`` is zero-based while ``retract_every`` is a cadence
         # in completed optimizer updates. Initialization applies the declared
         # constraint separately, so cadence 20 means updates 20, 40, ....
-        if (self.step_idx + 1) % cfg.retract_every == 0:
+        projected_decoder = (self.step_idx + 1) % cfg.retract_every == 0
+        if projected_decoder:
             floor_hits = _project_decoder_(self.master)
-        if not _all_finite(tuple(self.master.parameters())):
+        if projected_decoder and not _all_finite(tuple(self.master.parameters())):
             raise RuntimeError(
                 "decoder projection produced non-finite parameters; refusing "
                 "to continue (reload the last atomic checkpoint)"
@@ -952,29 +1022,32 @@ class Trainer:
                 for m, f in zip(self.master.parameters(), self.fwd.parameters()):
                     f.copy_(m)
                 self.fwd.theta.copy_(self.master.theta)
-        self.tracker.update(
-            out.mask,
-            coordinate_activity=(out.z_selected != 0),
-        )
+        if cfg.aux_variant not in {"none", "fel"}:
+            self.tracker.update(
+                out.mask,
+                coordinate_activity=(
+                    (out.z_selected != 0)
+                    if cfg.aux_variant == "sasa_release"
+                    else None
+                ),
+            )
         self.accepted_tokens += int(x.shape[0])
 
         record = {
             "step": self.step_idx,
             "rec": rec_val,
-            "total": float(parts["total"].detach()),
+            "total": total_val,
             "lr": self.sched.get_last_lr()[0],
             "grad_norm": grad_norm,
             "floor_hits": floor_hits,
-            "encoder_site_keep_fraction": float(
-                encoder_observed.sum() / observed.sum()
-            ),
+            "encoder_site_keep_fraction": keep_fraction,
         }
         if cfg.gradient_clip_norm is not None:
             record["grad_norm_unclipped"] = unclipped_grad_norm
         if "regularizer" in parts:
-            record["regularizer"] = float(parts["regularizer"].detach())
+            record["regularizer"] = scalar_values["regularizer"]
         if l_aux is not None:
-            record["aux"] = float(l_aux.detach())
+            record["aux"] = scalar_values["aux"]
         if log_step:
             record.update(self._diagnostics())
             self.history.append(record)

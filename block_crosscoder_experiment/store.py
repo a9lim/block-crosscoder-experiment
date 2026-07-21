@@ -77,6 +77,11 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _tensor_byte_view(tensor: torch.Tensor) -> memoryview:
+    """Zero-copy byte view for hashing a contiguous CPU tensor."""
+    return memoryview(tensor.contiguous().view(torch.uint8).numpy())
+
+
 class WhitenerAccumulator:
     """fp64 sufficient statistics for the per-site whitener.
 
@@ -444,8 +449,8 @@ class ShardWriter:
         self.tokens_per_shard = tokens_per_shard
         self.free_floor = free_space_floor_frac
         self.max_zero_row_frac = max_zero_row_frac
-        self._buffer: list[torch.Tensor] = []
-        self._row_id_buffer: list[torch.Tensor] = []
+        self._buffer: torch.Tensor | None = None
+        self._row_id_buffer: torch.Tensor | None = None
         self._buffered = 0
         self._row_id_width: int | None = None
         self.shards: list[dict] = []
@@ -509,12 +514,8 @@ class ShardWriter:
         self._row_id_width = int(manifest["row_id_width"])
         for record in self.shards:
             acts, row_ids = reader._shard_payload(record, verify=True)
-            self._content_stream_hasher.update(
-                acts.contiguous().view(torch.uint8).numpy().tobytes()
-            )
-            self._row_stream_hasher.update(
-                row_ids.contiguous().view(torch.uint8).numpy().tobytes()
-            )
+            self._content_stream_hasher.update(_tensor_byte_view(acts))
+            self._row_stream_hasher.update(_tensor_byte_view(row_ids))
         self._next_row_id = self.persisted_tokens
         expected_files = {record["file"] for record in self.shards}
         orphan_paths = tuple(
@@ -644,14 +645,14 @@ class ShardWriter:
                 f"orphan shard row identity payload mismatch in {path}: "
                 f"shape={tuple(row_ids.shape)} dtype={row_ids.dtype}"
             )
-        if not bool(torch.isfinite(acts.float()).all()):
+        if not bool(torch.isfinite(acts).all()):
             raise ValueError(f"orphan shard contains non-finite activations in {path}")
-        zero_rows = (acts.float().abs().sum(dim=(1, 2)) == 0).float().mean()
+        zero_rows = (~(acts != 0).any(dim=(1, 2))).float().mean()
         if float(zero_rows) > self.max_zero_row_frac:
             raise ValueError(f"orphan shard exceeds the zero-row limit in {path}")
 
-        content_bytes = acts.contiguous().view(torch.uint8).numpy().tobytes()
-        row_bytes = row_ids.contiguous().view(torch.uint8).numpy().tobytes()
+        content_bytes = _tensor_byte_view(acts)
+        row_bytes = _tensor_byte_view(row_ids)
         content_sha256 = hashlib.sha256(content_bytes).hexdigest()
         row_ids_sha256 = hashlib.sha256(row_bytes).hexdigest()
         for label, observed in (
@@ -720,30 +721,59 @@ class ShardWriter:
             self._row_id_width = int(row_ids.shape[1])
         elif row_ids.shape[1] != self._row_id_width:
             raise ValueError("row_ids width changed within a split")
-        self._buffer.append(x.to(device="cpu", dtype=STORE_DTYPE))
-        self._row_id_buffer.append(row_ids)
-        self._buffered += x.shape[0]
+        values = x.to(device="cpu", dtype=STORE_DTYPE)
         self._next_row_id += x.shape[0]
-        while self._buffered >= self.tokens_per_shard:
-            self._flush(self.tokens_per_shard)
+        offset = 0
+        while offset < len(values):
+            if self._buffer is None:
+                self._buffer = torch.empty(
+                    self.tokens_per_shard,
+                    len(self.sites),
+                    self.d_model,
+                    dtype=STORE_DTYPE,
+                )
+                self._row_id_buffer = torch.empty(
+                    self.tokens_per_shard,
+                    self._row_id_width,
+                    dtype=ROW_IDS_DTYPE,
+                )
+            assert self._row_id_buffer is not None
+            take = min(
+                len(values) - offset,
+                self.tokens_per_shard - self._buffered,
+            )
+            self._buffer[self._buffered : self._buffered + take].copy_(
+                values[offset : offset + take]
+            )
+            self._row_id_buffer[self._buffered : self._buffered + take].copy_(
+                row_ids[offset : offset + take]
+            )
+            self._buffered += take
+            offset += take
+            if self._buffered == self.tokens_per_shard:
+                self._flush(self.tokens_per_shard)
 
     def _flush(self, n_tokens: int) -> None:
-        chunk = torch.cat(self._buffer, dim=0)
-        row_chunk = torch.cat(self._row_id_buffer, dim=0)
-        out, rest = chunk[:n_tokens], chunk[n_tokens:]
-        out_ids, rest_ids = row_chunk[:n_tokens], row_chunk[n_tokens:]
-        self._buffer = [rest] if rest.shape[0] else []
-        self._row_id_buffer = [rest_ids] if rest_ids.shape[0] else []
-        self._buffered = rest.shape[0]
+        if (
+            self._buffer is None
+            or self._row_id_buffer is None
+            or n_tokens != self._buffered
+        ):
+            raise RuntimeError("shard flush must consume the complete staging buffer")
+        out = self._buffer[:n_tokens]
+        out_ids = self._row_id_buffer[:n_tokens]
+        self._buffer = None
+        self._row_id_buffer = None
+        self._buffered = 0
         self._write(out, out_ids)
 
     def _write(self, acts: torch.Tensor, row_ids: torch.Tensor) -> None:
         from safetensors.torch import save_file
 
         # Audit before bytes hit disk: all-finite, near-zero rows bounded.
-        if not torch.isfinite(acts.float()).all():
+        if not torch.isfinite(acts).all():
             raise ValueError("non-finite activations reached the shard writer")
-        zero_rows = (acts.float().abs().sum(dim=(1, 2)) == 0).float().mean()
+        zero_rows = (~(acts != 0).any(dim=(1, 2))).float().mean()
         if float(zero_rows) > self.max_zero_row_frac:
             raise ValueError(
                 f"zero-row fraction {float(zero_rows):.2e} exceeds "
@@ -760,14 +790,12 @@ class ShardWriter:
                 f"({usage.free / 1e9:.1f} GB free, shard {nbytes / 1e9:.2f} GB)"
             )
         idx = len(self.shards)
-        checksum = hashlib.sha256(
-            acts.contiguous().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
-        content_bytes = acts.contiguous().view(torch.uint8).numpy().tobytes()
-        row_checksum = hashlib.sha256(
-            row_ids.contiguous().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
-        row_bytes = row_ids.contiguous().view(torch.uint8).numpy().tobytes()
+        acts = acts.contiguous()
+        row_ids = row_ids.contiguous()
+        content_bytes = _tensor_byte_view(acts)
+        row_bytes = _tensor_byte_view(row_ids)
+        checksum = hashlib.sha256(content_bytes).hexdigest()
+        row_checksum = hashlib.sha256(row_bytes).hexdigest()
         header = {
             "whitener_hash": self.whitener_hash,
             "split": self.split,
@@ -785,7 +813,7 @@ class ShardWriter:
         path = self.dir / f"shard_{idx:05d}.safetensors"
         tmp = path.with_suffix(".tmp")
         save_file(
-            {"acts": acts.contiguous(), "row_ids": row_ids.contiguous()},
+            {"acts": acts, "row_ids": row_ids},
             tmp,
             metadata=header,
         )
@@ -865,8 +893,11 @@ class ShardWriter:
 
 
 def prefetch_batches(
-    it: Iterator[torch.Tensor], depth: int = 4
-) -> Iterator[torch.Tensor]:
+    it: Iterator,
+    depth: int = 4,
+    *,
+    pin_memory: bool = False,
+) -> Iterator:
     """Drive an I/O-bound batch iterator
     from a daemon thread, holding up to ``depth`` batches ahead of the
     consumer. Order-preserving, so determinism is untouched; worker
@@ -888,6 +919,15 @@ def prefetch_batches(
     end = object()
     stop = threading.Event()
 
+    def prepare(item):
+        if not pin_memory:
+            return item
+        if torch.is_tensor(item):
+            return item if item.is_pinned() else item.pin_memory()
+        if isinstance(item, tuple):
+            return tuple(prepare(value) for value in item)
+        raise TypeError("prefetched batches must be tensors or tensor tuples")
+
     def deliver(item: object) -> bool:
         while not stop.is_set():
             try:
@@ -900,7 +940,7 @@ def prefetch_batches(
     def worker() -> None:
         try:
             for x in it:
-                if not deliver(x):
+                if not deliver(prepare(x)):
                     return
             deliver(end)
         except BaseException as e:  # noqa: BLE001 — re-raised consumer-side
@@ -1263,7 +1303,13 @@ class StoreReader:
         for s in self.manifest["shards"]:
             acts = self._subset(self._shard_tokens(s))
             if carry is not None:
-                acts = torch.cat([carry, acts], dim=0)
+                needed = batch_size - len(carry)
+                if len(acts) < needed:
+                    carry = torch.cat((carry, acts), dim=0)
+                    continue
+                yield torch.cat((carry, acts[:needed]), dim=0)
+                acts = acts[needed:]
+                carry = None
             n_full = acts.shape[0] // batch_size * batch_size
             for i in range(0, n_full, batch_size):
                 yield acts[i : i + batch_size]
@@ -1281,8 +1327,20 @@ class StoreReader:
             acts, row_ids = self._shard_payload(shard)
             acts = self._subset(acts)
             if carry_x is not None:
-                acts = torch.cat((carry_x, acts), dim=0)
-                row_ids = torch.cat((carry_ids, row_ids), dim=0)
+                assert carry_ids is not None
+                needed = batch_size - len(carry_x)
+                if len(acts) < needed:
+                    carry_x = torch.cat((carry_x, acts), dim=0)
+                    carry_ids = torch.cat((carry_ids, row_ids), dim=0)
+                    continue
+                yield (
+                    torch.cat((carry_x, acts[:needed]), dim=0),
+                    torch.cat((carry_ids, row_ids[:needed]), dim=0),
+                )
+                acts = acts[needed:]
+                row_ids = row_ids[needed:]
+                carry_x = None
+                carry_ids = None
             n_full = acts.shape[0] // batch_size * batch_size
             for i in range(0, n_full, batch_size):
                 yield acts[i : i + batch_size], row_ids[i : i + batch_size]
@@ -1336,7 +1394,7 @@ class StoreReader:
                 buffer.append(acts)
                 buffered += acts.shape[0]
                 while buffered >= buffer_tokens:
-                    chunk = torch.cat(buffer, dim=0)
+                    chunk = buffer[0] if len(buffer) == 1 else torch.cat(buffer, dim=0)
                     take, rest = chunk[:buffer_tokens], chunk[buffer_tokens:]
                     buffer = [rest] if rest.shape[0] else []
                     buffered = rest.shape[0]
@@ -1352,7 +1410,7 @@ class StoreReader:
             # End of epoch: emit every remaining row. Dropping a partial
             # batch would silently shrink the declared unique-row pool.
             if buffered:
-                chunk = torch.cat(buffer, dim=0)
+                chunk = buffer[0] if len(buffer) == 1 else torch.cat(buffer, dim=0)
                 perm = torch.randperm(chunk.shape[0], generator=gen)
                 chunk = chunk[perm]
                 for i in range(0, chunk.shape[0], batch_size):

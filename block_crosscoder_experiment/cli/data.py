@@ -761,6 +761,19 @@ def capture(
         missing_hooks = [hook for hook in hooks if hook not in hook_dict]
         if missing_hooks:
             raise ValueError(f"model does not expose requested hooks: {missing_hooks}")
+    # TransformerLens' stop_at_layer is exclusive.  Residual hooks are bound
+    # at the start of their named block, so max(block)+1 captures every
+    # requested activation without executing unrelated later transformer
+    # blocks or the output head.  Unknown hook namespaces conservatively keep
+    # the full forward.
+    hook_layers = []
+    for hook in hooks:
+        match = re.fullmatch(r"blocks\.(\d+)\..+", hook)
+        if match is None:
+            hook_layers = []
+            break
+        hook_layers.append(int(match.group(1)))
+    stop_at_layer = max(hook_layers) + 1 if hook_layers else None
     d_model = int(model.cfg.d_model)
     if d_model <= 0:
         raise ValueError("model d_model must be positive")
@@ -1066,16 +1079,27 @@ def capture(
     )
     remaining_rows = itertools.islice(all_rows, start_sequence, None)
 
-    @torch.no_grad()
+    capture_positions = torch.arange(
+        args.drop_positions,
+        args.context,
+        dtype=torch.int64,
+    )
+
+    @torch.inference_mode()
     def process_rows(
         batch_rows: list[tuple[int, torch.Tensor]], skip: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         seq_ids = torch.tensor([item[0] for item in batch_rows], dtype=torch.int64)
-        toks = torch.stack([item[1] for item in batch_rows]).to(args.device)
+        toks_cpu = torch.stack([item[1] for item in batch_rows])
+        toks = toks_cpu.to(args.device)
+        forward_kwargs = {}
+        if stop_at_layer is not None and callable(getattr(model, "forward", None)):
+            forward_kwargs["stop_at_layer"] = stop_at_layer
         _, cache = model.run_with_cache(
             toks,
             names_filter=lambda name, selected=set(hooks): name in selected,
             return_type=None,
+            **forward_kwargs,
         )
         per_source: list[torch.Tensor] = []
         for hook in hooks:
@@ -1087,16 +1111,12 @@ def capture(
                 )
             per_source.append(acts[:, args.drop_positions :])
         stacked = torch.stack(per_source, dim=2).reshape(-1, len(per_source), d_model)
-        position = (
-            torch.arange(args.drop_positions, args.context, dtype=torch.int64)
-            .view(1, -1)
-            .expand(toks.shape[0], -1)
-        )
+        position = capture_positions.view(1, -1).expand(toks_cpu.shape[0], -1)
         identity = torch.stack(
             (
                 seq_ids.view(-1, 1).expand_as(position),
                 position,
-                toks[:, args.drop_positions :].cpu().to(torch.int64),
+                toks_cpu[:, args.drop_positions :].to(torch.int64),
             ),
             dim=-1,
         ).reshape(-1, 3)

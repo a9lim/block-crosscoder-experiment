@@ -57,6 +57,30 @@ def test_decode_matches_naive_and_bias(device):
     assert torch.allclose(zero, model.c.expand_as(zero), atol=1e-6)
 
 
+def test_pre_materialized_structured_weights_preserve_forward(device):
+    model = make_model(
+        device,
+        site_rank=2,
+        selection="token_topk",
+        decoder_constraint="free",
+        decoder_init_preconditioning="none",
+        decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+    )
+    x = whitened_batch(device, n=8)
+    expected = model(x)
+    decoder = model.decoder_tensor()
+    encoder = model.encoder_tensor()
+    actual, returned_decoder, returned_encoder = model.forward_with_materialized(
+        x,
+        _decoder=decoder,
+        _encoder=encoder,
+    )
+    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+        assert torch.equal(expected_tensor, actual_tensor)
+    assert returned_decoder is decoder
+    assert returned_encoder is encoder
+
+
 def test_batchtopk_exact_count_and_variable_per_token(device):
     B, G = 64, CFG.n_blocks
     gen = torch.Generator(device="cpu").manual_seed(2)

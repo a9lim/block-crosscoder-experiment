@@ -456,8 +456,23 @@ def _mock_capture_runtime(monkeypatch):
         def eval(self):
             return self
 
-        def run_with_cache(self, toks, *, names_filter, return_type):
+        def forward(self, toks, *, stop_at_layer=None):  # pragma: no cover
+            raise AssertionError("run_with_cache should own the forward")
+
+        def run_with_cache(
+            self,
+            toks,
+            *,
+            names_filter,
+            return_type,
+            stop_at_layer=None,
+        ):
             assert return_type is None
+            expected_layers = [
+                int(item["hook"].split(".")[1])
+                for item in expected_source["sources"]
+            ]
+            assert stop_at_layer == max(expected_layers) + 1
             cache = {}
             for index, item in enumerate(expected_source["sources"]):
                 hook = item["hook"]

@@ -100,16 +100,17 @@ def evaluate_shared_code(
     cfg = model.cfg
     S, G, b = cfg.n_sites, cfg.n_blocks, cfg.block_dim
     coord = model.coordinate_mask[:, 0, 0].to(device)
+    has_padded_coordinates = model._has_padded_coordinates
 
     target_sum = torch.zeros(S, cfg.d_model, dtype=torch.float64, device=device)
     target_sumsq = torch.zeros_like(target_sum)
     full_sse = torch.zeros(S, dtype=torch.float64, device=device)
     site_sse = torch.zeros(S, S, dtype=torch.float64, device=device)
     loo_sse = torch.zeros(S, S, dtype=torch.float64, device=device)
-    support_intersection = torch.zeros(S, dtype=torch.float64)
-    support_union = torch.zeros(S, dtype=torch.float64)
-    loo_intersection = torch.zeros(S, dtype=torch.float64)
-    loo_union = torch.zeros(S, dtype=torch.float64)
+    support_intersection = torch.zeros(S, dtype=torch.float64, device=device)
+    support_union = torch.zeros(S, dtype=torch.float64, device=device)
+    loo_intersection = torch.zeros(S, dtype=torch.float64, device=device)
+    loo_union = torch.zeros(S, dtype=torch.float64, device=device)
     site_intersection_count = torch.zeros(S, G, dtype=torch.float64, device=device)
     site_full_count = torch.zeros_like(site_intersection_count)
     site_concordance_numerator = torch.zeros(S, G, dtype=torch.float64, device=device)
@@ -131,7 +132,13 @@ def evaluate_shared_code(
     fire = torch.zeros(G, dtype=torch.float64, device=device)
     zsum = torch.zeros(G, b, dtype=torch.float64, device=device)
     zz = torch.zeros(G, b, b, dtype=torch.float64, device=device)
-    decoder = model.decoder_tensor().double()
+    materialized_decoder = model.decoder_tensor()
+    materialized_encoder = (
+        materialized_decoder * model.log_gamma.exp()
+        if cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    decoder = materialized_decoder.double()
     all_site_decoder_gram = torch.einsum("sgbd,sgcd->gbc", decoder, decoder)
     n_tokens = 0
 
@@ -152,7 +159,7 @@ def evaluate_shared_code(
         """Accumulate gauge-invariant agreement on matched support events."""
 
         intersection = partial.mask & full.mask
-        full_code = full.z.double()
+        full_code = full_code64
         partial_code = partial.z.double()
         intersection_f = intersection.unsqueeze(-1).double()
         full_intersection = full_code * intersection_f
@@ -175,15 +182,9 @@ def evaluate_shared_code(
             all_site_decoder_gram,
             partial_intersection,
         )
-        all_full_code = full.z_selected.double()
-        all_full_q = torch.einsum(
-            "ngb,gbc,ngc->ng",
-            all_full_code,
-            all_site_decoder_gram,
-            all_full_code,
-        )
+        all_full_q = all_full_q64
         intersection_count[index] += intersection.sum(dim=0).double()
-        full_count[index] += full.mask.sum(dim=0).double()
+        full_count[index] += full_mask_count64
         concordance_numerator[index] += 2.0 * cross.sum(dim=0)
         concordance_denominator[index] += full_q.sum(dim=0) + partial_q.sum(dim=0)
         full_code_sum[index] += full_intersection.sum(dim=0)
@@ -194,23 +195,46 @@ def evaluate_shared_code(
     for raw in batches:
         if max_tokens is not None and n_tokens >= max_tokens:
             break
-        x = raw.to(device=device, dtype=torch.float32)
+        x = raw.to(device=device, dtype=torch.float32, non_blocking=True)
         if max_tokens is not None:
             x = x[: max_tokens - n_tokens]
         if not x.numel():
             break
-        observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
-        full = model(x, mode=selection_mode, observed=observed_all)
-        valid = x.double() * coord
+        full, _, _ = model.forward_with_materialized(
+            x,
+            mode=selection_mode,
+            _decoder=materialized_decoder,
+            _encoder=materialized_encoder,
+        )
+        x64 = x.double()
+        valid = x64 * coord if has_padded_coordinates else x64
         target_sum += valid.sum(dim=0)
         target_sumsq += valid.square().sum(dim=0)
-        full_sse += ((x.double() - full.xhat.double()) * coord).square().sum(dim=(0, 2))
-        selected = full.z_selected.double()
-        fire += full.mask.sum(dim=0).double()
-        zsum += selected.sum(dim=0)
-        zz += torch.einsum("ngb,ngc->gbc", selected, selected)
+        full_residual = x64 - full.xhat.double()
+        if has_padded_coordinates:
+            full_residual = full_residual * coord
+        full_sse += full_residual.square().sum(dim=(0, 2))
+        full_code64 = full.z.double()
+        full_selected64 = full.z_selected.double()
+        full_mask_count64 = full.mask.sum(dim=0).double()
+        all_full_q64 = torch.einsum(
+            "ngb,gbc,ngc->ng",
+            full_selected64,
+            all_site_decoder_gram,
+            full_selected64,
+        )
+        fire += full_mask_count64
+        zsum += full_selected64.sum(dim=0)
+        zz += torch.einsum("ngb,ngc->gbc", full_selected64, full_selected64)
+        observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
+        zero_x: torch.Tensor | None = None
 
-        def run_view(view_observed: torch.Tensor):
+        def run_view(
+            view_observed: torch.Tensor,
+            *,
+            source_missing: bool,
+            empty: bool,
+        ):
             """Run a partial view, using a zero-information null encoding.
 
             Source-only fusion cannot encode a view which omits its declared
@@ -219,30 +243,46 @@ def evaluate_shared_code(
             the operational null: it preserves learned encoder/decoder biases
             without leaking any held-out activation.
             """
-            source_missing = cfg.encoder_fusion == "source" and not bool(
-                view_observed[:, cfg.source_site].all()
-            )
-            empty = not bool(view_observed.any(dim=1).all())
             if source_missing or empty:
+                nonlocal zero_x
+                if zero_x is None:
+                    zero_x = torch.zeros_like(x)
                 null_observed = torch.zeros_like(view_observed)
                 fallback = cfg.source_site if cfg.encoder_fusion == "source" else 0
                 null_observed[:, fallback] = True
-                return model(
-                    torch.zeros_like(x),
+                return model.forward_with_materialized(
+                    zero_x,
                     mode=selection_mode,
                     observed=null_observed,
-                )
-            return model(x, mode=selection_mode, observed=view_observed)
+                    validate_observed=False,
+                    _decoder=materialized_decoder,
+                    _encoder=materialized_encoder,
+                )[0]
+            return model.forward_with_materialized(
+                x,
+                mode=selection_mode,
+                observed=view_observed,
+                validate_observed=False,
+                _decoder=materialized_decoder,
+                _encoder=materialized_encoder,
+            )[0]
 
         for source in range(S):
             only_observed = torch.zeros_like(observed_all)
             only_observed[:, source] = True
-            only = run_view(only_observed)
-            site_sse[source] += (
-                ((x.double() - only.xhat.double()) * coord).square().sum(dim=(0, 2))
+            only = run_view(
+                only_observed,
+                source_missing=(
+                    cfg.encoder_fusion == "source" and source != cfg.source_site
+                ),
+                empty=False,
             )
-            support_intersection[source] += (only.mask & full.mask).sum().cpu()
-            support_union[source] += (only.mask | full.mask).sum().cpu()
+            site_residual = x64 - only.xhat.double()
+            if has_padded_coordinates:
+                site_residual = site_residual * coord
+            site_sse[source] += site_residual.square().sum(dim=(0, 2))
+            support_intersection[source] += (only.mask & full.mask).sum()
+            support_union[source] += (only.mask | full.mask).sum()
             accumulate_coordinate_concordance(
                 only,
                 full,
@@ -259,12 +299,19 @@ def evaluate_shared_code(
 
             missing_observed = observed_all.clone()
             missing_observed[:, source] = False
-            missing = run_view(missing_observed)
-            loo_sse[source] += (
-                ((x.double() - missing.xhat.double()) * coord).square().sum(dim=(0, 2))
+            missing = run_view(
+                missing_observed,
+                source_missing=(
+                    cfg.encoder_fusion == "source" and source == cfg.source_site
+                ),
+                empty=S == 1,
             )
-            loo_intersection[source] += (missing.mask & full.mask).sum().cpu()
-            loo_union[source] += (missing.mask | full.mask).sum().cpu()
+            loo_residual = x64 - missing.xhat.double()
+            if has_padded_coordinates:
+                loo_residual = loo_residual * coord
+            loo_sse[source] += loo_residual.square().sum(dim=(0, 2))
+            loo_intersection[source] += (missing.mask & full.mask).sum()
+            loo_union[source] += (missing.mask | full.mask).sum()
             accumulate_coordinate_concordance(
                 missing,
                 full,
@@ -279,10 +326,10 @@ def evaluate_shared_code(
                 full_energy=loo_full_energy,
             )
             pre_selection_loo_delta_sq[source] += (
-                (missing.z.double() - full.z.double()).square().sum(dim=(0, 2))
+                (missing.z.double() - full_code64).square().sum(dim=(0, 2))
             )
             post_selection_loo_delta_sq[source] += (
-                (missing.z_selected.double() - full.z_selected.double())
+                (missing.z_selected.double() - full_selected64)
                 .square()
                 .sum(dim=(0, 2))
             )

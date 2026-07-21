@@ -14,6 +14,7 @@ from block_crosscoder_experiment.codec import (
     _packet_from_output,
     decode_batch,
     encode_batch,
+    encode_batch_all_q,
     evaluate_rd,
     fit_codec,
 )
@@ -364,3 +365,45 @@ def test_explicit_sparse_packet_round_trip():
         bad_symbols[0, 0] = 1 << packet.q
         with pytest.raises(ValueError, match="alphabet"):
             decode_batch(model, codec, replace(packet, amplitude_symbols=bad_symbols))
+
+
+def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
+    model = make_model(g=12, b=2, k=3)
+    x = torch.randn(96, S, D)
+    model.fit_threshold_([x[:48]], target_avg_blocks=3)
+    codec = fit_codec(
+        model,
+        [x[:48]],
+        CodecSpec(qs=(2, 4, 6), floor=1, n_bootstrap=4),
+    )
+    original = model.forward_with_materialized
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_with_materialized", counted)
+    out, packets = encode_batch_all_q(model, codec, x[48:])
+    assert calls == 1
+    for q, packet in packets.items():
+        expected = _packet_from_output(model, codec, out, q)
+        assert torch.equal(packet.counts, expected.counts)
+        assert torch.equal(packet.block_ids, expected.block_ids)
+        assert torch.equal(packet.amplitude_symbols, expected.amplitude_symbols)
+
+
+def test_codec_device_cache_refreshes_after_tensor_mutation():
+    model = make_model(g=6, b=2, k=2)
+    x = torch.randn(64, S, D)
+    model.fit_threshold_([x[:32]], target_avg_blocks=2)
+    codec = fit_codec(
+        model,
+        [x[:32]],
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=4),
+    )
+    first = codec._tensor_on("lo", "cpu", dtype=torch.float64).clone()
+    codec.lo.add_(1.0)
+    second = codec._tensor_on("lo", "cpu", dtype=torch.float64)
+    assert torch.equal(second, first + 1.0)

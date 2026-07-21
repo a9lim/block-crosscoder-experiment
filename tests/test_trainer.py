@@ -69,6 +69,26 @@ def test_optimizer_numerics_are_explicitly_frozen():
         train_cfg(total_steps=1, foreach=True)
 
 
+def test_gradient_clipping_updates_master_gradients_and_reports_both_norms(device):
+    clip = 1e-4
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=2, gradient_clip_norm=clip),
+    )
+    record = trainer.step(planted_batches(device, n_batches=1)[0])
+    gradients = [
+        parameter.grad
+        for parameter in trainer.master.parameters()
+        if parameter.grad is not None
+    ]
+    actual = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(gradient.float()) for gradient in gradients])
+    )
+    assert record["grad_norm_unclipped"] > clip
+    assert float(actual) <= clip * 1.001
+    assert record["grad_norm"] == pytest.approx(float(actual), rel=2e-5)
+
+
 def test_projection_cadence_counts_completed_updates(device, monkeypatch):
     """Cadence two projects after updates 2 and 4, not 1, 3, and 5."""
     calls: list[int] = []
