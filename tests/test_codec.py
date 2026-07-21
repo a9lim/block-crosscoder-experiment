@@ -16,6 +16,7 @@ from block_crosscoder_experiment.codec import (
     decode_batch_all_q,
     encode_batch,
     encode_batch_all_q,
+    estimate_calibration_peak_bytes,
     evaluate_rd,
     fit_codec,
 )
@@ -85,6 +86,15 @@ def test_codec_calibration_memory_ceiling_fails_without_sampling():
     spec = CodecSpec(qs=(4,), floor=1, n_bootstrap=2, max_calibration_event_bytes=1)
     with pytest.raises(MemoryError, match="memory ceiling"):
         fit_codec(model, [torch.randn(16, S, D)], spec)
+
+
+def test_codec_calibration_memory_estimator_caps_moment_workspace():
+    boundary = 262_144
+    at_boundary = estimate_calibration_peak_bytes(boundary, 4)
+    assert at_boundary == boundary * (32 + 24 * 4 + 8 * 4 * 4 + 8 * 4)
+    assert estimate_calibration_peak_bytes(boundary + 1, 4) - at_boundary == (
+        32 + 24 * 4
+    )
 
 
 def test_high_q_approaches_unquantized():

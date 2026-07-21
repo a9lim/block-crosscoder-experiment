@@ -45,6 +45,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _support_matched_subspace_overlap,
     _tensor_payload_digest,
     _time_sharing_plan_key,
+    _transform_on_cuda,
     _training_batches,
     _train_config,
     _verify_real_source_contract,
@@ -1990,6 +1991,8 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     # manifests.  Exercise the numerical refusal gate directly here while
     # the campaign tests cover manifest binding and forgery rejection.
     preparation = {"data": {"kind": "activation_store", **resolved}}
+    assert not _transform_on_cuda(preparation, torch.device("cpu"))
+    assert _transform_on_cuda(preparation, torch.device("cuda"))
     preflight_ctx = SimpleNamespace(values=values)
     init_x = next(_training_batches(preflight_ctx, preparation, start_token=0))
     model = BlockCrosscoder(_model_config(cell))

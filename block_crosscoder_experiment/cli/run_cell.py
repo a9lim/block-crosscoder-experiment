@@ -47,6 +47,7 @@ from block_crosscoder_experiment.codec import (
     decode_batch_all_q,
     encode_batch,
     encode_batch_all_q,
+    estimate_calibration_peak_bytes,
     evaluate_rd,
     fit_codec,
 )
@@ -2977,6 +2978,18 @@ def _apply_prepared_transform(
     return result * coordinate_mask.unsqueeze(0)
 
 
+def _transform_on_cuda(
+    preparation: Mapping[str, Any],
+    device: torch.device,
+) -> bool:
+    data = preparation["data"]
+    return (
+        device.type == "cuda"
+        and data["kind"] == "activation_store"
+        and data.get("normalization", {}).get("application") == "on_the_fly"
+    )
+
+
 def _decode_transform(
     preparation: Mapping[str, Any],
 ) -> tuple[Whitener | None, tuple[int, ...]]:
@@ -3466,6 +3479,27 @@ def _rd_evaluation_batches(
     transform = _prepared_transform(preparation)
     for batch, row_ids in reader.sequential_batches_with_ids(batch_size):
         yield _apply_prepared_transform(batch, preparation, transform), row_ids
+
+
+def _prefetched_evaluation_batches(
+    ctx: _Context,
+    preparation: Mapping[str, Any],
+    role: str = "evaluation",
+) -> Iterator[torch.Tensor]:
+    batches: Iterator[torch.Tensor] = _evaluation_batches(ctx, preparation, role)
+    if _device(ctx).type == "cuda":
+        batches = prefetch_batches(batches, depth=2, pin_memory=True)
+    return batches
+
+
+def _prefetched_rd_evaluation_batches(
+    ctx: _Context,
+    preparation: Mapping[str, Any],
+) -> Iterator[torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    batches = _rd_evaluation_batches(ctx, preparation)
+    if _device(ctx).type == "cuda":
+        batches = prefetch_batches(batches, depth=2, pin_memory=True)
+    return batches
 
 
 def _unpack_training_batch(
@@ -4119,12 +4153,7 @@ def _train(
     checkpoint_tokens = max(1, int(ctx.values["runtime.checkpoint_tokens"]))
     next_checkpoint = ((start_token // checkpoint_tokens) + 1) * checkpoint_tokens
     cuda_transform: Whitener | None = None
-    transform_on_cuda = (
-        device.type == "cuda"
-        and preparation["data"]["kind"] == "real"
-        and preparation["data"].get("normalization", {}).get("application")
-        == "on_the_fly"
-    )
+    transform_on_cuda = _transform_on_cuda(preparation, device)
     if transform_on_cuda:
         cuda_transform = _prepared_transform(preparation)
         if cuda_transform is None:
@@ -4136,9 +4165,9 @@ def _train(
         apply_transform=not transform_on_cuda,
     )
     if device.type == "cuda":
-        # Transformation and shard reads remain deterministic CPU work.  Keep
-        # two pinned batches ready so Trainer's nonblocking transfers can run
-        # without putting storage latency on the GPU's critical path.
+        # Keep two pinned raw batches ready so shard latency and the next H2D
+        # transfer do not sit on the GPU's critical path.  On-the-fly Phase-3
+        # transforms execute after that nonblocking transfer on CUDA.
         training_batches = prefetch_batches(
             training_batches,
             depth=2,
@@ -4287,7 +4316,10 @@ def _calibrate(
             ctx.values["codec.max_calibration_event_bytes"]
         ),
     )
-    preflight_event_bytes = achieved_events * (32 + 24 * model.cfg.block_dim)
+    preflight_event_bytes = estimate_calibration_peak_bytes(
+        achieved_events,
+        model.cfg.block_dim,
+    )
     if preflight_event_bytes > spec.max_calibration_event_bytes:
         raise CellExecutionError(
             "exact codec calibration exceeds its resolved event-memory ceiling "
@@ -5063,18 +5095,27 @@ def _evaluate_native_selector(
     error = torch.zeros(sites, dtype=torch.float64, device=device)
     total_sum = torch.zeros(sites, width, dtype=torch.float64, device=device)
     total_square = torch.zeros_like(total_sum)
-    support_histogram: dict[int, int] = {}
-    gain_counts = {
-        "candidate_negative": 0,
-        "candidate_zero": 0,
-        "candidate_positive": 0,
-        "selected_negative": 0,
-        "selected_zero": 0,
-        "selected_positive": 0,
-    }
+    support_counts = torch.zeros(
+        model.cfg.n_blocks + 1,
+        dtype=torch.int64,
+        device=device,
+    )
+    gain_count_names = (
+        "candidate_negative",
+        "candidate_zero",
+        "candidate_positive",
+        "selected_negative",
+        "selected_zero",
+        "selected_positive",
+    )
+    gain_count_tensor = torch.zeros(
+        len(gain_count_names),
+        dtype=torch.int64,
+        device=device,
+    )
     tokens = 0
     for raw in batches:
-        x = raw.to(device=device, dtype=torch.float32)
+        x = raw.to(device=device, dtype=torch.float32, non_blocking=True)
         if not x.numel():
             continue
         # Isolated-loss diagnostics explicitly exercise observed-site
@@ -5095,25 +5136,40 @@ def _evaluate_native_selector(
             masked = masked * coordinate_mask
         total_sum += masked.sum(dim=0)
         total_square += masked.square().sum(dim=0)
-        counts = out.mask.sum(dim=1).cpu()
-        for count, frequency in zip(*torch.unique(counts, return_counts=True)):
-            key = int(count)
-            support_histogram[key] = support_histogram.get(key, 0) + int(frequency)
+        counts = out.mask.sum(dim=1)
+        support_counts += torch.bincount(
+            counts,
+            minlength=model.cfg.n_blocks + 1,
+        )
         if model.cfg.selection_score == "isolated_loss_decrease":
             scores = out.scores
-            selected_scores = scores[out.mask]
-            gain_counts["candidate_negative"] += int((scores < 0).sum())
-            gain_counts["candidate_zero"] += int((scores == 0).sum())
-            gain_counts["candidate_positive"] += int((scores > 0).sum())
-            gain_counts["selected_negative"] += int((selected_scores < 0).sum())
-            gain_counts["selected_zero"] += int((selected_scores == 0).sum())
-            gain_counts["selected_positive"] += int((selected_scores > 0).sum())
+            negative = scores < 0
+            zero = scores == 0
+            positive = scores > 0
+            gain_count_tensor += torch.stack(
+                (
+                    negative.sum(),
+                    zero.sum(),
+                    positive.sum(),
+                    (negative & out.mask).sum(),
+                    (zero & out.mask).sum(),
+                    (positive & out.mask).sum(),
+                )
+            )
         tokens += len(x)
     if tokens == 0:
         raise CellExecutionError("native-selector evaluation stream is empty")
     centered = total_square - total_sum.square() / tokens
     denominator = centered.sum(dim=1).clamp_min(1e-30)
     fvu = error / denominator
+    support_histogram = {
+        count: frequency
+        for count, frequency in enumerate(support_counts.cpu().tolist())
+        if frequency
+    }
+    gain_counts = dict(
+        zip(gain_count_names, gain_count_tensor.cpu().tolist(), strict=True)
+    )
     event_total = sum(
         count * frequency for count, frequency in support_histogram.items()
     )
@@ -6718,36 +6774,37 @@ def _evaluate(
     ):
         raise CellExecutionError("deployable codec/input binding mismatch")
 
+    device = _device(ctx)
     native = _evaluate_native_selector(
         model,
-        _evaluation_batches(ctx, preparation, "evaluation"),
-        device=_device(ctx),
+        _prefetched_evaluation_batches(ctx, preparation),
+        device=device,
         selection_mode="topk",
     )
     deployed = _evaluate_native_selector(
         model,
-        _evaluation_batches(ctx, preparation, "evaluation"),
-        device=_device(ctx),
+        _prefetched_evaluation_batches(ctx, preparation),
+        device=device,
         selection_mode="threshold",
     )
     shared_native = evaluate_shared_code(
         model,
-        _evaluation_batches(ctx, preparation, "evaluation"),
-        device=_device(ctx),
+        _prefetched_evaluation_batches(ctx, preparation),
+        device=device,
         selection_mode="topk",
     )
     shared_deployed = evaluate_shared_code(
         model,
-        _evaluation_batches(ctx, preparation, "evaluation"),
-        device=_device(ctx),
+        _prefetched_evaluation_batches(ctx, preparation),
+        device=device,
         selection_mode="threshold",
     )
     rd = evaluate_rd(
         model,
         codec,
-        _rd_evaluation_batches(ctx, preparation),
+        _prefetched_rd_evaluation_batches(ctx, preparation),
         row_len=1 if preparation["data"]["kind"] == "synthetic" else None,
-        device=str(_device(ctx)),
+        device=str(device),
     )
     first_batch = next(_evaluation_batches(ctx, preparation, "evaluation"))
     roundtrip_q = max(codec.spec.qs)

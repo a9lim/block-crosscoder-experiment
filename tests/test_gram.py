@@ -210,6 +210,7 @@ def test_chunked_site_spectrum_matches_and_has_grad(monkeypatch, device):
     D = random_stack(device, seed=10)
     expected = site_singular_values(D)
     monkeypatch.setattr(gram_module, "_SPECTRUM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "_SPECTRUM_CUDA_BLOCK_CHUNK", 3)
     monkeypatch.setattr(gram_module, "_SPECTRUM_UNCHUNKED_MAX", 0)
     D.requires_grad_(True)
     actual = site_singular_values(D)

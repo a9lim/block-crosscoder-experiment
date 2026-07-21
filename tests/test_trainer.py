@@ -183,6 +183,14 @@ def test_dead_tracker_windows_are_token_denominated(device):
     assert tracker.dead(
         "sasa", threshold=0.5, window_tokens=10, horizon_tokens=10
     ).tolist() == [False, True]
+    restored = DeadTracker(n_blocks=2, capacity=2, device=device, max_tokens=10)
+    restored.load_state_dict(tracker.state_dict())
+    assert restored.history_tokens == tracker.history_tokens
+    assert torch.equal(restored.frequency(10), tracker.frequency(10))
+    next_mask = torch.tensor([[True, False]] * 3, device=device)
+    tracker.update(next_mask)
+    restored.update(next_mask)
+    assert torch.equal(restored.frequency(10), tracker.frequency(10))
 
 
 def test_dead_tracker_slices_the_oldest_batch_at_the_exact_window(device):

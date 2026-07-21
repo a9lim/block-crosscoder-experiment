@@ -32,6 +32,7 @@ _EIGH_MAX_BATCH = 16384
 _GRAM_BLOCK_CHUNK = 512
 _RETRACT_UNCHUNKED_MAX = 4096
 _SPECTRUM_BLOCK_CHUNK = 256
+_SPECTRUM_CUDA_BLOCK_CHUNK = 256
 _SPECTRUM_UNCHUNKED_MAX = 4096
 
 __all__ = [
@@ -139,6 +140,18 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     D: [S, G, b, d]  ->  [S, G, b]
     """
     if D.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
+        if D.is_cuda:
+            # cuSOLVER reserves substantial workspace per tiny matrix.  A
+            # fixed 256-block slice bounds that workspace while keeping both
+            # the eigensolve and its backward pass on device; the former CPU
+            # fallback paid a full synchronization and PCIe round-trip.
+            chunks = []
+            for start in range(0, D.shape[1], _SPECTRUM_CUDA_BLOCK_CHUNK):
+                block = D[:, start : start + _SPECTRUM_CUDA_BLOCK_CHUNK].float()
+                gram = torch.einsum("sgbd,sgcd->sgbc", block, block)
+                flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
+                chunks.append(torch.linalg.eigvalsh(flat).reshape(gram.shape[:-1]))
+            return (torch.cat(chunks, dim=1).clamp_min(0.0) + eps).sqrt()
         gram_chunks = []
         for start in range(0, D.shape[1], _SPECTRUM_BLOCK_CHUNK):
             block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK].float()

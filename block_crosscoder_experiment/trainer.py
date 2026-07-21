@@ -262,6 +262,10 @@ class DeadTracker:
         self.max_tokens = max_tokens
         self.device = torch.device(device)
         self.chunks: list[torch.Tensor] = []
+        self._history_tokens = 0
+        self._history_count = torch.zeros(
+            n_blocks, dtype=torch.int64, device=self.device
+        )
         self.tokens_seen = 0
         self.last_fire = torch.full(
             (n_blocks,), -1, dtype=torch.int64, device=self.device
@@ -321,24 +325,43 @@ class DeadTracker:
         self.forward_passes += 1
 
         if self.max_tokens != 0:
+            if self.max_tokens is not None and len(accepted) >= self.max_tokens:
+                suffix = accepted[-self.max_tokens :].clone()
+                self.chunks = [suffix]
+                self._history_tokens = len(suffix)
+                self._history_count.copy_(suffix.sum(dim=0, dtype=torch.int64))
+                return
             self.chunks.append(accepted.clone())
+            self._history_tokens += len(accepted)
+            self._history_count += accepted.sum(dim=0, dtype=torch.int64)
             if self.max_tokens is None:
                 while len(self.chunks) > self.capacity:
-                    self.chunks.pop(0)
+                    removed = self.chunks.pop(0)
+                    self._history_tokens -= len(removed)
+                    self._history_count -= removed.sum(dim=0, dtype=torch.int64)
             else:
                 excess = self.history_tokens - self.max_tokens
                 while excess > 0 and self.chunks:
                     oldest = self.chunks[0]
                     if excess >= len(oldest):
                         excess -= len(oldest)
-                        self.chunks.pop(0)
+                        removed = self.chunks.pop(0)
+                        self._history_tokens -= len(removed)
+                        self._history_count -= removed.sum(
+                            dim=0, dtype=torch.int64
+                        )
                     else:
+                        removed = oldest[:excess]
                         self.chunks[0] = oldest[excess:].clone()
+                        self._history_tokens -= len(removed)
+                        self._history_count -= removed.sum(
+                            dim=0, dtype=torch.int64
+                        )
                         excess = 0
 
     @property
     def history_tokens(self) -> int:
-        return sum(len(chunk) for chunk in self.chunks)
+        return self._history_tokens
 
     def frequency(self, window_tokens: int) -> torch.Tensor:
         """Per-block frequency over the last ``window_tokens`` accepted tokens.
@@ -350,7 +373,10 @@ class DeadTracker:
             raise ValueError("window_tokens must be positive")
         if not self.chunks:
             return torch.zeros(self.n_blocks, device=self.device)
-        remaining = min(window_tokens, self.history_tokens)
+        history_tokens = self.history_tokens
+        if window_tokens >= history_tokens:
+            return self._history_count.float() / max(1, history_tokens)
+        remaining = window_tokens
         total = torch.zeros(self.n_blocks, device=self.device)
         for chunk in reversed(self.chunks):
             take = min(remaining, len(chunk))
@@ -358,8 +384,7 @@ class DeadTracker:
             remaining -= take
             if remaining == 0:
                 break
-        denominator = min(window_tokens, self.history_tokens)
-        return total / max(1, denominator)
+        return total / window_tokens
 
     def dead(
         self,
@@ -430,6 +455,10 @@ class DeadTracker:
             chunk.to(device=self.device, dtype=torch.bool).clone()
             for chunk in state.get("chunks", [])
         ]
+        self._history_tokens = sum(len(chunk) for chunk in self.chunks)
+        self._history_count.zero_()
+        for chunk in self.chunks:
+            self._history_count += chunk.sum(dim=0, dtype=torch.int64)
         self.tokens_seen = int(state.get("tokens_seen", self.history_tokens))
         self.last_fire = state.get("last_fire", self.last_fire).to(
             device=self.device, dtype=torch.int64

@@ -23,6 +23,8 @@ __all__ = [
     "load_trained_model",
 ]
 
+_DECODER_GRAM_BLOCK_CHUNK = 256
+
 
 def checkpoint_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -138,8 +140,26 @@ def evaluate_shared_code(
         if cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
-    decoder = materialized_decoder.double()
-    all_site_decoder_gram = torch.einsum("sgbd,sgcd->gbc", decoder, decoder)
+    # A publication-scale decoder can be several GiB in fp32.  Keeping a
+    # complete fp64 copy alive for evaluation can therefore exceed the 24 GiB
+    # device even though the Gram products themselves are tiny.  Materialize
+    # bounded fp64 block slices, retain only their O(S*G*b^2) Grams, and release
+    # each wide slice before the next one.
+    decoder_gram_chunks: list[torch.Tensor] = []
+    all_site_decoder_gram_chunks: list[torch.Tensor] = []
+    for start in range(0, G, _DECODER_GRAM_BLOCK_CHUNK):
+        decoder_chunk = materialized_decoder[
+            :, start : start + _DECODER_GRAM_BLOCK_CHUNK
+        ].double()
+        site_gram_chunk = torch.einsum(
+            "sgbd,sgcd->sgbc", decoder_chunk, decoder_chunk
+        )
+        decoder_gram_chunks.append(site_gram_chunk)
+        all_site_decoder_gram_chunks.append(site_gram_chunk.sum(dim=0))
+        del decoder_chunk
+    decoder_gram = torch.cat(decoder_gram_chunks, dim=1)
+    all_site_decoder_gram = torch.cat(all_site_decoder_gram_chunks, dim=0)
+    del decoder_gram_chunks, all_site_decoder_gram_chunks, site_gram_chunk
     n_tokens = 0
 
     def accumulate_coordinate_concordance(
@@ -164,24 +184,19 @@ def evaluate_shared_code(
         intersection_f = intersection.unsqueeze(-1).double()
         full_intersection = full_code * intersection_f
         partial_intersection = partial_code * intersection_f
-        full_q = torch.einsum(
-            "ngb,gbc,ngc->ng",
+        full_mapped = torch.einsum(
+            "ngb,gbc->ngc",
             full_intersection,
             all_site_decoder_gram,
-            full_intersection,
         )
+        full_q = (full_mapped * full_intersection).sum(dim=-1)
         partial_q = torch.einsum(
             "ngb,gbc,ngc->ng",
             partial_intersection,
             all_site_decoder_gram,
             partial_intersection,
         )
-        cross = torch.einsum(
-            "ngb,gbc,ngc->ng",
-            full_intersection,
-            all_site_decoder_gram,
-            partial_intersection,
-        )
+        cross = (full_mapped * partial_intersection).sum(dim=-1)
         all_full_q = all_full_q64
         intersection_count[index] += intersection.sum(dim=0).double()
         full_count[index] += full_mask_count64
@@ -381,31 +396,24 @@ def evaluate_shared_code(
         safe_count = intersection_count.clamp_min(1.0)
         mean_full = full_code_sum / safe_count.unsqueeze(-1)
         mean_partial = partial_code_sum / safe_count.unsqueeze(-1)
-        centered_numerator = numerator - 2.0 * intersection_count * torch.einsum(
-            "sgb,gbc,sgc->sg",
-            mean_full,
+        means = torch.stack((mean_full, mean_partial))
+        mapped_means = torch.einsum(
+            "xsgb,gbc->xsgc",
+            means,
             all_site_decoder_gram,
-            mean_partial,
         )
+        full_mean_q = (mapped_means[0] * mean_full).sum(dim=-1)
+        partial_mean_q = (mapped_means[1] * mean_partial).sum(dim=-1)
+        mean_cross = (mapped_means[0] * mean_partial).sum(dim=-1)
+        centered_numerator = numerator - 2.0 * intersection_count * mean_cross
         centered_denominator = concordance_denominator - intersection_count * (
-            torch.einsum(
-                "sgb,gbc,sgc->sg",
-                mean_full,
-                all_site_decoder_gram,
-                mean_full,
-            )
-            + torch.einsum(
-                "sgb,gbc,sgc->sg",
-                mean_partial,
-                all_site_decoder_gram,
-                mean_partial,
-            )
+            full_mean_q + partial_mean_q
         )
-        mean_offset_energy = intersection_count * torch.einsum(
-            "sgb,gbc,sgc->sg",
-            mean_full - mean_partial,
-            all_site_decoder_gram,
-            mean_full - mean_partial,
+        mean_delta = mean_full - mean_partial
+        mean_offset_energy = intersection_count * (
+            (mapped_means[0] - mapped_means[1]) * mean_delta
+        ).sum(
+            dim=-1
         )
         # Lin-style concordance in decoded-coordinate geometry.  Centering the
         # covariance prevents a common bias from dominating, while the mean-
@@ -569,8 +577,6 @@ def evaluate_shared_code(
     # constant nonzero code from masquerading as a varying used direction.
     # The algebra is batched in bounded chunks; a Python loop over S*G is
     # prohibitive for Phase-3 scalar dictionaries.
-    D = decoder
-    decoder_gram = torch.einsum("sgbd,sgcd->sgbc", D, D)
     used_eigenvalues = torch.zeros(S, G, b, dtype=torch.float64, device=device)
     chunk_size = 4096
     for start in range(0, G, chunk_size):

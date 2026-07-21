@@ -100,7 +100,13 @@ class StreamingScoreQuantile:
             raise ValueError("no scores accumulated")
         target = min(max(int(round(q * n)), 1), n)
         cum = torch.cumsum(self.counts, dim=0)
-        bin_idx = int(torch.searchsorted(cum, torch.tensor(target), right=False))
+        bin_idx = int(
+            torch.searchsorted(
+                cum,
+                torch.tensor(target, dtype=cum.dtype, device=cum.device),
+                right=False,
+            )
+        )
         if bin_idx == 0:
             return self.lo
         if bin_idx >= self.n_bins + 1:
@@ -166,7 +172,15 @@ class SignedStreamingScoreQuantile:
         target = min(max(int(round(q * count)), 1), count)
         cumulative = torch.cumsum(self.counts, dim=0)
         bin_index = int(
-            torch.searchsorted(cumulative, torch.tensor(target), right=False)
+            torch.searchsorted(
+                cumulative,
+                torch.tensor(
+                    target,
+                    dtype=cumulative.dtype,
+                    device=cumulative.device,
+                ),
+                right=False,
+            )
         )
         if bin_index == 0:
             return -self.hi

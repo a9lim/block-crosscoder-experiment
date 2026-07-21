@@ -69,6 +69,7 @@ __all__ = [
     "encode_batch_all_q",
     "decode_batch",
     "decode_batch_all_q",
+    "estimate_calibration_peak_bytes",
 ]
 
 
@@ -89,6 +90,21 @@ _CODEC_PAYLOAD_KEYS = {
     "meta",
     "artifact_sha256",
 }
+
+# Bounds the fp64 second-moment workspace independently of the number of
+# selected calibration events.  At the publication block width (b=4), this is
+# a 32 MiB outer-product slab plus a small code-conversion buffer.
+_CALIBRATION_MOMENT_CHUNK = 262_144
+
+
+def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int:
+    """Conservative host-memory estimate shared by preflight and fitting."""
+    if selected_events < 0 or block_dim <= 0:
+        raise ValueError("calibration events must be nonnegative and block_dim positive")
+    moment_events = min(selected_events, _CALIBRATION_MOMENT_CHUNK)
+    return selected_events * (32 + 24 * block_dim) + moment_events * (
+        8 * block_dim * block_dim + 8 * block_dim
+    )
 
 
 def _artifact_digest(payload: dict) -> str:
@@ -1013,7 +1029,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
         # Conservative bound for list storage, concatenation overlap,
         # canonical-code workspace, sort indices and per-event IDs.  The
         # ceiling fails closed; calibration never samples or truncates events.
-        estimated_peak_bytes = selected_events * (32 + 24 * b)
+        estimated_peak_bytes = estimate_calibration_peak_bytes(selected_events, b)
         if estimated_peak_bytes > spec.max_calibration_event_bytes:
             raise MemoryError(
                 "exact codec calibration exceeds its resolved event-memory ceiling: "
@@ -1058,9 +1074,17 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     # Canonical orientation: batched second moments via index_add, eigh
     # descending, sign so the active-mean projection is >= 0.
     M = torch.zeros(G, b, b, dtype=torch.float64)
-    M.index_add_(0, ids, torch.einsum("ni,nj->nij", codes.double(), codes.double()))
     mean_code = torch.zeros(G, b, dtype=torch.float64)
-    mean_code.index_add_(0, ids, codes.double())
+    for start in range(0, len(codes), _CALIBRATION_MOMENT_CHUNK):
+        stop = start + _CALIBRATION_MOMENT_CHUNK
+        codes64 = codes[start:stop].double()
+        chunk_ids = ids[start:stop]
+        M.index_add_(
+            0,
+            chunk_ids,
+            codes64.unsqueeze(2) * codes64.unsqueeze(1),
+        )
+        mean_code.index_add_(0, chunk_ids, codes64)
     denom = block_events.clamp_min(1).double()
     M /= denom.view(-1, 1, 1)
     mean_code /= denom.view(-1, 1)
@@ -1200,8 +1224,8 @@ def evaluate_rd(
         pend["sup"] = pend["bern"] = pend["cnt"] = 0.0
         pend["n"] = 0
 
-    excluded_events = 0
-    total_events = 0
+    excluded_events = torch.zeros((), dtype=torch.int64, device=device)
+    total_events = torch.zeros((), dtype=torch.int64, device=device)
     sequence_mode: str | None = None
     current_sequence: int | None = None
     fallback_token_offset = 0
@@ -1245,7 +1269,7 @@ def evaluate_rd(
                 // row_len
             )
             fallback_token_offset += x.shape[0]
-        x = x.to(device, torch.float32)
+        x = x.to(device, torch.float32, non_blocking=True)
         out = _threshold_forward(
             model,
             x,
@@ -1254,8 +1278,8 @@ def evaluate_rd(
         )
         raw_mask = out.mask
         mask = raw_mask & inc.unsqueeze(0)
-        excluded_events += int((raw_mask & ~inc.unsqueeze(0)).sum())
-        total_events += int(raw_mask.sum())
+        excluded_events += (raw_mask & ~inc.unsqueeze(0)).sum()
+        total_events += raw_mask.sum()
         counts = mask.sum(dim=1)
 
         # Non-operational support-rate sensitivities, per token.  The exact
@@ -1381,7 +1405,9 @@ def evaluate_rd(
         "row_len": row_len if sequence_mode == "fixed_length_fallback" else None,
         "avg_count": float(cnt.sum() / n_tok.sum()),
         "codec_meta": dict(codec.meta),
-        "eval_excluded_event_share": excluded_events / max(1, total_events),
+        "eval_excluded_event_share": float(
+            excluded_events / total_events.clamp_min(1)
+        ),
         "support_count_width_bits": count_width,
         "support_id_width_bits": id_width,
         "support_bits_per_token": float(fixed_support.sum() / n_tok.sum()),
