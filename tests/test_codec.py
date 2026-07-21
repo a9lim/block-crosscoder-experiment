@@ -18,17 +18,26 @@ from block_crosscoder_experiment.codec import (
     decode_batch,
     decode_batch_all_q,
     encode_batch,
+    encode_batch_all_q,
     estimate_calibration_peak_bytes,
     evaluate_rd,
     fit_codec,
 )
-from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
+from block_crosscoder_experiment.model import BSCOutput, BlockCrosscoder, BSCConfig
 
 G, B, S, D = 8, 4, 3, 16
 
 
-def make_model(seed=0, b=B, g=G, k=3.0):
-    cfg = BSCConfig(n_blocks=g, block_dim=b, n_sites=S, d_model=D, k=k, seed=seed)
+def make_model(seed=0, b=B, g=G, k=3.0, **overrides):
+    cfg = BSCConfig(
+        n_blocks=g,
+        block_dim=b,
+        n_sites=S,
+        d_model=D,
+        k=k,
+        seed=seed,
+        **overrides,
+    )
     m = BlockCrosscoder(cfg)
     return m
 
@@ -380,8 +389,11 @@ def test_explicit_sparse_packet_round_trip():
             decode_batch(model, codec, replace(packet, amplitude_symbols=bad_symbols))
 
 
-def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
-    model = make_model(g=12, b=2, k=3)
+@pytest.mark.parametrize("encoder_mode", ("untied", "tied"))
+def test_all_q_encoding_runs_one_selection_and_matches_packets(
+    monkeypatch, encoder_mode
+):
+    model = make_model(g=12, b=2, k=3, encoder_mode=encoder_mode)
     x = torch.randn(96, S, D)
     model.fit_threshold_([x[:48]], target_avg_blocks=3)
     codec = fit_codec(
@@ -389,7 +401,7 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
         [x[:48]],
         CodecSpec(qs=(2, 4, 6), floor=1, n_bootstrap=4),
     )
-    original = model.forward_with_materialized
+    original = model.select_with_materialized
     calls = 0
 
     def counted(*args, **kwargs):
@@ -397,9 +409,19 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(model, "forward_with_materialized", counted)
+    monkeypatch.setattr(model, "select_with_materialized", counted)
+    original_decode = model.decode
+    decode_calls = 0
+
+    def counted_decode(*args, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(model, "decode", counted_decode)
     out, events, packets = _encode_batch_all_q_events(model, codec, x[48:])
     assert calls == 1
+    assert decode_calls == 0
     sparse_mm = torch.sparse.mm
     sparse_calls = 0
 
@@ -422,6 +444,34 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
             rtol=1e-6,
             atol=1e-6,
         )
+
+    public_out, public_packets = encode_batch_all_q(model, codec, x[48:])
+    assert calls == 2
+    assert decode_calls == 1
+    assert isinstance(public_out, BSCOutput)
+    assert torch.equal(
+        public_out.xhat,
+        original_decode(public_out.z_selected),
+    )
+    assert public_packets.keys() == packets.keys()
+
+    alternate_decoder = model.decoder_tensor().clone()
+    alternate_decoder[0, 0, 0, 0] += 1.0
+    alternate_out, _ = encode_batch_all_q(
+        model,
+        codec,
+        x[48:],
+        _decoder=alternate_decoder,
+    )
+    with torch.no_grad():
+        expected_alternate = model.forward_with_materialized(
+                x[48:],
+                mode="threshold",
+                _decoder=alternate_decoder,
+                _score_geometry=model._frozen_score_geometry(alternate_decoder),
+        )[0]
+    for actual, expected in zip(alternate_out, expected_alternate, strict=True):
+        assert torch.equal(actual, expected)
 
     sparse_calls = 0
     trusted = {}

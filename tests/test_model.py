@@ -82,6 +82,22 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
     assert returned_decoder is decoder
     assert returned_encoder is encoder
 
+    selected, selected_decoder, selected_encoder = model.select_with_materialized(
+        x,
+        _decoder=decoder,
+        _encoder=encoder,
+    )
+    for expected_tensor, selected_tensor in zip(
+        actual[1:], selected, strict=True
+    ):
+        assert torch.equal(expected_tensor, selected_tensor)
+    assert selected_decoder is decoder
+    assert selected_encoder is encoder
+    assert torch.equal(
+        actual.xhat,
+        model.decode(selected.z_selected, _decoder=selected_decoder),
+    )
+
 
 def test_batchtopk_exact_count_and_variable_per_token(device):
     B, G = 64, CFG.n_blocks
@@ -421,6 +437,15 @@ def test_frozen_score_geometry_is_exact_and_decoder_bound(device, selection_scor
             _score_geometry=geometry,
         )[0]
         for actual, expected in zip(cached, reference, strict=True):
+            assert torch.equal(actual, expected)
+        selected = model.select_with_materialized(
+            x,
+            observed=observed,
+            _decoder=decoder,
+            _encoder=encoder,
+            _score_geometry=geometry,
+        )[0]
+        for actual, expected in zip(selected, cached[1:], strict=True):
             assert torch.equal(actual, expected)
         with pytest.raises(ValueError, match="not bound"):
             model.forward_with_materialized(

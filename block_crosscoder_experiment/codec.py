@@ -59,6 +59,7 @@ from pathlib import Path
 
 import torch
 
+from .model import BSCOutput, BSCSelection
 from .runtime_limits import TRUSTED_DECODE_Q_CHUNK
 
 __all__ = [
@@ -538,21 +539,25 @@ def _log2_binom(n: int, k: torch.Tensor) -> torch.Tensor:
 
 def _materialized_model_tensors(
     model,
+    decoder: torch.Tensor | None = None,
+    encoder: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not hasattr(model, "decoder_tensor") or not hasattr(
         model, "forward_with_materialized"
     ):
-        return None, None
-    decoder = model.decoder_tensor()
-    encoder = (
-        decoder * model.log_gamma.exp()
-        if model.cfg.encoder_mode == "tied"
-        else model.encoder_tensor()
-    )
+        return decoder, encoder
+    if decoder is None:
+        decoder = model.decoder_tensor()
+    if encoder is None:
+        encoder = (
+            decoder * model.log_gamma.exp()
+            if model.cfg.encoder_mode == "tied"
+            else model.encoder_tensor()
+        )
     return decoder, encoder
 
 
-def _threshold_forward(
+def _threshold_select(
     model,
     x: torch.Tensor,
     decoder: torch.Tensor | None,
@@ -561,6 +566,15 @@ def _threshold_forward(
 ):
     if decoder is None or encoder is None:
         return model(x, mode="threshold")
+    if hasattr(model, "select_with_materialized"):
+        return model.select_with_materialized(
+            x,
+            mode="threshold",
+            _decoder=decoder,
+            _encoder=encoder,
+            _score_geometry=score_geometry,
+        )[0]
+    # Preserve the duck-typed codec surface for external reference models.
     return model.forward_with_materialized(
         x,
         mode="threshold",
@@ -637,7 +651,7 @@ def encode_batch(model, codec: Codec, x: torch.Tensor, q: int) -> EncodedBatch:
     score_geometry = (
         None if decoder is None else model._frozen_score_geometry(decoder)
     )
-    out = _threshold_forward(model, x, decoder, encoder, score_geometry)
+    out = _threshold_select(model, x, decoder, encoder, score_geometry)
     return _packet_from_output(model, codec, out, q)
 
 
@@ -655,10 +669,12 @@ def _encode_batch_events(
     device = next(model.parameters()).device
     x = x.to(device, torch.float32, non_blocking=True)
     if _decoder is None or _encoder is None:
-        _decoder, _encoder = _materialized_model_tensors(model)
+        _decoder, _encoder = _materialized_model_tensors(
+            model, _decoder, _encoder
+        )
     if _score_geometry is None and _decoder is not None:
         _score_geometry = model._frozen_score_geometry(_decoder)
-    out = _threshold_forward(
+    out = _threshold_select(
         model,
         x,
         _decoder,
@@ -704,8 +720,12 @@ def encode_batch_all_q(
     _decoder: torch.Tensor | None = None,
     _encoder: torch.Tensor | None = None,
 ) -> tuple[object, dict[int, EncodedBatch]]:
-    """Run threshold inference once and emit every requested integer packet."""
-    out, _, packets = _encode_batch_all_q_events(
+    """Run threshold inference once and emit the full output plus every packet."""
+    if _decoder is None or _encoder is None:
+        _decoder, _encoder = _materialized_model_tensors(
+            model, _decoder, _encoder
+        )
+    selection, _, packets = _encode_batch_all_q_events(
         model,
         codec,
         x,
@@ -713,7 +733,11 @@ def encode_batch_all_q(
         _decoder=_decoder,
         _encoder=_encoder,
     )
-    return out, packets
+    if not isinstance(selection, BSCSelection):
+        return selection, packets
+    assert _decoder is not None
+    xhat = model.decode(selection.z_selected, _decoder=_decoder)
+    return BSCOutput(xhat, *selection), packets
 
 
 @torch.no_grad()
@@ -1227,7 +1251,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
 
     for raw_x in batches:
         x = raw_x.to(device, torch.float32, non_blocking=True)
-        out = _threshold_forward(
+        out = _threshold_select(
             model,
             x,
             materialized_decoder,
@@ -1487,7 +1511,7 @@ def evaluate_rd(
             )
             fallback_token_offset += x.shape[0]
         x = x.to(device, torch.float32, non_blocking=True)
-        out = _threshold_forward(
+        out = _threshold_select(
             model,
             x,
             materialized_decoder,

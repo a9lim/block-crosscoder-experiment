@@ -35,6 +35,7 @@ from .gram import (
 __all__ = [
     "BSCConfig",
     "BSCOutput",
+    "BSCSelection",
     "BlockCrosscoder",
     "SignedStreamingScoreQuantile",
     "StreamingScoreQuantile",
@@ -462,6 +463,15 @@ class BSCOutput(NamedTuple):
     z: torch.Tensor  # [B, G, b] pre-selection code
     z_selected: torch.Tensor  # [B, G, b] post-selection code (masked)
     scores: torch.Tensor  # [B, G] selection scores p_g = ||z_g||
+    mask: torch.Tensor  # [B, G] bool, selected blocks
+
+
+class BSCSelection(NamedTuple):
+    """Forward state through hard selection, before dense reconstruction."""
+
+    z: torch.Tensor  # [B, G, b] pre-selection code
+    z_selected: torch.Tensor  # [B, G, b] post-selection code (masked)
+    scores: torch.Tensor  # [B, G] endpoint-selection scores
     mask: torch.Tensor  # [B, G] bool, selected blocks
 
 
@@ -1102,6 +1112,36 @@ class BlockCrosscoder(nn.Module):
         full site-axis materialization.  Public callers can continue to use
         :meth:`forward` and receive the unchanged ``BSCOutput`` contract.
         """
+        selection, decoder, encoder = self.select_with_materialized(
+            x,
+            mode=mode,
+            observed=observed,
+            validate_observed=validate_observed,
+            _decoder=_decoder,
+            _encoder=_encoder,
+            _score_geometry=_score_geometry,
+        )
+        xhat = self.decode(selection.z_selected, _decoder=decoder)
+        return BSCOutput(xhat, *selection), decoder, encoder
+
+    def select_with_materialized(
+        self,
+        x: torch.Tensor,
+        *,
+        mode: str = "topk",
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+        _decoder: torch.Tensor | None = None,
+        _encoder: torch.Tensor | None = None,
+        _score_geometry: _ScoreGeometry | None = None,
+    ) -> tuple[BSCSelection, torch.Tensor, torch.Tensor]:
+        """Encode and select without paying for an unused dense decode.
+
+        Frozen calibration and codec paths consume only code, score, and
+        support tensors.  Keeping that contract separate from
+        :meth:`forward_with_materialized` avoids materializing ``[B,S,d]``
+        reconstructions while preserving the public forward result exactly.
+        """
         decoder = self.decoder_tensor() if _decoder is None else _decoder
         if _encoder is None:
             if self.cfg.encoder_mode == "tied":
@@ -1127,8 +1167,7 @@ class BlockCrosscoder(nn.Module):
         )
         mask = self._select_scores(scores, mode=mode, z=z)
         z_selected = z * mask.unsqueeze(-1)
-        xhat = self.decode(z_selected, _decoder=decoder)
-        return BSCOutput(xhat, z, z_selected, scores, mask), decoder, encoder
+        return BSCSelection(z, z_selected, scores, mask), decoder, encoder
 
     # -- init calibration --------------------------------------------------
 

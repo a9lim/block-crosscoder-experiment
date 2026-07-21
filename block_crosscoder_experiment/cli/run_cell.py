@@ -4606,6 +4606,20 @@ def _synthetic_recovery(
             _score_geometry=score_geometry,
         )[0]
 
+    def frozen_select(
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+    ):
+        return model.select_with_materialized(
+            x,
+            mode=selection_mode,
+            observed=observed,
+            _decoder=materialized_decoder,
+            _encoder=materialized_encoder,
+            _score_geometry=score_geometry,
+        )[0]
+
     dataset = evaluation_dataset
     n_factors = len(dataset.factors)
     n_groups = model.cfg.n_blocks
@@ -4619,7 +4633,7 @@ def _synthetic_recovery(
         stop=calibration_stop,
     ):
         matching_x = _apply_normalization(matching_batch.x, normalization).to(device)
-        matching_out = frozen_forward(
+        matching_out = frozen_select(
             matching_x,
             observed=matching_batch.observed.to(device),
         )
@@ -4708,7 +4722,7 @@ def _synthetic_recovery(
             isolated = _apply_normalization(
                 matching_batch.contributions, zero_mean_normalization
             ).to(device)
-            isolated_out = frozen_forward(isolated)
+            isolated_out = frozen_select(isolated)
             selected_codes = isolated_out.z_selected.detach().cpu().double()
             for factor in matching_batch.event_factor.unique().tolist():
                 rows = torch.nonzero(
@@ -4769,7 +4783,7 @@ def _synthetic_recovery(
         stop=evaluation_stop,
     ):
         x = _apply_normalization(batch.x, normalization).to(device)
-        out = frozen_forward(x, observed=batch.observed.to(device))
+        out = frozen_select(x, observed=batch.observed.to(device))
         truth_active = batch.active.bool().cpu()
         block_mask = out.mask.bool().cpu()
         alive |= block_mask.any(dim=0)
