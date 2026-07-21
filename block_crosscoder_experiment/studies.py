@@ -22,9 +22,19 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
+from .runtime_limits import (
+    EVALUATION_CONCORDANCE_BLOCK_CHUNK,
+    EVALUATION_REDUCTION_TOKEN_CHUNK,
+    TRUSTED_DECODE_Q_CHUNK,
+)
 
 SCHEMA_VERSION = "bsc-study-v1"
-ESTIMATOR_VERSION = "dense-linear-memory-v2"
+ESTIMATOR_VERSION = (
+    "dense-linear-memory-v3"
+    f"-q{TRUSTED_DECODE_Q_CHUNK}"
+    f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
+    f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
+)
 CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v1"
 BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v3"
 PHASE3_PROVISIONED_STORAGE_BYTES = 1_000_000_000_000
@@ -3580,6 +3590,7 @@ class Phase3Blueprint:
             "smoke": self.smoke,
             "projected_cells": self.projected_cells,
             "resource_contract": {
+                "estimator": ESTIMATOR_VERSION,
                 "provisioned_storage_bytes": PHASE3_PROVISIONED_STORAGE_BYTES,
                 "max_storage_bytes": PHASE3_STORAGE_CEILING_BYTES,
                 "max_training_tokens": PHASE3_TRAINING_TOKEN_CEILING,
@@ -3716,6 +3727,75 @@ def _positive_int(value: DecisionValue, name: str) -> int:
     return value
 
 
+def _evaluation_workspace_bytes(
+    *,
+    batch_tokens: int,
+    groups: int,
+    block_width: int,
+    total_dim: int,
+    operational_decoder_elements: int,
+    quantizer_count: int,
+    sites: int,
+) -> int:
+    """Conservative peak for the fixed-shape CUDA evaluation kernels.
+
+    Deployment always uses the calibrated threshold, independent of the
+    training selector, and that threshold has no hard cardinality ceiling.
+    Every cell's packet path is therefore priced at dense support.  Decode and
+    shared-code analysis do not run concurrently; the larger workspace is the
+    relevant peak.  Model outputs are included explicitly even though the
+    generic dense training allowance below also covers much of that storage.
+    """
+
+    q_chunk = min(TRUSTED_DECODE_Q_CHUNK, quantizer_count)
+    events = batch_tokens * groups
+    latents = groups * block_width
+
+    # The q-independent event stream remains live with every int32 packet.
+    # The chunk decoder additionally holds float symbols/canonical codes,
+    # rotated codes, CSR columns/rows, and q_chunk reconstructed activations.
+    retained_packet_bytes = (
+        batch_tokens * 4
+        + events * (32 + 12 * block_width)
+    )
+    trusted_decode_bytes = (
+        retained_packet_bytes
+        + q_chunk * events * block_width * 16
+        + events * block_width * 8
+        + (q_chunk * batch_tokens + 1) * 8
+        + q_chunk * batch_tokens * total_dim * 4
+        + operational_decoder_elements * 4
+    )
+
+    # Full and one partial BSC output coexist during sharing evaluation.
+    output_bytes = 2 * batch_tokens * (
+        total_dim * 4 + latents * 8 + groups * 5
+    )
+    concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
+    concordance_bytes = (
+        batch_tokens
+        * concordance_groups
+        * (8 * block_width + 4)
+        * 8
+    )
+    reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
+    reduction_bytes = reduction_tokens * total_dim * 4 * 8
+    decoder_gram_bytes = (sites + 1) * groups * block_width**2 * 8
+    accumulator_bytes = (
+        (20 * sites * groups + 4 * sites * groups * block_width)
+        + groups * block_width**2
+        + groups * block_width
+    ) * 8
+    shared_code_bytes = (
+        output_bytes
+        + concordance_bytes
+        + reduction_bytes
+        + decoder_gram_bytes
+        + accumulator_bytes
+    )
+    return max(trusted_decode_bytes, shared_code_bytes)
+
+
 def _estimate_components(
     cell: CellSpec,
 ) -> tuple[int, int, int, int, int, int, tuple[Any, ...]]:
@@ -3809,15 +3889,47 @@ def _estimate_components(
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the
-    # preflight.  A fixed 2 GiB covers CUDA/PyTorch context and allocator slack.
+    # preflight.  Fixed evaluation chunk geometry is content-bound through the
+    # estimator version and priced explicitly below.  A fixed 2 GiB covers
+    # CUDA/PyTorch context and allocator slack.
     dense_workspace_values = batch_tokens * (
         len(site_dims) * max(site_dims) + 6 * shared_coordinates + 2 * groups
     )
-    peak_vram_bytes = (
-        2 * 1024**3
-        + parameters * 28
+    quantizer_bits = values["codec.quantizer_bits"]
+    if not isinstance(quantizer_bits, tuple) or not quantizer_bits:
+        raise StudyError("codec.quantizer_bits must be a nonempty tuple")
+    evaluation_workspace_bytes = _evaluation_workspace_bytes(
+        batch_tokens=batch_tokens,
+        groups=groups,
+        block_width=block_width,
+        total_dim=total_dim,
+        operational_decoder_elements=operational_decoder_elements,
+        quantizer_count=len(quantizer_bits),
+        sites=len(site_dims),
+    )
+    factorized_materialization_bytes = (
+        operational_weight_elements * 8 if site_rank_value is not None else 0
+    )
+    training_residency_bytes = (
+        parameters * 28
         + dense_workspace_values * 4
-        + (operational_weight_elements * 8 if site_rank_value is not None else 0)
+        + factorized_materialization_bytes
+    )
+    # Evaluation runs after training state is released, so adding its complete
+    # workspace to Adam residency would invent a peak that cannot occur.  Keep
+    # two fp32 parameter copies as inference/checkpoint slack, then price the
+    # tied encoder or factorized full tensors that are genuinely materialized.
+    evaluation_materialization_bytes = factorized_materialization_bytes + (
+        operational_decoder_elements * 4 if tied else 0
+    )
+    evaluation_residency_bytes = (
+        parameters * 8
+        + evaluation_materialization_bytes
+        + evaluation_workspace_bytes
+    )
+    peak_vram_bytes = 2 * 1024**3 + max(
+        training_residency_bytes,
+        evaluation_residency_bytes,
     )
     calibration_ceiling = _positive_int(
         values["codec.max_calibration_event_bytes"],

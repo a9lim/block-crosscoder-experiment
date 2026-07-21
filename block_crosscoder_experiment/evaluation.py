@@ -15,6 +15,10 @@ from typing import Iterable
 import torch
 
 from .model import BSCConfig, BlockCrosscoder
+from .runtime_limits import (
+    EVALUATION_CONCORDANCE_BLOCK_CHUNK,
+    EVALUATION_REDUCTION_TOKEN_CHUNK,
+)
 
 __all__ = [
     "centered_fvu",
@@ -162,6 +166,35 @@ def evaluate_shared_code(
     del decoder_gram_chunks, all_site_decoder_gram_chunks, site_gram_chunk
     n_tokens = 0
 
+    def token_slices(n: int):
+        chunk = (
+            EVALUATION_REDUCTION_TOKEN_CHUNK
+            if torch.device(device).type == "cuda"
+            else n
+        )
+        for start in range(0, n, chunk):
+            yield slice(start, min(start + chunk, n))
+
+    def accumulate_target_statistics(target: torch.Tensor) -> None:
+        for token_slice in token_slices(len(target)):
+            values = target[token_slice].double()
+            if has_padded_coordinates:
+                values = values * coord
+            target_sum.add_(values.sum(dim=0))
+            target_sumsq.add_(values.square().sum(dim=0))
+
+    def squared_error_by_site(
+        target: torch.Tensor,
+        prediction: torch.Tensor,
+    ) -> torch.Tensor:
+        result = torch.zeros(S, dtype=torch.float64, device=device)
+        for token_slice in token_slices(len(target)):
+            residual = target[token_slice].double() - prediction[token_slice].double()
+            if has_padded_coordinates:
+                residual = residual * coord
+            result.add_(residual.square().sum(dim=(0, 2)))
+        return result
+
     def accumulate_coordinate_concordance(
         partial,
         full,
@@ -178,34 +211,51 @@ def evaluate_shared_code(
     ) -> None:
         """Accumulate gauge-invariant agreement on matched support events."""
 
-        intersection = partial.mask & full.mask
-        full_code = full_code64
-        partial_code = partial.z.double()
-        intersection_f = intersection.unsqueeze(-1).double()
-        full_intersection = full_code * intersection_f
-        partial_intersection = partial_code * intersection_f
-        full_mapped = torch.einsum(
-            "ngb,gbc->ngc",
-            full_intersection,
-            all_site_decoder_gram,
-        )
-        full_q = (full_mapped * full_intersection).sum(dim=-1)
-        partial_q = torch.einsum(
-            "ngb,gbc,ngc->ng",
-            partial_intersection,
-            all_site_decoder_gram,
-            partial_intersection,
-        )
-        cross = (full_mapped * partial_intersection).sum(dim=-1)
-        all_full_q = all_full_q64
-        intersection_count[index] += intersection.sum(dim=0).double()
         full_count[index] += full_mask_count64
-        concordance_numerator[index] += 2.0 * cross.sum(dim=0)
-        concordance_denominator[index] += full_q.sum(dim=0) + partial_q.sum(dim=0)
-        full_code_sum[index] += full_intersection.sum(dim=0)
-        partial_code_sum[index] += partial_intersection.sum(dim=0)
-        intersection_full_energy[index] += full_q.sum(dim=0)
-        full_energy[index] += all_full_q.sum(dim=0)
+        full_energy[index] += all_full_energy64
+        for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+            stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+            block_slice = slice(start, stop)
+            intersection = (
+                partial.mask[:, block_slice] & full.mask[:, block_slice]
+            )
+            full_code = full.z[:, block_slice].double()
+            partial_code = partial.z[:, block_slice].double()
+            intersection_f = intersection.unsqueeze(-1).double()
+            full_intersection = full_code * intersection_f
+            partial_intersection = partial_code * intersection_f
+            gram = all_site_decoder_gram[block_slice]
+            if b == 1:
+                full_scalar = full_intersection[..., 0]
+                partial_scalar = partial_intersection[..., 0]
+                weight = gram[:, 0, 0].unsqueeze(0)
+                full_q = full_scalar.square() * weight
+                partial_q = partial_scalar.square() * weight
+                cross = full_scalar * partial_scalar * weight
+            else:
+                full_mapped = torch.einsum(
+                    "ngb,gbc->ngc",
+                    full_intersection,
+                    gram,
+                )
+                full_q = (full_mapped * full_intersection).sum(dim=-1)
+                partial_q = torch.einsum(
+                    "ngb,gbc,ngc->ng",
+                    partial_intersection,
+                    gram,
+                    partial_intersection,
+                )
+                cross = (full_mapped * partial_intersection).sum(dim=-1)
+            intersection_count[index, block_slice] += intersection.sum(
+                dim=0
+            ).double()
+            concordance_numerator[index, block_slice] += 2.0 * cross.sum(dim=0)
+            concordance_denominator[index, block_slice] += full_q.sum(
+                dim=0
+            ) + partial_q.sum(dim=0)
+            full_code_sum[index, block_slice] += full_intersection.sum(dim=0)
+            partial_code_sum[index, block_slice] += partial_intersection.sum(dim=0)
+            intersection_full_energy[index, block_slice] += full_q.sum(dim=0)
 
     for raw in batches:
         if max_tokens is not None and n_tokens >= max_tokens:
@@ -221,26 +271,33 @@ def evaluate_shared_code(
             _decoder=materialized_decoder,
             _encoder=materialized_encoder,
         )
-        x64 = x.double()
-        valid = x64 * coord if has_padded_coordinates else x64
-        target_sum += valid.sum(dim=0)
-        target_sumsq += valid.square().sum(dim=0)
-        full_residual = x64 - full.xhat.double()
-        if has_padded_coordinates:
-            full_residual = full_residual * coord
-        full_sse += full_residual.square().sum(dim=(0, 2))
-        full_code64 = full.z.double()
-        full_selected64 = full.z_selected.double()
+        accumulate_target_statistics(x)
+        full_sse += squared_error_by_site(x, full.xhat)
         full_mask_count64 = full.mask.sum(dim=0).double()
-        all_full_q64 = torch.einsum(
-            "ngb,gbc,ngc->ng",
-            full_selected64,
-            all_site_decoder_gram,
-            full_selected64,
-        )
+        all_full_energy64 = torch.zeros(G, dtype=torch.float64, device=device)
         fire += full_mask_count64
-        zsum += full_selected64.sum(dim=0)
-        zz += torch.einsum("ngb,ngc->gbc", full_selected64, full_selected64)
+        for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+            stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+            block_slice = slice(start, stop)
+            selected = full.z_selected[:, block_slice].double()
+            gram = all_site_decoder_gram[block_slice]
+            if b == 1:
+                selected_energy = (
+                    selected[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
+                )
+            else:
+                selected_energy = torch.einsum(
+                    "ngb,gbc,ngc->ng",
+                    selected,
+                    gram,
+                    selected,
+                )
+            all_full_energy64[block_slice] = selected_energy.sum(dim=0)
+            zsum[block_slice] += selected.sum(dim=0)
+            zz[block_slice] += torch.einsum(
+                "ngb,ngc->gbc", selected, selected
+            )
+        del selected, selected_energy, gram
         observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
         zero_x: torch.Tensor | None = None
 
@@ -292,10 +349,7 @@ def evaluate_shared_code(
                 ),
                 empty=False,
             )
-            site_residual = x64 - only.xhat.double()
-            if has_padded_coordinates:
-                site_residual = site_residual * coord
-            site_sse[source] += site_residual.square().sum(dim=(0, 2))
+            site_sse[source] += squared_error_by_site(x, only.xhat)
             support_intersection[source] += (only.mask & full.mask).sum()
             support_union[source] += (only.mask | full.mask).sum()
             accumulate_coordinate_concordance(
@@ -311,6 +365,7 @@ def evaluate_shared_code(
                 intersection_full_energy=site_intersection_full_energy,
                 full_energy=site_full_energy,
             )
+            del only
 
             missing_observed = observed_all.clone()
             missing_observed[:, source] = False
@@ -321,10 +376,7 @@ def evaluate_shared_code(
                 ),
                 empty=S == 1,
             )
-            loo_residual = x64 - missing.xhat.double()
-            if has_padded_coordinates:
-                loo_residual = loo_residual * coord
-            loo_sse[source] += loo_residual.square().sum(dim=(0, 2))
+            loo_sse[source] += squared_error_by_site(x, missing.xhat)
             loo_intersection[source] += (missing.mask & full.mask).sum()
             loo_union[source] += (missing.mask | full.mask).sum()
             accumulate_coordinate_concordance(
@@ -340,14 +392,26 @@ def evaluate_shared_code(
                 intersection_full_energy=loo_intersection_full_energy,
                 full_energy=loo_full_energy,
             )
-            pre_selection_loo_delta_sq[source] += (
-                (missing.z.double() - full_code64).square().sum(dim=(0, 2))
-            )
-            post_selection_loo_delta_sq[source] += (
-                (missing.z_selected.double() - full_selected64)
-                .square()
-                .sum(dim=(0, 2))
-            )
+            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+                block_slice = slice(start, stop)
+                pre_selection_loo_delta_sq[source, block_slice] += (
+                    (
+                        missing.z[:, block_slice].double()
+                        - full.z[:, block_slice].double()
+                    )
+                    .square()
+                    .sum(dim=(0, 2))
+                )
+                post_selection_loo_delta_sq[source, block_slice] += (
+                    (
+                        missing.z_selected[:, block_slice].double()
+                        - full.z_selected[:, block_slice].double()
+                    )
+                    .square()
+                    .sum(dim=(0, 2))
+                )
+            del missing
         n_tokens += x.shape[0]
 
     if n_tokens == 0:

@@ -6,11 +6,17 @@ import pytest
 
 from block_crosscoder_experiment.campaign import Campaign
 from block_crosscoder_experiment.cli.run_cell import validate_cell_config
+from block_crosscoder_experiment.runtime_limits import (
+    EVALUATION_CONCORDANCE_BLOCK_CHUNK,
+    EVALUATION_REDUCTION_TOKEN_CHUNK,
+    TRUSTED_DECODE_Q_CHUNK,
+)
 from block_crosscoder_experiment.studies import (
     ANTHROPIC_ARCHITECTURE,
     BRIDGE_RECIPES,
     CONTROL_RECIPES,
     DECODER_WEIGHTED_BATCHTOPK_BRIDGE,
+    ESTIMATOR_VERSION,
     PAPER_RECIPES,
     PHASE3_COMPUTE_CEILING_FLOPS,
     PHASE3_PARAMETER_CEILING,
@@ -39,6 +45,7 @@ from block_crosscoder_experiment.studies import (
     SelectionPolicy,
     StudyError,
     StudyPlan,
+    _evaluation_workspace_bytes,
     adapted,
     build_phase1_blueprint,
     build_phase1_plan,
@@ -1169,6 +1176,9 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
 def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():
     blueprint = build_phase3_blueprint()
     assert blueprint.projected_cells == 48
+    assert blueprint.content_payload()["resource_contract"]["estimator"] == (
+        ESTIMATOR_VERSION
+    )
     assert blueprint.panel_slots[0].duplicate_policy == "fail"
     assert all(
         slot.duplicate_policy == "next_ranked_nonduplicate"
@@ -1435,6 +1445,12 @@ def test_manifests_are_deterministic_round_trip_and_tamper_evident():
 def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
+    assert phase1_estimate.estimator == (
+        "dense-linear-memory-v3"
+        f"-q{TRUSTED_DECODE_Q_CHUNK}"
+        f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
+        f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
+    )
     assert phase1_estimate.storage_bytes == phase1_estimate.parameters * 16
     assert phase1_estimate.peak_vram_bytes > phase1_estimate.parameters * 28
     assert phase1_estimate.peak_host_ram_bytes >= 8 * 1024**3
@@ -1462,6 +1478,30 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         Budget(max_peak_host_ram_bytes=estimate.peak_host_ram_bytes - 1).enforce(
             estimate
         )
+
+
+def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
+    groups = 16 * EVALUATION_CONCORDANCE_BLOCK_CHUNK
+    common = {
+        "batch_tokens": 128,
+        "groups": groups,
+        "block_width": 2,
+        "total_dim": 96,
+        "operational_decoder_elements": groups * 2 * 96,
+        "sites": 3,
+    }
+    one_q = _evaluation_workspace_bytes(quantizer_count=1, **common)
+    saturated = _evaluation_workspace_bytes(
+        quantizer_count=TRUSTED_DECODE_Q_CHUNK,
+        **common,
+    )
+    extra_qs = _evaluation_workspace_bytes(
+        quantizer_count=TRUSTED_DECODE_Q_CHUNK + 3,
+        **common,
+    )
+    assert one_q > 0
+    assert saturated >= one_q
+    assert extra_qs == saturated
 
 
 def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():

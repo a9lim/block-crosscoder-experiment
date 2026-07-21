@@ -43,10 +43,10 @@ from block_crosscoder_experiment.campaign import (
 from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
+    _decode_trusted_packet_events_q_chunks,
+    _encode_batch_events,
     decode_batch,
-    decode_batch_all_q,
     encode_batch,
-    encode_batch_all_q,
     estimate_calibration_peak_bytes,
     evaluate_rd,
     fit_codec,
@@ -5940,58 +5940,63 @@ def _evaluate_raw_space(
                 centered = centered * coordinate_mask
             token_denominator = centered.square().sum(dim=2)
             denominator += token_denominator.sum(dim=0)
-            _, packets = encode_batch_all_q(
+            threshold_output, packet_events = _encode_batch_events(
                 model,
                 codec,
                 x_normalized,
                 _decoder=materialized_decoder,
                 _encoder=materialized_encoder,
             )
-            normalized_predictions = decode_batch_all_q(
+            del threshold_output
+            token_errors: dict[int, torch.Tensor] = {}
+            for decoded_chunk in _decode_trusted_packet_events_q_chunks(
                 model,
                 codec,
-                packets,
+                packet_events,
+                qs=codec.spec.qs,
                 _decoder=materialized_decoder,
                 _decoder_matrix=materialized_decoder_matrix,
-            )
-            token_errors: dict[int, torch.Tensor] = {}
-            for q in codec.spec.qs:
-                normalized_prediction = normalized_predictions[q]
-                if data["kind"] == "synthetic":
-                    assert synthetic_normalization is not None
-                    if synthetic_normalization["kind"] == "token_layer_norm":
-                        raw_prediction = torch.zeros_like(normalized_prediction)
-                        for site, dim in enumerate(model.cfg.site_dims):
-                            values = x_raw[:, site, :dim]
-                            mean = values.mean(dim=-1, keepdim=True)
-                            variance = values.var(dim=-1, correction=0, keepdim=True)
-                            raw_prediction[:, site, :dim] = (
-                                normalized_prediction[:, site, :dim]
-                                * (variance + 1e-5).sqrt()
-                                + mean
+            ):
+                for q, normalized_prediction in decoded_chunk.items():
+                    if data["kind"] == "synthetic":
+                        assert synthetic_normalization is not None
+                        if synthetic_normalization["kind"] == "token_layer_norm":
+                            raw_prediction = torch.zeros_like(normalized_prediction)
+                            for site, dim in enumerate(model.cfg.site_dims):
+                                values = x_raw[:, site, :dim]
+                                mean = values.mean(dim=-1, keepdim=True)
+                                variance = values.var(
+                                    dim=-1, correction=0, keepdim=True
+                                )
+                                raw_prediction[:, site, :dim] = (
+                                    normalized_prediction[:, site, :dim]
+                                    * (variance + 1e-5).sqrt()
+                                    + mean
+                                )
+                        else:
+                            assert synthetic_mean_device is not None
+                            assert synthetic_scale_device is not None
+                            raw_prediction = (
+                                normalized_prediction / synthetic_scale_device
+                                + synthetic_mean_device.unsqueeze(0)
                             )
                     else:
-                        assert synthetic_mean_device is not None
-                        assert synthetic_scale_device is not None
-                        raw_prediction = (
-                            normalized_prediction / synthetic_scale_device
-                            + synthetic_mean_device.unsqueeze(0)
+                        raw_prediction = _invert_saved_real_normalization(
+                            normalized_prediction,
+                            x_raw,
+                            saved_normalization,
+                            inverse_W=inverse_W,
+                            mean=saved_mean_device,
+                            diagonal=saved_diagonal_device,
                         )
-                else:
-                    raw_prediction = _invert_saved_real_normalization(
-                        normalized_prediction,
-                        x_raw,
-                        saved_normalization,
-                        inverse_W=inverse_W,
-                        mean=saved_mean_device,
-                        diagonal=saved_diagonal_device,
-                    )
-                residual = (x_raw - raw_prediction).double()
-                if coordinate_mask is not None:
-                    residual = residual * coordinate_mask
-                token_error = residual.square().sum(dim=2)
-                token_errors[q] = token_error
-                errors[q] += token_error.sum(dim=0)
+                    residual = (x_raw - raw_prediction).double()
+                    if coordinate_mask is not None:
+                        residual = residual * coordinate_mask
+                    token_error = residual.square().sum(dim=2)
+                    token_errors[q] = token_error
+                    errors[q] += token_error.sum(dim=0)
+                del normalized_prediction, raw_prediction, residual, token_error
+                del decoded_chunk
             if time_sharing_plans:
                 horizon = next(iter(time_sharing_plans.values()))["horizon_tokens"]
                 if tokens + len(x_raw) > int(horizon):

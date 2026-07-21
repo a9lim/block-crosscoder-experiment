@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import block_crosscoder_experiment.evaluation as evaluation_module
 from block_crosscoder_experiment.evaluation import centered_fvu, evaluate_shared_code
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 
@@ -50,6 +51,34 @@ def test_shared_code_endpoints_work_for_tied_and_untied_encoders() -> None:
         assert result["n_tokens"] == 40
         assert len(result["site_only_fvu"]) == 2
         assert len(result["used_contribution_eigenvalues"]) == 2
+
+
+def test_shared_code_block_chunking_preserves_complete_payload(monkeypatch) -> None:
+    torch.manual_seed(123)
+    model = BlockCrosscoder(
+        BSCConfig(9, 2, 3, 5, 3, encoder_mode="untied", decoder_constraint="free")
+    )
+    x = torch.randn(37, 3, 5)
+    monkeypatch.setattr(evaluation_module, "EVALUATION_CONCORDANCE_BLOCK_CHUNK", 100)
+    reference = evaluate_shared_code(model, [x], selection_mode="topk")
+    monkeypatch.setattr(evaluation_module, "EVALUATION_CONCORDANCE_BLOCK_CHUNK", 2)
+    chunked = evaluate_shared_code(model, [x], selection_mode="topk")
+
+    def assert_payload_close(left, right) -> None:
+        if isinstance(left, dict):
+            assert left.keys() == right.keys()
+            for key in left:
+                assert_payload_close(left[key], right[key])
+        elif isinstance(left, list):
+            assert len(left) == len(right)
+            for left_item, right_item in zip(left, right, strict=True):
+                assert_payload_close(left_item, right_item)
+        elif isinstance(left, float):
+            assert left == pytest.approx(right, rel=1e-12, abs=1e-12)
+        else:
+            assert left == right
+
+    assert_payload_close(chunked, reference)
 
 
 def test_shared_code_native_mode_is_explicit_and_needs_no_deployed_threshold() -> None:

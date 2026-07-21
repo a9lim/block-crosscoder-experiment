@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import replace
+import weakref
 
 from types import SimpleNamespace
 
@@ -11,11 +12,12 @@ import torch
 from block_crosscoder_experiment.codec import (
     CodecSpec,
     _artifact_digest,
+    _decode_trusted_packet_events_q_chunks,
+    _encode_batch_all_q_events,
     _packet_from_output,
     decode_batch,
     decode_batch_all_q,
     encode_batch,
-    encode_batch_all_q,
     estimate_calibration_peak_bytes,
     evaluate_rd,
     fit_codec,
@@ -396,7 +398,7 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(model, "forward_with_materialized", counted)
-    out, packets = encode_batch_all_q(model, codec, x[48:])
+    out, events, packets = _encode_batch_all_q_events(model, codec, x[48:])
     assert calls == 1
     sparse_mm = torch.sparse.mm
     sparse_calls = 0
@@ -420,6 +422,106 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
             rtol=1e-6,
             atol=1e-6,
         )
+
+    sparse_calls = 0
+    trusted = {}
+    for chunk in _decode_trusted_packet_events_q_chunks(
+        model,
+        codec,
+        events,
+        packets,
+        q_chunk_size=2,
+    ):
+        trusted.update(chunk)
+    assert sparse_calls == 2
+    rows = torch.repeat_interleave(
+        torch.arange(events.n_tokens, device=events.counts.device),
+        events.counts.long(),
+    )
+    for q, packet in packets.items():
+        torch.testing.assert_close(trusted[q], decoded[q], rtol=1e-6, atol=1e-6)
+        levels = (1 << q) - 1
+        lo = codec._tensor_on("lo", events.original_ids.device)[events.original_ids]
+        span = (
+            codec._tensor_on("hi", events.original_ids.device)[events.original_ids]
+            - lo
+        ).clamp_min(1e-12)
+        canonical = lo + packet.amplitude_symbols.float() / levels * span
+        values = torch.einsum(
+            "eji,ej->ei",
+            codec._tensor_on("rotation", events.original_ids.device)[
+                events.original_ids
+            ],
+            canonical,
+        )
+        dense_code = torch.zeros(
+            events.n_tokens,
+            model.cfg.n_blocks,
+            model.cfg.block_dim,
+            device=values.device,
+        )
+        dense_code[rows, events.original_ids] = values
+        torch.testing.assert_close(
+            trusted[q],
+            model.decode(dense_code),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+    lazy_trusted = {}
+    for chunk in _decode_trusted_packet_events_q_chunks(
+        model,
+        codec,
+        events,
+        qs=tuple(packets),
+        q_chunk_size=2,
+    ):
+        lazy_trusted.update(chunk)
+    for q in packets:
+        torch.testing.assert_close(
+            lazy_trusted[q],
+            trusted[q],
+            rtol=0,
+            atol=0,
+        )
+
+    support_mutation = dict(packets)
+    support_mutation[4] = replace(
+        packets[4],
+        block_ids=packets[4].block_ids.clone(),
+    )
+    with pytest.raises(ValueError, match="support is not event-bound"):
+        list(
+            _decode_trusted_packet_events_q_chunks(
+                model,
+                codec,
+                events,
+                support_mutation,
+            )
+        )
+
+    previous_result = None
+
+    def lifetime_checked_sparse_mm(*args, **kwargs):
+        nonlocal previous_result
+        assert previous_result is None or previous_result() is None
+        result = sparse_mm(*args, **kwargs)
+        previous_result = weakref.ref(result)
+        return result
+
+    monkeypatch.setattr(torch.sparse, "mm", lifetime_checked_sparse_mm)
+    reduced = {}
+    for chunk in _decode_trusted_packet_events_q_chunks(
+        model,
+        codec,
+        events,
+        packets,
+        q_chunk_size=2,
+    ):
+        for q, prediction in chunk.items():
+            reduced[q] = prediction.sum().item()
+        del prediction, chunk
+    assert reduced.keys() == packets.keys()
 
     mismatched = dict(packets)
     changed_counts = packets[4].counts.clone()

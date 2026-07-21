@@ -59,6 +59,8 @@ from pathlib import Path
 
 import torch
 
+from .runtime_limits import TRUSTED_DECODE_Q_CHUNK
+
 __all__ = [
     "CodecSpec",
     "Codec",
@@ -635,6 +637,48 @@ def encode_batch(model, codec: Codec, x: torch.Tensor, q: int) -> EncodedBatch:
 
 
 @torch.no_grad()
+def _encode_batch_events(
+    model,
+    codec: Codec,
+    x: torch.Tensor,
+    *,
+    _decoder: torch.Tensor | None = None,
+    _encoder: torch.Tensor | None = None,
+) -> tuple[object, _PacketEvents]:
+    """Run threshold inference once and retain its trusted sparse event stream."""
+    device = next(model.parameters()).device
+    x = x.to(device, torch.float32, non_blocking=True)
+    if _decoder is None or _encoder is None:
+        _decoder, _encoder = _materialized_model_tensors(model)
+    out = _threshold_forward(model, x, _decoder, _encoder)
+    events = _packet_events_from_output(model, codec, out)
+    return out, events
+
+
+@torch.no_grad()
+def _encode_batch_all_q_events(
+    model,
+    codec: Codec,
+    x: torch.Tensor,
+    qs: tuple[int, ...] | None = None,
+    *,
+    _decoder: torch.Tensor | None = None,
+    _encoder: torch.Tensor | None = None,
+) -> tuple[object, _PacketEvents, dict[int, EncodedBatch]]:
+    """Run threshold inference once and materialize public packets for all q."""
+    out, events = _encode_batch_events(
+        model,
+        codec,
+        x,
+        _decoder=_decoder,
+        _encoder=_encoder,
+    )
+    requested = codec.spec.qs if qs is None else tuple(qs)
+    packets = {q: _packet_from_events(codec, events, q) for q in requested}
+    return out, events, packets
+
+
+@torch.no_grad()
 def encode_batch_all_q(
     model,
     codec: Codec,
@@ -645,14 +689,15 @@ def encode_batch_all_q(
     _encoder: torch.Tensor | None = None,
 ) -> tuple[object, dict[int, EncodedBatch]]:
     """Run threshold inference once and emit every requested integer packet."""
-    device = next(model.parameters()).device
-    x = x.to(device, torch.float32, non_blocking=True)
-    if _decoder is None or _encoder is None:
-        _decoder, _encoder = _materialized_model_tensors(model)
-    out = _threshold_forward(model, x, _decoder, _encoder)
-    events = _packet_events_from_output(model, codec, out)
-    requested = codec.spec.qs if qs is None else tuple(qs)
-    return out, {q: _packet_from_events(codec, events, q) for q in requested}
+    out, _, packets = _encode_batch_all_q_events(
+        model,
+        codec,
+        x,
+        qs,
+        _decoder=_decoder,
+        _encoder=_encoder,
+    )
+    return out, packets
 
 
 @torch.no_grad()
@@ -996,6 +1041,151 @@ def decode_batch_all_q(
 
 
 @torch.no_grad()
+def _decode_trusted_packet_events_q_chunks(
+    model,
+    codec: Codec,
+    events: _PacketEvents,
+    packets: dict[int, EncodedBatch] | None = None,
+    *,
+    qs: tuple[int, ...] | None = None,
+    _decoder: torch.Tensor | None = None,
+    _decoder_matrix: torch.Tensor | None = None,
+    q_chunk_size: int = TRUSTED_DECODE_Q_CHUNK,
+):
+    """Yield bounded multi-q decodes for the encoder's own packet stream.
+
+    Public decode entry points must authenticate arbitrary external packets.
+    Here the support, ordering, and integer alphabets were produced moments
+    earlier by ``_packet_events_from_output`` and ``_packet_from_events``.
+    Carrying that trusted event stream forward avoids a global event sort and
+    all device-to-host validation synchronizations on every evaluation batch.
+    """
+    if q_chunk_size <= 0:
+        raise ValueError("trusted decode q_chunk_size must be positive")
+    requested = tuple(packets) if packets is not None else (
+        codec.spec.qs if qs is None else tuple(qs)
+    )
+    if not requested:
+        return
+    if len(requested) != len(set(requested)) or any(
+        q not in codec.spec.qs for q in requested
+    ):
+        raise ValueError("trusted decode q binding is invalid")
+    for q, packet in (packets or {}).items():
+        if q != packet.q:
+            raise ValueError("trusted packet q binding is invalid")
+        if packet.n_tokens != events.n_tokens:
+            raise ValueError("trusted packet token count is not event-bound")
+        if (
+            packet.counts is not events.counts
+            or packet.block_ids is not events.block_ids
+        ):
+            raise ValueError("trusted packet support is not event-bound")
+        if packet.amplitude_symbols.shape != (
+            len(events.block_ids),
+            model.cfg.block_dim,
+        ):
+            raise ValueError("trusted packet amplitude shape is invalid")
+    device = next(model.parameters()).device
+    G, b = model.cfg.n_blocks, model.cfg.block_dim
+    ids = codec._tensor_on("rank_to_block", device, dtype=torch.long)[
+        events.block_ids.long()
+    ]
+    counts = events.counts
+    lo = codec._tensor_on("lo", device)[ids]
+    span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
+    normalized_codes = (
+        None
+        if packets is not None
+        else ((events.canonical_codes - lo) / span).clamp(0, 1)
+    )
+    expanded_counts = counts.to(dtype=torch.long) * b
+    event_columns = (
+        ids.unsqueeze(1) * b
+        + torch.arange(b, dtype=torch.long, device=device).unsqueeze(0)
+    ).reshape(-1)
+    if _decoder_matrix is None:
+        decoder = model.decoder_tensor() if _decoder is None else _decoder
+        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
+            G * b,
+            model.cfg.n_sites * model.cfg.d_model,
+        )
+    else:
+        decoder_matrix = _decoder_matrix
+
+    for start in range(0, len(requested), q_chunk_size):
+        chunk_qs = requested[start : start + q_chunk_size]
+        levels = torch.tensor(
+            [(1 << q) - 1 for q in chunk_qs],
+            dtype=torch.float32,
+            device=device,
+        ).view(-1, 1, 1)
+        if packets is None:
+            assert normalized_codes is not None
+            symbols = torch.round(normalized_codes.unsqueeze(0) * levels).to(
+                torch.int32
+            )
+        else:
+            symbols = torch.stack(
+                [packets[q].amplitude_symbols for q in chunk_qs]
+            )
+        z_can = lo.unsqueeze(0) + symbols / levels * span.unsqueeze(0)
+        z_events = torch.einsum(
+            "eji,qej->qei",
+            codec._tensor_on("rotation", device)[ids],
+            z_can,
+        )
+        crow = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.long, device=device),
+                expanded_counts.repeat(len(chunk_qs)).cumsum(dim=0),
+            )
+        )
+        columns = event_columns.repeat(len(chunk_qs))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Sparse CSR tensor support is in beta state.*",
+                category=UserWarning,
+            )
+            sparse_code = torch.sparse_csr_tensor(
+                crow,
+                columns,
+                z_events.reshape(-1),
+                size=(len(chunk_qs) * events.n_tokens, G * b),
+                device=device,
+                check_invariants=False,
+            )
+        predictions = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+            len(chunk_qs),
+            events.n_tokens,
+            model.cfg.n_sites,
+            model.cfg.d_model,
+        )
+        if model.cfg.decoder_bias:
+            predictions = predictions + model.c.view(
+                1,
+                1,
+                model.cfg.n_sites,
+                model.cfg.d_model,
+            )
+        if model._has_padded_coordinates:
+            predictions = predictions * model.coordinate_mask[:, 0, 0].to(
+                predictions.dtype
+            ).unsqueeze(0)
+        decoded_chunk = {
+            q: predictions[index]
+            for index, q in enumerate(chunk_qs)
+        }
+        yield decoded_chunk
+        # The consumer deletes its chunk before requesting the next one.  Drop
+        # the generator frame's aliases as soon as it resumes so two SpMM
+        # outputs and CSR workspaces cannot overlap in lifetime.
+        del decoded_chunk, predictions, sparse_code, columns, crow
+        del z_events, z_can, symbols, levels
+
+
+@torch.no_grad()
 def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     """One calibration pass. `batches` yields [B, S, d] (CPU, any float
     dtype except fp16); selection in threshold mode against the model's
@@ -1305,23 +1495,23 @@ def evaluate_rd(
             bern_bits = torch.zeros(x.shape[0], dtype=torch.float64)
 
         packet_events = _packet_events_from_output(model, codec, out)
-        packets = {
-            q: _packet_from_events(codec, packet_events, q) for q in spec.qs
-        }
-        decoded_by_q = decode_batch_all_q(
+        del out, raw_mask, mask
+        err_site = {}
+        for decoded_chunk in _decode_trusted_packet_events_q_chunks(
             model,
             codec,
-            packets,
+            packet_events,
+            qs=spec.qs,
             _decoder=materialized_decoder,
             _decoder_matrix=materialized_decoder_matrix,
-        )
-        err_site = {}
-        for q in spec.qs:
-            # Distortion is measured on the same validated integer packet a
-            # saved artifact will decode, never on an algebraically similar
-            # floating-point shortcut.
-            xhat = decoded_by_q[q]
-            err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
+        ):
+            for q, xhat in decoded_chunk.items():
+                # Distortion uses the exact integer packet a saved artifact
+                # will decode. Only redundant validation is elided here.
+                err_site[q] = (
+                    (x - xhat).double().pow(2).sum(dim=2).cpu()
+                )  # [n, S]
+            del xhat, decoded_chunk
         tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
 
         # Assemble exact stored sequences (or the labelled synthetic fallback).
