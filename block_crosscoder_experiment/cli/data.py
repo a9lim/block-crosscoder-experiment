@@ -461,6 +461,12 @@ def derive_views(
         for path in sorted(raw_root.iterdir())
         if path.is_dir() and (path / "split.json").exists()
     ]
+    # Verification authenticates immutable source bytes and does not depend on
+    # the requested normalization mode.  Reusing these stateless readers avoids
+    # re-hashing every raw shard once per derived view.
+    source_readers = {split: StoreReader(raw_root, split) for split in split_names}
+    for reader in source_readers.values():
+        reader.verify()
     results: dict[str, dict] = {}
     for mode in modes:
         view_root = out_root / mode
@@ -489,8 +495,7 @@ def derive_views(
         transform.save(view_root / "whitener.pt")
         view_splits = {}
         for split in split_names:
-            reader = StoreReader(raw_root, split)
-            reader.verify()
+            reader = source_readers[split]
             meta = {
                 **reader.manifest.get("meta", {}),
                 **transform_source_meta,

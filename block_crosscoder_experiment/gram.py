@@ -95,7 +95,7 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
     """
     if D.dtype != torch.float32:
         raise TypeError(f"retraction operates on fp32 master weights, got {D.dtype}")
-    floor_hits = 0
+    floor_hits = torch.zeros((), dtype=torch.int64, device=D.device)
     chunk_size = (
         D.shape[1] if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
     )
@@ -103,11 +103,11 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
         chunk = D[:, start : start + chunk_size]
         M = torch.einsum("sgbd,sgcd->gbc", chunk, chunk)
         evals, evecs = torch.linalg.eigh(M)
-        floor_hits += int((evals < eig_floor).sum().item())
+        floor_hits += (evals < eig_floor).sum()
         evals = evals.clamp_min(eig_floor)
         inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
         chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
-    return floor_hits
+    return int(floor_hits.item())
 
 
 @torch.no_grad()
@@ -139,19 +139,19 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     D: [S, G, b, d]  ->  [S, G, b]
     """
     if D.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
-        chunks = []
+        gram_chunks = []
         for start in range(0, D.shape[1], _SPECTRUM_BLOCK_CHUNK):
             block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK].float()
-            gram = torch.einsum("sgbd,sgcd->sgbc", block, block)
-            flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
-            # CUDA's batched solver reserves roughly 256 KiB per 4x4 matrix;
-            # with optimizer state resident that dominates the actual 1 MiB
-            # tensor. The exact CPU eigensolve has tiny storage, and autograd
-            # carries its gradient back through the device copy.
-            evals = torch.linalg.eigvalsh(flat.cpu()).to(D.device)
-            evals = evals.reshape(gram.shape[:-1])
-            chunks.append(evals)
-        return (torch.cat(chunks, dim=1).clamp_min(0.0) + eps).sqrt()
+            gram_chunks.append(torch.einsum("sgbd,sgcd->sgbc", block, block))
+        gram = torch.cat(gram_chunks, dim=1)
+        flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
+        # CUDA's batched solver reserves roughly 256 KiB per 4x4 matrix; with
+        # optimizer state resident that dominates this small Gram tensor.  Move
+        # every independently formed block Gram to CPU together so the exact
+        # eigensolve needs one device round-trip rather than one per chunk.
+        evals = torch.linalg.eigvalsh(flat.cpu()).to(D.device)
+        evals = evals.reshape(gram.shape[:-1])
+        return (evals.clamp_min(0.0) + eps).sqrt()
 
     D32 = D.float()
     gram_s = torch.einsum("sgbd,sgcd->sgbc", D32, D32)

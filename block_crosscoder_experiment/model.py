@@ -840,7 +840,8 @@ class BlockCrosscoder(nn.Module):
                 self.decoder_tensor() if _decoder is None else _decoder
             ).float()
             gram = torch.einsum("sgbd,sgcd->gbc", D, D)
-            energy_sq = torch.einsum("ngb,gbc,ngc->ng", z.float(), gram, z.float())
+            code = z.float()
+            energy_sq = torch.einsum("ngb,gbc,ngc->ng", code, gram, code)
             score = energy_sq.clamp_min(0).sqrt().to(z.dtype)
         elif self.cfg.selection_score == "isolated_loss_decrease":
             if x is None:

@@ -294,7 +294,7 @@ class DeadTracker:
         accepted = mask.detach().to(device=self.device, dtype=torch.bool)
         any_fire = accepted.any(dim=0)
         self.tokens_since_fired += len(accepted)
-        self.tokens_since_fired[any_fire] = 0
+        self.tokens_since_fired.masked_fill_(any_fire, 0)
         reverse_offset = accepted.flip(0).to(torch.int8).argmax(dim=0)
         positions = self.tokens_seen + len(accepted) - 1 - reverse_offset
         self.last_fire.copy_(torch.where(any_fire, positions, self.last_fire))
@@ -317,7 +317,7 @@ class DeadTracker:
             .to(device=self.device, dtype=torch.bool)
             .any(dim=0)
         )
-        self.coordinate_passes_since_fired[did_fire] = 0
+        self.coordinate_passes_since_fired.masked_fill_(did_fire, 0)
         self.forward_passes += 1
 
         if self.max_tokens != 0:
@@ -406,7 +406,10 @@ class DeadTracker:
             raise ValueError(f"current_mask must have shape [B, {self.n_blocks}]")
         projected = self.tokens_since_fired + int(current_mask.shape[0])
         projected = projected.clone()
-        projected[current_mask.detach().to(self.device).any(dim=0)] = 0
+        projected.masked_fill_(
+            current_mask.detach().to(self.device).any(dim=0),
+            0,
+        )
         return projected >= horizon_tokens
 
     def state_dict(self) -> dict:
@@ -701,7 +704,7 @@ def _all_finite(obj) -> bool:
         by_device.setdefault(tensor.device, []).append(tensor)
     for device_tensors in by_device.values():
         norms = torch._foreach_norm(device_tensors, ord=float("inf"))
-        if not bool(torch.stack([torch.isfinite(norm) for norm in norms]).all()):
+        if not bool(torch.isfinite(torch.stack(norms)).all()):
             return False
     return True
 

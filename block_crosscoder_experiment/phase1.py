@@ -1366,6 +1366,7 @@ class LadderDataset(Phase1Dataset):
             realized_pair_principal_angles_degrees
         )
         self.contribution_maps = maps
+        self._contribution_maps_float64 = maps.to(torch.float64)
         self._ground_truth_extra = {
             "coordinate_truth": (
                 "shared_support_site_specific_coordinates"
@@ -1620,17 +1621,27 @@ class LadderDataset(Phase1Dataset):
         n, n_factors = len(example_ids), len(self.factors)
         active = self._draw_support(example_ids)
         n_events = n * self.config.active_per_example
-        event_example = torch.empty(n_events, dtype=torch.long)
-        event_factor = torch.empty(n_events, dtype=torch.long)
+        factor_events = active.transpose(0, 1).nonzero(as_tuple=False)
+        if len(factor_events) != n_events:
+            raise RuntimeError("ladder event accounting mismatch")
+        event_factor = factor_events[:, 0].contiguous()
+        event_example = factor_events[:, 1].contiguous()
+        factor_offsets = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.long),
+                torch.bincount(event_factor, minlength=n_factors).cumsum(dim=0),
+            )
+        ).tolist()
         coordinates = torch.zeros(n_events, self.n_sites, self.max_coordinate_dim)
         contributions = torch.zeros(n_events, self.n_sites, self.padded_dim)
+        clean_x = torch.zeros(n, self.n_sites, self.padded_dim)
 
-        cursor = 0
         for factor, metadata in enumerate(self.factors):
-            rows = torch.nonzero(active[:, factor], as_tuple=False).flatten()
-            count = len(rows)
-            if count == 0:
+            start, stop = factor_offsets[factor : factor + 2]
+            if start == stop:
                 continue
+            sl = slice(start, stop)
+            rows = event_example[sl]
             ids = example_ids[rows]
             rank = metadata.coordinate_dim
             shared = _factor_coordinates(
@@ -1640,9 +1651,6 @@ class LadderDataset(Phase1Dataset):
                 seed=self.split_seed,
                 stream=1_000 + 17 * factor,
             ) / math.sqrt(rank)
-            sl = slice(cursor, cursor + count)
-            event_example[sl] = rows
-            event_factor[sl] = factor
             for site in metadata.active_sites:
                 if self.config.step == "shared_support":
                     if site == 0:
@@ -1661,20 +1669,9 @@ class LadderDataset(Phase1Dataset):
             contributions[sl] = torch.einsum(
                 "esr,sdr->esd",
                 coordinates[sl].to(torch.float64),
-                self.contribution_maps[factor].to(torch.float64),
+                self._contribution_maps_float64[factor],
             ).to(torch.float32)
-            cursor += count
-        if cursor != n_events:
-            raise RuntimeError("ladder event accounting mismatch")
-
-        clean_x = torch.zeros(n, self.n_sites, self.padded_dim)
-        _add_events_by_factor_(
-            clean_x,
-            event_example,
-            event_factor,
-            contributions,
-            n_factors=n_factors,
-        )
+            clean_x[rows] = clean_x[rows] + contributions[sl]
         x = clean_x.clone()
         if self.config.step == "noise":
             x = x + self.config.noise_std * _normal(

@@ -44,6 +44,7 @@ from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
     decode_batch,
+    decode_batch_all_q,
     encode_batch,
     encode_batch_all_q,
     evaluate_rd,
@@ -94,6 +95,10 @@ TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
 EXECUTOR_SCHEMA = "bsc-cell-executor-v2"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
+_SYNTHETIC_NORMALIZATION_CACHE: dict[
+    tuple[int, torch.dtype, torch.device],
+    tuple[Mapping[str, Any], torch.Tensor, torch.Tensor],
+] = {}
 _DEPLOYABLE_CODEC_KEYS = {
     "format_version",
     "schema",
@@ -1256,8 +1261,22 @@ def _apply_normalization(x: torch.Tensor, record: Mapping[str, Any]) -> torch.Te
             variance = values.var(dim=-1, correction=0, keepdim=True)
             output[:, site, :dim] = (values - mean) / (variance + 1e-5).sqrt()
         return output
-    mean = torch.tensor(record["mean"], dtype=result.dtype)
-    scale = torch.tensor(record["scale"], dtype=result.dtype).view(1, -1, 1)
+    cache_key = (id(record), result.dtype, result.device)
+    cached = _SYNTHETIC_NORMALIZATION_CACHE.get(cache_key)
+    if cached is None or cached[0] is not record:
+        mean = torch.tensor(
+            record["mean"],
+            dtype=result.dtype,
+            device=result.device,
+        )
+        scale = torch.tensor(
+            record["scale"],
+            dtype=result.dtype,
+            device=result.device,
+        ).view(1, -1, 1)
+        _SYNTHETIC_NORMALIZATION_CACHE[cache_key] = (record, mean, scale)
+    else:
+        _, mean, scale = cached
     result = (result - mean.unsqueeze(0)) * scale
     for site, dim in enumerate(dims):
         result[:, site, dim:] = 0
@@ -5669,6 +5688,10 @@ def _evaluate_raw_space(
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
+    materialized_decoder_matrix = materialized_decoder.permute(1, 2, 0, 3).reshape(
+        model.cfg.n_latents,
+        model.cfg.n_sites * model.cfg.d_model,
+    )
     sites, width = model.cfg.n_sites, model.cfg.d_model
     coordinate_mask = (
         model.coordinate_mask[:, 0, 0].to(device).double()
@@ -5868,15 +5891,16 @@ def _evaluate_raw_space(
                 _decoder=materialized_decoder,
                 _encoder=materialized_encoder,
             )
+            normalized_predictions = decode_batch_all_q(
+                model,
+                codec,
+                packets,
+                _decoder=materialized_decoder,
+                _decoder_matrix=materialized_decoder_matrix,
+            )
             token_errors: dict[int, torch.Tensor] = {}
             for q in codec.spec.qs:
-                packet = packets[q]
-                normalized_prediction = decode_batch(
-                    model,
-                    codec,
-                    packet,
-                    _decoder=materialized_decoder,
-                ).to(device)
+                normalized_prediction = normalized_predictions[q]
                 if data["kind"] == "synthetic":
                     assert synthetic_normalization is not None
                     if synthetic_normalization["kind"] == "token_layer_norm":

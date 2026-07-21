@@ -13,6 +13,7 @@ from block_crosscoder_experiment.codec import (
     _artifact_digest,
     _packet_from_output,
     decode_batch,
+    decode_batch_all_q,
     encode_batch,
     encode_batch_all_q,
     evaluate_rd,
@@ -387,11 +388,35 @@ def test_all_q_encoding_runs_one_forward_and_matches_packets(monkeypatch):
     monkeypatch.setattr(model, "forward_with_materialized", counted)
     out, packets = encode_batch_all_q(model, codec, x[48:])
     assert calls == 1
+    sparse_mm = torch.sparse.mm
+    sparse_calls = 0
+
+    def counted_sparse_mm(*args, **kwargs):
+        nonlocal sparse_calls
+        sparse_calls += 1
+        return sparse_mm(*args, **kwargs)
+
+    monkeypatch.setattr(torch.sparse, "mm", counted_sparse_mm)
+    decoded = decode_batch_all_q(model, codec, packets)
+    assert sparse_calls == 1
     for q, packet in packets.items():
         expected = _packet_from_output(model, codec, out, q)
         assert torch.equal(packet.counts, expected.counts)
         assert torch.equal(packet.block_ids, expected.block_ids)
         assert torch.equal(packet.amplitude_symbols, expected.amplitude_symbols)
+        torch.testing.assert_close(
+            decoded[q],
+            decode_batch(model, codec, packet),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+    mismatched = dict(packets)
+    changed_counts = packets[4].counts.clone()
+    changed_counts[0] += 1
+    mismatched[4] = replace(packets[4], counts=changed_counts)
+    with pytest.raises(ValueError, match="identical support counts"):
+        decode_batch_all_q(model, codec, mismatched)
 
 
 def test_codec_device_cache_refreshes_after_tensor_mutation():

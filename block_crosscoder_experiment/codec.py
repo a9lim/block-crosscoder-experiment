@@ -68,6 +68,7 @@ __all__ = [
     "encode_batch",
     "encode_batch_all_q",
     "decode_batch",
+    "decode_batch_all_q",
 ]
 
 
@@ -645,6 +646,7 @@ def decode_batch(
     packet: EncodedBatch,
     *,
     _decoder: torch.Tensor | None = None,
+    _decoder_matrix: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode an explicit packet without access to the source activations."""
     device = next(model.parameters()).device
@@ -757,11 +759,14 @@ def decode_batch(
             device=device,
             check_invariants=False,
         )
-    decoder = model.decoder_tensor() if _decoder is None else _decoder
-    decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
-        G * b,
-        model.cfg.n_sites * model.cfg.d_model,
-    )
+    if _decoder_matrix is None:
+        decoder = model.decoder_tensor() if _decoder is None else _decoder
+        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
+            G * b,
+            model.cfg.n_sites * model.cfg.d_model,
+        )
+    else:
+        decoder_matrix = _decoder_matrix
     xhat = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
         packet.n_tokens,
         model.cfg.n_sites,
@@ -775,6 +780,206 @@ def decode_batch(
 
 
 @torch.no_grad()
+def decode_batch_all_q(
+    model,
+    codec: Codec,
+    packets: dict[int, EncodedBatch],
+    *,
+    _decoder: torch.Tensor | None = None,
+    _decoder_matrix: torch.Tensor | None = None,
+) -> dict[int, torch.Tensor]:
+    """Validate common support once and decode every quantizer in one SpMM.
+
+    ``encode_batch_all_q`` emits one immutable support stream shared by all
+    amplitude precisions.  Revalidating and sorting that support, rebuilding
+    the same CSR structure, and launching one sparse product per q adds no
+    packet evidence.  Stacking q on the sparse row axis retains the same
+    packet arithmetic while issuing one sparse matrix product.
+    """
+    if not packets:
+        raise ValueError("multi-q decode requires at least one packet")
+    requested = tuple(packets)
+    if len(set(requested)) != len(requested):  # defensive for mapping-like callers
+        raise ValueError("multi-q decode requires unique q values")
+    for q, packet in packets.items():
+        if q != packet.q:
+            raise ValueError("packet mapping key disagrees with packet q")
+        if q not in codec.spec.qs:
+            raise ValueError(f"packet q={q} is not in the frozen codec spec")
+
+    first = packets[requested[0]]
+    n_tokens = first.n_tokens
+    if n_tokens < 0 or first.counts.shape != (n_tokens,):
+        raise ValueError("packet counts must have one entry per token")
+    if first.counts.dtype not in {torch.int32, torch.int64}:
+        raise TypeError("packet counts must be an integer tensor")
+    if first.block_ids.dtype not in {torch.int32, torch.int64}:
+        raise TypeError("packet block_ids must be an integer tensor")
+
+    packet_devices = {
+        tensor.device
+        for packet in packets.values()
+        for tensor in (packet.counts, packet.block_ids, packet.amplitude_symbols)
+    }
+    validation_device = (
+        next(iter(packet_devices)) if len(packet_devices) == 1 else torch.device("cpu")
+    )
+    counts = first.counts.detach().to(device=validation_device, dtype=torch.long)
+    block_ids = first.block_ids.detach().to(
+        device=validation_device,
+        dtype=torch.long,
+    )
+    count_sum = counts.sum()
+    valid_count_bounds = (counts >= 0).all() & (counts <= codec.n_included).all()
+    if not bool(valid_count_bounds):
+        raise ValueError("packet has an impossible support count")
+    n_events = int(count_sum)
+    if first.block_ids.shape != (n_events,):
+        raise ValueError("packet block_ids length disagrees with support counts")
+
+    def same_tensor(left: torch.Tensor, right: torch.Tensor) -> bool:
+        if left is right:
+            return True
+        return (
+            left.device == right.device
+            and left.dtype == right.dtype
+            and left.shape == right.shape
+            and left.stride() == right.stride()
+            and left.storage_offset() == right.storage_offset()
+            and left.data_ptr() == right.data_ptr()
+        )
+
+    symbols_by_q: dict[int, torch.Tensor] = {}
+    for q, packet in packets.items():
+        if packet.n_tokens != n_tokens or packet.counts.shape != (n_tokens,):
+            raise ValueError("multi-q packets do not share one token/count shape")
+        if packet.counts.dtype not in {torch.int32, torch.int64}:
+            raise TypeError("packet counts must be an integer tensor")
+        if packet.block_ids.dtype not in {torch.int32, torch.int64}:
+            raise TypeError("packet block_ids must be an integer tensor")
+        if packet.block_ids.shape != (n_events,):
+            raise ValueError("packet block_ids length disagrees with support counts")
+        if packet.amplitude_symbols.shape != (n_events, model.cfg.block_dim):
+            raise ValueError(
+                "packet amplitude symbol shape disagrees with events/block width"
+            )
+        if packet.amplitude_symbols.dtype not in {torch.int32, torch.int64}:
+            raise TypeError("packet amplitude symbols must be integers")
+        if not same_tensor(packet.counts, first.counts) and not torch.equal(
+            packet.counts.detach().to(validation_device), counts
+        ):
+            raise ValueError("multi-q packets do not share identical support counts")
+        if not same_tensor(packet.block_ids, first.block_ids) and not torch.equal(
+            packet.block_ids.detach().to(validation_device, dtype=torch.long),
+            block_ids,
+        ):
+            raise ValueError("multi-q packets do not share identical block IDs")
+        symbols_by_q[q] = packet.amplitude_symbols.detach().to(
+            device=validation_device,
+            dtype=torch.long,
+        )
+
+    if n_events:
+        starts = torch.repeat_interleave(
+            torch.arange(n_tokens, device=validation_device),
+            counts,
+        )
+        keys = starts * max(1, codec.n_included) + block_ids
+        order = torch.argsort(keys)
+        sorted_keys = keys[order]
+        valid_ids = (block_ids >= 0).all() & (block_ids < codec.n_included).all()
+        duplicate = (sorted_keys[1:] == sorted_keys[:-1]).any()
+        if not bool(valid_ids & ~duplicate):
+            if bool(duplicate):
+                raise ValueError("packet repeats a block id within one token")
+            raise ValueError("packet block rank is outside the frozen support alphabet")
+        block_ids = block_ids[order]
+        symbols_by_q = {q: symbols[order] for q, symbols in symbols_by_q.items()}
+
+    valid_amplitudes = torch.stack(
+        [
+            (symbols >= 0).all() & (symbols <= (1 << q) - 1).all()
+            for q, symbols in symbols_by_q.items()
+        ]
+    ).all()
+    if not bool(valid_amplitudes):
+        raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
+
+    device = next(model.parameters()).device
+    G, b = model.cfg.n_blocks, model.cfg.block_dim
+    ranks = block_ids.to(device=device, non_blocking=True)
+    ids = codec._tensor_on("rank_to_block", device, dtype=torch.long)[ranks]
+    lo = codec._tensor_on("lo", device)[ids]
+    span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
+    symbol_stack = torch.stack(
+        [symbols_by_q[q].to(device=device, non_blocking=True) for q in requested]
+    )
+    levels = torch.tensor(
+        [(1 << q) - 1 for q in requested],
+        dtype=torch.float32,
+        device=device,
+    ).view(-1, 1, 1)
+    z_can = lo.unsqueeze(0) + symbol_stack.float() / levels * span.unsqueeze(0)
+    z_events = torch.einsum(
+        "eji,qej->qei",
+        codec._tensor_on("rotation", device)[ids],
+        z_can,
+    )
+    expanded_counts = counts.to(device=device, non_blocking=True) * b
+    crow = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long, device=device),
+            expanded_counts.repeat(len(requested)).cumsum(dim=0),
+        )
+    )
+    event_columns = (
+        ids.unsqueeze(1) * b
+        + torch.arange(b, dtype=torch.long, device=device).unsqueeze(0)
+    ).reshape(-1)
+    columns = event_columns.repeat(len(requested))
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Sparse CSR tensor support is in beta state.*",
+            category=UserWarning,
+        )
+        sparse_code = torch.sparse_csr_tensor(
+            crow,
+            columns,
+            z_events.reshape(-1),
+            size=(len(requested) * n_tokens, G * b),
+            device=device,
+            check_invariants=False,
+        )
+    if _decoder_matrix is None:
+        decoder = model.decoder_tensor() if _decoder is None else _decoder
+        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
+            G * b,
+            model.cfg.n_sites * model.cfg.d_model,
+        )
+    else:
+        decoder_matrix = _decoder_matrix
+    predictions = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+        len(requested),
+        n_tokens,
+        model.cfg.n_sites,
+        model.cfg.d_model,
+    )
+    if model.cfg.decoder_bias:
+        predictions = predictions + model.c.view(
+            1,
+            1,
+            model.cfg.n_sites,
+            model.cfg.d_model,
+        )
+    if model._has_padded_coordinates:
+        predictions = predictions * model.coordinate_mask[:, 0, 0].to(
+            predictions.dtype
+        ).unsqueeze(0)
+    return {q: predictions[index] for index, q in enumerate(requested)}
+
+
+@torch.no_grad()
 def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     """One calibration pass. `batches` yields [B, S, d] (CPU, any float
     dtype except fp16); selection in threshold mode against the model's
@@ -785,7 +990,8 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     ev_codes: list[torch.Tensor] = []
     ev_ids: list[torch.Tensor] = []
     ev_tokens: list[torch.Tensor] = []
-    block_events = torch.zeros(G, dtype=torch.long)
+    accumulation_device = torch.device(device)
+    block_events = torch.zeros(G, dtype=torch.long, device=accumulation_device)
     mean_acc = torch.zeros(S, d, dtype=torch.float64)
     n_tokens = 0
     selected_events = 0
@@ -814,11 +1020,11 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
                 f"estimated {estimated_peak_bytes} > "
                 f"{spec.max_calibration_event_bytes} bytes"
             )
-        ev_codes.append(z_sel[mask].float().cpu())
+        ev_codes.append(z_sel[nz[:, 0], nz[:, 1]].float().cpu())
         ev_ids.append(nz[:, 1].to(torch.int32).cpu())
         ev_tokens.append((nz[:, 0] + n_tokens).to(torch.int32).cpu())
-        block_events += mask.sum(dim=0).cpu()
-        mean_acc += raw_x.double().sum(dim=0).cpu()
+        block_events += mask.sum(dim=0)
+        mean_acc += torch.sum(raw_x, dim=0, dtype=torch.float64).cpu()
         n_tokens += x.shape[0]
 
     codes = torch.cat(ev_codes) if ev_codes else torch.zeros(0, b)
@@ -832,6 +1038,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     ev_codes.clear()
     ev_ids.clear()
     ev_tokens.clear()
+    block_events = block_events.cpu()
     included = block_events >= spec.floor
     rank_to_block = included.nonzero(as_tuple=False).flatten().to(torch.long)
 
@@ -874,9 +1081,10 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     sorted_ids = ids[order]
     sorted_codes = codes_can[order]
     boundaries = torch.searchsorted(sorted_ids, torch.arange(G + 1, dtype=torch.long))
+    boundary_values = boundaries.tolist()
     qs = torch.tensor([spec.clip_lo, spec.clip_hi])
     for g in included.nonzero().flatten().tolist():
-        seg = sorted_codes[boundaries[g] : boundaries[g + 1]]
+        seg = sorted_codes[boundary_values[g] : boundary_values[g + 1]]
         ql = torch.quantile(seg, qs, dim=0)
         lo[g], hi[g] = ql[0], ql[1]
     # Count model: add-one smoothing over the *entire legal alphabet*
@@ -998,6 +1206,14 @@ def evaluate_rd(
     current_sequence: int | None = None
     fallback_token_offset = 0
     materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
+    materialized_decoder_matrix = (
+        None
+        if materialized_decoder is None
+        else materialized_decoder.permute(1, 2, 0, 3).reshape(
+            model.cfg.n_blocks * model.cfg.block_dim,
+            model.cfg.n_sites * model.cfg.d_model,
+        )
+    )
     for item in batches:
         if isinstance(item, tuple):
             if len(item) != 2:
@@ -1045,8 +1261,9 @@ def evaluate_rd(
         # Non-operational support-rate sensitivities, per token.  The exact
         # fixed-width packet rate is assembled below from count and ID widths.
         if codec.n_included:
-            sup_bits = -codec.log2_count_prob(counts.cpu()).double() + _log2_binom(
-                codec.n_included, counts.cpu()
+            counts_host = counts.cpu()
+            sup_bits = -codec.log2_count_prob(counts_host).double() + _log2_binom(
+                codec.n_included, counts_host
             )
             act_p = (
                 (
@@ -1067,17 +1284,19 @@ def evaluate_rd(
         packets = {
             q: _packet_from_events(codec, packet_events, q) for q in spec.qs
         }
+        decoded_by_q = decode_batch_all_q(
+            model,
+            codec,
+            packets,
+            _decoder=materialized_decoder,
+            _decoder_matrix=materialized_decoder_matrix,
+        )
         err_site = {}
         for q in spec.qs:
             # Distortion is measured on the same validated integer packet a
             # saved artifact will decode, never on an algebraically similar
             # floating-point shortcut.
-            xhat = decode_batch(
-                model,
-                codec,
-                packets[q],
-                _decoder=materialized_decoder,
-            )
+            xhat = decoded_by_q[q]
             err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
         tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
 
