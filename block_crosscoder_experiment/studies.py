@@ -30,7 +30,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v4"
+    "dense-linear-memory-v5"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3946,11 +3946,14 @@ def _estimate_components(
         "codec.max_calibration_event_bytes",
     )
     # Host training is streamed; this prices optimizer/checkpoint staging,
-    # the declared exact calibration-event materialization, and 8 GiB of
+    # the declared exact calibration-event materialization, cached per-token
+    # raw endpoint errors used to avoid schedule replay, and 8 GiB of
     # shard/prefetch/runtime headroom without pretending the store is resident.
+    endpoint_error_cache_bytes = stored_rows * (len(quantizer_bits) + 1) * 8
     peak_host_ram_bytes = max(
         8 * 1024**3 + parameters * 20,
         8 * 1024**3 + calibration_ceiling,
+        8 * 1024**3 + endpoint_error_cache_bytes,
     )
     store_view_policy = values["data.store_view_policy"]
     view_identity = (

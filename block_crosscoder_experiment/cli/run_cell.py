@@ -26,7 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -5788,6 +5788,14 @@ def _load_deployment_schedule_bundle(
     return plans
 
 
+@dataclass(frozen=True)
+class _RawEndpointErrorCache:
+    endpoint_names: tuple[str, ...]
+    chunks: tuple[torch.Tensor, ...]  # each [endpoints, batch_tokens] fp64 CPU
+    tokens: int
+    pooled_denominator: float
+
+
 @torch.no_grad()
 def _evaluate_raw_space(
     ctx: _Context,
@@ -5796,8 +5804,8 @@ def _evaluate_raw_space(
     codec: Codec,
     deployment: Mapping[str, Any],
     *,
-    time_sharing_plans: Mapping[str, Mapping[str, Any]] | None = None,
-) -> dict[str, Any]:
+    retain_endpoint_errors: bool = False,
+) -> tuple[dict[str, Any], _RawEndpointErrorCache | None]:
     """Evaluate the serialized quantized codec in paired source coordinates."""
 
     data = preparation["data"]
@@ -5826,14 +5834,11 @@ def _evaluate_raw_space(
     errors = {
         q: torch.zeros(sites, dtype=torch.float64, device=device) for q in codec.spec.qs
     }
-    time_sharing_plans = {
-        str(key): dict(plan) for key, plan in (time_sharing_plans or {}).items()
-    }
-    time_sharing_errors = {
-        key: torch.zeros((), dtype=torch.float64, device=device)
-        for key in time_sharing_plans
-    }
-    time_sharing_evaluation_upper_tokens = {key: 0 for key in time_sharing_plans}
+    endpoint_names = (
+        "zero_event_calibration_mean",
+        *(f"q{q}" for q in codec.spec.qs),
+    )
+    endpoint_error_chunks: list[torch.Tensor] = []
 
     saved_normalization = deployment["normalization"]
     inverse_W: torch.Tensor | None = None
@@ -5894,9 +5899,19 @@ def _evaluate_raw_space(
                 )
 
     else:
-        normalized = _store_reader(preparation, "evaluation")
-        raw = _store_reader(preparation, "evaluation", raw=True)
         on_the_fly = data.get("normalization", {}).get("application") == "on_the_fly"
+        if on_the_fly and (
+            Path(data["root"]).resolve() != Path(data["raw_root"]).resolve()
+            or data["bindings"]["evaluation"]
+            != data["raw_bindings"]["evaluation"]
+        ):
+            raise CellExecutionError(
+                "single-view evaluation root/binding differs from its raw view"
+            )
+        normalized = (
+            None if on_the_fly else _store_reader(preparation, "evaluation")
+        )
+        raw = _store_reader(preparation, "evaluation", raw=True)
         saved_mode = str(saved_normalization.get("mode", "none"))
         oracle_layer_inverse = (
             saved_normalization.get("kind") == "frozen_transform"
@@ -5926,8 +5941,20 @@ def _evaluate_raw_space(
         ]:
             nonlocal serialized_forward_verified
             nonlocal persisted_view_max_abs_difference
-            normalized_stream = normalized.sequential_batches_with_ids(batch_size)
             raw_stream = raw.sequential_batches_with_ids(batch_size)
+            if on_the_fly:
+                for x_raw, raw_ids in raw_stream:
+                    encoder_input = _apply_saved_real_normalization(
+                        x_raw,
+                        saved_normalization,
+                        mean=saved_mean_cpu,
+                        operator=saved_operator_cpu,
+                    )
+                    serialized_forward_verified = True
+                    yield (encoder_input, x_raw.float(), raw_ids)
+                return
+            assert normalized is not None
+            normalized_stream = normalized.sequential_batches_with_ids(batch_size)
             sentinel = object()
             for normalized_item, raw_item in itertools.zip_longest(
                 normalized_stream, raw_stream, fillvalue=sentinel
@@ -5947,34 +5974,28 @@ def _evaluate_raw_space(
                 # persisted Phase-2 view remains useful as an independent
                 # materialization check, but is never a shortcut around the
                 # actual consumer preprocessing path.
-                if on_the_fly and not torch.equal(x_normalized, x_raw):
-                    raise CellExecutionError(
-                        "single-view evaluation readers do not expose identical "
-                        "raw activation bytes"
-                    )
                 encoder_input = _apply_saved_real_normalization(
                     x_raw,
                     saved_normalization,
                     mean=saved_mean_cpu,
                     operator=saved_operator_cpu,
                 )
-                if not on_the_fly:
-                    difference = float(
-                        (encoder_input - x_normalized.float()).abs().max()
+                difference = float(
+                    (encoder_input - x_normalized.float()).abs().max()
+                )
+                persisted_view_max_abs_difference = max(
+                    persisted_view_max_abs_difference, difference
+                )
+                if not torch.allclose(
+                    encoder_input,
+                    x_normalized.float(),
+                    rtol=0.012,
+                    atol=0.012,
+                ):
+                    raise CellExecutionError(
+                        "serialized deployment normalization does not reproduce "
+                        "the bound persisted evaluation view"
                     )
-                    persisted_view_max_abs_difference = max(
-                        persisted_view_max_abs_difference, difference
-                    )
-                    if not torch.allclose(
-                        encoder_input,
-                        x_normalized.float(),
-                        rtol=0.012,
-                        atol=0.012,
-                    ):
-                        raise CellExecutionError(
-                            "serialized deployment normalization does not reproduce "
-                            "the bound persisted evaluation view"
-                        )
                 serialized_forward_verified = True
                 yield (encoder_input, x_raw.float(), raw_ids)
 
@@ -6067,39 +6088,16 @@ def _evaluate_raw_space(
                     errors[q] += token_error.sum(dim=0)
                 del normalized_prediction, raw_prediction, residual, token_error
                 del decoded_chunk
-            if time_sharing_plans:
-                horizon = next(iter(time_sharing_plans.values()))["horizon_tokens"]
-                if tokens + len(x_raw) > int(horizon):
-                    raise CellExecutionError(
-                        "raw evaluation exceeds the declared time-sharing horizon"
-                    )
-                token_indices = torch.arange(
-                    tokens,
-                    tokens + len(x_raw),
-                    device=device,
-                    dtype=torch.int64,
+            if retain_endpoint_errors:
+                endpoint_error_chunks.append(
+                    torch.stack(
+                        (
+                            token_denominator.sum(dim=1),
+                            *(token_errors[q].sum(dim=1) for q in codec.spec.qs),
+                        ),
+                        dim=0,
+                    ).cpu()
                 )
-                endpoint_errors: dict[str, torch.Tensor] = {
-                    "zero_event_calibration_mean": token_denominator.sum(dim=1)
-                }
-                endpoint_errors.update(
-                    {f"q{q}": token_errors[q].sum(dim=1) for q in codec.spec.qs}
-                )
-                masks: dict[int, torch.Tensor] = {}
-                for key, plan in time_sharing_plans.items():
-                    upper_tokens = int(plan["upper_tokens"])
-                    mask = masks.get(upper_tokens)
-                    if mask is None:
-                        mask = ((token_indices + 1) * upper_tokens) // int(horizon) > (
-                            token_indices * upper_tokens
-                        ) // int(horizon)
-                        masks[upper_tokens] = mask
-                    time_sharing_errors[key] += torch.where(
-                        mask,
-                        endpoint_errors[str(plan["upper_name"])],
-                        endpoint_errors[str(plan["lower_name"])],
-                    ).sum()
-                    time_sharing_evaluation_upper_tokens[key] += int(mask.sum())
 
             sequences = row_ids[:, 0].to(dtype=torch.int64)
             unique_sequences, inverse = torch.unique_consecutive(
@@ -6187,20 +6185,8 @@ def _evaluate_raw_space(
         if synthetic_normalization is not None
         else str(saved_normalization.get("mode", "none"))
     )
-    pooled_denominator = denominator.sum()
-    operational_time_sharing = {
-        key: {
-            **plan,
-            "evaluation_tokens": tokens,
-            "evaluation_upper_tokens": time_sharing_evaluation_upper_tokens[key],
-            "raw_space_fvu": float(time_sharing_errors[key] / pooled_denominator),
-            "distortion_measurement": (
-                "executed_balanced_schedule_on_paired_raw_evaluation_rows"
-            ),
-        }
-        for key, plan in time_sharing_plans.items()
-    }
-    return {
+    pooled_denominator = float(denominator.sum())
+    payload = {
         "eligible": not oracle_layer_inverse,
         "mode": mode,
         "n_tokens": tokens,
@@ -6215,13 +6201,111 @@ def _evaluate_raw_space(
             else None
         ),
         "points": points,
-        "operational_time_sharing": operational_time_sharing,
+        "operational_time_sharing": {},
         "oracle_side_information": oracle_layer_inverse,
         "reason": (
             "token LayerNorm inverse uses unpriced source-token mean/variance"
             if oracle_layer_inverse
             else "paired row-identical raw view and invertible frozen transform"
         ),
+    }
+    cache = (
+        _RawEndpointErrorCache(
+            endpoint_names=endpoint_names,
+            chunks=tuple(endpoint_error_chunks),
+            tokens=tokens,
+            pooled_denominator=pooled_denominator,
+        )
+        if retain_endpoint_errors
+        else None
+    )
+    return payload, cache
+
+
+@torch.no_grad()
+def _evaluate_cached_time_sharing(
+    cache: _RawEndpointErrorCache,
+    plans: Mapping[str, Mapping[str, Any]],
+    *,
+    device: torch.device,
+) -> dict[str, dict[str, Any]]:
+    """Execute balanced schedules from first-pass paired raw endpoint errors."""
+
+    resolved = {str(key): dict(plan) for key, plan in plans.items()}
+    if not resolved:
+        return {}
+    name_to_index = {name: index for index, name in enumerate(cache.endpoint_names)}
+    if len(name_to_index) != len(cache.endpoint_names):
+        raise CellExecutionError("raw endpoint cache repeats an endpoint name")
+    horizons = {int(plan["horizon_tokens"]) for plan in resolved.values()}
+    if len(horizons) != 1:
+        raise CellExecutionError(
+            "deployment schedules do not share one common horizon"
+        )
+    horizon = next(iter(horizons))
+    if horizon <= 0 or cache.tokens > horizon:
+        raise CellExecutionError(
+            "cached raw evaluation exceeds the deployment schedule horizon"
+        )
+    for plan in resolved.values():
+        if (
+            str(plan["lower_name"]) not in name_to_index
+            or str(plan["upper_name"]) not in name_to_index
+        ):
+            raise CellExecutionError(
+                "deployment schedule names an endpoint absent from the raw cache"
+            )
+
+    errors = {
+        key: torch.zeros((), dtype=torch.float64, device=device) for key in resolved
+    }
+    upper_counts = {key: 0 for key in resolved}
+    token_offset = 0
+    for cpu_chunk in cache.chunks:
+        if (
+            cpu_chunk.device.type != "cpu"
+            or cpu_chunk.dtype != torch.float64
+            or cpu_chunk.ndim != 2
+            or cpu_chunk.shape[0] != len(cache.endpoint_names)
+        ):
+            raise CellExecutionError("raw endpoint cache chunk is malformed")
+        chunk = cpu_chunk.to(device=device, non_blocking=True)
+        chunk_tokens = chunk.shape[1]
+        indices = torch.arange(
+            token_offset,
+            token_offset + chunk_tokens,
+            device=device,
+            dtype=torch.int64,
+        )
+        masks: dict[int, torch.Tensor] = {}
+        for key, plan in resolved.items():
+            upper_tokens = int(plan["upper_tokens"])
+            mask = masks.get(upper_tokens)
+            if mask is None:
+                mask = ((indices + 1) * upper_tokens) // horizon > (
+                    indices * upper_tokens
+                ) // horizon
+                masks[upper_tokens] = mask
+            lower = chunk[name_to_index[str(plan["lower_name"])]]
+            upper = chunk[name_to_index[str(plan["upper_name"])]]
+            errors[key] += torch.where(mask, upper, lower).sum()
+            upper_counts[key] += int(mask.sum())
+        token_offset += chunk_tokens
+    if token_offset != cache.tokens:
+        raise CellExecutionError("raw endpoint cache token count is inconsistent")
+    if not math.isfinite(cache.pooled_denominator) or cache.pooled_denominator <= 0:
+        raise CellExecutionError("raw endpoint cache denominator is invalid")
+    return {
+        key: {
+            **plan,
+            "evaluation_tokens": cache.tokens,
+            "evaluation_upper_tokens": upper_counts[key],
+            "raw_space_fvu": float(errors[key] / cache.pooled_denominator),
+            "distortion_measurement": (
+                "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+            ),
+        }
+        for key, plan in resolved.items()
     }
 
 
@@ -6945,14 +7029,15 @@ def _evaluate(
             )
             for endpoint in ("native", "deployed")
         }
-    raw_space = _evaluate_raw_space(
+    raw_space, raw_endpoint_cache = _evaluate_raw_space(
         ctx,
         preparation,
         model,
         codec,
         deployment,
-        time_sharing_plans={},
+        retain_endpoint_errors=True,
     )
+    assert raw_endpoint_cache is not None
     schedule_plans = _selected_time_sharing_plans(
         ctx,
         rd=rd,
@@ -6974,17 +7059,12 @@ def _evaluate(
         schedule_contract=str(ctx.values["codec.time_sharing_schedule_contract"]),
     )
     if loaded_schedule_plans:
-        scheduled_raw = _evaluate_raw_space(
-            ctx,
-            preparation,
-            model,
-            codec,
-            deployment,
-            time_sharing_plans=loaded_schedule_plans,
+        raw_space["operational_time_sharing"] = _evaluate_cached_time_sharing(
+            raw_endpoint_cache,
+            loaded_schedule_plans,
+            device=device,
         )
-        raw_space["operational_time_sharing"] = scheduled_raw[
-            "operational_time_sharing"
-        ]
+    del raw_endpoint_cache
     fixed_rate = _fixed_rate_raw_score(
         ctx,
         rd=rd,

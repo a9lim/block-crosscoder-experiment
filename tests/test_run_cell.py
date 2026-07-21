@@ -21,9 +21,11 @@ from block_crosscoder_experiment.campaign import (
 from block_crosscoder_experiment.cli.run_cell import (
     CellExecutionError,
     _Context,
+    _RawEndpointErrorCache,
     _VERIFIED_STORE_BINDINGS,
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
+    _evaluate_cached_time_sharing,
     _balanced_schedule_uses_upper,
     _expected_capture_allocation,
     _expected_real_source_contract,
@@ -1439,6 +1441,81 @@ def test_balanced_time_sharing_schedule_has_exact_count_without_mode_bits() -> N
     ]
     with pytest.raises(ValueError, match="invalid balanced"):
         _balanced_schedule_uses_upper(11, upper_tokens=3, horizon_tokens=11)
+
+
+def test_cached_time_sharing_matches_paired_batch_execution() -> None:
+    chunks = (
+        torch.tensor(
+            [[10.0, 11.0, 12.0], [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            dtype=torch.float64,
+        ),
+        torch.tensor(
+            [
+                [13.0, 14.0, 15.0, 16.0],
+                [7.0, 8.0, 9.0, 10.0],
+                [11.0, 12.0, 13.0, 14.0],
+            ],
+            dtype=torch.float64,
+        ),
+        torch.tensor(
+            [
+                [17.0, 18.0, 19.0, 20.0],
+                [15.0, 16.0, 17.0, 18.0],
+                [19.0, 20.0, 21.0, 22.0],
+            ],
+            dtype=torch.float64,
+        ),
+    )
+    cache = _RawEndpointErrorCache(
+        endpoint_names=("zero_event_calibration_mean", "q4", "q8"),
+        chunks=chunks,
+        tokens=11,
+        pooled_denominator=200.0,
+    )
+    plan = {
+        "schedule": {
+            "lower_name": "q4",
+            "upper_name": "q8",
+            "upper_tokens": 3,
+            "horizon_tokens": 11,
+        }
+    }
+    result = _evaluate_cached_time_sharing(cache, plan, device=torch.device("cpu"))
+    lower = torch.cat([chunk[1] for chunk in chunks])
+    upper = torch.cat([chunk[2] for chunk in chunks])
+    mask = torch.tensor(
+        [
+            _balanced_schedule_uses_upper(
+                index,
+                upper_tokens=3,
+                horizon_tokens=11,
+            )
+            for index in range(11)
+        ]
+    )
+    expected = float(torch.where(mask, upper, lower).sum() / 200.0)
+    assert result["schedule"]["raw_space_fvu"] == expected
+    assert result["schedule"]["evaluation_upper_tokens"] == 3
+    prefix_plan = {
+        "schedule": {
+            **plan["schedule"],
+            "upper_tokens": 6,
+            "horizon_tokens": 22,
+        }
+    }
+    prefix = _evaluate_cached_time_sharing(
+        cache,
+        prefix_plan,
+        device=torch.device("cpu"),
+    )
+    assert prefix["schedule"]["raw_space_fvu"] == expected
+    assert prefix["schedule"]["evaluation_tokens"] == 11
+    with pytest.raises(CellExecutionError, match="horizon"):
+        _evaluate_cached_time_sharing(
+            cache,
+            {"schedule": {**plan["schedule"], "horizon_tokens": 10}},
+            device=torch.device("cpu"),
+        )
 
 
 def _schedule_bundle(

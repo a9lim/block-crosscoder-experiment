@@ -1121,6 +1121,21 @@ class Campaign:
                 )
             source_cells_by_id = {cell.cell_id: cell for cell in source_stage.cells}
             try:
+                selected_cells = tuple(
+                    source_cells_by_id[cell_id] for cell_id in selection.cell_ids
+                )
+            except KeyError as exc:
+                raise CampaignError(
+                    "Phase-1 selection names a cell outside its source"
+                ) from exc
+            if any(
+                cell.decision_map.get("qualification.promotable") is not True
+                for cell in selected_cells
+            ):
+                raise CampaignError(
+                    "Phase-1 selection includes a nonpromotable candidate"
+                )
+            try:
                 replayed_selections = tuple(
                     FrozenSelection.from_cells(
                         policy,
@@ -1148,15 +1163,6 @@ class Campaign:
                 raise CampaignError(
                     "Phase-1 selection is not the exact policy-ranked winner"
                 )
-            source_cells = {cell.cell_id: cell for cell in source_stage.cells}
-            try:
-                selected_cells = tuple(
-                    source_cells[cell_id] for cell_id in selection.cell_ids
-                )
-            except KeyError as exc:
-                raise CampaignError(
-                    "Phase-1 selection names a cell outside its source"
-                ) from exc
             if (
                 chain_item.get("source_plan_id") != expected.plan_id
                 or chain_item.get("source_stage") != source_stage.name
