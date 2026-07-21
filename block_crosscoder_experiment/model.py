@@ -484,6 +484,16 @@ class _ScoreGeometry(NamedTuple):
     site_decoder_gram: torch.Tensor | None
 
 
+class _FrozenEncoderSites(NamedTuple):
+    """Batch-local frozen per-site encoder contractions."""
+
+    input_key: tuple[object, ...]
+    encoder_key: tuple[object, ...]
+    preprocessing_key: tuple[object, ...]
+    postprocess_key: tuple[object, ...]
+    values: torch.Tensor  # [S, B, G*b]
+
+
 def _site_axis_factorize(
     tensor: torch.Tensor,
     rank: int,
@@ -767,21 +777,60 @@ class BlockCrosscoder(nn.Module):
             raise ValueError("encoder fusion has no observed source site for a token")
         return keep
 
-    def _encode_with_tensor(
-        self,
-        x: torch.Tensor,
-        encoder: torch.Tensor,
-        *,
-        observed: torch.Tensor | None = None,
-        validate_observed: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Encode with an already materialized structured encoder.
+    @staticmethod
+    def _tensor_binding_key(tensor: torch.Tensor) -> tuple[object, ...]:
+        return (
+            id(tensor),
+            tensor._version,
+            tensor.device,
+            tensor.dtype,
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+        )
 
-        A factorized or tied model otherwise rebuilt its full site tensor once
-        for encoding and again in later forward stages.  Keeping the tensor
-        local to one forward preserves autograd while avoiding those duplicate
-        materializations.
-        """
+    def _encoder_preprocessing_key(self) -> tuple[object, ...]:
+        cfg = self.cfg
+        return (
+            cfg.n_sites,
+            cfg.n_blocks,
+            cfg.block_dim,
+            cfg.d_model,
+            tuple(cfg.site_dims),
+            self._has_padded_coordinates,
+            cfg.apply_decoder_bias_to_input,
+            (
+                self._tensor_binding_key(self.coordinate_mask)
+                if self._has_padded_coordinates
+                else None
+            ),
+            (
+                self._tensor_binding_key(self.c)
+                if cfg.apply_decoder_bias_to_input
+                else None
+            ),
+        )
+
+    def _encoder_postprocess_key(self) -> tuple[object, ...]:
+        cfg = self.cfg
+        return (
+            cfg.encoder_fusion,
+            cfg.source_site,
+            cfg.n_sites,
+            cfg.n_blocks,
+            cfg.block_dim,
+            self._tensor_binding_key(self.a) if self.a is not None else None,
+            cfg.code_activation,
+            cfg.group_threshold_parameterization,
+            cfg.group_threshold_scope,
+            (
+                self._tensor_binding_key(self.log_threshold)
+                if self.log_threshold is not None
+                else None
+            ),
+        )
+
+    def _prepare_encoder_input(self, x: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg
         if x.ndim != 3 or x.shape[1:] != (cfg.n_sites, cfg.d_model):
             raise ValueError(
@@ -791,22 +840,14 @@ class BlockCrosscoder(nn.Module):
             x = x * self.coordinate_mask[:, 0, 0].to(x.dtype)
         if cfg.apply_decoder_bias_to_input:
             x = x - self.c.to(x.dtype).unsqueeze(0)
-        # The dominant real-model path observes every site and uses literal
-        # sum fusion.  Its observation mask is algebraically all ones, so do
-        # not allocate it or stream the complete activation batch through a
-        # no-op multiplication.
-        if observed is None and cfg.encoder_fusion == "sum":
-            keep = None
-        else:
-            keep = self._site_observation_mask(
-                x,
-                observed,
-                validate=validate_observed,
-            )
-            x = x * keep
-        W = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
-        per_site = torch.bmm(x.transpose(0, 1), W.transpose(1, 2))
-        z = per_site.sum(dim=0)
+        return x
+
+    def _finish_encoded_sum(
+        self,
+        z: torch.Tensor,
+        keep: torch.Tensor | None,
+    ) -> torch.Tensor:
+        cfg = self.cfg
         if cfg.encoder_fusion == "mean":
             assert keep is not None
             z = z / keep.sum(dim=1)
@@ -831,7 +872,102 @@ class BlockCrosscoder(nn.Module):
                 else threshold.view(1, -1, 1)
             )
             z = z * torch.relu(1.0 - threshold / norm.clamp_min(1e-12))
-        return z, keep
+        return z
+
+    def _encode_with_tensor(
+        self,
+        x: torch.Tensor,
+        encoder: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Encode with an already materialized structured encoder.
+
+        A factorized or tied model otherwise rebuilt its full site tensor once
+        for encoding and again in later forward stages.  Keeping the tensor
+        local to one forward preserves autograd while avoiding those duplicate
+        materializations.
+        """
+        cfg = self.cfg
+        x = self._prepare_encoder_input(x)
+        # The dominant real-model path observes every site and uses literal
+        # sum fusion.  Its observation mask is algebraically all ones, so do
+        # not allocate it or stream the complete activation batch through a
+        # no-op multiplication.
+        if observed is None and cfg.encoder_fusion == "sum":
+            keep = None
+        else:
+            keep = self._site_observation_mask(
+                x,
+                observed,
+                validate=validate_observed,
+            )
+            x = x * keep
+        W = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
+        per_site = torch.bmm(x.transpose(0, 1), W.transpose(1, 2))
+        z = per_site.sum(dim=0)
+        return self._finish_encoded_sum(z, keep), keep
+
+    def _frozen_encoder_sites(
+        self,
+        x: torch.Tensor,
+        encoder: torch.Tensor,
+    ) -> _FrozenEncoderSites:
+        """Compute the reusable per-site contraction for one no-grad batch."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("frozen encoder sites require no-grad execution")
+        prepared = self._prepare_encoder_input(x)
+        cfg = self.cfg
+        W = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
+        values = torch.bmm(prepared.transpose(0, 1), W.transpose(1, 2))
+        return _FrozenEncoderSites(
+            self._tensor_binding_key(x),
+            self._tensor_binding_key(encoder),
+            self._encoder_preprocessing_key(),
+            self._encoder_postprocess_key(),
+            values,
+        )
+
+    def _encode_from_frozen_sites(
+        self,
+        x: torch.Tensor,
+        encoder: torch.Tensor,
+        frozen_sites: _FrozenEncoderSites,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Fuse one observed view from an exact frozen site contraction."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("frozen encoder sites require no-grad execution")
+        cfg = self.cfg
+        if frozen_sites.input_key != self._tensor_binding_key(x):
+            raise ValueError("frozen encoder sites are not bound to this input")
+        if frozen_sites.encoder_key != self._tensor_binding_key(encoder):
+            raise ValueError("frozen encoder sites are not bound to this encoder")
+        if frozen_sites.preprocessing_key != self._encoder_preprocessing_key():
+            raise ValueError("frozen encoder input preprocessing changed")
+        if frozen_sites.postprocess_key != self._encoder_postprocess_key():
+            raise ValueError("frozen encoder postprocessing changed")
+        expected_shape = (cfg.n_sites, x.shape[0], cfg.n_latents)
+        if frozen_sites.values.shape != expected_shape:
+            raise ValueError(
+                "frozen encoder sites have invalid shape: "
+                f"expected {expected_shape}, got {tuple(frozen_sites.values.shape)}"
+            )
+        if observed is None and cfg.encoder_fusion == "sum":
+            keep = None
+            per_site = frozen_sites.values
+        else:
+            keep = self._site_observation_mask(
+                x,
+                observed,
+                validate=validate_observed,
+            )
+            per_site = frozen_sites.values * keep.transpose(0, 1)
+        z = per_site.sum(dim=0)
+        return self._finish_encoded_sum(z, keep), keep
 
     def encode(
         self,
@@ -1105,6 +1241,7 @@ class BlockCrosscoder(nn.Module):
         _decoder: torch.Tensor | None = None,
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
+        _encoder_sites: _FrozenEncoderSites | None = None,
     ) -> tuple[BSCOutput, torch.Tensor, torch.Tensor]:
         """Forward plus the exact structured weights used by that pass.
 
@@ -1120,6 +1257,7 @@ class BlockCrosscoder(nn.Module):
             _decoder=_decoder,
             _encoder=_encoder,
             _score_geometry=_score_geometry,
+            _encoder_sites=_encoder_sites,
         )
         xhat = self.decode(selection.z_selected, _decoder=decoder)
         return BSCOutput(xhat, *selection), decoder, encoder
@@ -1134,6 +1272,7 @@ class BlockCrosscoder(nn.Module):
         _decoder: torch.Tensor | None = None,
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
+        _encoder_sites: _FrozenEncoderSites | None = None,
     ) -> tuple[BSCSelection, torch.Tensor, torch.Tensor]:
         """Encode and select without paying for an unused dense decode.
 
@@ -1151,12 +1290,21 @@ class BlockCrosscoder(nn.Module):
                 encoder = self.encoder_tensor()
         else:
             encoder = _encoder
-        z, keep = self._encode_with_tensor(
-            x,
-            encoder,
-            observed=observed,
-            validate_observed=validate_observed,
-        )
+        if _encoder_sites is None:
+            z, keep = self._encode_with_tensor(
+                x,
+                encoder,
+                observed=observed,
+                validate_observed=validate_observed,
+            )
+        else:
+            z, keep = self._encode_from_frozen_sites(
+                x,
+                encoder,
+                _encoder_sites,
+                observed=observed,
+                validate_observed=validate_observed,
+            )
         scores = self.scores(
             z,
             x=x,

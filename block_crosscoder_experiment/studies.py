@@ -30,7 +30,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v5"
+    "dense-linear-memory-v6"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3787,12 +3787,17 @@ def _evaluation_workspace_bytes(
         + groups * block_width**2
         + groups * block_width
     ) * 8
+    # Shared-view evaluation retains one exact per-site encoder contraction
+    # while materializing one equally sized masked view.  This removes repeat
+    # BMMs but must remain a hard-gated, explicitly priced multi-GiB workspace.
+    frozen_encoder_site_bytes = sites * batch_tokens * latents * 4
     shared_code_bytes = (
         output_bytes
         + concordance_bytes
         + reduction_bytes
         + decoder_gram_bytes
         + accumulator_bytes
+        + 2 * frozen_encoder_site_bytes
     )
     if selection_score == "decoded_energy":
         score_geometry_bytes = groups * block_width**2 * 4

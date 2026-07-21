@@ -266,12 +266,14 @@ def evaluate_shared_code(
             x = x[: max_tokens - n_tokens]
         if not x.numel():
             break
+        encoder_sites = model._frozen_encoder_sites(x, materialized_encoder)
         full, _, _ = model.forward_with_materialized(
             x,
             mode=selection_mode,
             _decoder=materialized_decoder,
             _encoder=materialized_encoder,
             _score_geometry=score_geometry,
+            _encoder_sites=encoder_sites,
         )
         accumulate_target_statistics(x)
         full_sse += squared_error_by_site(x, full.xhat)
@@ -302,6 +304,7 @@ def evaluate_shared_code(
         del selected, selected_energy, gram
         observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
         zero_x: torch.Tensor | None = None
+        null_output = None
 
         def run_view(
             view_observed: torch.Tensor,
@@ -318,13 +321,15 @@ def evaluate_shared_code(
             without leaking any held-out activation.
             """
             if source_missing or empty:
-                nonlocal zero_x
+                nonlocal zero_x, null_output
+                if null_output is not None:
+                    return null_output
                 if zero_x is None:
                     zero_x = torch.zeros_like(x)
                 null_observed = torch.zeros_like(view_observed)
                 fallback = cfg.source_site if cfg.encoder_fusion == "source" else 0
                 null_observed[:, fallback] = True
-                return model.forward_with_materialized(
+                null_output = model.forward_with_materialized(
                     zero_x,
                     mode=selection_mode,
                     observed=null_observed,
@@ -333,6 +338,9 @@ def evaluate_shared_code(
                     _encoder=materialized_encoder,
                     _score_geometry=score_geometry,
                 )[0]
+                return null_output
+            if cfg.encoder_fusion == "source" or S == 1:
+                return full
             return model.forward_with_materialized(
                 x,
                 mode=selection_mode,
@@ -341,6 +349,7 @@ def evaluate_shared_code(
                 _decoder=materialized_decoder,
                 _encoder=materialized_encoder,
                 _score_geometry=score_geometry,
+                _encoder_sites=encoder_sites,
             )[0]
 
         for source in range(S):
@@ -416,6 +425,7 @@ def evaluate_shared_code(
                     .sum(dim=(0, 2))
                 )
             del missing
+        del encoder_sites, null_output
         n_tokens += x.shape[0]
 
     if n_tokens == 0:

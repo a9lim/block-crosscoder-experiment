@@ -76,6 +76,66 @@ def test_shared_code_builds_frozen_score_geometry_once(monkeypatch) -> None:
     assert calls == 1
 
 
+@pytest.mark.parametrize(
+    ("config", "expected_bmm_calls"),
+    (
+        (BSCConfig(8, 2, 3, 6, 2, encoder_fusion="sum"), 1),
+        (BSCConfig(8, 2, 3, 6, 2, encoder_fusion="source"), 2),
+        (BSCConfig(8, 2, 1, 6, 2, encoder_fusion="sum"), 2),
+    ),
+)
+def test_shared_code_reuses_one_encoder_contraction_per_batch(
+    monkeypatch, config, expected_bmm_calls
+) -> None:
+    model = BlockCrosscoder(config)
+    x = torch.randn(17, config.n_sites, config.d_model)
+    original = torch.bmm
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "bmm", counted)
+    result = evaluate_shared_code(model, [x], selection_mode="topk")
+    assert result["n_tokens"] == len(x)
+    assert calls == expected_bmm_calls
+
+
+@pytest.mark.parametrize("selection_mode", ("topk", "threshold"))
+def test_shared_code_cached_views_preserve_complete_payload_exactly(
+    monkeypatch, selection_mode
+) -> None:
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=7,
+            block_dim=2,
+            n_sites=3,
+            d_model=5,
+            k=2,
+            encoder_fusion="availability_rescaled_sum",
+            selection_score="isolated_loss_decrease",
+            decoder_constraint="free",
+            decoder_bias=False,
+        )
+    )
+    x = torch.randn(23, 3, 5, generator=torch.Generator().manual_seed(844))
+    if selection_mode == "threshold":
+        model.fit_threshold_([x], target_avg_blocks=2)
+    original = model.forward_with_materialized
+
+    def uncached(*args, **kwargs):
+        kwargs.pop("_encoder_sites", None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_with_materialized", uncached)
+    reference = evaluate_shared_code(model, [x], selection_mode=selection_mode)
+    monkeypatch.setattr(model, "forward_with_materialized", original)
+    cached = evaluate_shared_code(model, [x], selection_mode=selection_mode)
+    assert cached == reference
+
+
 def test_shared_code_block_chunking_preserves_complete_payload(monkeypatch) -> None:
     torch.manual_seed(123)
     model = BlockCrosscoder(

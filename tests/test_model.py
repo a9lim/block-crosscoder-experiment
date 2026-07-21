@@ -99,6 +99,126 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
     )
 
 
+@pytest.mark.parametrize(
+    "topology",
+    ("factorized", "tied", "padded"),
+)
+@pytest.mark.parametrize(
+    "fusion",
+    ("sum", "mean", "availability_rescaled_sum", "source"),
+)
+@pytest.mark.parametrize(
+    "activation",
+    ("signed", "relu", "group_soft_threshold"),
+)
+def test_frozen_encoder_sites_preserve_every_view_exactly(
+    device, topology, fusion, activation
+):
+    overrides = {
+        "encoder_fusion": fusion,
+        "source_site": 1,
+        "code_activation": activation,
+        "decoder_constraint": "free",
+        "encoder_bias": True,
+        "decoder_bias": True,
+        "apply_decoder_bias_to_input": True,
+    }
+    if topology == "factorized":
+        overrides["site_rank"] = 2
+    elif topology == "tied":
+        overrides["encoder_mode"] = "tied"
+    else:
+        overrides["site_dims"] = (32, 24, 16, 8)
+    model = make_model(device, **overrides)
+    x = whitened_batch(device, n=9, seed=417)
+    mixed = torch.ones(9, CFG.n_sites, dtype=torch.bool, device=device)
+    mixed[::2, 0] = False
+    only_first = torch.zeros_like(mixed)
+    only_first[:, 0] = True
+    without_first = torch.ones_like(mixed)
+    without_first[:, 0] = False
+    with torch.no_grad():
+        model.c.copy_(torch.randn_like(model.c))
+        decoder = model.decoder_tensor()
+        encoder = (
+            decoder * model.log_gamma.exp()
+            if model.cfg.encoder_mode == "tied"
+            else model.encoder_tensor()
+        )
+        frozen_sites = model._frozen_encoder_sites(x, encoder)
+        for observed in (None, mixed, only_first, without_first):
+            reference = model.forward_with_materialized(
+                x,
+                observed=observed,
+                validate_observed=False,
+                _decoder=decoder,
+                _encoder=encoder,
+            )[0]
+            cached = model.forward_with_materialized(
+                x,
+                observed=observed,
+                validate_observed=False,
+                _decoder=decoder,
+                _encoder=encoder,
+                _encoder_sites=frozen_sites,
+            )[0]
+            for actual, expected in zip(cached, reference, strict=True):
+                assert torch.equal(actual, expected)
+
+
+def test_frozen_encoder_sites_fail_closed_on_stale_state(device):
+    model = make_model(
+        device,
+        decoder_constraint="free",
+        encoder_bias=True,
+        decoder_bias=True,
+        apply_decoder_bias_to_input=True,
+        code_activation="group_soft_threshold",
+        site_dims=(32, 24, 16, 8),
+    )
+    x = whitened_batch(device, n=7, seed=418)
+    encoder = model.encoder_tensor()
+    state_keys = set(model.state_dict())
+    with pytest.raises(RuntimeError, match="no-grad"):
+        model._frozen_encoder_sites(x, encoder)
+    with torch.no_grad():
+        frozen_sites = model._frozen_encoder_sites(x, encoder)
+    with pytest.raises(RuntimeError, match="no-grad"):
+        model._encode_from_frozen_sites(x, encoder, frozen_sites)
+
+    def fresh_cache():
+        with torch.no_grad():
+            return model._frozen_encoder_sites(x, encoder)
+
+    with torch.no_grad():
+        x.add_(1)
+        with pytest.raises(ValueError, match="input"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+        frozen_sites = fresh_cache()
+        encoder.add_(1)
+        with pytest.raises(ValueError, match="encoder"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+        frozen_sites = fresh_cache()
+        model.c.add_(1)
+        with pytest.raises(ValueError, match="preprocessing"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+        frozen_sites = fresh_cache()
+        assert model.a is not None
+        model.a.add_(1)
+        with pytest.raises(ValueError, match="postprocessing"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+        frozen_sites = fresh_cache()
+        assert model.log_threshold is not None
+        model.log_threshold.add_(1)
+        with pytest.raises(ValueError, match="postprocessing"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+        frozen_sites = fresh_cache()
+        model.coordinate_mask[0, 0, 0, 0].logical_not_()
+        with pytest.raises(ValueError, match="preprocessing"):
+            model._encode_from_frozen_sites(x, encoder, frozen_sites)
+    assert set(model.state_dict()) == state_keys
+
+
 def test_batchtopk_exact_count_and_variable_per_token(device):
     B, G = 64, CFG.n_blocks
     gen = torch.Generator(device="cpu").manual_seed(2)
@@ -429,6 +549,7 @@ def test_frozen_score_geometry_is_exact_and_decoder_bound(device, selection_scor
             _encoder=encoder,
         )[0]
         geometry = model._frozen_score_geometry(decoder)
+        encoder_sites = model._frozen_encoder_sites(x, encoder)
         cached = model.forward_with_materialized(
             x,
             observed=observed,
@@ -446,6 +567,16 @@ def test_frozen_score_geometry_is_exact_and_decoder_bound(device, selection_scor
             _score_geometry=geometry,
         )[0]
         for actual, expected in zip(selected, cached[1:], strict=True):
+            assert torch.equal(actual, expected)
+        encoder_cached = model.forward_with_materialized(
+            x,
+            observed=observed,
+            _decoder=decoder,
+            _encoder=encoder,
+            _score_geometry=geometry,
+            _encoder_sites=encoder_sites,
+        )[0]
+        for actual, expected in zip(encoder_cached, cached, strict=True):
             assert torch.equal(actual, expected)
         with pytest.raises(ValueError, match="not bound"):
             model.forward_with_materialized(

@@ -1452,7 +1452,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v5"
+        "dense-linear-memory-v6"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1525,6 +1525,65 @@ def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
     assert by_score["decoder_weighted"] - base == groups * 4
     assert by_score["decoded_energy"] - base == groups * 2**2 * 4
     assert by_score["isolated_loss_decrease"] - base == 3 * groups * 2**2 * 4
+
+
+def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
+    batch_tokens = 128
+    groups = 256
+    block_width = 2
+    sites = 16
+    total_dim = 16
+    decoder_elements = sites * groups * block_width
+    actual = _evaluation_workspace_bytes(
+        batch_tokens=batch_tokens,
+        groups=groups,
+        block_width=block_width,
+        total_dim=total_dim,
+        operational_decoder_elements=decoder_elements,
+        quantizer_count=1,
+        sites=sites,
+        selection_score="code_norm",
+    )
+    events = batch_tokens * groups
+    latents = groups * block_width
+    trusted_decode = (
+        batch_tokens * 4
+        + events * (32 + 12 * block_width)
+        + events * block_width * 16
+        + events * block_width * 8
+        + (batch_tokens + 1) * 8
+        + batch_tokens * total_dim * 4
+        + decoder_elements * 4
+    )
+    output = 2 * batch_tokens * (
+        total_dim * 4 + latents * 8 + groups * 5
+    )
+    concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
+    concordance = (
+        batch_tokens
+        * concordance_groups
+        * (8 * block_width + 4)
+        * 8
+    )
+    reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
+    reduction = reduction_tokens * total_dim * 4 * 8
+    decoder_grams = (sites + 1) * groups * block_width**2 * 8
+    accumulators = (
+        (20 * sites * groups + 4 * sites * groups * block_width)
+        + groups * block_width**2
+        + groups * block_width
+    ) * 8
+    one_site_tensor = sites * batch_tokens * latents * 4
+    shared_code = (
+        output
+        + concordance
+        + reduction
+        + decoder_grams
+        + accumulators
+        + 2 * one_site_tensor
+    )
+    assert shared_code > trusted_decode
+    assert actual == shared_code
 
 
 def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():
