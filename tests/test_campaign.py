@@ -998,7 +998,7 @@ def qualified_phase2_campaign(
                 campaign,
                 cell.cell_id,
                 metric=float(index + 1),
-                validation={"fixed_rate_raw_fvu": float(index + 1)},
+                validation={"negative_mean_raw_fvu": float(index + 1)},
             )
         if stage.selection_policy is None:
             break
@@ -1031,7 +1031,7 @@ def qualified_phase2_campaign(
                     campaign,
                     cell.cell_id,
                     metric=float(index + 1),
-                    validation={"fixed_rate_raw_fvu": float(index + 1)},
+                    validation={"negative_mean_raw_fvu": float(index + 1)},
                 )
             if stage.name == family.rounds[-1].name:
                 nomination_path = (
@@ -1059,7 +1059,7 @@ def qualified_phase2_campaign(
                         campaign,
                         cell.cell_id,
                         metric=float(index + 1),
-                        validation={"fixed_rate_raw_fvu": float(index + 1)},
+                        validation={"negative_mean_raw_fvu": float(index + 1)},
                     )
                 campaign.select_stage(
                     revisit_stage.name,
@@ -2015,7 +2015,7 @@ def test_family_revisit_reconcile_recovers_post_commit_pointer_crash(
                 campaign,
                 cell.cell_id,
                 metric=float(index + 1),
-                validation={"fixed_rate_raw_fvu": float(index + 1)},
+                validation={"negative_mean_raw_fvu": float(index + 1)},
             )
         selection_path = tmp_path / "selections" / f"{stage.name}.json"
         payload = campaign.select_stage(stage.name, out=selection_path)
@@ -2047,7 +2047,7 @@ def test_family_revisit_reconcile_recovers_post_commit_pointer_crash(
                 campaign,
                 cell.cell_id,
                 metric=float(cell_index + 1),
-                validation={"fixed_rate_raw_fvu": float(cell_index + 1)},
+                validation={"negative_mean_raw_fvu": float(cell_index + 1)},
             )
         if index == len(family.rounds) - 1:
             break
@@ -2129,7 +2129,7 @@ def test_phase2_selection_enforces_authenticated_per_seed_sharing_guards(tmp_pat
             campaign,
             cell.cell_id,
             metric=float(index + 1),
-            validation={"fixed_rate_raw_fvu": float(index + 1)},
+            validation={"negative_mean_raw_fvu": float(index + 1)},
         )
     selection_path = tmp_path / "selections" / "anchors.json"
     payload = campaign.select_stage("anchors_1m", out=selection_path)
@@ -2164,7 +2164,7 @@ def test_phase2_selection_enforces_authenticated_per_seed_sharing_guards(tmp_pat
             campaign,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard,
         )
     with pytest.raises(CampaignError, match="no seed-complete"):
@@ -2207,7 +2207,7 @@ def test_sharing_guard_enforces_absolute_and_root_relative_fvu(tmp_path):
             absolute,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard(0.995, 0.995),
         )
     absolute_path = tmp_path / "absolute" / "selections" / "root.json"
@@ -2223,7 +2223,7 @@ def test_sharing_guard_enforces_absolute_and_root_relative_fvu(tmp_path):
             absolute,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard(1.001, 1.001),
         )
     with pytest.raises(
@@ -2245,7 +2245,7 @@ def test_sharing_guard_enforces_absolute_and_root_relative_fvu(tmp_path):
             cumulative,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard(0.30, 0.25),
         )
     selection_path = tmp_path / "cumulative" / "selections" / "root.json"
@@ -2262,7 +2262,7 @@ def test_sharing_guard_enforces_absolute_and_root_relative_fvu(tmp_path):
             cumulative,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard(0.319, 0.269),
         )
     first_path = tmp_path / "cumulative" / "selections" / "first.json"
@@ -2322,7 +2322,7 @@ def test_sharing_guard_enforces_absolute_and_root_relative_fvu(tmp_path):
             cumulative,
             cell.cell_id,
             metric=1.0,
-            validation={"fixed_rate_raw_fvu": 1.0},
+            validation={"negative_mean_raw_fvu": 1.0},
             sharing_guard=guard(0.329, 0.279),
         )
     with pytest.raises(CampaignError, match="no seed-complete"):
@@ -2364,7 +2364,7 @@ def test_sharing_guard_uses_coordinate_agreement_not_all_view_synergy(tmp_path):
                 campaign,
                 cell.cell_id,
                 metric=1.0,
-                validation={"fixed_rate_raw_fvu": 1.0},
+                validation={"negative_mean_raw_fvu": 1.0},
                 sharing_guard=guard(concordance=1.0, coverage=1.0),
             )
         selection_path = root / "selections" / "root.json"
@@ -2380,7 +2380,7 @@ def test_sharing_guard_uses_coordinate_agreement_not_all_view_synergy(tmp_path):
                 campaign,
                 cell.cell_id,
                 metric=1.0,
-                validation={"fixed_rate_raw_fvu": 1.0},
+                validation={"negative_mean_raw_fvu": 1.0},
                 sharing_guard=child_guard,
             )
         return campaign
@@ -2507,7 +2507,7 @@ def test_confirmation_score_noninferiority_boundary_is_seedwise(tmp_path, monkey
 
     def record_for(cell: CellSpec, score: float) -> CampaignRecord:
         metrics = {
-            "validation": {"fixed_rate_raw_fvu": score},
+            "validation": {"negative_mean_raw_fvu": score},
             "sharing_guard": {
                 "all_site_fvu_mean": 0.10,
                 "site_only_heldout_fvu_mean": 0.30,
@@ -2603,7 +2603,7 @@ def _phase2_campaign_at_main_stage(
                 campaign,
                 cell.cell_id,
                 metric=float(index + 1),
-                validation={"fixed_rate_raw_fvu": float(index + 1)},
+                validation={"negative_mean_raw_fvu": float(index + 1)},
             )
         selection_path = root / "selections" / f"{stage.name}.json"
         payload = campaign.select_stage(stage.name, out=selection_path)
@@ -2634,7 +2634,7 @@ def test_factorization_carrier_failure_retains_only_exact_parent_control(tmp_pat
             campaign,
             cell.cell_id,
             metric=metric,
-            validation={"fixed_rate_raw_fvu": metric},
+            validation={"negative_mean_raw_fvu": metric},
         )
     payload = campaign.select_stage(factorization.name)
     assert len(payload["selected"]) == 1
@@ -2672,7 +2672,7 @@ def test_factorization_selection_uses_lowest_seedwise_noninferior_rank(tmp_path)
             campaign,
             cell.cell_id,
             metric=metrics[variant],
-            validation={"fixed_rate_raw_fvu": metrics[variant]},
+            validation={"negative_mean_raw_fvu": metrics[variant]},
         )
 
     payload = campaign.select_stage(factorization.name)

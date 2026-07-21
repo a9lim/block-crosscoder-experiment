@@ -52,6 +52,9 @@ PHASE1_SCIENTIFIC_SEEDS = (0, 1, 2)
 PHASE2_SCIENTIFIC_SEEDS = (0, 1)
 PHASE2_CONFIRMATION_SCORE_DEGRADATION_MAX = 0.02
 PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY = (0.01, 0.02, 0.05)
+PHASE2_SELECTION_METRIC_KEY = "negative_mean_raw_fvu"
+PHASE2_SELECTION_METRIC_PATH = f"validation.{PHASE2_SELECTION_METRIC_KEY}"
+PHASE2_INELIGIBLE_SELECTION_SCORE = -1.0e30
 PHASE2_CONFIRMATION_THRESHOLD_BASIS = (
     "novel_preregistered_confirmation_reproducibility_guard_not_a_paper_value"
 )
@@ -5738,7 +5741,10 @@ def _source_contract_defaults(
             engineering(
                 "data.normalization_fit_count",
                 250_000,
-                rationale="bind the full Phase-2 normalization-fit split",
+                rationale=(
+                    "bind the exact Phase-2 250,000-row fit prefix, excluding "
+                    "whole-sequence rounding surplus"
+                ),
             ),
             engineering(
                 "data.normalization_fit_statistic",
@@ -5905,7 +5911,10 @@ def _source_contract_defaults(
         engineering(
             "data.normalization_fit_count",
             250_000,
-            rationale="bind the full Phase-3 normalization-fit split",
+            rationale=(
+                "bind the exact Phase-3 250,000-row fit prefix, excluding "
+                "whole-sequence rounding surplus"
+            ),
         ),
         engineering(
             "data.normalization_fit_statistic",
@@ -8191,7 +8200,10 @@ def _pilot_overrides(
         engineering(
             "precision.forward",
             "bf16",
-            rationale="the GPU pilot uses bf16 after fp32 parity",
+            rationale=(
+                "the pilot uses declared bf16 forward precision; executable "
+                "fp32/bf16 parity is reserved for the Phase-3 preflight"
+            ),
         ),
         engineering(
             "protocol.hyperparameter_tuning",
@@ -10003,7 +10015,7 @@ def _development_selection_policy(
     parsimony_noninferiority_absolute_tolerance: float | None = None,
 ) -> SelectionPolicy:
     return SelectionPolicy(
-        metric_path="validation.fixed_rate_raw_fvu",
+        metric_path=PHASE2_SELECTION_METRIC_PATH,
         map_key=None,
         direction="max",
         retain_count=retain_count,

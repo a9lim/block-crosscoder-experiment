@@ -48,10 +48,11 @@ decoder-weighted selector and residual-Aux mechanics analyzed by
 [Minder et al.](https://arxiv.org/abs/2504.02922) are adapted only as generic
 multi-site mechanisms.
 
-[fmxcoders](https://arxiv.org/abs/2605.09438) are also in scope as the closest
-frontier treatment of scalable same-model cross-layer dictionaries. Their
+[fmxcoders: Factorized Masked Crosscoders for Cross-Layer Feature Discovery](https://arxiv.org/abs/2605.09438)
+is also in scope as the closest frontier treatment of scalable same-model
+cross-layer dictionaries. Its
 full three-mode factorization motivates our narrower, adapted site-axis-only
-factorization; their stochastic observation masking supplies a separate
+factorization; its stochastic observation masking supplies a separate
 hypothesis. Both follow the staged derived-candidate contract in Section 12.
 
 Methods whose scientific object is allocating shared and exclusive features
@@ -469,6 +470,10 @@ Subsequent selected-parent rounds are:
 | `auxiliary_16m` | 16M | exact selected parent; no Aux; BSF runner-up Aux; SASA source, low-weight, or long-window dead-group Aux |
 | `confirmation_16m` | 16M | scalar RMS, none, `sqrt_d`, shrinkage whitening, token LayerNorm |
 
+Phase 2 uses each cell's declared bf16 forward precision. It has no matrix-level
+fp32/bf16 parity cell: the executable parity-and-short-run stability preflight
+is deliberately Phase-3-only.
+
 There are deliberately no Phase-2 observation-site/evidence-topology or
 missing-site-fusion tuning rounds: the four hooks and their availability
 semantics stay fixed. Model architecture is explicitly retuned in
@@ -540,6 +545,10 @@ IDs even when another family's stage is most recent in the journal.
 | Anthropic dense L1 | activity; decoder-weighted L1 coefficient; learning rate; schedule |
 | decoder-weighted BatchTopK | activity; learning rate; batch size; schedule |
 | scalar ReLU BatchTopK | activity; learning rate; batch size; schedule |
+
+Every family learning-rate round has exactly four peak-rate arms:
+`3e-5`, `1e-4`, `2e-4`, and `3e-4`. This is independent family calibration,
+not the three-rate main-chain ladder plus its exact-parent control.
 
 Every block family resolves `groups = 8192 // block_width` and
 `active_blocks = target_active_coordinates // block_width`; the center is
@@ -743,9 +752,11 @@ configuration projection builds the exact five-seed production plan and then
 fingerprints the seed-zero representative of each slot.
 Each slot uses seeds 0–4. The model is pinned `google/gemma-3-4b-pt`; the four
 ordered residual-pre sites are blocks 8, 14, 20, and 26; the corpus is pinned
-FineWeb-Edu; context is 512. One raw bf16 store contains 25M unique training
+FineWeb-Edu; context is 512. One raw bf16 store requests 25M unique training
 rows, 250k normalization-fit rows, 250k calibration rows, 250k dedicated
-stability rows, and 2M final rows.
+stability rows, and 2M final rows; physical splits round upward to whole packed
+sequences. Transform fitting consumes exactly the requested 250k-row
+normalization prefix and excludes that rounding surplus.
 Every cell receives 100M optimizer-token presentations, scalar-RMS
 normalization, 16,384 total latent coordinates, and 128 active scalar
 coordinates before achieved-rate matching.
@@ -832,11 +843,26 @@ constraint, retraction cadence, objective reduction, regularizer, Aux bundle,
 deadness unit, selector tie behavior, and inference-threshold estimator. Only
 Adam and AdamW are scientific optimizer choices in the live recipes.
 
+The shared kernels also retain guarded configuration values used only by unit
+fixtures or explicitly quarantined source-release adapters. Those values are
+test-only or quarantined, not latent matrix rows: only a canonical cell emitted
+by `studies.py` is live, and nonmaterializable recipes fail before execution.
+
 Atomic checkpoints include model, optimizer, scheduler, retraction/dead-state,
 attempted and accepted tokens, data cursor, Python/NumPy/Torch/accelerator RNG
 states, and all content bindings. Resume validates the bindings and continues
-the exact deterministic presentation stream. No checkpoint is discarded until
-qualification and retention are journaled.
+the exact deterministic presentation stream. The campaign never
+garbage-collects a recorded final checkpoint or store and emits no retention
+journal event. Archival or deletion is an external operational action; any
+recorded artifact that later goes missing fails verification.
+
+The append-only journal supplies concurrency-safe operational history and its
+transition/artifact consistency is replayed at freeze. Before freeze, however,
+it is not an externally authenticated origin ledger: a writer with filesystem
+access could replace the journal and all matching evidence. The frozen decision
+content-addresses and replays the bytes it receives, but cannot prove who
+produced that pre-freeze state. Host/directory access control and an externally
+preserved frozen decision are therefore part of the provenance trust boundary.
 
 ## 10. Qualification, scientific outcome, and promotion
 
@@ -869,8 +895,9 @@ For a uniformly smoke stage, an otherwise-promotable cell may instead be
 `smoke_protocol_only`: the campaign can deterministically exercise selection,
 child materialization, and resume without reading scientific outcome values or
 enforcing scientific sharing/noninferiority gates. The artifact is explicitly
-non-scientific, cannot promote a cell, and cannot freeze or feed a Phase-3
-panel.
+non-scientific. It may feed the next smoke-only protocol stage, and a uniformly
+smoke Phase-2 campaign may freeze a protocol-test panel for smoke Phase 3, but
+neither artifact can authorize or feed non-smoke scientific Phase 3.
 
 Stage integrity gates may count complete negative evidence. Selection and
 promotion require a passed scientific outcome and the entire declared seed

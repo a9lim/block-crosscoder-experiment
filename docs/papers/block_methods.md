@@ -219,7 +219,8 @@ dead-latent Aux over original preactivations is a different algorithm.
 | Setting | GPT-2 Small | Mistral-7B-v0.1 |
 |---|---:|---:|
 | site/data | residual-pre block 7 / OpenWebText | residual-pre block 8 / Pile |
-| tokens/context | 150M / 128 | 500M / 512 |
+| SASA tokens/context | 150M / 128 | 500M / 512 |
+| external SAE tokens in sample-efficiency comparison | 300M | 1B |
 | `(groups,width,active)` | `(2048,6,10)` | `(4096,8,10)` |
 | scalar-equivalent width/L0 | `12288/60` | `32768/80` |
 | auxiliary groups | 512 | 256 |
@@ -229,6 +230,10 @@ Both settings use token LayerNorm, token batch 4,096, AdamW with betas
 final fifth. Reported endpoints include KL, CE, FVE, L0, absorption, matched
 scalar baselines, redundancy, probes, automated interpretation, and several
 semantic subspace-geometry analyses.
+The GPT-2 `150M/300M` pair is therefore SASA versus the external standard-SAE
+sample-efficiency comparator, not two SASA training budgets. The separate
+architecture comparison trains the scalar baselines on the same data and token
+budget as SASA.
 
 ### 3.4 Inspected-release drift
 

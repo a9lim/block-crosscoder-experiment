@@ -185,8 +185,9 @@ training axis.
 - [Multimodal group-sparse autoencoders](https://arxiv.org/abs/2601.20028)
   encourage paired scalar supports across modalities. Shared event support
   does not establish shared within-block coordinates.
-- [fmxcoders](https://arxiv.org/abs/2605.09438) factorize layer-axis weights and
-  use stochastic layer masking to encourage one-layer-to-all-layer functional
+- The paper [*fmxcoders: Factorized Masked Crosscoders for Cross-Layer Feature Discovery*](https://arxiv.org/abs/2605.09438)
+  factorizes layer-axis weights and uses stochastic layer masking to encourage
+  one-layer-to-all-layer functional
   coherence. The live same-model adaptation first retains the exact selected
   parent, then tests Tucker-style site-axis ranks `1,2,4` against an
   unfactorized free four-layer carrier subject to frozen carrier

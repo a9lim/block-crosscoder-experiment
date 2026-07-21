@@ -41,7 +41,7 @@ tie order.
 | SASA paper | signed vector block | free linear; per-token Top-s | free block maps | `sum_g ||D_g E_g||_*`; whole-group dead-residual Aux | effective-map-dimension and block-revival anchor |
 | Anthropic original | nonnegative scalar | sum affine site encoders; dense ReLU during training | free affine decoder per site | activation times the sum of per-site L2 decoder norms | same-model cross-layer comparator family; never sparse-finalist-eligible |
 | decoder-weighted BatchTopK adaptation | nonnegative scalar | sum affine site encoders; score by activation times sum of decoder norms; batch-global event allocation | free affine decoder per site | optional token-horizon residual Aux as a separate bundle | strongest scalar multi-site mechanism comparator |
-| fmxcoder-derived adaptation | signed vector block retained locally | Tucker-style low-rank site-axis encoder/decoder factors; optional stochastic encoder-site masking | compatible free decoder | clean-target reconstruction from partial layer evidence | Phase-1 capability evidence and Phase-2 real-model tuning; not a reproduction of the source tensor factorization |
+| adaptation from *fmxcoders: Factorized Masked Crosscoders for Cross-Layer Feature Discovery* | signed vector block retained locally | Tucker-style low-rank site-axis encoder/decoder factors; optional stochastic encoder-site masking | compatible free decoder | clean-target reconstruction from partial layer evidence | Phase-1 capability evidence and Phase-2 real-model tuning; not a reproduction of the source tensor factorization |
 | BSC | signed vector block | joint sum/mean/source encoder; block selector | site-specific block decoders with declared cross-site gauge | optional named block penalty or Aux | novel target method |
 
 The original Anthropic training model is retained exactly as dense ReLU plus
@@ -92,12 +92,15 @@ not the decoder nuclear norm. A group is dead when its firing frequency is at
 most `1e-4` over 1,000 tokens; the detached residual is re-encoded with dead
 groups and the selected auxiliary groups reconstruct it at coefficient one.
 
-The GPT-2 paper setting is residual-pre block 7 on OpenWebText, 150M tokens,
+The GPT-2 SASA setting is residual-pre block 7 on OpenWebText, 150M tokens,
 context 128, `(groups,width,active)=(2048,6,10)`, 512 auxiliary groups, token
 LayerNorm, token batch 4,096, AdamW, LR `2e-4`, WD `1e-3`, 1,000 warmup steps,
-and final-fifth linear decay. The Mistral setting uses block 8, 500M tokens,
-context 512, `(4096,8,10)`, and 256 auxiliary groups with the same optimizer
-family.
+and final-fifth linear decay. In the paper's sample-efficiency comparison, that
+150M SASA run is compared with a standard externally trained SAE using 300M
+tokens; `300M` is not a second SASA budget. Its controlled architecture
+comparison instead trains the scalar baselines on the same data and token
+budget. The Mistral SASA setting uses block 8, 500M tokens, context 512,
+`(4096,8,10)`, and 256 auxiliary groups with the same optimizer family.
 
 The paper does not disclose numeric `lambda_dim`, so the live paper bridge does
 not transfer an invented absolute coefficient across dimensions or reduction
@@ -327,8 +330,9 @@ selection. Width/activity are calibrated for block families; Group Lasso
 calibrates its coefficient and Appendix-Aux bundle; SASA calibrates its
 `0/.01/.03/.10` initial map-penalty ratios and source Aux bundles; Anthropic
 calibrates L1 coefficient; both BatchTopK scalar families calibrate
-batch size; every family calibrates activity, learning rate, and schedule as
-applicable. One top-two nomination policy ranks the complete union of qualified
+batch size; every family calibrates activity, schedule, and the exact four-rate
+learning-rate ladder `3e-5/1e-4/2e-4/3e-4` as applicable. One top-two nomination
+policy ranks the complete union of qualified
 4M family-round candidates, deduplicates resolved non-replicate execution
 signatures before outcome ranking while preserving every stage/candidate alias
 and metric spread, and binds one universe hash. The earliest declared source
@@ -387,6 +391,7 @@ total bits/token. Those budgets are the exact fourfold transfer of the pilot
 distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
+The resource envelope uses estimator schema `dense-linear-memory-v2`.
 
 ## 7. Fairness and compatibility
 
@@ -410,7 +415,9 @@ Smoke reductions preserve each full cell's resolved promotable intent, while
 `runtime.smoke` independently makes scientific promotion impossible. A
 uniformly smoke stage may emit only a `smoke_protocol_only` selection to test
 the state machine; it does not consume scientific outcomes or sharing guards,
-cannot promote a cell, and cannot freeze a Phase-3 panel.
+and cannot promote a cell. Smoke selections may feed only subsequent smoke
+stages; a uniformly smoke Phase-2 campaign may freeze a protocol panel for
+smoke Phase 3, but it cannot feed non-smoke scientific Phase 3.
 
 ## 8. Implemented derived-mechanism roles
 

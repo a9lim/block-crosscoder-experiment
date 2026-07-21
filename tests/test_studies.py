@@ -575,6 +575,27 @@ def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chai
             not round_spec.selection_policy.require_sharing_guard
             for round_spec in family.rounds
         )
+        learning_rate_round = next(
+            round_spec
+            for round_spec in family.rounds
+            if round_spec.name.endswith("_learning_rate_4m")
+        )
+        assert [
+            (
+                variant.name,
+                next(
+                    decision.value
+                    for decision in variant.decisions
+                    if decision.name == "optimizer.learning_rate"
+                ),
+            )
+            for variant in learning_rate_round.variants
+        ] == [
+            ("lr_3e_minus_5", 3e-5),
+            ("lr_1e_minus_4", 1e-4),
+            ("lr_2e_minus_4", 2e-4),
+            ("lr_3e_minus_4", 3e-4),
+        ]
     assert any(
         "coefficient" in item.name for item in families["anthropic_dense_l1"].rounds
     )

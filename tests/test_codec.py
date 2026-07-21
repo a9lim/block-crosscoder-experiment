@@ -61,6 +61,8 @@ def test_codec_fits_and_evaluates():
     assert codec.n_included > 0
     res = evaluate_rd(m, codec, batches_of(torch.randn(2048, S, D)), row_len=128)
     assert res["n_rows"] == 16
+    assert res["distortion_space"] == "transformed_activation_view"
+    assert res["fvu_definition"] == "sse_over_centered_total_in_transformed_view"
     p4, p8 = res["points"]["4"], res["points"]["8"]
     # More levels: distortion no worse, amplitude bits higher.
     assert p8["fvu_pooled"] <= p4["fvu_pooled"] + 1e-9

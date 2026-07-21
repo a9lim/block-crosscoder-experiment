@@ -89,6 +89,12 @@ Comparator-family calibration reports these same endpoints but does not gate
 on them, preserving deliberately non-sharing baselines for the frozen Phase-3
 comparison. Its top-two union deduplicates resolved non-replicate execution
 signatures while preserving every stage/candidate alias.
+Every comparator family independently calibrates the same four peak learning
+rates: `3e-5`, `1e-4`, `2e-4`, and `3e-4`.
+
+Phase 2 cells use their declared bf16 forward precision. The executable
+fp32/bf16 parity-and-short-run stability gate is a Phase-3-only preflight; the
+pilot does not claim to have passed that later production-shape gate.
 
 At the default seeds, Phase 1 declares and executes **198 cells**. Phase 2 has
 a **414-cell pre-elision ceiling**: 176 main-chain cells and 238 independently
@@ -182,6 +188,18 @@ Qualification means that the evidence bundle is complete and internally
 consistent. Scientific outcome and promotion eligibility are separate fields;
 a well-recorded negative result is still valid evidence.
 
+A smoke campaign may freeze and consume protocol-only selections and a
+protocol-only panel through a smoke Phase 3. Those artifacts remain
+non-scientific and are rejected if supplied to a non-smoke Phase-3 campaign.
+
+The journal is append-only through the campaign API, but before a freeze it is
+not an externally authenticated origin ledger. A writer with filesystem access
+could replace the journal and evidence together. Freeze replays and
+content-addresses the current internally consistent evidence; it does not prove
+who produced the pre-freeze bytes. Protect the campaign directory operationally
+and preserve the frozen decision outside that trust boundary when provenance
+against a malicious local writer matters.
+
 ## Activation-store runbook
 
 Capture every requested hook from one pinned model and one packed-token pass.
@@ -190,8 +208,10 @@ slow tokenizer at that exact revision, checks its class/BOS/vocabulary hash,
 and passes that tokenizer explicitly into TransformerLens. Store format v3
 binds `int64` row identities and writes an incomplete, hash-bound manifest after
 every durable shard. If capture stops, repeat the identical command with
-`--resume`; changed code, dependencies, sources, split order, or shard geometry
-are refused.
+`--resume`. The phase profile fixes the complete role set and canonical
+allocation order, independent of `--split` argument order; changed code,
+dependencies, sources, profile, role sizes, resulting binding, or shard
+geometry are refused.
 
 Phase 2 capture and materialized views:
 
@@ -203,6 +223,7 @@ bsc data estimate \
   --site-dim 768 --site-dim 768 --site-dim 768 --site-dim 768
 
 bsc data capture \
+  --profile phase2 \
   --source 'openai-community/gpt2|607a30d783dfa663caf39e06633721c8d4cfcd7e|blocks.3.hook_resid_pre' \
   --source 'openai-community/gpt2|607a30d783dfa663caf39e06633721c8d4cfcd7e|blocks.5.hook_resid_pre' \
   --source 'openai-community/gpt2|607a30d783dfa663caf39e06633721c8d4cfcd7e|blocks.7.hook_resid_pre' \
@@ -217,7 +238,8 @@ bsc data capture \
   --split train=16000000 --out /data/stores/bsc-gpt2-raw
 
 # Only after an interrupted invocation; every other argument must be identical.
-# bsc data capture ... --out /data/stores/bsc-gpt2-raw --resume
+# bsc data capture --profile phase2 ... \
+#   --out /data/stores/bsc-gpt2-raw --resume
 
 bsc data derive --raw /data/stores/bsc-gpt2-raw \
   --out /data/stores/bsc-gpt2-views \
@@ -253,6 +275,7 @@ bsc data estimate \
   --site-dim 2560 --site-dim 2560 --site-dim 2560 --site-dim 2560
 
 bsc data capture \
+  --profile phase3 \
   --source 'google/gemma-3-4b-pt|cc012e0a6d0787b4adcc0fa2c4da74402494554d|blocks.8.hook_resid_pre' \
   --source 'google/gemma-3-4b-pt|cc012e0a6d0787b4adcc0fa2c4da74402494554d|blocks.14.hook_resid_pre' \
   --source 'google/gemma-3-4b-pt|cc012e0a6d0787b4adcc0fa2c4da74402494554d|blocks.20.hook_resid_pre' \
@@ -285,12 +308,14 @@ their verified physical-byte credit. The full scientific estimate remains
 unchanged.
 
 The 1 TB `/data` volume should not be assumed to hold both campaigns. After the
-Phase-2 panel is frozen and all qualification/retention records, checkpoints,
-codecs, evaluations, decisions, and logs are durably retained, verify the raw
-and derived stores one last time and move reproducible Phase-2 activation stores
-to another volume before Phase-3 capture. Never remove a store needed by an
-unqualified cell or by an unresolved retention record. Re-run planning after
-the handoff so the incremental preflight reflects the live filesystem.
+Phase-2 panel is frozen and its checkpoints, codecs, evaluations, decisions,
+logs, and evidence envelope are independently backed up, verify the raw and
+derived stores one last time and move reproducible Phase-2 activation stores to
+another volume before Phase-3 capture. The campaign never performs this move or
+deletes recorded final checkpoints/stores itself; external deletion is an
+operator decision, and any later verifier will reject a recorded artifact that
+is missing. Re-run planning after the handoff so the incremental preflight
+reflects the live filesystem.
 
 ## References and environment
 

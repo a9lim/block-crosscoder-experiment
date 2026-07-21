@@ -917,6 +917,11 @@ def evaluate_rd(
     results: dict = {
         "rate_model": "fixed_width_decodable_payload_bits_v1",
         "sensitivity_rate_model": "ideal_enumerative_and_bernoulli_logical_bits_v1",
+        # Codec-local FVU diagnoses quantization in the bound transformed
+        # activation view. Real-model selection is computed separately after
+        # applying the deployable inverse to the original activation space.
+        "distortion_space": "transformed_activation_view",
+        "fvu_definition": "sse_over_centered_total_in_transformed_view",
         "packet_roundtrip_validated": True,
         "n_rows": n_rows,
         "n_tokens": int(n_tok.sum()),

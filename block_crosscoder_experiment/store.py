@@ -31,7 +31,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import torch
 
@@ -1177,15 +1177,73 @@ class StoreReader:
     def _shard_tokens(self, shard: str | dict, *, verify: bool = False) -> torch.Tensor:
         return self._shard_payload(shard, verify=verify)[0]
 
-    def verify(self) -> int:
-        """Re-hash every shard against its header. Returns tokens verified."""
+    def verify(self, *, expected_row_identity: Mapping[str, int] | None = None) -> int:
+        """Re-hash every shard and optionally verify its exact row allocation."""
         if self.n_tokens <= 0 or not self.manifest["shards"]:
             raise ValueError("activation-store split is empty")
+        if expected_row_identity is not None:
+            required = {
+                "sequence_start",
+                "sequence_stop_exclusive",
+                "tokens_per_sequence",
+                "position_start",
+            }
+            if set(expected_row_identity) != required or any(
+                not isinstance(expected_row_identity[name], int)
+                or isinstance(expected_row_identity[name], bool)
+                for name in required
+            ):
+                raise ValueError("expected row identity contract is malformed")
+            sequence_start = expected_row_identity["sequence_start"]
+            sequence_stop = expected_row_identity["sequence_stop_exclusive"]
+            tokens_per_sequence = expected_row_identity["tokens_per_sequence"]
+            position_start = expected_row_identity["position_start"]
+            if (
+                sequence_start < 0
+                or sequence_stop <= sequence_start
+                or tokens_per_sequence <= 0
+                or position_start < 0
+                or (sequence_stop - sequence_start) * tokens_per_sequence
+                != self.n_tokens
+            ):
+                raise ValueError("expected row identity allocation is inconsistent")
         total = 0
         stream = hashlib.sha256()
         row_stream = hashlib.sha256()
         for s in self.manifest["shards"]:
             acts, row_ids = self._shard_payload(s, verify=True)
+            if expected_row_identity is not None:
+                if row_ids.shape[1] < 2:
+                    raise ValueError(
+                        "captured row identity lacks sequence and position"
+                    )
+                offsets = torch.arange(
+                    total,
+                    total + row_ids.shape[0],
+                    dtype=torch.int64,
+                )
+                expected_sequences = sequence_start + offsets // tokens_per_sequence
+                expected_positions = position_start + offsets % tokens_per_sequence
+                if not torch.equal(row_ids[:, 0], expected_sequences):
+                    mismatch = int(
+                        torch.nonzero(
+                            row_ids[:, 0] != expected_sequences, as_tuple=False
+                        )[0]
+                    )
+                    raise ValueError(
+                        "row identity sequence differs from the canonical split "
+                        f"allocation at stored row {total + mismatch}"
+                    )
+                if not torch.equal(row_ids[:, 1], expected_positions):
+                    mismatch = int(
+                        torch.nonzero(
+                            row_ids[:, 1] != expected_positions, as_tuple=False
+                        )[0]
+                    )
+                    raise ValueError(
+                        "row identity position differs from the canonical packed "
+                        f"sequence at stored row {total + mismatch}"
+                    )
             total += acts.shape[0]
             stream.update(acts.contiguous().view(torch.uint8).numpy().tobytes())
             row_stream.update(row_ids.contiguous().view(torch.uint8).numpy().tobytes())

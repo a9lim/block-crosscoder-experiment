@@ -67,6 +67,8 @@ from block_crosscoder_experiment.studies import (
     Phase1Blueprint,
     Phase2Blueprint,
     Phase3Blueprint,
+    PHASE2_INELIGIBLE_SELECTION_SCORE,
+    PHASE2_SELECTION_METRIC_KEY,
     StudyError,
     StudyPlan,
     build_phase1_blueprint,
@@ -85,7 +87,7 @@ PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
 EXECUTOR_SCHEMA = "bsc-cell-executor-v2"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
-_VERIFIED_STORE_BINDINGS: set[tuple[str, str, str]] = set()
+_VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _DEPLOYABLE_CODEC_KEYS = {
     "format_version",
     "schema",
@@ -156,10 +158,24 @@ def _tensor_payload_digest(value: Any) -> str:
     return digest.hexdigest()
 
 
-def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> None:
+def _verify_store_reader_once(
+    reader: StoreReader,
+    root: Path,
+    split: str,
+    *,
+    expected_row_identity: Mapping[str, int] | None = None,
+) -> None:
     manifest = root / split / MANIFEST_NAME
     manifest_sha256 = _sha256(manifest)
-    key = (str(root.resolve()), split, manifest_sha256)
+    row_identity_digest = (
+        "generic"
+        if expected_row_identity is None
+        else hashlib.sha256(
+            canonical_json(dict(expected_row_identity)).encode("utf-8")
+        ).hexdigest()
+    )
+    key = (str(root.resolve()), split, manifest_sha256, row_identity_digest)
+    generic_key = (str(root.resolve()), split, manifest_sha256, "generic")
     if key in _VERIFIED_STORE_BINDINGS:
         return
 
@@ -184,11 +200,16 @@ def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> No
     cache_base = os.environ.get("BSC_VERIFICATION_CACHE_ROOT")
     if cache_base is None:
         campaign_root = os.environ.get("BSC_CAMPAIGN_ROOT")
-        cache_root = (
-            Path(campaign_root) / ".store-verification"
-            if campaign_root is not None
-            else Path(tempfile.gettempdir()) / "bsc-store-verification"
-        )
+        if campaign_root is None:
+            # A persistent receipt in a shared temporary directory could be
+            # forged by another local user. Ad-hoc callers therefore receive
+            # only the process-local cache; registered campaigns persist
+            # receipts under their authenticated root.
+            reader.verify(expected_row_identity=expected_row_identity)
+            _VERIFIED_STORE_BINDINGS.add(key)
+            _VERIFIED_STORE_BINDINGS.add(generic_key)
+            return
+        cache_root = Path(campaign_root) / ".store-verification"
     else:
         cache_root = Path(cache_base)
     cache_key = hashlib.sha256(
@@ -197,6 +218,7 @@ def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> No
                 "root": str(root.resolve()),
                 "split": split,
                 "manifest_sha256": manifest_sha256,
+                "expected_row_identity": expected_row_identity,
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -210,6 +232,7 @@ def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> No
         "content_stream_sha256": reader.manifest.get("content_stream_sha256"),
         "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
         "n_tokens": reader.n_tokens,
+        "expected_row_identity": expected_row_identity,
         "stat_fingerprint": fingerprint,
     }
     if receipt_path.is_file():
@@ -219,8 +242,9 @@ def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> No
             receipt = None
         if receipt == expected_receipt:
             _VERIFIED_STORE_BINDINGS.add(key)
+            _VERIFIED_STORE_BINDINGS.add(generic_key)
             return
-    verified_tokens = reader.verify()
+    verified_tokens = reader.verify(expected_row_identity=expected_row_identity)
     if verified_tokens != reader.n_tokens:
         raise CellExecutionError(
             f"store verification returned {verified_tokens} rows, expected "
@@ -228,6 +252,7 @@ def _verify_store_reader_once(reader: StoreReader, root: Path, split: str) -> No
         )
     _atomic_bytes(receipt_path, _json_bytes(expected_receipt))
     _VERIFIED_STORE_BINDINGS.add(key)
+    _VERIFIED_STORE_BINDINGS.add(generic_key)
 
 
 def _json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -1414,6 +1439,43 @@ def _verify_real_source_contract(
     return expected
 
 
+def _expected_capture_allocation(
+    values: Mapping[str, Any],
+) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
+    """Rebuild the canonical whole-sequence allocation from cell decisions."""
+
+    declared_items = tuple(values["data.split_sizes"])
+    split_order = tuple(str(name) for name, _ in declared_items)
+    drop_policy = str(values["data.context_drop_policy"])
+    if drop_policy == "none":
+        drop_positions = 0
+    elif drop_policy == "drop_bos_position_0":
+        drop_positions = 1
+    else:
+        raise CellExecutionError(
+            f"unsupported data.context_drop_policy {drop_policy!r}"
+        )
+    tokens_per_sequence = int(values["data.context_length"]) - drop_positions
+    if tokens_per_sequence <= 0:
+        raise CellExecutionError("capture tokens per sequence must be positive")
+    next_sequence = 0
+    plan: dict[str, dict[str, int]] = {}
+    for name, requested in declared_items:
+        name = str(name)
+        requested = int(requested)
+        n_sequences = math.ceil(requested / tokens_per_sequence)
+        sequence_stop = next_sequence + n_sequences
+        plan[name] = {
+            "requested_tokens": requested,
+            "actual_tokens": n_sequences * tokens_per_sequence,
+            "sequence_start": next_sequence,
+            "sequence_stop_exclusive": sequence_stop,
+            "tokens_per_sequence": tokens_per_sequence,
+        }
+        next_sequence = sequence_stop
+    return split_order, plan
+
+
 def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[str, Any]:
     capture_path = raw_root / "capture.json"
     if not capture_path.is_file():
@@ -1431,12 +1493,29 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
     if computed_source_hash != source_hash:
         raise CellExecutionError("capture source contract hash mismatch")
     declared = _verify_real_source_contract(source, values)
+    split_order, split_plan = _expected_capture_allocation(values)
+    if capture.get("schema") != "bsc-capture-manifest-v1":
+        raise CellExecutionError("capture source contract has an unknown schema")
+    if capture.get("split_order") != list(split_order):
+        raise CellExecutionError(
+            "capture split order differs from the canonical cell allocation"
+        )
+    if capture.get("split_plan") != split_plan or capture.get("splits") != split_plan:
+        raise CellExecutionError(
+            "capture split allocation differs from data.split_sizes"
+        )
+    capture_binding_sha256 = capture.get("capture_binding_sha256")
+    if not isinstance(capture_binding_sha256, str) or len(capture_binding_sha256) != 64:
+        raise CellExecutionError("capture binding digest is malformed")
     return {
         "path": str(capture_path),
         "sha256": _sha256(capture_path),
         "source_hash": source_hash,
         "source": source,
         "declared": declared,
+        "split_order": split_order,
+        "split_plan": split_plan,
+        "capture_binding_sha256": capture_binding_sha256,
     }
 
 
@@ -1467,11 +1546,19 @@ def _verify_declared_split_contract(
     root: Path,
     values: Mapping[str, Any],
     *,
+    capture_contract: Mapping[str, Any],
     expected_store_axis: tuple[int, ...],
     expected_whitener_hash: str,
 ) -> dict[str, Any]:
     declared_items = tuple(values["data.split_sizes"])
     declared = {str(name): int(tokens) for name, tokens in declared_items}
+    expected_order = tuple(str(item) for item in capture_contract["split_order"])
+    if tuple(declared) != expected_order:
+        raise CellExecutionError(
+            "activation-store split order differs from the capture allocation"
+        )
+    split_plan = capture_contract["split_plan"]
+    capture_binding_sha256 = str(capture_contract["capture_binding_sha256"])
     available = {
         path.name
         for path in root.iterdir()
@@ -1489,7 +1576,30 @@ def _verify_declared_split_contract(
     for split, requested_tokens in declared_items:
         split = str(split)
         reader = StoreReader(root, split)
-        _verify_store_reader_once(reader, root, split)
+        allocation = split_plan[split]
+        if reader.n_tokens != int(allocation["actual_tokens"]):
+            raise CellExecutionError(
+                f"store split {split!r} has {reader.n_tokens} rows, but the "
+                f"canonical allocation requires {allocation['actual_tokens']}"
+            )
+        try:
+            _verify_store_reader_once(
+                reader,
+                root,
+                split,
+                expected_row_identity={
+                    "sequence_start": int(allocation["sequence_start"]),
+                    "sequence_stop_exclusive": int(
+                        allocation["sequence_stop_exclusive"]
+                    ),
+                    "tokens_per_sequence": int(allocation["tokens_per_sequence"]),
+                    "position_start": int(capture_contract["source"]["drop_positions"]),
+                },
+            )
+        except (OSError, ValueError) as exc:
+            raise CellExecutionError(
+                f"store split {split!r} failed canonical row verification: {exc}"
+            ) from exc
         meta = reader.manifest.get("meta", {})
         if tuple(reader.sites) != expected_store_axis:
             raise CellExecutionError(
@@ -1511,6 +1621,23 @@ def _verify_declared_split_contract(
         if meta.get("split_actual_tokens") != reader.n_tokens:
             raise CellExecutionError(
                 f"store split {split!r} does not bind its actual row count"
+            )
+        expected_meta = {
+            "sequence_start": allocation["sequence_start"],
+            "sequence_stop_exclusive": allocation["sequence_stop_exclusive"],
+            "tokens_per_sequence": allocation["tokens_per_sequence"],
+            "ordered_split_allocation": list(expected_order),
+            "capture_binding_sha256": capture_binding_sha256,
+        }
+        mismatched_meta = {
+            key: {"expected": expected, "observed": meta.get(key, "<missing>")}
+            for key, expected in expected_meta.items()
+            if meta.get(key, "<missing>") != expected
+        }
+        if mismatched_meta:
+            raise CellExecutionError(
+                f"store split {split!r} allocation metadata differs from capture: "
+                + canonical_json(mismatched_meta)
             )
         if any(
             int(shard.get("row_id_width", -1)) != row_id_width
@@ -1553,6 +1680,7 @@ def _resolve_single_raw_store(
     declared_split_contract = _verify_declared_split_contract(
         raw_root,
         values,
+        capture_contract=source_contract,
         expected_store_axis=expected_store_axis,
         expected_whitener_hash=f"raw:{source_hash}",
     )
@@ -1676,6 +1804,7 @@ def _resolve_single_raw_store(
         "source_fit_content_stream_sha256": fit_reader.manifest[
             "content_stream_sha256"
         ],
+        "source_fit_requested_tokens": int(values["data.normalization_fit_count"]),
         "transform_contract": transform_contract,
     }
     rejected: list[str] = []
@@ -1689,6 +1818,10 @@ def _resolve_single_raw_store(
             }
             if transform.mode != normalization:
                 raise ValueError(f"mode {transform.mode!r} != {normalization!r}")
+            if transform.n_fit_tokens != int(values["data.normalization_fit_count"]):
+                raise ValueError(
+                    "transform fit count differs from data.normalization_fit_count"
+                )
             if path.parent.name != transform.hash:
                 raise ValueError("parent directory is not the Whitener content hash")
             if tuple(transform.sites) != expected_store_axis:
@@ -1770,6 +1903,7 @@ def _resolve_single_raw_store(
             "source_fit_manifest_file_sha256": _sha256(fit_manifest_path),
             "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
             "source_fit_row_stream_sha256": fit_reader.manifest["row_stream_sha256"],
+            "source_fit_requested_tokens": transform.n_fit_tokens,
         },
     }
 
@@ -1870,6 +2004,14 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
         if transform.mode != normalization:
             raise CellExecutionError(
                 f"transform mode {transform.mode!r} != cell normalization {normalization!r}"
+            )
+        if transform.n_fit_tokens != int(
+            values["data.normalization_fit_count"]
+        ) or transform.meta.get("source_fit_requested_tokens") != int(
+            values["data.normalization_fit_count"]
+        ):
+            raise CellExecutionError(
+                "transform fit count differs from data.normalization_fit_count"
             )
         if train_manifest.get("whitener_hash") != transform.hash:
             raise CellExecutionError(
@@ -1988,6 +2130,7 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
     raw_declared_split_contract = _verify_declared_split_contract(
         raw_root,
         values,
+        capture_contract=source_contract,
         expected_store_axis=expected_store_axis,
         expected_whitener_hash=f"raw:{source_hash}",
     )
@@ -1998,6 +2141,7 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
     declared_split_contract = _verify_declared_split_contract(
         root,
         values,
+        capture_contract=source_contract,
         expected_store_axis=expected_store_axis,
         expected_whitener_hash=transform.hash,
     )
@@ -2742,6 +2886,9 @@ def _prepared_transform(preparation: Mapping[str, Any]) -> Whitener | None:
         != record["source_fit_manifest_sha256"]
         or transform.meta.get("source_fit_row_stream_sha256")
         != record["source_fit_row_stream_sha256"]
+        or transform.n_fit_tokens != record["source_fit_requested_tokens"]
+        or transform.meta.get("source_fit_requested_tokens")
+        != record["source_fit_requested_tokens"]
     ):
         raise CellExecutionError("Phase-3 frozen transform binding mismatch")
     return transform
@@ -3813,7 +3960,7 @@ def _train(
     binding = _binding(
         ctx,
         preparation,
-        model_cfg,
+        model.cfg,
         train_cfg,
         initialization,
     )
@@ -6305,6 +6452,44 @@ def _fixed_rate_raw_score(
     return payload
 
 
+def _selection_validation_metrics(
+    phase: Phase,
+    *,
+    identification: Mapping[str, Any] | None,
+    fixed_rate: Mapping[str, Any],
+) -> dict[str, bool | float]:
+    """Map executor endpoints into the schema consumed by live policies."""
+
+    if phase is Phase.PHASE1:
+        return {
+            "phase1_identification_conjunction": bool(
+                identification is not None
+                and identification["native"]["passed"]
+                and identification["deployed"]["passed"]
+            ),
+            "phase1_identification_margin": (
+                -1.0e9
+                if identification is None
+                else min(
+                    float(identification["native"]["margin"]),
+                    float(identification["deployed"]["margin"]),
+                )
+            ),
+        }
+    selection_score = fixed_rate.get("selection_score")
+    if selection_score is None and fixed_rate.get("eligible") is not True:
+        selection_score = PHASE2_INELIGIBLE_SELECTION_SCORE
+    if (
+        not isinstance(selection_score, (int, float))
+        or isinstance(selection_score, bool)
+        or not math.isfinite(float(selection_score))
+    ):
+        raise CellExecutionError(
+            "fixed-rate selection score must be finite or ineligible"
+        )
+    return {PHASE2_SELECTION_METRIC_KEY: float(selection_score)}
+
+
 def _evaluate(
     ctx: _Context,
     prerequisites: Mapping[str, tuple[Path, str]],
@@ -6481,24 +6666,10 @@ def _evaluate(
         calibration_hash=calibration_hash,
         deployment_schedule_manifest=deployment_schedule_manifest,
     )
-    validation = (
-        {
-            "phase1_identification_conjunction": bool(
-                identification is not None
-                and identification["native"]["passed"]
-                and identification["deployed"]["passed"]
-            ),
-            "phase1_identification_margin": (
-                -1.0e9
-                if identification is None
-                else min(
-                    float(identification["native"]["margin"]),
-                    float(identification["deployed"]["margin"]),
-                )
-            ),
-        }
-        if ctx.cell.phase is Phase.PHASE1
-        else {"fixed_rate_raw_fvu": fixed_rate["selection_score"]}
+    validation = _selection_validation_metrics(
+        ctx.cell.phase,
+        identification=identification,
+        fixed_rate=fixed_rate,
     )
     site_only = shared_deployed["site_only_fvu"]
     loo = shared_deployed["leave_one_site_out_fvu"]

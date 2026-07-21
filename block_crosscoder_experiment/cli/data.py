@@ -53,6 +53,22 @@ TOKENIZER_PREFLIGHTS = {
 }
 CAPTURE_STATE_NAME = "capture.state.json"
 CAPTURE_MANIFEST_NAME = "capture.json"
+CAPTURE_PROFILE_SPLITS = {
+    "phase2": (
+        "normalization_fit",
+        "calibration",
+        "development",
+        "confirmation",
+        "train",
+    ),
+    "phase3": (
+        "normalization_fit",
+        "calibration",
+        "stability",
+        "final",
+        "train",
+    ),
+}
 
 
 def transformer_lens_model_name(hf_model_name: str) -> str:
@@ -273,6 +289,39 @@ def parse_split_sizes(values: list[str] | None) -> dict[str, int]:
     return result
 
 
+def parse_capture_split_sizes(
+    values: list[str] | None, *, profile: str | None
+) -> dict[str, int]:
+    """Parse and enforce one complete phase-specific capture role set."""
+
+    if profile not in CAPTURE_PROFILE_SPLITS:
+        choices = ", ".join(CAPTURE_PROFILE_SPLITS)
+        raise ValueError(
+            f"capture profile must be explicitly declared as one of: {choices}"
+        )
+    result = parse_split_sizes(values)
+    required = CAPTURE_PROFILE_SPLITS[profile]
+    required_set = set(required)
+    observed_set = set(result)
+    missing = [name for name in required if name not in observed_set]
+    unexpected = [name for name in result if name not in required_set]
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unexpected:
+            details.append(f"unexpected {unexpected}")
+        raise ValueError(
+            f"{profile} capture requires exactly the split roles {list(required)}; "
+            + "; ".join(details)
+        )
+    # Corpus allocation is semantically meaningful: roles receive consecutive
+    # packed-sequence ranges.  Canonicalize it from the profile instead of
+    # allowing CLI argument order to change which examples become train,
+    # development, confirmation, stability, or final evidence.
+    return {name: result[name] for name in required}
+
+
 def estimate_store_bytes(
     split_sizes: dict[str, int], site_dims: Iterable[int], *, n_views: int = 1
 ) -> int:
@@ -315,6 +364,44 @@ def _ensure_empty(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _normalization_fit_requested_tokens(capture: dict, fit_reader: StoreReader) -> int:
+    """Resolve the exact declared prefix, excluding sequence-rounding surplus."""
+
+    split_plan = capture.get("split_plan")
+    if not isinstance(split_plan, dict):
+        raise ValueError("capture.json lacks its split allocation")
+    spec = split_plan.get("normalization_fit")
+    if not isinstance(spec, dict):
+        raise ValueError("capture.json lacks normalization_fit allocation")
+    requested = spec.get("requested_tokens")
+    actual = spec.get("actual_tokens")
+    if (
+        not isinstance(requested, int)
+        or isinstance(requested, bool)
+        or requested <= 0
+        or not isinstance(actual, int)
+        or isinstance(actual, bool)
+        or actual != fit_reader.n_tokens
+        or requested > actual
+    ):
+        raise ValueError("normalization_fit allocation is inconsistent with its store")
+    return requested
+
+
+def _sequential_prefix(
+    reader: StoreReader, *, batch_size: int, n_tokens: int
+) -> Iterator[torch.Tensor]:
+    remaining = n_tokens
+    for batch in reader.sequential_batches(batch_size):
+        if remaining <= 0:
+            break
+        take = min(remaining, batch.shape[0])
+        yield batch[:take]
+        remaining -= take
+    if remaining:
+        raise ValueError("activation store ended before the declared fit prefix")
+
+
 def derive_views(
     raw_root: Path,
     out_root: Path,
@@ -346,18 +433,21 @@ def derive_views(
     fit_reader.verify()
     if fit_reader.whitener_hash != f"raw:{source_hash}":
         raise ValueError("normalization-fit split is not bound to capture source")
+    fit_tokens = _normalization_fit_requested_tokens(capture, fit_reader)
     accumulator = WhitenerAccumulator(
         fit_reader.n_sites,
         fit_reader.d_model,
         track_covariance="whiten" in modes,
     )
-    for x in fit_reader.sequential_batches(batch_size):
+    for x in _sequential_prefix(fit_reader, batch_size=batch_size, n_tokens=fit_tokens):
         accumulator.update(x.float())
     centered_norm = None
     if "sqrt_d" in modes:
         fitted_mean = (accumulator.sum / accumulator.n).float()
         totals = torch.zeros(fit_reader.n_sites, dtype=torch.float64)
-        for x in fit_reader.sequential_batches(batch_size):
+        for x in _sequential_prefix(
+            fit_reader, batch_size=batch_size, n_tokens=fit_tokens
+        ):
             for site, width in enumerate(fit_reader.site_dims):
                 totals[site] += (
                     (x[:, site, :width].float() - fitted_mean[site, :width])
@@ -386,6 +476,7 @@ def derive_views(
             "source_fit_content_stream_sha256": fit_reader.manifest[
                 "content_stream_sha256"
             ],
+            "source_fit_requested_tokens": fit_tokens,
             "transform_contract": "content_addressed_materialized_view-v1",
             "site_dims": list(fit_reader.site_dims),
         }
@@ -470,18 +561,21 @@ def fit_transform_artifacts(
     fit_reader.verify()
     if fit_reader.whitener_hash != f"raw:{source_hash}":
         raise ValueError("normalization-fit split is not bound to capture source")
+    fit_tokens = _normalization_fit_requested_tokens(capture, fit_reader)
     accumulator = WhitenerAccumulator(
         fit_reader.n_sites,
         fit_reader.d_model,
         track_covariance="whiten" in modes,
     )
-    for x in fit_reader.sequential_batches(batch_size):
+    for x in _sequential_prefix(fit_reader, batch_size=batch_size, n_tokens=fit_tokens):
         accumulator.update(x.float())
     centered_norm = None
     if "sqrt_d" in modes:
         fitted_mean = (accumulator.sum / accumulator.n).float()
         totals = torch.zeros(fit_reader.n_sites, dtype=torch.float64)
-        for x in fit_reader.sequential_batches(batch_size):
+        for x in _sequential_prefix(
+            fit_reader, batch_size=batch_size, n_tokens=fit_tokens
+        ):
             for site, width in enumerate(fit_reader.site_dims):
                 totals[site] += (
                     (x[:, site, :width].float() - fitted_mean[site, :width])
@@ -500,6 +594,7 @@ def fit_transform_artifacts(
         "source_fit_content_stream_sha256": fit_reader.manifest[
             "content_stream_sha256"
         ],
+        "source_fit_requested_tokens": fit_tokens,
         "transform_contract": "content_addressed_transform_only-v1",
         "transform_only": True,
         "site_dims": list(fit_reader.site_dims),
@@ -533,6 +628,7 @@ def fit_transform_artifacts(
             "source_fit_content_stream_sha256": fit_reader.manifest[
                 "content_stream_sha256"
             ],
+            "source_fit_requested_tokens": fit_tokens,
             "source_raw_root": str(raw_root.resolve()),
             "transform_contract": "content_addressed_transform_only-v1",
         }
@@ -596,10 +692,6 @@ def capture(
 ) -> dict[str, object]:
     """Capture one pinned model's hooks into a resumable immutable row stream."""
 
-    from datasets import load_dataset
-    from huggingface_hub import HfApi
-    from sae_lens import HookedSAETransformer
-
     if args.context <= 1 or args.drop_positions < 0:
         raise ValueError(
             "context must exceed one and drop_positions cannot be negative"
@@ -622,10 +714,15 @@ def capture(
     hooks = [source.hook for source in raw_sources]
     if len(set(hooks)) != len(hooks):
         raise ValueError("capture hooks must be unique")
-    split_sizes = parse_split_sizes(args.split)
+    profile = getattr(args, "profile", None)
+    split_sizes = parse_capture_split_sizes(args.split, profile=profile)
     tokens_per_row = args.context - args.drop_positions
     if tokens_per_row <= 0:
         raise ValueError("drop_positions must be smaller than context")
+
+    from datasets import load_dataset
+    from huggingface_hub import HfApi
+    from sae_lens import HookedSAETransformer
 
     # Resolve every mutable ref before touching the output.  Cross-model
     # capture is deliberately refused: this project studies cross-layer
@@ -720,6 +817,7 @@ def capture(
     }
     binding = {
         "schema": "bsc-capture-binding-v1",
+        "campaign_profile": profile,
         "source_hash": source_hash,
         "split_order": split_order,
         "split_plan": split_plan,
@@ -1163,6 +1261,12 @@ def main(argv: Iterable[str] | None = None) -> None:
     cap.add_argument("--batch-rows", type=int, default=8)
     cap.add_argument("--write-batch-tokens", type=int, default=65_536)
     cap.add_argument("--tokens-per-shard", type=int, default=150_000)
+    cap.add_argument(
+        "--profile",
+        choices=tuple(CAPTURE_PROFILE_SPLITS),
+        required=True,
+        help="campaign capture contract: phase2 pilot or phase3 publication",
+    )
     cap.add_argument("--split", action="append", required=True, help="NAME=TOKENS")
     cap.add_argument("--device", default="cuda")
     cap.add_argument("--out", type=Path, required=True)

@@ -17,6 +17,7 @@ from block_crosscoder_experiment.cli.data import (
     estimate_store_bytes,
     fit_transform_artifacts,
     load_pinned_tokenizer,
+    parse_capture_split_sizes,
     parse_split_sizes,
     tokenizer_contract_hash,
     transformer_lens_model_name,
@@ -32,7 +33,7 @@ from block_crosscoder_experiment.cli.matrix import (
 )
 from block_crosscoder_experiment.cli.matrix import main as matrix_main
 from block_crosscoder_experiment.cli.run_cell import _expected_real_source_contract
-from block_crosscoder_experiment.store import ShardWriter, StoreReader
+from block_crosscoder_experiment.store import ShardWriter, StoreReader, Whitener
 from block_crosscoder_experiment.studies import (
     FrozenSelection,
     StudyError,
@@ -56,6 +57,8 @@ def test_capture_cli_rejects_retired_store_contract_before_loading(tmp_path):
                 "openai-community/gpt2|" + "a" * 40 + "|blocks.3.hook_resid_pre",
                 "--tokenizer-contract",
                 "gpt2-byte-bpe-files-v1",
+                "--profile",
+                "phase2",
                 "--store-contract-version",
                 "activation-store-v2",
                 "--split",
@@ -67,6 +70,30 @@ def test_capture_cli_rejects_retired_store_contract_before_loading(tmp_path):
     assert exc_info.value.code == 2
 
 
+def test_capture_cli_requires_profile_and_complete_profile_roles(tmp_path):
+    common = [
+        "capture",
+        "--source",
+        "openai-community/gpt2|" + "a" * 40 + "|blocks.3.hook_resid_pre",
+        "--tokenizer-contract",
+        "gpt2-byte-bpe-files-v1",
+        "--split",
+        "normalization_fit=1",
+        "--split",
+        "calibration=1",
+        "--split",
+        "train=1",
+        "--out",
+        str(tmp_path / "store"),
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        data_module.main(common)
+    assert exc_info.value.code == 2
+
+    with pytest.raises(ValueError, match="missing.*development.*confirmation"):
+        data_module.main([*common, "--profile", "phase2"])
+
+
 def _raw_store(root, *, offset=0.0):
     root.mkdir(parents=True, exist_ok=True)
     source = {
@@ -76,16 +103,27 @@ def _raw_store(root, *, offset=0.0):
     source_hash = hashlib.sha256(
         json.dumps(source, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    (root / "capture.json").write_text(
-        json.dumps({"source": source, "source_hash": source_hash}) + "\n"
-    )
-    gen = torch.Generator().manual_seed(4)
-    for split, n in {
+    split_sizes = {
         "normalization_fit": 64,
         "calibration": 48,
         "eval": 32,
         "train": 80,
-    }.items():
+    }
+    split_plan = whole_sequence_split_plan(split_sizes, 1)
+    (root / "capture.json").write_text(
+        json.dumps(
+            {
+                "source": source,
+                "source_hash": source_hash,
+                "split_order": list(split_sizes),
+                "split_plan": split_plan,
+                "splits": split_plan,
+            }
+        )
+        + "\n"
+    )
+    gen = torch.Generator().manual_seed(4)
+    for split, n in split_sizes.items():
         writer = ShardWriter(
             root,
             split,
@@ -199,6 +237,71 @@ def test_split_parser_and_estimate():
         ]
     )
     assert phase3["final"] == 5
+
+
+def test_capture_split_profiles_require_exact_complete_role_sets():
+    phase2 = parse_capture_split_sizes(
+        [
+            "normalization_fit=2",
+            "calibration=3",
+            "train=7",
+            "development=5",
+            "confirmation=11",
+        ],
+        profile="phase2",
+    )
+    assert tuple(phase2) == (
+        "normalization_fit",
+        "calibration",
+        "development",
+        "confirmation",
+        "train",
+    )
+    phase3 = parse_capture_split_sizes(
+        [
+            "normalization_fit=2",
+            "calibration=3",
+            "train=7",
+            "stability=5",
+            "final=11",
+        ],
+        profile="phase3",
+    )
+    assert tuple(phase3) == (
+        "normalization_fit",
+        "calibration",
+        "stability",
+        "final",
+        "train",
+    )
+
+    with pytest.raises(ValueError, match="missing.*confirmation"):
+        parse_capture_split_sizes(
+            [
+                "normalization_fit=2",
+                "calibration=3",
+                "train=7",
+                "development=5",
+            ],
+            profile="phase2",
+        )
+    with pytest.raises(ValueError, match="unexpected.*development"):
+        parse_capture_split_sizes(
+            [
+                "normalization_fit=2",
+                "calibration=3",
+                "train=7",
+                "stability=5",
+                "final=11",
+                "development=13",
+            ],
+            profile="phase3",
+        )
+    with pytest.raises(ValueError, match="explicitly declared"):
+        parse_capture_split_sizes(
+            ["normalization_fit=2", "calibration=3", "train=7"],
+            profile=None,
+        )
 
 
 def test_whole_sequence_split_plan_rounds_each_split_without_overlap():
@@ -424,9 +527,12 @@ def _mock_capture_runtime(monkeypatch):
             batch_rows=2,
             write_batch_tokens=64,
             tokens_per_shard=64,
+            profile="phase2",
             split=[
                 "normalization_fit=2",
                 "calibration=2",
+                "development=2",
+                "confirmation=2",
                 "train=2",
             ],
             device="cpu",
@@ -448,6 +554,8 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
     assert uninterrupted["split_order"] == [
         "normalization_fit",
         "calibration",
+        "development",
+        "confirmation",
         "train",
     ]
     assert uninterrupted["capture_implementation"]["test_runtime"] == "exact"
@@ -455,6 +563,29 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
     assert loader_calls[0][0] == "gpt2"
     assert loader_calls[0][1]["revision"] == expected_source["sources"][0]["revision"]
     assert loader_calls[0][1]["tokenizer"] is not None
+
+    derived_root = tmp_path / "derived"
+    derive_views(
+        uninterrupted_root,
+        derived_root,
+        ("scalar_rms",),
+        batch_size=32,
+    )
+    derived_transform = Whitener.load(derived_root / "scalar_rms" / "whitener.pt")
+    assert uninterrupted["split_plan"]["normalization_fit"]["actual_tokens"] == 127
+    assert derived_transform.n_fit_tokens == 2
+    assert derived_transform.meta["source_fit_requested_tokens"] == 2
+
+    transform_root = tmp_path / "transforms"
+    fitted = fit_transform_artifacts(
+        uninterrupted_root,
+        transform_root,
+        ("scalar_rms",),
+        batch_size=32,
+    )["scalar_rms"]
+    fitted_transform = Whitener.load(fitted["path"])
+    assert fitted_transform.n_fit_tokens == 2
+    assert fitted_transform.meta["source_fit_requested_tokens"] == 2
 
     fired = False
 

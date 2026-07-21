@@ -25,16 +25,19 @@ from block_crosscoder_experiment.cli.run_cell import (
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
     _balanced_schedule_uses_upper,
+    _expected_capture_allocation,
     _expected_real_source_contract,
     _fixed_rate_raw_score,
     _lower_convex_rate_envelope,
     _load_deployable_codec,
     _load_deployment_schedule_bundle,
+    _load_capture_contract,
     _matching_pathologies,
     _model_config,
     _normalization_record,
     _production_precision_preflight,
     _resolve_real_store,
+    _selection_validation_metrics,
     _synthetic_batches,
     _synthetic_dataset,
     _synthetic_source_contract,
@@ -60,6 +63,9 @@ from block_crosscoder_experiment.studies import (
     FrozenSelection,
     Phase,
     Phase1Blueprint,
+    PHASE2_INELIGIBLE_SELECTION_SCORE,
+    PHASE2_SELECTION_METRIC_KEY,
+    PHASE2_SELECTION_METRIC_PATH,
     RELEASE_DIAGNOSTIC_RECIPES,
     StageSpec,
     StudyPlan,
@@ -76,6 +82,8 @@ from block_crosscoder_experiment.studies import (
 
 import pytest
 import torch
+
+import block_crosscoder_experiment.cli.run_cell as run_cell_module
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -804,6 +812,161 @@ def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
     assert second["training_report"].sha256 == first["training_report"].sha256
 
 
+def test_nonzero_ratio_regularizer_resumes_exactly_from_recovery_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_ratio = 0.03
+    base = _cell(recipe_index=2, seed=45)
+    cell = replace(
+        base,
+        name="phase1.test.regularizer_ratio_interrupted.s45",
+        decisions=merge_decisions(
+            base.decisions,
+            (
+                engineering(
+                    "objective.regularizer",
+                    "end_to_end_map_nuclear",
+                    rationale="exercise ratio-calibration recovery",
+                ),
+                engineering(
+                    "objective.regularizer_reduction",
+                    "sum_blocks",
+                    rationale="exercise the SASA map penalty path",
+                ),
+                engineering(
+                    "objective.regularizer_coefficient",
+                    0.0,
+                    rationale="reserve the coefficient for calibration",
+                ),
+                engineering(
+                    "objective.regularizer_coefficient_mode",
+                    "initial_loss_ratio",
+                    rationale="exercise recovery with a resolved coefficient",
+                ),
+                engineering(
+                    "objective.regularizer_target_initial_ratio",
+                    target_ratio,
+                    rationale="require a nonzero calibrated coefficient",
+                ),
+                engineering(
+                    "objective.regularizer_calibration_contract",
+                    "post_init_train_prefix_true_observation_fp32_v1",
+                    rationale="bind the first training batch and fp32 fit",
+                ),
+            ),
+        ),
+    )
+
+    baseline_campaign = _campaign(tmp_path / "baseline", cell)
+    baseline_runner = _runner(baseline_campaign)
+    assert baseline_runner.run(stop_after="prepare").completed_cells == 1
+    baseline_campaign.transition(cell.cell_id, RunState.RUNNING)
+    baseline = {
+        item.kind: item
+        for item in baseline_runner._invoke(cell.cell_id, "train", resume=False)
+    }
+    baseline_checkpoint = torch.load(
+        baseline["checkpoint"].resolve(baseline_campaign.root),
+        map_location="cpu",
+        weights_only=True,
+    )
+
+    resumed_campaign = _campaign(tmp_path / "resumed", cell)
+    resumed_runner = _runner(resumed_campaign)
+    assert resumed_runner.run(stop_after="prepare").completed_cells == 1
+    resumed_campaign.transition(cell.cell_id, RunState.RUNNING)
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(resumed_campaign.root))
+    ctx = _Context(
+        resumed_campaign.cell_manifest_path(cell.cell_id),
+        resumed_campaign.cell_dir(cell.cell_id) / "train-test-artifacts.json",
+        "train",
+    )
+    prerequisites = ctx.prerequisites()
+    original_training_batches = run_cell_module._training_batches
+
+    def interrupt_after_recovery_checkpoint(*args, **kwargs):
+        for index, batch in enumerate(original_training_batches(*args, **kwargs)):
+            if index == 2:
+                raise RuntimeError("intentional interruption after recovery checkpoint")
+            yield batch
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(
+            run_cell_module,
+            "_training_batches",
+            interrupt_after_recovery_checkpoint,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="intentional interruption after recovery checkpoint",
+        ):
+            run_cell_module._train(ctx, prerequisites, resume=False)
+
+    assert ctx.progress.is_file()
+    assert not ctx.checkpoint.exists()
+    recovery = torch.load(ctx.progress, map_location="cpu", weights_only=True)
+    assert recovery["step_idx"] == 2
+    assert recovery["accepted_tokens"] == 32
+    assert recovery["data_cursor"] == {"next_token": 32, "stream": "train"}
+    resolved = recovery["model_cfg"]["lambda_regularizer"]
+    assert resolved > 0.0
+    assert recovery["run_binding"]["model_cfg"]["lambda_regularizer"] == resolved
+
+    original_load_checkpoint = run_cell_module.Trainer.load_checkpoint
+    load_calls: list[Path] = []
+
+    def tracking_load_checkpoint(
+        cls,
+        path,
+        *,
+        device="cpu",
+        expected_binding=None,
+    ):
+        load_calls.append(Path(path))
+        return original_load_checkpoint(
+            path,
+            device=device,
+            expected_binding=expected_binding,
+        )
+
+    with monkeypatch.context() as resume_patch:
+        resume_patch.setattr(
+            run_cell_module.Trainer,
+            "load_checkpoint",
+            classmethod(tracking_load_checkpoint),
+        )
+        resumed = dict(run_cell_module._train(ctx, prerequisites, resume=True))
+
+    assert load_calls == [ctx.progress]
+    assert not ctx.progress.exists()
+    resumed_checkpoint = torch.load(
+        resumed["checkpoint"], map_location="cpu", weights_only=True
+    )
+
+    def assert_nested_exact(actual, expected) -> None:
+        if torch.is_tensor(expected):
+            assert actual.dtype == expected.dtype
+            assert actual.shape == expected.shape
+            assert torch.equal(
+                actual.contiguous().reshape(-1).view(torch.uint8),
+                expected.contiguous().reshape(-1).view(torch.uint8),
+            )
+        elif isinstance(expected, dict):
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                assert_nested_exact(actual[key], expected[key])
+        elif isinstance(expected, (list, tuple)):
+            assert type(actual) is type(expected)
+            assert len(actual) == len(expected)
+            for actual_item, expected_item in zip(actual, expected):
+                assert_nested_exact(actual_item, expected_item)
+        else:
+            assert actual == expected
+
+    assert_nested_exact(resumed_checkpoint, baseline_checkpoint)
+
+
 def test_orphan_final_checkpoint_rebuilds_an_exact_cursor_report(
     tmp_path: Path,
 ) -> None:
@@ -991,10 +1154,10 @@ def test_store_verification_receipt_skips_rehash_until_file_stat_changes(
     calls = 0
     original_verify = StoreReader.verify
 
-    def counted(reader):
+    def counted(reader, **kwargs):
         nonlocal calls
         calls += 1
-        return original_verify(reader)
+        return original_verify(reader, **kwargs)
 
     monkeypatch.setattr(StoreReader, "verify", counted)
     _VERIFIED_STORE_BINDINGS.clear()
@@ -1006,6 +1169,48 @@ def test_store_verification_receipt_skips_rehash_until_file_stat_changes(
 
     shard = root / "train" / "shard_00000.safetensors"
     os.utime(shard, None)
+    _VERIFIED_STORE_BINDINGS.clear()
+    _verify_store_reader_once(StoreReader(root, "train"), root, "train")
+    assert calls == 2
+
+
+def test_ad_hoc_store_verification_uses_process_cache_without_shared_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "store"
+    writer = ShardWriter(
+        root,
+        "train",
+        whitener_hash="raw:test",
+        sites=(0,),
+        d_model=3,
+        meta={"site_dims": [3]},
+        tokens_per_shard=8,
+    )
+    writer.add(
+        torch.randn(8, 1, 3),
+        torch.stack((torch.arange(8), torch.arange(8)), dim=1),
+    )
+    writer.close()
+    monkeypatch.delenv("BSC_VERIFICATION_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("BSC_CAMPAIGN_ROOT", raising=False)
+    calls = 0
+    original_verify = StoreReader.verify
+
+    def counted(reader, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_verify(reader, **kwargs)
+
+    monkeypatch.setattr(StoreReader, "verify", counted)
+    _VERIFIED_STORE_BINDINGS.clear()
+    reader = StoreReader(root, "train")
+    _verify_store_reader_once(reader, root, "train")
+    _verify_store_reader_once(reader, root, "train")
+    assert calls == 1
+
+    # A fresh process cannot inherit an unauthenticated receipt from shared
+    # temporary storage, so clearing the in-memory cache forces a full verify.
     _VERIFIED_STORE_BINDINGS.clear()
     _verify_store_reader_once(StoreReader(root, "train"), root, "train")
     assert calls == 2
@@ -1376,6 +1581,71 @@ def test_fixed_rate_budget_uses_better_lower_rate_packet(
     assert result["fixed_budgets"][0]["bracket"] == ["q4", "q4"]
 
 
+def test_ineligible_fixed_rate_endpoint_produces_durable_worst_score(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(phase=Phase.PHASE2)
+    values = {
+        **cell.decision_map,
+        "evaluation.fixed_rate_budgets_bits_per_token": (0.001,),
+        "evaluation.side_information_amortization_tokens": 1_000,
+    }
+    deployment = tmp_path / "deployable-codec.pt"
+    deployment.write_bytes(b"x")
+    deployment_hash = hashlib.sha256(deployment.read_bytes()).hexdigest()
+    _, schedule_manifest, _ = _schedule_bundle(
+        tmp_path,
+        cell=cell,
+        deployment_hash=deployment_hash,
+        values=values,
+        plans={},
+    )
+    fixed_rate = _fixed_rate_raw_score(
+        SimpleNamespace(cell=cell, values=values),
+        rd={
+            "rate_model": "fixed_width_decodable_payload_bits_v1",
+            "support_count_width_bits": 5,
+            "support_id_width_bits": 8,
+            "codec_meta": {
+                "packet_contract": values["codec.packet_contract"],
+                "side_information_contract": values["codec.side_information_contract"],
+                "count_alphabet_max": 16,
+            },
+            "points": {
+                "4": {"rate_bits_per_token": 4.0},
+                "8": {"rate_bits_per_token": 8.0},
+            },
+        },
+        raw_space={
+            "eligible": True,
+            "points": {
+                "4": {"fvu_pooled": 0.8},
+                "8": {"fvu_pooled": 0.7},
+            },
+        },
+        deployment_path=deployment,
+        deployment_hash=deployment_hash,
+        calibration_hash="0" * 64,
+        deployment_schedule_manifest=schedule_manifest,
+    )
+    assert fixed_rate["eligible"] is False
+    assert fixed_rate["selection_score"] is None
+    validation = _selection_validation_metrics(
+        Phase.PHASE2,
+        identification=None,
+        fixed_rate=fixed_rate,
+    )
+    assert validation == {
+        PHASE2_SELECTION_METRIC_KEY: PHASE2_INELIGIBLE_SELECTION_SCORE
+    }
+    policy = build_phase2_plan(seeds=(0,), smoke=True).stages[0].selection_policy
+    assert policy is not None
+    assert (
+        Campaign._policy_metric({"validation": validation}, policy)
+        == PHASE2_INELIGIBLE_SELECTION_SCORE
+    )
+
+
 def test_fixed_rate_mixture_prices_reproducible_schedule_header(
     tmp_path: Path,
 ) -> None:
@@ -1500,6 +1770,31 @@ def test_fixed_rate_mixture_prices_reproducible_schedule_header(
     assert fallback["reason"] == "lower_endpoint_outperformed_executed_time_sharing"
 
 
+def test_phase2_evaluator_metric_schema_resolves_through_live_policy() -> None:
+    validation = _selection_validation_metrics(
+        Phase.PHASE2,
+        identification=None,
+        fixed_rate={"selection_score": -0.375},
+    )
+    assert validation == {PHASE2_SELECTION_METRIC_KEY: -0.375}
+    policy = build_phase2_plan(seeds=(0,), smoke=True).stages[0].selection_policy
+    assert policy is not None
+    assert policy.metric_path == PHASE2_SELECTION_METRIC_PATH
+    assert policy.direction == "max"
+    selection_metrics = {"validation": validation}
+    assert Campaign._policy_metric(selection_metrics, policy) == -0.375
+    better = {
+        "validation": _selection_validation_metrics(
+            Phase.PHASE2,
+            identification=None,
+            fixed_rate={"selection_score": -0.25},
+        )
+    }
+    assert Campaign._policy_metric(better, policy) > Campaign._policy_metric(
+        selection_metrics, policy
+    )
+
+
 def test_bsf_released_bridge_wires_shared_group_threshold() -> None:
     base = _cell()
     release = RELEASE_DIAGNOSTIC_RECIPES["bsf_group_lasso_released_paper_mode_drift"]
@@ -1544,6 +1839,54 @@ def test_anthropic_anchor_maps_only_the_minimal_dense_l1_method() -> None:
     assert cell.decision_map["qualification.promotable"] is True
 
 
+def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
+    tmp_path: Path,
+) -> None:
+    values = _phase3_cell().decision_map
+    source = _expected_real_source_contract(values)
+    source_hash = hashlib.sha256(canonical_json(source).encode("utf-8")).hexdigest()
+    split_order, split_plan = _expected_capture_allocation(values)
+    payload = {
+        "schema": "bsc-capture-manifest-v1",
+        "source": source,
+        "source_hash": source_hash,
+        "split_order": list(split_order),
+        "split_plan": split_plan,
+        "splits": split_plan,
+        "capture_implementation": {"test_runtime": "exact"},
+        "capture_binding_sha256": hashlib.sha256(b"binding").hexdigest(),
+    }
+    tmp_path.mkdir(exist_ok=True)
+    capture_path = tmp_path / "capture.json"
+    capture_path.write_text(json.dumps(payload, indent=2) + "\n")
+    loaded = _load_capture_contract(tmp_path, values)
+    assert loaded["split_order"] == split_order
+    assert loaded["split_plan"] == split_plan
+
+    reordered = copy.deepcopy(payload)
+    reordered["split_order"][0], reordered["split_order"][1] = (
+        reordered["split_order"][1],
+        reordered["split_order"][0],
+    )
+    capture_path.write_text(json.dumps(reordered, indent=2) + "\n")
+    with pytest.raises(CellExecutionError, match="split order"):
+        _load_capture_contract(tmp_path, values)
+
+    reassigned = copy.deepcopy(payload)
+    first, second = split_order[:2]
+    (
+        reassigned["split_plan"][first]["sequence_start"],
+        reassigned["split_plan"][second]["sequence_start"],
+    ) = (
+        reassigned["split_plan"][second]["sequence_start"],
+        reassigned["split_plan"][first]["sequence_start"],
+    )
+    reassigned["splits"] = copy.deepcopy(reassigned["split_plan"])
+    capture_path.write_text(json.dumps(reassigned, indent=2) + "\n")
+    with pytest.raises(CellExecutionError, match="split allocation"):
+        _load_capture_contract(tmp_path, values)
+
+
 def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1559,31 +1902,44 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
         }
     )
     source_hash = hashlib.sha256(canonical_json(source).encode("utf-8")).hexdigest()
+    split_order, split_plan = _expected_capture_allocation(values)
+    capture_binding_sha256 = hashlib.sha256(b"phase3-test-capture-binding").hexdigest()
     raw_root.mkdir()
     (raw_root / "capture.json").write_text(
         json.dumps(
-            {"source": source, "source_hash": source_hash, "splits": {}},
+            {
+                "schema": "bsc-capture-manifest-v1",
+                "source": source,
+                "source_hash": source_hash,
+                "split_order": list(split_order),
+                "split_plan": split_plan,
+                "splits": split_plan,
+                "capture_implementation": {"test_runtime": "exact"},
+                "capture_binding_sha256": capture_binding_sha256,
+            },
             indent=2,
         )
         + "\n"
     )
-    split_starts = {
-        "train": 0,
-        "normalization_fit": 100,
-        "calibration": 200,
-        "stability": 300,
-        "final": 400,
-    }
     store_site_count = len(values["data.store_sites"])
     captured_width = max(int(item) for item in values["data.site_dims"])
-    for split, sequence_start in split_starts.items():
+    for split in split_order:
+        allocation = split_plan[split]
+        sequence_start = allocation["sequence_start"]
+        sequence_stop = allocation["sequence_stop_exclusive"]
+        tokens_per_sequence = allocation["tokens_per_sequence"]
+        n_tokens = allocation["actual_tokens"]
         generator = torch.Generator().manual_seed(sequence_start + 1)
-        x = torch.randn(64, store_site_count, captured_width, generator=generator)
+        x = torch.randn(n_tokens, store_site_count, captured_width, generator=generator)
         row_ids = torch.stack(
             (
-                torch.arange(sequence_start, sequence_start + 64),
-                torch.zeros(64, dtype=torch.int64),
-                torch.arange(64),
+                torch.arange(sequence_start, sequence_stop).repeat_interleave(
+                    tokens_per_sequence
+                ),
+                torch.arange(1, tokens_per_sequence + 1).repeat(
+                    sequence_stop - sequence_start
+                ),
+                torch.arange(n_tokens),
             ),
             dim=1,
         )
@@ -1596,10 +1952,16 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
             meta={
                 **source,
                 "site_dims": [captured_width] * store_site_count,
-                "split_requested_tokens": 64,
-                "split_actual_tokens": 64,
+                "split_requested_tokens": allocation["requested_tokens"],
+                "split_actual_tokens": n_tokens,
+                "sequence_start": sequence_start,
+                "sequence_stop_exclusive": sequence_stop,
+                "tokens_per_sequence": tokens_per_sequence,
+                "sequence_allocation": "whole_packed_contexts_v1",
+                "capture_binding_sha256": capture_binding_sha256,
+                "ordered_split_allocation": list(split_order),
             },
-            tokens_per_shard=64,
+            tokens_per_shard=n_tokens,
         )
         writer.add(x, row_ids)
         writer.close()
@@ -1613,7 +1975,10 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     monkeypatch.setenv("BSC_TRANSFORM_ROOT", str(raw_root / "transforms"))
     resolved = _resolve_real_store(values)
     assert resolved["store_view_policy"].startswith("single_bf16_raw_view")
-    assert resolved["bindings"]["train"]["n_tokens"] == 64
+    assert (
+        resolved["bindings"]["train"]["n_tokens"]
+        == split_plan["train"]["actual_tokens"]
+    )
     assert resolved["normalization"]["application"] == "on_the_fly"
     assert (
         resolved["normalization"]["source_capture_sha256"]
@@ -1657,6 +2022,28 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     resumed_batches = list(_training_batches(replay_ctx, preparation, start_token=16))
     assert [len(batch) for batch in resumed_batches] == [7]
     assert torch.equal(torch.cat(full_batches)[16:], torch.cat(resumed_batches))
+
+    final_reader = StoreReader(raw_root, "final")
+    final_batches = list(final_reader.sequential_batches_with_ids(128))
+    final_meta = dict(final_reader.manifest["meta"])
+    (raw_root / "final").rename(tmp_path / "valid-final")
+    bad_writer = ShardWriter(
+        raw_root,
+        "final",
+        whitener_hash=final_reader.whitener_hash,
+        sites=final_reader.sites,
+        d_model=final_reader.d_model,
+        meta=final_meta,
+        tokens_per_shard=final_reader.manifest["tokens_per_shard"],
+    )
+    for acts, row_ids in final_batches:
+        shifted_ids = row_ids.clone()
+        shifted_ids[:, 0] += 100
+        bad_writer.add(acts, shifted_ids)
+    bad_writer.close()
+    _VERIFIED_STORE_BINDINGS.clear()
+    with pytest.raises(CellExecutionError, match="row identity sequence"):
+        _resolve_real_store(values)
 
 
 def test_released_and_adapted_mechanics_reach_declared_config_branches() -> None:

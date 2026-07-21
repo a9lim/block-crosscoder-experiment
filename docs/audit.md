@@ -22,8 +22,10 @@ exit is not evidence by itself.
 - Anthropic dense L1 uses the source-exact sum of per-site L2 decoder norms.
   It cannot be selected as the sparse finalist, but its Phase-3 comparator must
   come from an independently calibrated Phase-2 family selection.
-- Every live matrix row appears in `studies.py`, and every executor branch is
-  reachable from at least one valid cell or deleted.
+- Every live matrix row appears in `studies.py`. Executor values reached only by
+  unit-test fixtures or explicitly nonmaterializable release adapters are
+  marked test-only/quarantined; merely retaining a guarded config branch does
+  not make it a live cell. Any other unreachable branch is deleted.
 - A derived candidate has a failure-mode hypothesis, nearest-parent delta,
   falsifier, coefficient policy, rate/compute match, preregistered stage, and
   declared role: capability, provisional carrier, phase-local tuning, or
@@ -158,6 +160,14 @@ exit is not evidence by itself.
   cursor, and reports.
 - Campaign transitions are append-only and legal; retries cannot overwrite
   earlier attempts.
+- Append-only is an API/filesystem discipline, not pre-freeze origin
+  authentication. A writer who can replace the journal and all matching
+  artifacts lies outside the in-process tamper model; freeze proves internal
+  consistency of the supplied evidence, not who created its pre-freeze bytes.
+  Protect the directory and preserve the frozen decision outside that boundary.
+- The campaign does not garbage-collect recorded final checkpoints or stores and
+  has no retention event. Archival/deletion is external; any missing recorded
+  artifact fails verification.
 - Qualification rehashes every prerequisite rather than trusting an artifact
   manifest's claim about itself.
 - Integrity qualification, scientific outcome, and promotion eligibility are
@@ -166,7 +176,9 @@ exit is not evidence by itself.
   `runtime.smoke` forces `promotion_eligible=false`. A uniformly smoke stage
   may select only through qualification mode `smoke_protocol_only`, without
   consuming scientific outcomes or enforcing sharing/noninferiority gates;
-  the resulting artifact cannot promote or enter a Phase-3 panel.
+  the resulting artifact may feed only another smoke stage. A smoke Phase-2
+  campaign may freeze a protocol panel for smoke Phase 3, but that panel cannot
+  register non-smoke scientific Phase 3.
 - Selection requires the complete stage seed universe and aggregates the
   frozen metric by median, then worst seed, then candidate ID.
 - Selection freezes the entire eligible/ineligible universe and all metric and
@@ -235,6 +247,8 @@ exit is not evidence by itself.
   root selection, conditional calibration rounds, and fresh winner/runner-up
   revisit. Counts are derived from the serialized blueprint, and reports state
   that staged ordering does not prove a global optimum.
+- Every comparator-family learning-rate round has exactly four arms:
+  `3e-5`, `1e-4`, `2e-4`, and `3e-4`.
 - Default counts are rederived as 198 declared/executed Phase-1 cells at three
   seeds and a 414-cell Phase-2 pre-elision ceiling at two seeds: 176 main-chain
   plus 238 family-chain. Phase-2 reports separately record the smaller realized
@@ -268,6 +282,9 @@ exit is not evidence by itself.
 - Non-smoke Phase 3 requires the exact preregistered seed tuple
   `(0,1,2,3,4)`. Caller-supplied production seed reductions cannot turn the
   48-cell publishable panel into a smaller canonical campaign.
+- Phase 2 uses its declared bf16 forward precision but has no matrix-level
+  fp32/bf16 parity claim. The executable parity-and-short-run stability gate is
+  Phase-3-only.
 - Phase-3 slots serialize duplicate handling. Scientific projection uses all
   five required production seeds before fingerprinting the seed-zero member
   of each design. The selected-finalist slot fails
@@ -323,9 +340,10 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema v2 binds peak training VRAM and peak host RAM in
-  addition to persistent storage and aggregate compute; estimates are finite,
-  nonnegative, and monotone under the declared scaling checks.
+- Resource-estimator schema `dense-linear-memory-v2` binds peak training VRAM
+  and peak host RAM in addition to persistent storage and aggregate compute;
+  estimates are finite, nonnegative, and monotone under the declared scaling
+  checks.
 - The planner refuses a declared budget violation before registration.
 - Local filesystem planning checks live free space unless explicitly overridden
   for planning only.
@@ -366,6 +384,6 @@ bsc cell --help
 Also run at least one schema-complete CPU campaign through prepare, train,
 calibrate, evaluate, and qualify; advance every smoke blueprint stage through
 its explicit `smoke_protocol_only` selection artifact; exercise the real-store
-path with a tiny content-bound store; assert that a smoke-derived Phase-3 panel
-freeze is refused; and deliberately corrupt each artifact class to confirm
-refusal.
+path with a tiny content-bound store; assert that a smoke Phase-2 panel can
+register only a smoke Phase-3 protocol campaign and is refused by non-smoke
+Phase 3; and deliberately corrupt each artifact class to confirm refusal.

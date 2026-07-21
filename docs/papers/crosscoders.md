@@ -163,9 +163,9 @@ or runner-up selector.
 
 ## 6. Relevant cross-layer frontier
 
-### fmxcoders
+### fmxcoders: Factorized Masked Crosscoders for Cross-Layer Feature Discovery
 
-[Functionally coherent and scalable cross-layer dictionaries](https://arxiv.org/abs/2605.09438)
+[The fmxcoders paper](https://arxiv.org/abs/2605.09438)
 start from the same summed affine layer encoders, shared ReLU-plus-sparsifier,
 and affine layer decoders as a standard scalar crosscoder (paper pp. 4--5).
 They then factorize the **entire three-mode** encoder tensor and, independently,

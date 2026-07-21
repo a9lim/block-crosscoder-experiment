@@ -67,6 +67,9 @@ preview cannot authorize registration.
   selected time-sharing schedule on paired raw rows, and never extrapolate.
 - Qualification records integrity-complete positive and negative results.
   Scientific-outcome pass and promotion eligibility are distinct gates.
+- Smoke selections and frozen panels are protocol-only. They may drive the next
+  stage only when that next stage is also smoke, including a smoke Phase 3;
+  they can never authorize or feed non-smoke scientific Phase 3.
 - Phase-2 sharing admission is conjunctive for both site-only and leave-one-out
   inference: worst-site decoded-coordinate Lin concordance in the all-site
   decoder-Gram geometry, with the mean-offset penalty, is at least `.80`;
@@ -128,16 +131,19 @@ analysis package.
 - Checkpoints, stores, reports, generated references, logs, and evaluations are
   ignored local artifacts. Committed `data/` contains placeholders only.
 - Every promotion is an immutable content-addressed decision artifact.
-- Never delete a checkpoint until qualification and retention are durably
-  recorded.
+- The campaign never garbage-collects a recorded final checkpoint or store.
+  Deletion or archival is an external operational action; missing recorded
+  artifacts are detected by verification, and there is no retention journal
+  event to wait for or claim.
 
 ## Runtime
 
 - Use shared plain Python 3.12; no project venv and no `uv`.
 - Training/capture run on `jobe`; use plain `python` there and pass
   `PIP_CONSTRAINT=~/.venv/constraints.txt` for installations.
-- fp16 is forbidden in capture/store. Phase 1 uses fp32 reference execution;
-  real campaigns use declared bf16 only after parity checks.
+- fp16 is forbidden in capture/store. Phase 1 uses fp32 reference execution and
+  Phase 2 uses its declared bf16 forward precision. The executable fp32/bf16
+  parity-and-stability preflight exists only in Phase 3.
 - Only declared Adam/AdamW recipes are scientific cells. No automatic optimizer
   resolution is permitted.
 - Do not load evaluation checkpoints concurrently with training on the 24 GB
