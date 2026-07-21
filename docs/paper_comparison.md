@@ -1,600 +1,507 @@
-# BSC training compared with BSFs, crosscoders, and SASA
-
-## Bottom line
-
-The BSC formulation aligns with both parent ideas at the level that matters
-most:
-
-- from BSFs it takes a signed vector block as the sparse unit, selects by a
-  rotation-invariant block norm, and decodes the whole vector within an active
-  subspace;
-- from crosscoders it takes one code inferred jointly from several sites and a
-  separate decoder at every site.
-
-It does **not** follow the complete training procedure of either parent paper.
-The production model is a novel hybrid: free, biasless cross-site encoders;
-concatenated orthonormal decoder frames; block BatchTopK; a site-profile
-decoder penalty; and a SASA-inspired dead-block auxiliary loss. No Fel BSF has
-that combination, Anthropic's original crosscoder is ReLU/L1 rather than
-signed TopK, Minder's BatchTopK model is scalar and affine/ReLU, and SASA is
-single-site with per-token Top-s and a nuclear norm on the end-to-end map.
-
-That is not a reason to discard the design. It is a reason to treat each
-difference as an empirical factor, add faithful bridge implementations, and
-narrow every claim until the bridges have been run. Implementation defects
-and claim consequences are tracked separately in
-[audit_2026-07-20.md](audit_2026-07-20.md).
-
-## Phase-0.5 implementation disposition
-
-The comparison above describes the audited baseline. Phase 0.5 has now made
-the differences executable rather than implicit. The shared model stack can
-instantiate Fel Vanilla, Grassmannian, and Group-Lasso BSFs; the original
-affine ReLU/L1 Crosscoder; Minder's decoder-weighted ReLU BatchTopK
-Crosscoder; free-map SASA; the native BSC; and its signed scalar and `S=1 BSC`
-controls. The original site-profile term has been renamed, and SASA's
-end-to-end map nuclear norm is computed exactly for constrained or free
-decoders.
-
-`bsc reproduce-papers` owns the clean exact-k Fel synthetic bridge. `bsc
-phase05-matrix` owns the activation-store program. Its stable manifest has 16
-recipes, five normalization gauges, three learning rates, two schedules,
-three epoch budgets, two full-factorial seeds, method-specific lambda grids, paper/local auxiliary
-variants, three SASA dead windows, and two binding ratio caps. It produces 80
-screening cells and 68,220 full-factorial cells. These are all recipe-valid
-combinations of the finite declared factors; they are not a mathematically
-unbounded claim about every optimizer or architecture one could invent.
-
-The screen deliberately fixes `lr=1e-4`, four epochs, and each recipe's
-primary penalty/Aux because `1e-4` is the strongest directly paper-supported
-starting point (Fel/Minder) and was absent from the former preferred stack.
-The full matrix then crosses `1e-4,2e-4,3e-4`, cosine versus final-fifth
-linear decay, and 2/4/8 epochs. Site-profile/map coefficients are
-`0,3e-4,1e-3,3e-3`; Crosscoder L1 coefficients are
-`1e-6,3e-6,1e-5,3e-5,1e-4`; Group-Lasso coefficients are
-`1e-4,3e-4,1e-3,3e-3,1e-2`. No old `3e-4, lambda=1e-3` winner is privileged.
-
-Every normalization uses the same pinned token stream. Reports include both
-training-coordinate and raw-coordinate FVU, saved-codec rate, support-count
-distribution, and the trained shared-code/effective-span endpoints. The
-campaign stops after the screen if any cell fails and retains no scientific
-claim from implementation tests alone.
-
-## Sources and naming
-
-This comparison uses the following primary sources rather than secondary
-summaries:
-
-- Fel et al. (2026), *Structuring Sparsity: Block-Sparse Featurizers Capture
-  Visual Concept Manifolds*: [paper](https://arxiv.org/abs/2606.25234),
-  [official repository](https://github.com/goodfire-ai/block-sparse-featurizer),
-  [local full text](../references/fel2026-block-sparse-featurizers.md).
-- Lindsey et al. (2024), *Sparse Crosscoders for Cross-Layer Features and
-  Model Diffing*: [primary report](https://transformer-circuits.pub/2024/crosscoders/index.html),
-  [local text](../references/anthropic2024-crosscoders.md).
-- Minder et al. (2025), *Overcoming Sparsity Artifacts in Crosscoders to
-  Interpret Chat-Tuning*: [paper](https://arxiv.org/abs/2504.02922),
-  [training code](https://github.com/jkminder/dictionary_learning),
-  [local full text](../references/minder2025-overcoming-sparsity-artifacts-crosscoders.md).
-- Dalili and Mahdavi (2026), *Subspace-Aware Sparse Autoencoders for Effective
-  Mechanistic Interpretability*: [paper](https://arxiv.org/abs/2606.06333),
-  [official repository](https://github.com/arshandalili/sasa),
-  [local full text](../references/dalili2026-sasa.md).
-
-“Fel BSF” below refers to the three paper variants—Vanilla, Grassmannian, and
-Group Lasso. “Original crosscoder” refers to the Anthropic ReLU/L1 model.
-“Minder crosscoder” refers specifically to the later BatchTopK variant unless
-the L1 arm is named. “Current BSC” refers to the Phase-1 configuration in
-[design.md](design.md) and the implementation in
-[`model.py`](../block_crosscoder_experiment/model.py),
-[`trainer.py`](../block_crosscoder_experiment/trainer.py), and
-[`gram.py`](../block_crosscoder_experiment/gram.py) at audit baseline
-`e7f9017`.
-
-## The current BSC in one equation
-
-For sites `s=1,...,S`, block `g` has an encoder
-`E_g^s in R^(b x d)` and decoder frame `D_g^s in R^(b x d)`. Given transformed
-site activations `x_s`, the shared pre-code is
-
-`z_g = sum_s E_g^s x_s`.
-
-The training selector retains `kB` block events with largest `||z_g||_2`
-over a batch of `B` tokens. Each site reconstructs
-
-`xhat_s = c_s + sum_(g active) D_g^{sT} z_g`,
-
-subject to
-
-`sum_s D_g^s D_g^{sT} = I_b` for every block.
-
-The audited objective is
-
-`L = L_rec + lambda_site_profile R_site_profile + alpha_aux L_aux`,
-
-where the audited baseline called the middle coefficient `lambda_rank`, but
-
-`R_site_profile = mean_g[(sum_s ||D_g^s||_* - b)/b]`
-
-is not an effective-rank penalty. Inference replaces BatchTopK with a fixed
-global threshold fit on the calibration split to the target average block
-count.
-
-The decoder constraint has an especially useful consequence. If the isolated
-contribution of block `g` is concatenated over sites, its squared norm is
-
-```text
-sum_s ||D_g^{sT} z_g||_2^2
-  = z_g^T (sum_s D_g^s D_g^{sT}) z_g
-  = ||z_g||_2^2.
-```
-
-Thus the selection score is exactly isolated cross-site output energy. It is
-not necessarily marginal error reduction because different blocks can overlap
-and cancel.
-
-## Architecture comparison
-
-| Method | Code and selector | Encoder | Decoder constraint | Regularization | Aux/revival | Sites |
-|---|---|---|---|---|---|---|
-| Fel Vanilla BSF | Signed vector blocks; per-sample block TopK | Free affine `xW+b` | Each block in Frobenius unit ball | Reconstruction only; hard block count | Core method does not require dead-block Aux | One |
-| Fel Grassmannian BSF | Signed vector blocks; per-sample block TopK | Tied `gamma xD^T`, one positive learned scale | Each block individually Stiefel; QR about every 20 steps | Reconstruction only | Core method does not require dead-block Aux | One |
-| Fel Group Lasso BSF | Signed vector blocks; learned block soft threshold | Free affine `xW+b` | Free decoder with scale control | Reconstruction plus `lambda ||z||_(2,1)`, activated against target sparsity in implementation | No required dead-block Aux in core formulation | One |
-| Anthropic original crosscoder | Shared nonnegative scalar code; ReLU; L1 sparsity | Free affine sum over sites | Free per-site scalar decoder vectors and biases | Activation times L1-of-per-site decoder norms | Not central to published formulation | Many |
-| Minder L1 crosscoder | Same affine/ReLU scalar family | Separate base/chat encoders plus bias | Free base/chat decoders | Decoder-norm-weighted L1 | L1 arm as trained | Two models |
-| Minder BatchTopK crosscoder | ReLU scores scaled by sum of decoder norms; top `Bk` globally; threshold at inference | Free affine | Free base/chat decoders | Reconstruction | Dead-latent residual Aux, usually `k_aux=512`, `alpha=1/32` | Two models |
-| SASA | Signed vector blocks; per-token Top-s by encoder-block norm | Free linear block encoder | Free block decoder | Nuclear norm of the end-to-end block map `||D_k E_k||_*` | Residual re-encoding through frequency-dead blocks | One |
-| Current BSC | Shared signed vector blocks; block BatchTopK; global threshold at inference | Free linear cross-site encoder, no bias | Concatenated site frames are Stiefel; per-step polar retraction | Reconstruction plus decoder site-profile penalty | SASA-style dead-block residual Aux with gradient-ratio cap | Eight layers |
-
-### What is inherited cleanly
-
-The following correspondences are direct rather than metaphorical.
-
-1. **Block as the sparse event.** Fel's MAP argument charges once for switching
-   on a factor and does not charge its internal coordinates separately. BSC
-   does the same during selection and in its block codec.
-2. **Signed internal coordinates.** Fel rejects coordinatewise ReLU because it
-   restricts a subspace to a positive cone. BSC likewise preserves positive
-   and negative coordinates within each selected block.
-3. **Basis-invariant support score.** Both use the Euclidean norm of a block,
-   so an orthogonal change of basis inside the block leaves support unchanged.
-4. **Shared code, site-specific decoding.** Anthropic's crosscoder computes a
-   latent from all sites and decodes it separately at each site. BSC replaces
-   each shared scalar with one shared vector and each decoder direction with a
-   frame.
-5. **BatchTopK training/global-threshold inference.** BSC is structurally close
-   to Minder here. Because the concatenated decoder frame is normalized, the
-   BSC block norm already equals the decoder-scaled energy used to make
-   Minder's scalar scores comparable.
-
-### What is genuinely new or unmatched
-
-1. **Free encoder plus Stiefel decoder.** Fel either makes both maps free with a
-   decoder ball constraint or ties them under a Stiefel constraint. BSC frees
-   the encoder while putting the *concatenated* multi-site decoder on Stiefel.
-2. **Cross-site vector coordinates.** A scalar crosscoder can share feature
-   presence. BSC also forces the within-feature position `z_g` to be common
-   across sites, up to the learned site frames. That is a stronger hypothesis
-   and should be tested with site-only and leave-one-site-out endpoints.
-3. **Decoder site-profile pressure.** No parent method uses
-   `sum_s ||D_g^s||_*` under a concatenated Gram constraint. It redistributes a
-   fixed decoder spectrum across sites and can encourage coefficient-level
-   site partitioning. It is neither Fel's constraint nor SASA's map nuclear
-   norm.
-4. **Whitening plus site RMS renormalization.** This is materially different
-   from Fel's isotropic input scaling, Anthropic's independent layer
-   normalization, and SASA's layer-normalized activations.
-5. **The exact Aux/guard combination.** The long frequency window, auxiliary
-   capacity, gradient-ratio cap, and spike guard are local engineering choices.
-
-## Fel BSF comparison in detail
-
-### Vanilla BSF
-
-Fel's Vanilla model computes `z=Pi_k(xW+b)`, uses a free decoder, constrains
-each decoder block to the Frobenius unit ball, and minimizes reconstruction.
-The encoder is initialized from the decoder transpose with a calibrated scale.
-It is the nearest Fel model to BSC's *free encoder*, but differs on four axes:
-
-- BSC has no encoder bias;
-- BSC makes the concatenated decoder block orthonormal rather than bounding
-  each single-site block's Frobenius norm;
-- BSC uses batch-global rather than per-token TopK;
-- BSC normally adds site-profile and Aux terms.
-
-An `S=1` BSC is therefore not Vanilla BSF: it keeps the free encoder but swaps
-the decoder ball for an orthonormal frame and deletes the affine bias.
-
-### Grassmannian BSF
-
-Fel's Grassmannian model uses `z_g=gamma xD_g^T`, a single learned positive
-`gamma`, per-sample TopK, and an orthonormal decoder frame for each block. It
-minimizes pure reconstruction and reprojects by QR; the paper reports that
-every 20 steps is sufficient.
-
-An `S=1` BSC shares the frame geometry, but its encoder is a separate learned
-matrix and its polar retraction runs every optimizer step. This distinction is
-large: the tied model makes selection and reconstruction use the same
-subspace, while the free encoder can learn an oblique discriminative routing
-map unrelated to the decoder frame.
-
-### Group Lasso BSF
-
-Fel's Group Lasso model uses an affine encoder, learned positive block
-thresholds, the group soft-threshold
-`(1-theta/||u||)_+ u`, and an `L_(2,1)` penalty. It obtains variable block
-counts without coupling examples in a batch. BSC's calibrated inference
-threshold also yields variable counts, but it hard-keeps the whole block and
-does not shrink magnitudes. These are different estimators even if their mean
-support is matched.
-
-### Fel AuxK ambiguity
-
-The paper's per-method descriptions specify pure reconstruction for Vanilla
-and Grassmannian and an additional group penalty only for Group Lasso. A
-shared Appendix-D loss later includes a runner-up block AuxK term with
-`alpha=1/ell`; the toy description says auxiliary loss is absent unless
-prescribed, and the released implementation does not make that Appendix term
-part of the core architecture. A faithful comparison should therefore use
-**no Aux** as the primary Fel bridge and treat the exact Appendix runner-up
-Aux as a separately named arm. The local `aux_variant="fel"` is faithful only
-when its runner-up count equals the main sparsity, since the paper's coefficient
-is `1/ell`, not generically `1/s_aux` for an unrelated count.
-
-### Fel synthetic bridge
-
-The existing synthetic battery is a useful BSC stress test, not a Fel
-reproduction. Fel's controlled recovery uses one site, ambient dimension 128,
-four factors active without replacement, 256 blocks of width four, top four
-blocks per sample, clean generated examples, and long 300k/100k train/eval
-sets. The local generator uses four sites, six independent Bernoulli factors
-with expected active count one, Gaussian noise `0.02`, 16 blocks, block
-BatchTopK with `k=1`, and the SASA auxiliary path. A method bridge should first
-reproduce the Fel setup and expected recovery ordering, then introduce sites,
-batch selection, noise, and Aux one at a time.
-
-## Crosscoder comparison in detail
-
-### Anthropic's original ReLU/L1 crosscoder
-
-For site activations `a^s`, Anthropic computes
-
-`f = ReLU(sum_s W_enc^s a^s + b_enc)`
-
-and reconstructs each site with `W_dec^s f + b_dec^s`. Its objective sums site
-MSE and
-
-`sum_i f_i sum_s ||W_dec,i^s||_2`.
-
-The L1-of-site-norms form is intentional: compared with treating the
-concatenated decoder as one L2-normalized vector, it charges a feature for
-being present at each site and makes the loss comparable with a collection of
-single-site SAEs. Anthropic separately normalizes each layer and sweeps feature
-count and training steps/FLOPs.
-
-BSC agrees on joint encoding and site-specific decoding, but differs on sign,
-unit dimension, selector, decoder constraint, sparsity loss, bias, and input
-gauge. In particular, BSC's site-profile penalty is *not* the block analogue of
-Anthropic's activation-weighted L1-of-site-norms: it does not multiply by
-activation, and the Stiefel constraint fixes total decoder energy.
-
-The original model is still a necessary bridge because its optimization can
-produce model/layer-specific norm artifacts that a normalized signed model
-cannot. Without it, BSC has not shown that blocks solve a problem faced by the
-published crosscoder rather than by its own scalar special case.
-
-### Minder's L1 and BatchTopK crosscoders
-
-Minder et al. identify two L1-crosscoder artifacts:
-
-- **Complete Shrinkage:** a feature's contribution is suppressed in one model
-  even when that feature is present;
-- **Latent Decoupling:** separate latents encode related base/chat content,
-  making one appear model-specific.
-
-Their Latent Scaling diagnostic fits contribution scaling against
-reconstruction and reconstruction error. Their BatchTopK variant starts from
-the affine/ReLU code, scales each latent by the sum of its base/chat decoder
-norms, selects the top `Bk` events globally, adds dead-latent residual Aux, and
-fits an inference threshold to obtain mean count `k`. On Gemma 2 2B base/chat
-layer 13 it used 100M training tokens, two epochs, learning rate `1e-4`, and
-`k=100`; the paper's own model has 73,728 latents. Its L1 comparator used
-`mu≈0.04`, the same learning rate, and realized L0 near 100.
-
-This is the closest published selector to BSC. The remaining differences are
-not cosmetic:
-
-- Minder scores a nonnegative scalar activation times decoder norm; BSC scores
-  a signed vector norm whose cross-site decoder energy is fixed by constraint;
-- Minder has an encoder bias and free decoder norms; BSC has neither;
-- Minder's model-specific-feature analysis uses Latent Scaling and causal
-  activation replacement with None/All/error controls; BSC does not yet route
-  corresponding shared-code falsifications as required endpoints;
-- BSC's block code can hide coordinate-level site exclusivity even when the
-  whole block appears shared.
-
-The proper test is not just FVU. Apply a block generalization of Latent Scaling:
-fit a small linear map or scalar/profile family from each block contribution
-to held-out reconstruction and error, compare site-norm classification with
-that fitted map, and run causal replacement/ablation. At minimum, use the
-already specified site-only FVU matrix, leave-one-site-out reconstruction,
-CCA, and Procrustes as cross-layer analogues.
-
-## SASA comparison in detail
-
-SASA is a single-site block model. It computes `p_k=E_k h`, keeps the `s`
-blocks with largest `||p_k||_2` independently for each token, reconstructs with
-`sum_k D_k a_k`, and minimizes
-
-`sum_i ||h_i-Da(h_i)||_2^2 + lambda_dim sum_k ||D_k E_k||_*`.
-
-The nuclear norm is on the end-to-end block map. This matters: it couples
-encoder and decoder and can shrink unused singular directions of the actual
-linear reconstruction operator. BSC's concatenated Stiefel decoder always has
-capacity rank `b`, while its current regularizer only reallocates that decoder
-capacity among sites. Decoder-frame singular values cannot substitute for
-SASA's map spectrum or for activation-weighted contribution rank.
-
-SASA's stated GPT-2 setting is `(K,r,s)=(2048,6,10)` and its Mistral setting is
-`(4096,8,10)`, with `s_aux=512` and `256` respectively, auxiliary coefficient
-one, AdamW at `2e-4`, weight decay `1e-3`, 1k warmup, linear decay over the last
-fifth of training, batch 4096, and layer-normalized inputs. It defines a dead
-group by frequency at most `1e-4` over 1,000 tokens, detaches the residual,
-re-encodes it through dead blocks, and selects per-token top `s_aux` residual
-blocks.
-
-Current BSC borrows the residual/dead-group logic but uses a 100-*batch*
-window—409,600 tokens at production batch size—plus a local gradient-ratio cap.
-It also gives both the block and scalar arms `s_aux=256`, which means up to
-1,024 block coefficients versus 256 scalar coefficients. These should not be
-called faithful SASA settings until the window and capacity are matched and a
-binding cap test passes.
-
-There is one additional design subtlety for a true cross-site SASA bridge. If
-the full concatenated decoder `Dbar` has orthonormal rows, then
-`||Dbar^T Ebar||_* = ||Ebar||_*`; the decoder no longer supplies an adaptive
-singular-value factor. A useful bridge should therefore compare:
-
-1. a faithful single-site SASA with free `D_k,E_k`;
-2. a multi-site free-map SASA generalization;
-3. a Stiefel-decoder BSC with an explicitly acknowledged encoder-spectrum
-   penalty; and
-4. the current decoder site-profile penalty.
-
-Conflating those objectives would make a nominal “SASA regularizer” arm much
-less informative than it sounds.
-
-## Hyperparameters and scale
-
-Raw hyperparameter similarity is weak evidence across different activation
-dimensions, site counts, modalities, and objectives. The useful comparison is
-both literal and normalized.
-
-| Setting | Current BSC Phase 1 | Fel DINO BSF sweep | Minder BatchTopK crosscoder | SASA |
-|---|---|---|---|---|
-| Data/model | Gemma 3 4B residual-post, 8 sites | DINOv3 ViT-B final-layer patches | Gemma 2 2B base/chat, layer 13 | GPT-2 and Mistral-7B single layers |
-| Input dimension | `d=2560` per site; concatenated 20,480 | `d=768` | Model hidden size at two models | Model hidden size, one site |
-| Dictionary | `G=4096`, `b=4` | `G=4096..32768`, `b=1..32` | 73,728 scalar latents | GPT-2 `K=2048,r=6`; Mistral `K=4096,r=8` |
-| Main sparsity | `k=32` blocks; 128 active coefficients on average | `ell=8,16,32,64` per token | `k=100` scalar events on average | `s=10` blocks per token |
-| Selector | Block BatchTopK; global threshold inference | Per-token block TopK; Group Lasso variant soft-thresholds | Scalar BatchTopK; global threshold inference | Per-token block Top-s |
-| Optimizer | 8-bit AdamW moments, fp32 masters/bf16 forward | Adam | Paper training library; LR reported | AdamW, weight decay `1e-3` |
-| Learning rate | `3e-4` to zero cosine | `1e-4` to `1e-5` cosine | `1e-4` | `2e-4`, linear late decay |
-| Warmup | 1,000 steps | 2,000 steps | Not the transferable headline variable | 1,000 steps |
-| Batch | 4,096 tokens | 8,192 patches | Paper reports token corpus/epochs; implementation-specific batch | 4,096 tokens |
-| Budget | 76M optimizer tokens planned, two passes over 38M | Three epochs over activation shards | 100M tokens, two epochs | Paper claims about half-token budgets vs scalar baselines; task-specific |
-| Normalization | Shrinkage whitening plus site RMS renorm | Scale mean norm to `sqrt(d)` | Not specified in the paper's training-details table | Layer-normalized activations |
-| Structural penalty | `1e-3` site-profile; zero for fair scalar frontier | None for TopK arms; Group Lasso tuned | None in BatchTopK; L1 arm `mu≈0.04` | Map nuclear norm `lambda_dim` |
-| Auxiliary | SASA-style, `s_aux=256`, coefficient 1, cap 1.0 | Core arms no Aux; appendix runner-up `alpha=1/ell` | Dead-latent residual, usually `k_aux=512`, `alpha=1/32` | `s_aux=512/256`, coefficient 1 |
-
-### Are `G=4096`, `b=4`, and `k=32` sensible?
-
-Yes as a starting operating point. All three literal values lie inside Fel's
-real-activation sweep, and width four agrees with the project's synthetic and
-Phase-0 results. But the normalized capacity is very different:
-
-- Fel at `d=768,G=4096,b=4,k=32` allocates `Gb/d=21.3` decoder coordinates per
-  input dimension and activates `kb/d=16.7%` as many coefficients as input
-  dimensions.
-- BSC at one `d=2560` site allocates `Gb/d=6.4` coordinates and activates
-  `kb/d=5%`.
-- Relative to the eight-site concatenated dimension 20,480, BSC allocates only
-  `Gb/(Sd)=0.8` shared coordinates per input coordinate and activates
-  `kb/(Sd)=0.625%`.
-
-The cross-site structure should reduce redundant capacity, so the last ratio
-need not match Fel. It does show why “same `G,b,k` as the paper” is not a
-capacity argument. The appropriate sweep includes block count, active
-coefficient count, parameter/FLOP budget, and coded rate.
-
-### Does `lr=3e-4` make sense?
-
-It is plausible but aggressive relative to the nearest papers: Fel uses a
-`1e-4` peak, Minder reports `1e-4`, and SASA uses `2e-4`. BSC also has far more
-parameters, bf16 forward weights, an 8-bit optimizer, per-step retraction, and
-a batch-coupled selector. Phase-0 spike guards and deterministic tests are
-evidence that it can run, not evidence that it is optimal. The executable
-matrix should compare at least the current schedule with a `1e-4` Fel/Minder
-bridge and a `2e-4` SASA-like arm, holding optimizer-token budget fixed.
-
-### Does `lambda_site_profile=1e-3` make sense?
-
-Only as an empirically screened strength for the *site-profile* objective.
-Phase 0 rejected `3e-3` and retained `3e-4`/`1e-3` under a flat-profile veto.
-There is no meaningful numerical comparison to SASA's `lambda_dim`, because
-the functions, normalizations, and parameter gauges differ. Architecture-fair
-frontiers should remain at zero; any regularized headline needs a three-way
-none/site-profile/map-spectrum ablation.
-
-### Does the 76M-token budget make sense?
-
-It is a reasonable forecast, not a demonstrated convergence budget. Phase 0
-showed a 0.016–0.020 FVU gain from doubling optimizer tokens to 24M while fresh
-data at fixed budget contributed only 0.0013. That favors repeats if storage is
-binding, but it also warns that architecture comparisons can be budget-limited.
-The 76M run needs a predeclared held-out slope gate and a matched 100M extension
-for every surviving headline arm if still improving.
-
-## Exhaustive conceptual factor space
-
-The scientific object is a factorial family, not one scalar “BSC versus
-papers” switch. The conceptual space below is intentionally broader than what
-should be executed as a Cartesian product.
-
-| Axis | Levels that must be distinguished |
-|---|---|
-| Site structure | One site; multiple layers; base/chat models; mixed layers and models |
-| Shared object | No sharing/independent models; shared scalar; shared vector block; shared presence but site-specific coordinates |
-| Block width | `b in {1,2,4,6,8,16}` plus task-driven widths |
-| Dictionary capacity | `G`; total coefficients `Gb`; parameter matched; FLOP matched; memory matched |
-| Decoder geometry | Unconstrained scalar; per-block Frobenius ball; per-block Stiefel; concatenated cross-site Stiefel; free map with weight decay |
-| Encoder relation | Tied with one scale; untied linear; untied affine; partially tied/shared encoder |
-| Code sign/nonlinearity | Signed linear block; ReLU scalar; block soft threshold; other cone constraints only as explicit controls |
-| Training selector | Per-token TopK/Top-s; BatchTopK; learned/global threshold; L1; group lasso |
-| Inference selector | Same as training; calibrated threshold; fixed per-token count; rate-targeted per-sequence code |
-| Sparsity match | Mean block events; coefficient events; support entropy; full coded bits; per-token count distribution |
-| Structural regularizer | None; current site-profile; SASA end-to-end map nuclear; Anthropic activation-weighted L1-of-site-norms; group `L_(2,1)` |
-| Auxiliary path | None; Fel runner-up; Minder dead-latent; SASA residual dead-block; block-event matched; coefficient-capacity matched |
-| Deadness definition | Token horizon; batch horizon; frequency threshold; time-since-last-fire; no revival |
-| Input gauge | Raw/isotropic norm; separately normalized sites; layer norm; shrinkage whitening; whitening plus site renorm |
-| Reconstruction metric | Transformed-coordinate MSE/FVU; raw-coordinate MSE/FVU; site weighted; downstream causal/behavioral loss |
-| Optimizer | Adam; AdamW; 8-bit moments; full precision moments; fp32 vs bf16 forward; weight decay policy |
-| Schedule | Peak LR; warmup; cosine/linear decay; floor; retraction frequency |
-| Budget | Unique tokens; optimizer tokens; steps; epochs/repeats; FLOPs; early-stop rule |
-| Initialization | Tied decoder transpose; independent encoder; norm calibration; bias initialization; cold versus warm bridge |
-| Causality | Acausal all-site encoding; prefix/causal encoding; site-only; leave-one-site-out |
-| Evaluation | FVU; deadness; support distribution; R–D; factor recovery; map/code/contribution rank; Latent Scaling; patching/intervention |
-
-Executing the full Cartesian product would be wasteful and statistically
-opaque. The correct use of this table is to prevent hidden factor changes,
-then prune through staged gates.
-
-## Staged executable matrix
-
-### Stage A — Paper-faithfulness and implementation validation
-
-Run small, high-precision, two- or three-seed cells. No whitening, local
-regularizer, custom guard behavior, or SASA Aux should enter a bridge until the
-paper-faithful version passes its own recovery/reconstruction check.
-
-| Cell family | Fixed factors | Deliberate comparison | Pass condition |
-|---|---|---|---|
-| A0 Fel toy reproduction | `S=1,d=128,G=256,b=4,k=4`, clean Fel generator, per-token TopK, Adam, paper budget | Vanilla vs Grassmannian vs Group Lasso; paper constraints/bias/tie | Recovery ordering and near-oracle block recovery qualitatively reproduce paper; deterministic artifact |
-| A1 Local synthetic delta | Start from A0 | Add local noise, Bernoulli supports, then BatchTopK, then Aux one at a time | Each delta's effect on assignment, contribution R², deadness, and FVU is attributable |
-| A2 Original crosscoder bridge | Small multi-site activation store, `b=1`, separately normalized sites | Anthropic affine/ReLU/L1 vs independent SAEs | Published loss definition, decoder-norm profiles, L0/FVU and feature-sharing diagnostics work |
-| A3 Minder bridge | Same data and width as A2 | ReLU/L1 vs ReLU/BatchTopK with exact score, threshold, and Aux | BatchTopK support and threshold calibration reproduce target L0; Latent Scaling detects injected shrinkage/decoupling controls |
-| A4 SASA bridge | Single-site language activation store, paper-like `(K,r,s)` at reduced width if necessary | Map nuclear on/off; exact 1k-token dead window and Aux | Map spectrum responds to `lambda_dim`; revival behavior and per-token Top-s match source semantics |
-| A5 BSC identity tests | Synthetic multi-site rotated frames | Joint vector code vs independent `S=1 BSC`; exact concatenated Stiefel | Recover shared support/coordinates up to `O(b)` gauge; site-only and leave-one-out tests pass |
-
-Stage A is also where numerical tests belong: fp64 Gram/gradient references,
-post-step rollback, checkpoint experiment mismatch refusal, saved-codec
-round-trips, and zero-rate exclusion tests.
-
-### Stage B — Isolate BSC innovations on a common pilot store
-
-Use a moderate fixed `G,b,k`, one common activation gauge per submatrix, common
-optimizer-token checkpoints, and at least two seeds for promoted comparisons.
-Change one factor family at a time.
-
-| Submatrix | Arms | Question |
+# Paper bridges and executable conditional matrix
+
+*Normative comparison ledger, 2026-07-20. `studies.py` is authoritative for
+the exact serialized cells; this document is authoritative for their scientific
+interpretation.*
+
+## 1. The methods do not form one flat grid
+
+[BSF](https://arxiv.org/abs/2606.25234) and
+[SASA](https://arxiv.org/abs/2606.06333) learn signed vector blocks at one
+site. [Anthropic's original crosscoder](https://transformer-circuits.pub/2024/crosscoders/index.html)
+learns one nonnegative scalar code from several sites. The native BSC combines
+the cross-site topology with the vector-block ontology; no reviewed paper
+publishes that combination.
+
+The matrix is therefore conditional:
+
+1. test source equations and invariants;
+2. establish truth-known identification;
+3. select one parent;
+4. change one/few related decisions;
+5. promote only complete-seed winners to the next round;
+6. confirm the final recipe without tuning.
+
+Every row is a whole recipe. A selector, decoder gauge, regularizer, or Aux
+bundle is not transplanted invisibly.
+
+Hard TopK tie behavior is one universal engineering contract, not a method
+axis: score descending, then lowest block index within a token or lowest
+row-major `(token, block)` index batch-wide at the exact cutoff. Threshold
+equality is excluded by strict greater-than. No recipe inherits backend TopK
+tie order.
+
+## 2. Source-method comparison
+
+| Source recipe | Sparse object | Encoder and selector | Decoder/gauge | Objective beyond reconstruction | Project role |
+|---|---|---|---|---|---|
+| BSF Vanilla | signed vector block | untied affine; per-token block TopK | per-block Frobenius ball | none | paper parent and single-site geometry anchor |
+| BSF Grassmannian | signed vector block | decoder-tied with one positive scale; per-token block TopK | Stiefel block; periodic QR | none | tied-inference and subspace-gauge anchor |
+| BSF Group Lasso | signed vector block | affine; learned group soft threshold | source scale control | conditional group `L2,1` | variable-support block anchor |
+| SASA paper | signed vector block | free linear; per-token Top-s | free block maps | `sum_g ||D_g E_g||_*`; whole-group dead-residual Aux | effective-map-dimension and block-revival anchor |
+| Anthropic original | nonnegative scalar | sum affine site encoders; dense ReLU during training | free affine decoder per site | activation times the sum of per-site L2 decoder norms | same-model cross-layer comparator family; never sparse-finalist-eligible |
+| decoder-weighted BatchTopK adaptation | nonnegative scalar | sum affine site encoders; score by activation times sum of decoder norms; batch-global event allocation | free affine decoder per site | optional token-horizon residual Aux as a separate bundle | strongest scalar multi-site mechanism comparator |
+| fmxcoder-derived adaptation | signed vector block retained locally | Tucker-style low-rank site-axis encoder/decoder factors; optional stochastic encoder-site masking | compatible free decoder | clean-target reconstruction from partial layer evidence | Phase-1 capability evidence and Phase-2 real-model tuning; not a reproduction of the source tensor factorization |
+| BSC | signed vector block | joint sum/mean/source encoder; block selector | site-specific block decoders with declared cross-site gauge | optional named block penalty or Aux | novel target method |
+
+The original Anthropic training model is retained exactly as dense ReLU plus
+the disclosed L1-of-site-norms objective. Its norm geometry is
+`sum_s ||d_i^s||_2`, not `||(d_i^1,...,d_i^S)||_2`. Calibration fits a
+deployment threshold so packet behavior can be measured. This post-training
+sparsification does not make it eligible as the sparse finalist, but its
+Phase-3 comparator is selected through its own Phase-2 calibration chain.
+
+The decoder-weighted BatchTopK and token-horizon Aux rows are explicitly
+`adapted`. They preserve the relevant equations while changing the task to
+same-model layers. They make no claim to reproduce the source experiment.
+
+## 3. Paper settings and disclosure gaps
+
+### 3.1 BSF
+
+The truth-known source generator has ambient width 128, 128 factors, four
+active factors per example, 300,000 training and 100,000 held-out examples,
+independent seeds, and no primary observation noise. The executable Phase-1
+bridge separately binds 50,000 factor-calibration examples, 300,000 unique
+training examples, and disjoint 100,000-example codec-calibration,
+development, and confirmation ranges. Half the factors are
+one-dimensional; the remainder span circles, disks, spheres, tori, Möbius
+strips, Swiss rolls, and helices after factorwise calibration and random
+orthonormal embedding.
+
+The core anchor uses `G=256`, `b=4`, and four active blocks. Vanilla uses an
+affine encoder and Frobenius-ball projection. Grassmannian ties inference to
+the decoder and reports QR about every 20 steps. Group Lasso learns block
+thresholds and penalizes group activity while activity exceeds target.
+
+Appendix D adds a distinct runner-up residual auxiliary: select the next four
+unselected blocks and weight their residual reconstruction by `1/4`. The live
+matrix therefore separates primary and Appendix-Aux recipes. The exact toy
+optimizer schedule is incompletely disclosed; transferred batch/LR/epoch
+values remain adapted even when the architecture is exact.
+
+### 3.2 SASA
+
+The defining penalty is the nuclear norm of the end-to-end map,
+
+\[
+L=L_{\rm rec}+\lambda_{\rm dim}\sum_g\lVert D_gE_g\rVert_* ,
+\]
+
+not the decoder nuclear norm. A group is dead when its firing frequency is at
+most `1e-4` over 1,000 tokens; the detached residual is re-encoded with dead
+groups and the selected auxiliary groups reconstruct it at coefficient one.
+
+The GPT-2 paper setting is residual-pre block 7 on OpenWebText, 150M tokens,
+context 128, `(groups,width,active)=(2048,6,10)`, 512 auxiliary groups, token
+LayerNorm, token batch 4,096, AdamW, LR `2e-4`, WD `1e-3`, 1,000 warmup steps,
+and final-fifth linear decay. The Mistral setting uses block 8, 500M tokens,
+context 512, `(4096,8,10)`, and 256 auxiliary groups with the same optimizer
+family.
+
+The paper does not disclose numeric `lambda_dim`, so the live paper bridge does
+not transfer an invented absolute coefficient across dimensions or reduction
+conventions. After all declared initialization and encoder-scale fitting, it
+measures the unweighted map penalty and reconstruction loss on the hash-bound
+first training batch in fp32 and resolves the coefficient to target an initial
+penalty/reconstruction ratio. The independent SASA ladder is
+`0/.01/.03/.10`, centered at `.03`; the zero arm retains the map objective.
+The inspected release's absolute value `100` belongs only to its decoder-only
+nuclear-norm drift recipe, which is diagnostic and nonpromotable.
+
+### 3.3 Anthropic architecture bridge
+
+The disclosed equations are
+
+\[
+f(x)=\operatorname{ReLU}\left(\sum_sW^s_{\rm enc}x^s+b_{\rm enc}\right),
+\qquad
+\hat x^s=W^s_{\rm dec}f+b^s_{\rm dec},
+\]
+
+with squared reconstruction and
+
+\[
+\lambda\sum_i f_i(x)\sum_s\lVert d_i^s\rVert_2 .
+\]
+
+Separate site normalization and width/compute sweeps are described, but the
+model, corpus, exact normalization, token budget, width values, optimizer,
+batch, LR, coefficient, initialization, and dead-feature treatment are not
+sufficiently disclosed for numerical reproduction. Every numeric runtime value
+in the executable architecture bridge is therefore adapted or engineering.
+
+### 3.4 Adapted decoder-weighted mechanisms
+
+For dense positive activation $f_{ti}$, the carrier scores
+
+\[
+v_{ti}=f_{ti}\sum_s\lVert d_i^s\rVert_2,
+\]
+
+retains the largest `batch_tokens * target_events` scores across the batch, and
+decodes the corresponding unscaled $f_{ti}$. Deployment uses a threshold fit
+only on calibration to reproduce the support target.
+
+The optional residual-Aux bundle declares death by accepted-token horizon,
+scores only dead candidates with the same decoder weighting, and reconstructs
+the detached residual. The implemented source-grounded pilot bundle has
+coefficient `1/32`, Aux width 384, and a 10M-token dead horizon. It is not a
+live Phase-2 matrix arm: the live decoder-weighted anchor isolates selection,
+and `auxiliary_16m` isolates BSF and SASA auxiliaries. Activating the Minder
+bundle would require a separately declared selected-parent round.
+
+## 4. Exact live Phase-1 matrix
+
+Default development seeds are 0, 1, and 2. Initial stages are materialized;
+later stages are exact selected-parent children.
+
+| Stage | Recipes/variants | Selection or gate |
 |---|---|---|
-| B1 Encoder/decoder | Tied Grassmannian; free linear/Stiefel; free affine/Stiefel; free affine/Frobenius-ball | Is the hybrid free-encoder/Stiefel choice better, and is encoder bias necessary? |
-| B2 Selector | Per-token block TopK; block BatchTopK; learned/group threshold; calibrated hard threshold training | Does variable support help enough to justify batch coupling? |
-| B3 Structural penalty | None; current site-profile at `3e-4,1e-3`; true map-spectrum matched on effective scale | Is the winner due to useful site localization or coordinate partition? |
-| B4 Aux | None; Fel runner-up; SASA dead residual; Minder-style dead residual | Which revival prior improves final held-out quality rather than only early deadness? |
-| B5 Aux fairness | Same block-event count; same maximum coefficient count; matched realized Aux rate | Does the block arm retain an advantage without 4× auxiliary capacity? |
-| B6 Gauge | Isotropic/raw; separate layer norm; shrinkage whitening; whitening plus site renorm | Is the architecture advantage stable outside the promoted transformed metric? |
-| B7 Scalar bridge | Signed normalized scalar; Anthropic ReLU/L1; Minder ReLU/BatchTopK | Is the block gain specific to the current scalar baseline? |
-| B8 Sharing | Joint BSC; eight `S=1 BSC`; site-specific coordinate maps; scalar crosscoder | Does one shared vector code fit, or is shared presence with flexible coordinates better? |
+| `paper_anchors` | BSF Vanilla/Grassmannian/Group-Lasso, each primary and Appendix Aux; SASA paper; Anthropic architecture | integrity-complete gate only |
+| `representable_controls` | signed scalar token-TopK; scalar ReLU decoder-weighted BatchTopK; source-only block; source-only scalar | opens after complete anchor evidence |
+| `fusion_identification` | shared-coordinate sum; shared-coordinate mean | non-promotable parity diagnostic after complete controls |
+| `dgp_identification_screen` | BSC single-site; support-only stress; shared coordinates | shared-coordinate arm is the sole eligible parent |
+| `capacity_identification` | widths `1,2,4,8` at fixed total/active coordinates; width-4 half/double capacity; width-4 half/double activity | capability only; fixed `width_4` carrier advances |
+| `retraction_identification` | QR concatenated Stiefel; symmetric-polar concatenated Stiefel | capability only; fixed `qr_retraction` carrier advances |
+| `site_factorization_identification` | exact selected parent; unfactorized full free-site weights; site ranks `1,2,4` | capability only; fixed `selected_parent_carrier` advances |
+| `site_mask_fusion_control_identification` | literal sum `p=0`; literal sum `p=.10`; availability-rescaled sum `p=.10` | capability only; fixed rescaled-sum `p=.10` carrier advances; literal positive masking is diagnostic |
+| `site_masking_identification` | Bernoulli clean-target masking `0,.02,.05,.10`; exactly one hidden; exactly one retained | capability only; fixed zero-mask carrier advances |
+| `selection_score_identification` | code norm, exact isolated decoded energy, and exact isolated squared-loss decrease on the Stiefel equality-control carrier; the same three scores on one common free decoder | capability only; every free-decoder arm is nonpromotable and the fixed Stiefel decoded-energy provisional carrier advances |
+| `selector_identification` | token block-TopK; block BatchTopK | capability only; fixed token-TopK carrier advances |
+| `robustness_confirmation` | baseline; support-only; site rotation; site-scale ratio 2; noise `0.1`; rank heterogeneity; two/eight active factors; rank-two/independent site maps; one/two-site spans; Zipf-alpha-one frequency; pair forcing `.5/.9`; standardized Student-t df=3 coordinates; paired 30-degree factor subspaces | confirmation stream, no selection; support-only and one-site spans are negative controls; independent maps retain shared coordinates and stress site-axis factorization |
 
-Primary endpoints for every B cell are held-out transformed and raw FVU,
-per-site FVU, realized support distribution, dead fraction, coded rate from a
-saved codec, training FLOPs, and stability. BSC-specific endpoints are the
-site-only/all-site FVU matrix, leave-one-site-out, CCA/Procrustes, centered
-code/contribution/map spectra, and truncation FVU.
+Every capability challenger still runs all seeds and contributes its
+qualification digest and pass/fail outcome, but it is nonpromotable and cannot
+replace the named carrier or prune a real-model option. No Phase-1 capability
+round chooses a model-specific winner. All advancing carriers require complete
+seeds and a passed scientific outcome; their metric is the minimum normalized margin
+across same-block support/subspace/code recovery and aggregate pathology
+guardrails.
 
-### Stage C — Confirmatory production shortlist
+For observed sites $O$, the new signed score is
 
-Only Stage-B winners reach the 4B production store. Keep the shortlist small
-enough that all arms receive the same budget and two confirmatory seeds.
+\[
+\Delta_g(O)=\lVert x_O\rVert^2-\lVert x_O-D_{g,O}^{\top}z_g\rVert^2
+=2\langle x_O,D_{g,O}^{\top}z_g\rangle
+-\lVert D_{g,O}^{\top}z_g\rVert^2.
+\]
 
-Recommended minimum shortlist:
+It excludes hidden clean targets, requires a bias-free quadratic objective,
+retains negative gains, is invariant to reciprocal within-block gauge, and
+reduces to $\lVert z_g\rVert^2$ under unit-scale tied concatenated Stiefel. Its
+deployment threshold uses a signed deterministic histogram.
 
-1. current BSC without structural penalty;
-2. best site-profile or map-spectrum BSC, selected without using confirmatory
-   eval;
-3. best faithful block bridge (`S=1` controls plus the multi-site extension);
-4. signed scalar BatchTopK control;
-5. Minder-style ReLU BatchTopK crosscoder;
-6. independent single-site block and scalar controls.
+At seeds 0, 1, and 2 the serialized variants declare and execute **198 cells**:
+51 initial, 96 capability/contract cells, and 51 confirmation cells. The score
+panel contributes 18 cells: three Stiefel equality controls and the same three
+scores on a common free decoder, at all three seeds. Synthetic LR,
+native-regularizer, and Aux tuning rounds do not exist.
 
-Checkpoint every arm at common optimizer-token budgets (for example 24M,
-50M, and 76M). At 76M, apply the preregistered convergence gate. If any
-headline arm is still improving materially, extend **all headline arms** to at
-least 100M. Winner election requires full calibration, a serialized codec,
-all safety/provenance gates, all shared-code/effective-span endpoints, and raw
-as well as transformed distortion.
+### 4.1 Transfer to Phase 2
 
-### Stage D — Sensitivity and frontier mapping
+The frozen `bsc-phase1-transfer-v2` payload separates the universal method
+contract, the signed-coordinate/decoded-energy provisional carrier, and all
+diagnostic capability panels; it also binds claim-scope narrowing, selection
+IDs, source plan/blueprint IDs, evidence hashes, and its own content ID. It
+contains no synthetic numeric winner for architecture, width, rank, masking,
+score, selector, optimizer, or scale, and capability failures do not filter the pilot.
+The signed coordinate ontology is universal, while the literal activation
+operator and score are explicitly reopened; group soft thresholding remains a
+signed-coordinate Phase-2 method.
+A runnable Phase-2 blueprint binds both the
+Phase-1 decision ID and transfer ID; its `phase1_contract_bsc` anchor is rebuilt
+from that evidence, while an unbound preview remains non-runnable.
 
-After a model family wins, sweep only the factors that define its operating
-frontier:
+## 5. Exact live Phase-2 matrix
 
-- `b in {1,2,4,8}` initially, adding six if comparison with SASA warrants it;
-- `G` at parameter- and coefficient-capacity-matched points;
-- target block rate and target coefficient rate, including variable-support
-  thresholds;
-- quantization `q in {4,6}` plus bf16 shadow;
-- unique-data versus repeat budget at fixed optimizer tokens;
-- peak LR `1e-4,2e-4,3e-4` with schedule family fixed;
-- structural coefficient around the selected zero/nonzero boundary;
-- causal/site-prefix versus fully acausal encoding where the scientific claim
-  depends on temporal formation.
+Default pilot seeds are 0 and 1. Every cell uses the same pinned four-layer
+GPT-2 raw task and an actual saved-codec round trip. Site count is a later
+robustness question, not an architecture-search confound.
 
-Report Pareto surfaces over distortion, coded rate, parameters/FLOPs, and
-scientific recovery. Do not choose `b` from FVU alone: reconstruction is
-monotone in capacity. Use coded rate and used-span/truncation evidence.
+| Stage | Budget and split | Recipes/variants |
+|---|---|---|
+| `anchors_1m` | 1M, development | BSF Vanilla/Grassmannian/Group-Lasso; scalar ReLU BatchTopK; SASA; Anthropic dense-L1; adapted decoder-weighted BatchTopK; evidence-bound `phase1_contract_bsc`; nonpromotable `phase1_contract_source_only_control` |
+| `architecture_4m` | 4M, development | exact selected parent; labeled parent architecture; no init preconditioning; tied Grassmann `b=4` QR; tied Grassmann `b=4` polar |
+| `capacity_4m` | 4M, development | exact selected parent; widths `1,2,4,8` at fixed total/active coordinates; width-4 half/double capacity; width-4 half/double activity |
+| `site_factorization_4m` | 4M, development | exact selected parent; unfactorized full free-site weights; factorized site ranks `1,2,4` |
+| `site_masking_4m` | 4M, development | exact selected parent; Bernoulli clean-target masking `0,.02,.05,.10`; exactly one hidden; exactly one retained |
+| `site_factorization_revisit_4m` | 4M, development | exact selected masked parent; unfactorized full free-site weights; factorized site ranks `1,2,4`; only the exact parent materializes when zero Bernoulli masking wins |
+| `hard_selector_score_interaction_4m` | 4M, development | full 3-by-2 product of code norm, exact isolated decoded energy, or exact isolated loss decrease with signed token-TopK or signed block-BatchTopK; decoded-energy/token-TopK is the exact incoming control |
+| `group_threshold_method_4m` | 4M, development | exact selected parent; complete affine group-soft-threshold/unit-Frobenius/conditional-L2,1 method bundles at `3e-4`, `1e-3`, or `3e-3` |
+| `learning_rate_4m` | 4M, development | exact selected parent; `3e-5`, `1e-4`, `3e-4` |
+| `batch_size_4m` | 4M, development | exact selected parent; 2,048; 4,096; 8,192 optimizer tokens per batch |
+| `warmup_4m` | 4M, development | accepted-update fractions `.02`, selected-parent `.05`, `.10` |
+| `schedule_4m` | 4M, development | exact selected parent; constant after selected warmup; cosine; final-fifth linear decay |
+| `learning_rate_revisit_4m` | 4M, development | exact selected parent; revisit `3e-5`, `1e-4`, `3e-4` after batch/warmup/schedule selection |
+| `regularization_16m` | 16M, development | exact selected parent; no regularizer/Aux; SASA map nuclear at initial penalty/reconstruction ratios `.01/.03/.10`; decoder-only nuclear diagnostics at absolute `30/100/300` |
+| `auxiliary_16m` | 16M, development | exact selected parent; no Aux; BSF runner-up Aux; SASA source, low-weight, or long-window dead-group Aux |
+| `confirmation_16m` | 16M, confirmation | scalar RMS; none; `sqrt_d`; shrinkage whiten; token LayerNorm |
 
-## Decision rules
+Observation-site/evidence topology and missing-site fusion are absent from the
+Phase-2 tuning chain; model architecture is explicitly retuned.
+Availability-rescaled fusion is inherited as a universal semantic. Decoded
+energy enters only as a provisional score carrier. Site-axis rank and mask
+probability are retuned because their optimum is model-, hook-, scale-, and
+rate-dependent, and rank is revisited after the selected mask. The pilot then
+runs the complete three-score by two-hard-selector interaction rather than a
+coordinate-descent score/selector/revisit sequence. Learned group thresholding
+is isolated as a bundled method because it changes the affine encoder, bias,
+decoder constraint, shrinkage activation, L2,1 objective, and activity schedule
+together.
+For a learned group-threshold arm, dense training support is the nonzero
+post-shrinkage code, independent of the inherited endpoint-ranking score. The
+score is reintroduced only at calibrated deployment, so isolated loss decrease
+cannot silently become an extra hard training gate.
+The tied-architecture QR/polar comparison is intentionally narrow: Phase 1
+measured both mechanisms and advanced QR by declaration, whereas real
+conditioning and dimension can change their optimization behavior. No
+truth-known capability failure deletes a Phase-2 option.
 
-The staged program should answer concrete forks rather than accumulate cells.
+The live coordinate contract is exact at every width:
+`groups=8192//block_width` and
+`active_blocks=32//block_width`. Architecture rows keep total latent coordinates and nominal active
+coordinates explicit; the headline comparison is nevertheless made again at
+achieved packet rate.
 
-1. **Keep BatchTopK** only if it improves held-out distortion/rate or recovery
-   over per-token TopK without unacceptable count tails or token-class harms.
-2. **Add encoder bias** if it fixes offset/antipodal recovery or improves real
-   held-out results without support collapse; otherwise retain the simpler
-   linear encoder and document the negative result.
-3. **Keep the site-profile penalty** only if it improves causal/shared-code
-   endpoints after controlling for site-exclusive coordinate partition. Never
-   call it rank adaptation.
-4. **Prefer map-spectrum regularization** only if it reduces code-anchored used
-   span or improves truncation/R–D, not merely decoder singular values.
-5. **Use an auxiliary path** only if final held-out quality or recovery improves
-   at matched auxiliary capacity. Early dead-count reduction alone is not
-   enough.
-6. **Claim a BSF extension** only after exact Fel bridges reproduce expected
-   behavior and the multi-site delta is isolated.
-7. **Claim a crosscoder improvement** only against both the internal signed
-   scalar control and at least the Minder ReLU/BatchTopK bridge, with
-   Latent-Scaling-style and causal diagnostics.
-8. **Claim effective dimension** only from activation-weighted contribution or
-   map spectra plus truncation, never decoder capacity alone.
+Every development stage retains one candidate using mean raw FVU at the frozen
+256, 384, and 512 total-bit/token budgets. Operational packet bits and exact
+serialized codec bytes amortized over 100M tokens are included. Adjacent
+lower-envelope mixtures use the content-bound
+`balanced_global_token_counter_u64_v1` schedule, requiring no per-token side
+bits. Each selected operating point is serialized as an exact 32-byte record
+in the immutable `deployment_schedules` bundle, reloaded through the consumer
+path, and amortized with the deployable codec. Mixture distortion is measured
+by executing those bytes on paired raw rows, not by averaging the aggregate
+endpoint FVUs. The score comes only from the
+lower convex envelope of measured zero-event and
+2/4/6/8/12/16-bit amplitude points; no extrapolation is allowed. Seeds
+aggregate by median, then worst seed, then candidate ID. `confirmation_16m`
+has no selection policy. The anchor allowlist admits only the shared-coordinate
+BSC to the first transition, and the source-only anchor is explicitly
+nonpromotable. Every ordinary main-chain development round declares an inert
+exact parent. Materialization retains one representative of each resolved
+execution-value signature and records every redundant parent/center label it
+elides. A child replaces the retained parent only if its fixed-rate score
+improves by at least `0.002` on every seed and on the median and worst-seed
+aggregates. The initial factorization round instead requires the full free-site
+carrier to remain within `0.01` of the exact selected parent, then chooses the
+lowest of rank `1`, rank `2`, rank `4`, and full that remains within `0.01` of
+full on every seed and on the median/worst aggregates. The post-mask rank
+revisit uses ordinary parent retention and emits no rank children when the
+selected mask is Bernoulli zero.
 
-## Recommended formulation language
+The nonselectable confirmation round does not tune a gauge. Panel freeze uses
+the scalar-RMS rerun and requires every seed to re-pass qualification and the
+sharing guard while remaining within `0.02` fixed-rate score of its exact
+development parent. This is a novel project reproducibility rule, content-
+bound in the confirmation cells with a `.01/.02/.05` marginal sensitivity
+report and an ungated descriptive result; it is not attributed to a paper.
 
-Until the matrix is executed, the defensible concise description is:
+Every selected-parent/revisit development policy also freezes conjunctive
+sharing admission. For both site-only and leave-one-out inference, the
+worst-site decoded-coordinate Lin concordance in the all-site decoder-Gram
+geometry, with a mean-offset penalty, must be at least `.80`. Worst-site
+support-intersection recall and full-view decoded-energy coverage on that
+intersection must be at least `.75` and `.90`, respectively. Parent-relative
+site-only and leave-one-out FVU degradations remain capped at `.02`, their mean
+support-IoU drops at `.05`, root-relative FVU degradation at `.02`, and absolute
+partial-view FVU at `1.0`. The same-candidate all-view FVU advantage is reported
+only descriptively, not gated: redundant shared factors need not exhibit
+positive reconstruction synergy. This is not a comparison with the separately
+trained source-only anchor. Missing guard data fails before candidate
+aggregation.
 
-> A BSC is a cross-site, block-sparse dictionary model with one signed vector
-> code inferred jointly from several activations and a site-specific decoder
-> frame. Its concatenated decoder frame is orthonormal, so block norm equals
-> isolated total decoded energy. The current training procedure uses block
-> BatchTopK and a free linear encoder; it is a hybrid inspired by, but not an
-> exact implementation of, any one BSF, crosscoder, or SASA variant.
+These winner-changing practical-effect, noninferiority, and sharing thresholds
+are novel preregistered project policies, not values from any paper. Each
+applicable policy content-binds the complete sensitivity grid: minimum effect
+`0/.001/.002/.005`; noninferiority `.005/.01/.02`; FVU degradation
+`.01/.02/.05`; support-IoU drop `.02/.05/.10`; concordance, intersection recall,
+and decoded-energy coverage `.50/.80/.90`, `.50/.75/.90`, and `.75/.90/.95`,
+respectively; and absolute FVU `.75/1.0/1.25`.
+Each selection artifact reports marginal counterfactual pass sets from the
+authenticated measurements without retuning the center policy.
 
-The following descriptions should be avoided without new evidence:
+Seven independent comparator-family chains branch from their own anchor
+selection. Width/activity are calibrated for block families; Group Lasso
+calibrates its coefficient and Appendix-Aux bundle; SASA calibrates its
+`0/.01/.03/.10` initial map-penalty ratios and source Aux bundles; Anthropic
+calibrates L1 coefficient; both BatchTopK scalar families calibrate
+batch size; every family calibrates activity, learning rate, and schedule as
+applicable. One top-two nomination policy ranks the complete union of qualified
+4M family-round candidates, deduplicates resolved non-replicate execution
+signatures before outcome ranking while preserving every stage/candidate alias
+and metric spread, and binds one universe hash. The earliest declared source
+round is the representative, preventing best-of-repeats bias. Comparator-family policies report but do not gate on BSC sharing
+admission, so a deliberately non-sharing baseline cannot disappear before the
+comparison. Each chain ends with a fresh 16M-token revisit of that overall
+winner and strongest distinct resolved runner-up,
+followed by a one-winner family selection. This probes local path/order sensitivity but does not
+claim a global optimum. Phase 3 consumes those content-addressed family
+selections, never the root anchors. At seeds 0 and 1 the blueprint derives
+a pre-elision ceiling of **176 main-chain cells** and **238 family cells**,
+**414 total**, computed from the manifest. The main chain has 18 anchors and
+158 declared cells in 15 rounds from architecture through confirmation.
+Execution-equivalent parent/center cells are deterministically elided, and the
+rank revisit conditionally loses four children when Bernoulli-zero masking
+wins, so the realized count is lower and recorded in each materialized stage.
 
-- “SASA rank regularization” for the decoder site-profile penalty;
-- “the Fel training procedure extended across layers” for the current hybrid;
-- “the original crosscoder baseline” for the signed normalized scalar arm;
-- “effective block dimension” for raw decoder-frame singular values;
-- “paper-faithful SASA Aux” for a 409,600-token dead window and unmatched
-  auxiliary coefficient capacity.
+Scientific-outcome guardrails require calibrated mean support within `0.1`
+block of target and no more than `1%` selected events excluded on calibration
+or evaluation. A candidate with an oracle-only raw inverse or an ineligible
+fixed budget cannot promote.
+
+## 6. Frozen Phase-3 panel
+
+The Phase-2 evidence producer freezes one exact selected recipe and seven
+comparators:
+
+| Slot | Role |
+|---|---|
+| selected finalist | exact Phase-2-derived recipe |
+| shared-coordinate BSC | mechanism comparator |
+| BSF Grassmannian | paper comparator |
+| BSF Group Lasso | paper comparator |
+| SASA | paper comparator |
+| Anthropic dense L1 | independently calibrated architecture comparator |
+| decoder-weighted BatchTopK | adapted mechanism comparator |
+| scalar ReLU BatchTopK | controlled scalar baseline |
+
+Every non-finalist panel entry must carry a derived family recipe, its complete
+selection chain, family blueprint ID, and root lineage. If a ranked comparator
+duplicates the selected finalist, its serialized slot policy advances to the
+next ranked nonduplicate; a duplicate selected-finalist slot fails closed.
+
+Before the final panel can open, all eight frozen designs run one 262,144-token
+production-shape stability cell on a dedicated `stability` split. Each uses the
+exact Gemma hook geometry and capacity, records an fp32-versus-bf16 initial
+forward comparison, requires reconstruction relative error at most `.05` and
+support IoU at least `.90`, and completes the short optimization without
+nonfinite state. This is a conjunctive refusal gate, not a ranking or tuning
+stage, and it never reads the final split. The frozen panel then runs five
+seeds, four pinned Gemma layers, 100M optimizer tokens per cell, 25M unique
+training tokens, and untouched final evaluation at 1,024, 1,536, and 2,048
+total bits/token. Those budgets are the exact fourfold transfer of the pilot
+`256/384/512` frontier, preregistered from the nominal active-coordinate ratio
+`128/32`; the preflight also requires nonzero packet coverage and at least two
+distinct nonzero frontier endpoints. Phase 3 therefore contains
+eight preflight cells plus 40 final cells; no Phase-3 row has a selection
+policy.
+
+## 7. Fairness and compatibility
+
+Every headline comparison reports:
+
+1. nominal block-event and active-coordinate matches;
+2. actual fixed-width packet rate and amplitude rate;
+3. exact deployable-codec side information;
+4. parameter, forward/training FLOP, peak-VRAM, and peak-host-RAM estimates;
+5. identical raw rows, split, and token presentations;
+6. common optimizer-token checkpoints on development only;
+7. all method-native endpoints and common endpoints.
+
+Forbidden silent hybrids include a decoder-only nuclear norm called SASA, a
+raw unweighted BatchTopK selector called the decoder-weighted carrier, a
+concatenated decoder norm called Anthropic's L1-of-site-norms, an oracle
+LayerNorm inverse called deployable, or a vector block presented as an exact
+scalar-crosscoder implementation.
+
+Smoke reductions preserve each full cell's resolved promotable intent, while
+`runtime.smoke` independently makes scientific promotion impossible. A
+uniformly smoke stage may emit only a `smoke_protocol_only` selection to test
+the state machine; it does not consume scientific outcomes or sharing guards,
+cannot promote a cell, and cannot freeze a Phase-3 panel.
+
+## 8. Implemented derived-mechanism roles
+
+Derived mechanisms are not a standing grid multiplied across paper anchors.
+Four families are executable, with deliberately different phase roles:
+
+1. FMX-inspired site-axis rank runs as a Phase-1 fixed-carrier capability
+   panel and a Phase-2 parsimony contest over an exact parent, full free-site
+   carrier, and `R={1,2,4}`, followed by a conditional post-mask rank revisit.
+2. Clean-target observation masking runs as a Phase-1 capability panel with a
+   fixed zero-mask carrier, then as a Phase-2 contest over
+   `p={0,.02,.05,.10}`, exactly-one-hidden, and exactly-one-retained draws.
+3. Availability-rescaled missing-site fusion is validated against literal sum
+   in Phase 1 and then transferred as a universal semantic; Phase 2 does not
+   retune it.
+4. Gauge-aware support scoring compares code norm, decoded energy
+   `sqrt(z_g^T (sum_s D_g^s D_g^{sT}) z_g)`, and signed isolated loss decrease
+   in Phase 1 on both the Stiefel equality control and a common free decoder.
+   Decoded energy on Stiefel is the fixed provisional carrier; Phase 2 runs the
+   full three-score by two-hard-selector interaction on real evidence.
+
+The Phase-1 stages are `site_factorization_identification`,
+`site_mask_fusion_control_identification`, `site_masking_identification`, and
+`selection_score_identification`. Factorization, masking, and score reappear as
+Phase-2 tuning stages; rank is revisited after masking, followed by the full
+hard score-selector interaction and the separate group-threshold bundled-method
+round. The
+model, trainer, saved codec, masked evaluation, exact resume, transfer object,
+and blueprint tests bind this boundary. Other frontier ideas remain outside
+the executable matrix until they receive the same complete contract.
+
+Gauge-invariant partial-view coordinate concordance is now mandatory admission
+evidence, not a future live cell. Its decoder-Gram Lin concordance, support
+intersection recall, and decoded-energy coverage separate support drift from
+coordinate drift for both site-only and leave-one-out inference. A
+fixed-support restricted least-squares refit gap remains the highest-priority
+contingent diagnostic; it opens a new inference round only after at least `.05`
+aligned-code R2, `.01` FVU, or a method-order reversal.
+Pattern-specific threshold calibration and a fixed effective-rank codec remain
+contingent on reproducible missingness-rate drift and decoder-Gram anisotropy,
+respectively, with every new basis/rank byte priced.
+
+## 9. Adversarial non-paper design-space triage
+
+No item below is source-exact for a same-model signed block crosscoder. An
+`adapted` label means the nearest paper supplies a mechanism, while the block,
+multi-site, or packet-budget transfer remains untried. A `novel` label means
+even the mechanism-level hypothesis is local. The ranking is scientific
+priority if its trigger fires, not permission to tune on confirmation.
+
+| Rank | Candidate and lineage | Untried hypothesis, confounds, and minimal controls | Phase-1 discriminator | Phase-2 endpoint and burden | Decision |
+|---:|---|---|---|---|---|
+| 1 | input-adaptive block count; **adapted** from SoftSAE | predict per-token `k`, train through soft selection, deploy hard variable-count blocks; compare token-TopK, BatchTopK, and learned threshold under the same mean total packet bits, because matching mean blocks is unfair across widths; guard soft-weight information hiding and soft/hard mismatch | on mixed 2/4/8-factor examples, require better count calibration and worst-rank support/coordinate recovery without split/merge regression | exact fixed-rate FVU and sharing guards; active-count field and every selector byte priced; high burden because the source selector/MLP substantially increases training cost | highest-priority contingent round only if fixed-count robustness fails; not live now |
+| 2 | separate block gate and signed coordinate head; **adapted** from Gated SAE | let a scalar head choose support and a vector head estimate coordinates; exact-parent and parameter-matched encoder controls are required because the extra head may buy reconstruction rather than better support | support precision/recall, same-block aligned-code R2, and gate/contribution disagreement on amplitude/SNR stresses | fixed-rate FVU at matched events/packets plus parameter/FLOP reporting; roughly one extra encoder head | contingent on support errors with already-good subspaces; not live now |
+| 3 | heterogeneous block widths or sparse-within-block coordinates; **novel** | allocate different intrinsic dimensions in one dictionary; uniform-width winners, equal total coordinates, equal active coordinates, and exact rate are all controls; ragged amplitudes and coordinate masks must be serialized | mixed planted rank with recovery reported separately for rank 1/2/4/8, including wrong-rank splitting | fixed-rate FVU with variable packet lengths; high model/codec implementation burden | scientifically strong but reserve until uniform-width Phase 1 establishes the failure |
+| 4 | all-site versus masked-site code consistency; **novel**, adjacent to FMX masking | add a detached full-view teacher/code-agreement loss after masking; zero coefficient and masking-only parent isolate the loss; guard collapse and true layer-local features | site-only aligned-code R2 and factor recovery on shared versus one-site-span controls | site-only/leave-one-out FVU and support IoU under the existing sharing guard; about two encoder passes | contingent only if masking improves reconstruction while code drift remains |
+| 5 | block-subspace incoherence; **adapted** from OrtSAE | replace scalar decoder cosine with a principal-angle/projector-overlap penalty; coefficient zero and a short ladder; correlated-truth controls prevent orthogonalizing real cofeatures | duplicate/mixing fractions and recovery while independently varying true factor-subspace overlap | fixed-rate FVU plus block-overlap and feature-duplication diagnostics; stochastic pair sampling adds modest cost | contingent on observed duplication/absorption, not prophylactic |
+| 6 | quantization/entropy-aware fine-tuning; **adapted** from learned compression | optimize a rate-distortion surrogate without changing the selected topology; exact post-hoc-codec parent and a frozen small multiplier ladder; price learned entropy models and reject oracle relaxation gains | not an identification selector; at most verify truth recovery is retained after fine-tuning | actual integer-packet frontier, not surrogate rate; moderate post-selection cost | finalist-only appendix candidate, never an upstream selection axis |
+| 7 | nested block prefixes; **adapted** from Matryoshka SAE | one ordered dictionary serves several widths/capacities; compare every prefix with an independently trained equal-size model; prefix order, loss weights, and dictionary ID coding are confounds | broad/specific planted factor recovery at each prefix and feature-continuity mapping across prefixes | every prefix's exact packet frontier; multiple reconstructions increase training cost | broad-rate appendix candidate after one stable family wins |
+| 8 | cosine/hybrid block score; **adapted** from cosine-scored SAE | define a gauge-aware directional score and compare with code norm, decoded energy, and isolated loss decrease; pure cosine is not presumed adequate | admit only if support selection remains correlated with irrelevant input/code norm on scale stresses | matched-event and matched-packet FVU plus support-tail diagnostics; low-to-moderate cost | contingent diagnostic round; the two gauge-aware scores answer nearer failures first |
+| 9 | invariant site-profile smoothness/contiguity; **novel** | penalize variation of decoder-energy or Gram profiles, not raw gauge-dependent weights; compare zero/short ladder and step-change truth | smooth, abrupt, and reappearing factor site maps with identical support | sharing endpoints and fixed-rate FVU; low compute but weakly identified with only four hooks | reserve for a denser hook panel after factorization results |
+| 10 | active-block/capacity curriculum or data-derived subspace initialization; **novel engineering/scientific** | each can improve optimization while silently changing effective rate or pre-solving geometry; compare exact fixed parent at equal tokens/compute and use fit/train data only | learning curves plus final recovery and seed variance; convergence speed alone cannot win | final packet frontier and frozen score, with schedule/initializer artifact bound; modest-to-medium burden | trigger only on reproducible optimization instability, never sweep speculatively |
+
+Three broader proposals are useful falsifiers but are not members of the BSC
+hyperparameter space:
+
+- A dense low-rank scaffold beside the sparse residual is an **adapted
+  alternative ontology**. Open it only after persistent dense-latent or
+  residual-rank evidence, with rank, gradient-stop/co-adaptation, and complete
+  dense-channel rate controls.
+- SpaDE, mixtures of factor analyzers/experts, and bilinear autoencoders are
+  **alternative local or nonlinear ontologies**. They require their own
+  truth-association and codec contract after the linear BSC fails the frozen
+  nonlinear DGP.
+- Procrustes prealignment is an **adapted diagnostic**, not a primary learner.
+  An alignment map fit on paired activations can perform the very cross-layer
+  identification under study; any diagnostic must use calibration-only fits,
+  an identity control, and fully priced dense maps.
+
+The audit also rejects several superficially cheap axes. A learned scalar site
+weight is non-identifiable with the free untied site encoders; rare-token or
+high-norm oversampling changes the target distribution without truth labels;
+and causal/downstream losses change the estimand from activation
+factorization. Additional normalization choices are unnecessary until the
+already frozen identity/RMS/`sqrt_d`/whitening/LayerNorm confirmation resolves
+the scale question. Arbitrary optimizer and schedule grids are likewise not a
+scientific substitute for a diagnosed failure.
+
+Thus the executable campaign remains bounded: four implemented mechanism
+families have declared phase roles, ranks 1–10 are preregistered intake with
+explicit evidence triggers, and
+the ontology falsifiers remain separate studies. A trigger can open one
+selected-parent round on development evidence; none can inspect confirmation
+or multiply across every source family.

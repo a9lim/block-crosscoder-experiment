@@ -1,26 +1,20 @@
 [project]
 name = "block-crosscoder-experiment"
 version = "0.1.0"
-description = "Block-sparse crosscoders: unsupervised cross-layer manifold discovery on gemma, feeding the saklas steering runtime."
+description = "Phased paper-bridge experiments for block-sparse crosscoders."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC-BY-SA-4.0"
 license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
-    "transformer-experiments>=0.1,<0.2",
     "datasets",
-    "matplotlib",
+    "huggingface-hub",
     "numpy",
-    "plotly",
     "sae-lens",
-    "saklas>=1.4.6",
-    "scikit-learn",
-    "scipy",
+    "safetensors",
     "torch",
-    # saklas is also developed locally when needed:
-    #   pip install -e ../../saklas
-    #   pip install -e .
+    "transformers",
 ]
 
 [project.scripts]

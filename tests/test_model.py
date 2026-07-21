@@ -9,6 +9,7 @@ from block_crosscoder_experiment.gram import gram_residual, retract_
 from block_crosscoder_experiment.model import (
     BlockCrosscoder,
     BSCConfig,
+    SignedStreamingScoreQuantile,
     batch_topk_mask,
     bsc_loss,
     token_topk_mask,
@@ -78,12 +79,55 @@ def test_token_topk_exact_per_token_count(device):
     assert torch.equal(mask.sum(dim=1), torch.full((64,), 3, device=device))
 
 
+def test_topk_exact_ties_use_lowest_declared_candidate_index(device):
+    token_scores = torch.zeros(2, 5, device=device)
+    token_mask = token_topk_mask(token_scores, 2)
+    assert torch.equal(
+        token_mask,
+        torch.tensor(
+            [[True, True, False, False, False], [True, True, False, False, False]],
+            device=device,
+        ),
+    )
+
+    batch_scores = torch.zeros(3, 4, device=device)
+    batch_mask = batch_topk_mask(batch_scores, 1)
+    assert torch.equal(
+        batch_mask.reshape(-1),
+        torch.tensor(
+            [
+                True,
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],
+            device=device,
+        ),
+    )
+
+
+def test_selector_tie_policy_is_content_bound():
+    assert CFG.selector_tie_break == "lowest_flat_index_at_cutoff"
+    with pytest.raises(ValueError, match="selector_tie_break"):
+        BSCConfig(**{**CFG.__dict__, "selector_tie_break": "runtime_default"})
+
+
 def test_encoder_bias_breaks_antipodal_support(device):
     model = make_model(device, encoder_bias=True, selection="token_topk")
     with torch.no_grad():
         model.a.normal_(mean=0.5, std=0.1)
     x = whitened_batch(device, n=64)
-    assert not torch.allclose(model.scores(model.encode(x)), model.scores(model.encode(-x)))
+    assert not torch.allclose(
+        model.scores(model.encode(x)), model.scores(model.encode(-x))
+    )
 
 
 def test_tied_grassmannian_uses_single_gamma(device):
@@ -96,8 +140,13 @@ def test_tied_grassmannian_uses_single_gamma(device):
 
 def test_relu_dense_crosscoder_bridge(device):
     model = make_model(
-        device, block_dim=1, code_activation="relu", selection="dense",
-        regularizer="crosscoder_l1", lambda_regularizer=1e-4, encoder_bias=True,
+        device,
+        block_dim=1,
+        code_activation="relu",
+        selection="dense",
+        regularizer="crosscoder_l1",
+        lambda_regularizer=1e-4,
+        encoder_bias=True,
         decoder_constraint="frobenius",
     )
     x = whitened_batch(device, n=32)
@@ -108,10 +157,52 @@ def test_relu_dense_crosscoder_bridge(device):
     assert parts["regularizer"] >= 0
 
 
+def test_anthropic_crosscoder_l1_sums_per_site_decoder_norms(device):
+    model = make_model(
+        device,
+        n_blocks=2,
+        block_dim=1,
+        n_sites=2,
+        d_model=2,
+        site_dims=(2, 2),
+        k=2,
+        code_activation="relu",
+        selection="dense",
+        regularizer="crosscoder_l1",
+        lambda_regularizer=1e-4,
+        encoder_bias=True,
+        decoder_constraint="free",
+        decoder_norm_geometry="sum_l2",
+        decoder_init_preconditioning="none",
+        decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+    )
+    with torch.no_grad():
+        model.E.fill_(0.5)
+        model.a.fill_(0.25)
+        model.D.zero_()
+        # Per-site norms are (3, 4) for block 0 and (5, 12) for block 1.
+        model.D[0, 0, 0, 0] = 3.0
+        model.D[1, 0, 0, 0] = 4.0
+        model.D[0, 1, 0, 0] = 5.0
+        model.D[1, 1, 0, 0] = 12.0
+    x = torch.ones(3, 2, 2, device=device)
+    out = model(x)
+    observed = bsc_loss(out, x, model)["regularizer"]
+    summed_site_cost = torch.tensor((7.0, 17.0), device=device)
+    expected = (out.scores.float() * summed_site_cost).sum(dim=1).mean()
+    concatenated_cost = torch.tensor((5.0, 13.0), device=device)
+    negative_control = (out.scores.float() * concatenated_cost).sum(dim=1).mean()
+    assert torch.allclose(observed, expected)
+    assert not torch.allclose(observed, negative_control)
+
+
 def test_decoder_weighted_batchtopk_score_matches_minder(device):
     model = make_model(
-        device, block_dim=1, code_activation="relu",
-        selection_score="decoder_weighted", decoder_constraint="free",
+        device,
+        block_dim=1,
+        code_activation="relu",
+        selection_score="decoder_weighted",
+        decoder_constraint="free",
     )
     x = whitened_batch(device, n=32)
     z = model.encode(x)
@@ -121,8 +212,11 @@ def test_decoder_weighted_batchtopk_score_matches_minder(device):
 
 def test_group_lasso_bridge_has_positive_learned_threshold(device):
     model = make_model(
-        device, selection="dense", code_activation="group_soft_threshold",
-        decoder_constraint="free", regularizer="group_l21",
+        device,
+        selection="dense",
+        code_activation="group_soft_threshold",
+        decoder_constraint="free",
+        regularizer="group_l21",
         lambda_regularizer=1e-3,
         encoder_bias=True,
     )
@@ -133,6 +227,38 @@ def test_group_lasso_bridge_has_positive_learned_threshold(device):
     parts = bsc_loss(out, x, model)
     parts["total"].backward()
     assert model.log_threshold.grad is not None
+
+
+def test_group_threshold_training_mask_is_independent_of_endpoint_score(device):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=1,
+            block_dim=1,
+            n_sites=1,
+            d_model=1,
+            k=1,
+            selection="dense",
+            code_activation="group_soft_threshold",
+            selection_score="isolated_loss_decrease",
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            decoder_init_preconditioning="none",
+            decoder_init_operation_order=(
+                "gaussian_mask_rescale_then_declared_constraint"
+            ),
+            group_threshold_effective_init=1.0,
+        )
+    ).to(device)
+    with torch.no_grad():
+        assert model.E is not None and model.D is not None
+        model.E.fill_(-2.0)
+        model.D.fill_(1.0)
+    out = model(torch.ones(1, 1, 1, device=device))
+    assert out.z.item() < 0
+    assert out.scores.item() < 0
+    assert out.mask.item() is True
+    assert torch.equal(out.z_selected, out.z)
 
 
 def test_free_decoder_projection_is_noop(device):
@@ -152,9 +278,7 @@ def test_frobenius_decoder_projection(device):
 
 
 def test_map_nuclear_regularizer(device):
-    model = make_model(
-        device, regularizer="map_nuclear", lambda_regularizer=1e-3
-    )
+    model = make_model(device, regularizer="map_nuclear", lambda_regularizer=1e-3)
     x = whitened_batch(device, n=32)
     parts = bsc_loss(model(x), x, model)
     assert parts["regularizer"] > 0
@@ -207,7 +331,7 @@ def test_init_tied_and_score_comparability(device):
 def planted_lowrank_batch(device, n=1024, rank=8, seed=3):
     """Data with structure a sparse model can actually fit: a low-rank
     linear source (rank < k*b) plus small noise — a micro-preview of the
-    Phase -1 generator."""
+    Phase-1 generator."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     u = torch.randn(n, rank, generator=gen)
     P = torch.randn(rank, CFG.n_sites * CFG.d_model, generator=gen) / rank**0.5
@@ -216,25 +340,11 @@ def planted_lowrank_batch(device, n=1024, rank=8, seed=3):
     return x.to(device)
 
 
-def test_exact_k_planted_model_matches_fel_support():
-    from block_crosscoder_experiment.synthetic import (
-        BlockSpec,
-        ExactKPlantedModel,
-    )
-
-    truth = ExactKPlantedModel(
-        [BlockSpec(rank=1, frequency=0.25) for _ in range(8)],
-        n_sites=1, d_model=16, block_dim=2, active_per_sample=2,
-    )
-    batch = truth.sample(128, seed=3)
-    assert torch.equal(batch.active.sum(dim=1), torch.full((128,), 2))
-
-
 def test_train_smoke_loss_decreases(device):
     """Full ordering on tiny data: optimizer step -> retract -> next step.
     Loss must fall and the constraint must hold at every step."""
     torch.manual_seed(0)
-    model = make_model(device, lambda_regularizer=1e-3)
+    model = make_model(device)
     x = planted_lowrank_batch(device)
     opt = torch.optim.Adam(
         [
@@ -317,3 +427,247 @@ def test_fit_threshold_streaming_matches_exact(device):
     )
     assert abs(theta_stream - theta_exact) / theta_exact < 1e-3
     assert abs(float(counts_stream.mean()) - float(counts_exact.mean())) <= 0.1
+
+
+def test_decoded_energy_score_equals_isolated_decoded_contribution_norm():
+    cfg = BSCConfig(
+        n_blocks=5,
+        block_dim=3,
+        n_sites=2,
+        d_model=7,
+        k=2,
+        decoder_constraint="free",
+        selection_score="decoded_energy",
+    )
+    model = BlockCrosscoder(cfg)
+    z = torch.randn(11, 5, 3, generator=torch.Generator().manual_seed(481))
+    contribution = torch.einsum("ngb,sgbd->nsgd", z, model.decoder_tensor())
+    expected = contribution.float().pow(2).sum(dim=(1, 3)).sqrt()
+    assert torch.allclose(model.scores(z), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_decoded_energy_reduces_to_code_norm_on_concatenated_stiefel_blocks():
+    decoded = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=7,
+            block_dim=3,
+            n_sites=4,
+            d_model=11,
+            k=2,
+            decoder_constraint="qr",
+            selection_score="decoded_energy",
+        )
+    )
+    conventional = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=7,
+            block_dim=3,
+            n_sites=4,
+            d_model=11,
+            k=2,
+            decoder_constraint="qr",
+            selection_score="code_norm",
+        )
+    )
+    conventional.load_state_dict(decoded.state_dict())
+    z = torch.randn(13, 7, 3, generator=torch.Generator().manual_seed(482))
+    assert torch.allclose(
+        decoded.scores(z), conventional.scores(z), rtol=2e-5, atol=2e-6
+    )
+
+
+def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions():
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=5,
+            block_dim=3,
+            n_sites=2,
+            d_model=7,
+            k=2,
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+        )
+    )
+    generator = torch.Generator().manual_seed(483)
+    x = torch.randn(11, 2, 7, generator=generator)
+    z = torch.randn(11, 5, 3, generator=generator)
+    contribution = torch.einsum("ngb,sgbd->nsgd", z, model.decoder_tensor())
+    expected = 2.0 * torch.einsum(
+        "nsd,nsgd->ng", x, contribution
+    ) - contribution.square().sum(dim=(1, 3))
+    assert torch.allclose(model.scores(z, x=x), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_isolated_loss_decrease_excludes_hidden_clean_targets():
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=4,
+            block_dim=2,
+            n_sites=3,
+            d_model=5,
+            k=2,
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+        )
+    )
+    x = torch.randn(9, 3, 5, generator=torch.Generator().manual_seed(484))
+    observed = torch.tensor([[True, False, True]]).expand(len(x), -1)
+    z = model.encode(x, observed=observed)
+    baseline = model.scores(z, x=x, observed=observed)
+    changed = x.clone()
+    changed[:, 1] += 10_000.0
+    assert torch.equal(model.encode(changed, observed=observed), z)
+    assert torch.equal(model.scores(z, x=changed, observed=observed), baseline)
+
+
+def test_isolated_loss_decrease_reduces_to_squared_code_norm_for_tied_stiefel():
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=6,
+            block_dim=2,
+            n_sites=3,
+            d_model=7,
+            k=2,
+            encoder_mode="tied",
+            decoder_constraint="qr",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+        )
+    )
+    x = torch.randn(13, 3, 7, generator=torch.Generator().manual_seed(485))
+    z = model.encode(x)
+    assert torch.allclose(
+        model.scores(z, x=x), z.square().sum(dim=-1), rtol=2e-5, atol=2e-5
+    )
+
+
+def test_isolated_loss_decrease_is_reciprocal_block_gauge_invariant():
+    config = BSCConfig(
+        n_blocks=3,
+        block_dim=2,
+        n_sites=2,
+        d_model=4,
+        k=2,
+        decoder_constraint="free",
+        decoder_bias=False,
+        reconstruction_loss="squared_l2",
+        selection_score="isolated_loss_decrease",
+    )
+    original = BlockCrosscoder(config)
+    transformed = BlockCrosscoder(config)
+    transformed.load_state_dict(original.state_dict())
+    gauge = torch.tensor([[2.0, 0.25], [0.0, 0.5]])
+    inverse_transpose = torch.linalg.inv(gauge).T
+    with torch.no_grad():
+        assert transformed.E is not None and transformed.D is not None
+        transformed.E.copy_(torch.einsum("bc,sgcd->sgbd", gauge, transformed.E))
+        transformed.D.copy_(
+            torch.einsum("bc,sgcd->sgbd", inverse_transpose, transformed.D)
+        )
+    x = torch.randn(17, 2, 4, generator=torch.Generator().manual_seed(487))
+    original_code = original.encode(x)
+    transformed_code = transformed.encode(x)
+    assert torch.allclose(
+        transformed.scores(transformed_code, x=x),
+        original.scores(original_code, x=x),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_isolated_loss_decrease_preserves_harmful_negative_scores():
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=1,
+            block_dim=1,
+            n_sites=1,
+            d_model=1,
+            k=1,
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+        )
+    )
+    with torch.no_grad():
+        assert model.D is not None
+        model.D.fill_(1.0)
+    score = model.scores(torch.tensor([[[-1.0]]]), x=torch.tensor([[[1.0]]]))
+    assert score.item() == -3.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"decoder_bias": True, "reconstruction_loss": "squared_l2"},
+        {"decoder_bias": False, "reconstruction_loss": "mean_l2"},
+    ),
+)
+def test_isolated_loss_decrease_rejects_nonquadratic_or_biased_carriers(
+    overrides,
+):
+    with pytest.raises(
+        ValueError, match="bias-free quadratic reconstruction objective"
+    ):
+        BSCConfig(
+            n_blocks=2,
+            block_dim=2,
+            n_sites=2,
+            d_model=3,
+            k=1,
+            selection_score="isolated_loss_decrease",
+            **overrides,
+        )
+
+
+def test_signed_streaming_quantile_matches_exact_and_is_order_independent(device):
+    generator = torch.Generator().manual_seed(486)
+    scores = torch.randn(200_000, generator=generator).pow(3)
+    chunks = list(scores.split(4096))
+    forward = SignedStreamingScoreQuantile(device=device)
+    reverse = SignedStreamingScoreQuantile(device=device)
+    for chunk in chunks:
+        forward.update(chunk.to(device))
+    for chunk in reversed(chunks):
+        reverse.update(chunk.to(device))
+    assert torch.equal(forward.counts, reverse.counts)
+    for quantile in (0.01, 0.5, 0.99):
+        index = min(max(int(round(quantile * scores.numel())), 1), scores.numel())
+        exact = float(scores.kthvalue(index).values)
+        approximate = forward.quantile(quantile)
+        assert abs(approximate - exact) / max(abs(exact), 1e-9) < 1e-3
+
+
+def test_isolated_loss_decrease_streaming_threshold_matches_exact(device):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=16,
+            block_dim=2,
+            n_sites=3,
+            d_model=8,
+            k=3,
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+        )
+    ).to(device)
+    generator = torch.Generator().manual_seed(488)
+    calibration = [
+        torch.randn(128, 3, 8, generator=generator).to(device) for _ in range(8)
+    ]
+    exact = model.fit_threshold_(calibration, 3.0, method="exact")
+    exact_counts = torch.cat(
+        [model(batch, mode="threshold").mask.sum(dim=1) for batch in calibration]
+    ).float()
+    streaming = model.fit_threshold_(calibration, 3.0, method="streaming")
+    streaming_counts = torch.cat(
+        [model(batch, mode="threshold").mask.sum(dim=1) for batch in calibration]
+    ).float()
+    assert abs(streaming - exact) / max(abs(exact), 1e-9) < 1e-3
+    assert abs(float(streaming_counts.mean() - exact_counts.mean())) <= 0.1

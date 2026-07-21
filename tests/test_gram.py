@@ -1,9 +1,6 @@
-"""Numeric checks that the implementation has the four properties the
-Gram constraint was chosen for (design v2.2, round-2 algebra PASS):
+"""Numeric checks that the Gram constraint has its four required properties:
 scale-gauge death, O(b)-invariant spectra, exact selection scores, and
 free per-site Frobenius shares."""
-
-import math
 
 import pytest
 import torch
@@ -16,7 +13,6 @@ from block_crosscoder_experiment.gram import (
     init_decoder_stack,
     map_nuclear_penalty,
     project_block_frobenius_,
-    rank_penalty,
     retract_,
     site_frobenius_shares,
     site_singular_values,
@@ -81,9 +77,7 @@ def test_retraction_floor_hits_on_deficient_block(device):
 def test_site_shares_sum_to_one_and_start_equal(device):
     D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
     shares = site_frobenius_shares(D)  # [S, G]
-    assert torch.allclose(
-        shares.sum(dim=0), torch.ones(G, device=device), atol=1e-5
-    )
+    assert torch.allclose(shares.sum(dim=0), torch.ones(G, device=device), atol=1e-5)
     # Gaussian init + one retraction: approximately equal shares (1/S).
     assert (shares.mean(dim=1) - 1 / S).abs().max().item() < 0.05
 
@@ -115,26 +109,6 @@ def test_unequal_shares_preserved(device):
     assert torch.allclose(shares[:, 0], expected, atol=1e-5)
 
 
-def test_rank_penalty_endpoints(device):
-    # Site-exclusive: penalty ~ 0 (up to the eps inside sqrt).
-    D = site_exclusive_stack(device)
-    assert rank_penalty(D).item() < 1e-3
-    # Flat: D_g^s = Q_g / sqrt(S) with orthonormal Q_g -> penalty = sqrt(S)-1.
-    gen = torch.Generator(device="cpu").manual_seed(4)
-    q, _ = torch.linalg.qr(torch.randn(D_MODEL, B_DIM, generator=gen))
-    flat = (q.T / math.sqrt(S)).expand(S, G, B_DIM, D_MODEL).contiguous().to(device)
-    assert gram_residual(flat).max().item() < 1e-5
-    assert abs(rank_penalty(flat).item() - (math.sqrt(S) - 1)) < 1e-3
-
-
-def test_site_partition_is_zero_profile_not_zero_joint_rank(device):
-    D = site_exclusive_stack(device)
-    assert rank_penalty(D).item() < 1e-3
-    assert torch.linalg.matrix_rank(
-        D[:, 0].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL).float()
-    ) == B_DIM
-
-
 def test_map_nuclear_matches_explicit_end_to_end_map(device):
     D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
     E = random_stack(device, seed=21)
@@ -159,6 +133,32 @@ def test_map_nuclear_matches_explicit_for_unconstrained_decoder(device):
     assert torch.allclose(actual, torch.stack(explicit).mean(), atol=2e-4)
 
 
+def test_map_nuclear_exact_zero_smoothing_has_finite_grassmann_gradient(device):
+    # The concatenated Gram constraint repeats every decoder-Gram eigenvalue
+    # at one.  The exact SASA objective must therefore avoid eigendecomposition
+    # eigenvector gradients, which are undefined at this intentional
+    # degeneracy.
+    D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device).requires_grad_()
+    E = random_stack(device, seed=29).requires_grad_()
+    loss = map_nuclear_penalty(D, E, eps=0.0)
+    loss.backward()
+    assert D.grad is not None and torch.isfinite(D.grad).all()
+    assert E.grad is not None and torch.isfinite(E.grad).all()
+
+
+def test_map_nuclear_accepts_rank_deficient_encoder(device):
+    D = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
+    E = random_stack(device, seed=31)
+    E[:, :, 1:] = 0.0
+    actual = map_nuclear_penalty(D, E, eps=0.0)
+    explicit = []
+    for g in range(G):
+        dbar = D[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        ebar = E[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
+        explicit.append(torch.linalg.svdvals(dbar.T @ ebar).sum() / B_DIM)
+    assert torch.allclose(actual, torch.stack(explicit).mean(), atol=1e-4)
+
+
 def test_frobenius_projection(device):
     D = random_stack(device, scale=3.0)
     hits = project_block_frobenius_(D)
@@ -177,20 +177,8 @@ def test_site_singular_values_casts_before_gram(device):
     assert torch.allclose(actual, expected, atol=2e-2)
 
 
-def test_rank_penalty_bounds_and_grad(device):
-    D = random_stack(device, seed=5)
-    retract_(D)
-    D.requires_grad_(True)
-    r = rank_penalty(D)
-    assert 0.0 <= r.item() <= math.sqrt(S) - 1 + 1e-4
-    r.backward()
-    assert D.grad is not None and torch.isfinite(D.grad).all()
-
-
 def test_o_b_invariance(device):
-    """A per-block O(b) rotation leaves constraint, spectra, and penalty
-    unchanged — the residual gauge the design exploits for canonical
-    orientation."""
+    """A per-block O(b) rotation leaves constraint and spectra unchanged."""
     D = random_stack(device, seed=6)
     retract_(D)
     R = random_orthogonal(B_DIM, device, seed=7)
@@ -198,7 +186,6 @@ def test_o_b_invariance(device):
     assert gram_residual(D_rot).max().item() < 1e-4
     sv, sv_rot = site_singular_values(D), site_singular_values(D_rot)
     assert (sv - sv_rot).abs().max().item() < 1e-4
-    assert abs(rank_penalty(D).item() - rank_penalty(D_rot).item()) < 1e-5
 
 
 def test_block_gram_matches_naive(device):

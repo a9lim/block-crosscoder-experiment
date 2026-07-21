@@ -1,181 +1,228 @@
-# Block-sparse crosscoders in the literature
+# Literature synthesis and scope map
 
-*Position and source ledger, last full-text sweep 2026-07-16. The executable
-method is [`design.md`](design.md); this document establishes intellectual
-lineage, adjacent work, and the scope of the novelty claim.*
+*Primary-source map for the 2026-07-20 design. The committed bibliography is
+`references/refs.yaml`; generated Markdown copies are local research inputs,
+not committed evidence.*
 
-## Position
+## 1. The closest parents
 
-The project joins two young lines of work:
+### Signed vector blocks at one site
 
-- block-sparse featurizers and subspace-aware sparse autoencoders learn a
-  multidimensional subspace as one sparse unit, but at one site;
-- crosscoders learn one sparse scalar code across layers, models, or
-  checkpoints, but keep one-dimensional units.
+[Block-Sparse Featurizers](https://arxiv.org/abs/2606.25234) and
+[SASA](https://arxiv.org/abs/2606.06333) are the direct parents of the BSC
+latent ontology. Both select a whole signed vector by its block norm. BSF
+varies the inference/decoder gauge: free affine plus Frobenius control,
+decoder-tied Stiefel frames, and learned group shrinkage. SASA keeps free
+encoder/decoder maps and penalizes the nuclear norm of each end-to-end block
+map. These are substantively different hypotheses, not cosmetic
+parameterizations.
 
-The checked LLM-interpretability literature therefore forms a 2×2:
+BSF contributes the most useful truth-known generator and isolated-factor
+recovery protocol. SASA contributes an explicit effective-map-dimension
+regularizer and a whole-group dead-residual auxiliary. Neither paper trains a
+multi-layer crosscoder. Their released implementations also differ from their
+paper equations in important ways, so the experiment keeps paper and release
+lineages separate.
 
-| | one site | shared across sites |
-|---|---|---|
-| scalar unit | SAE | crosscoder and variants |
-| subspace unit | BSF / SASA | **BSC (this project)** |
+### One scalar code across layers
 
-Narrow claim: as of the sweep, no checked work learned sparse
-multidimensional blocks with one shared vector code and distinct frames
-across model sites. This statement is scoped to the thirteen sources below
-and LLM interpretability. It is **not yet** a claim over the older
-multi-view, coupled, joint, or group-sparse dictionary-learning literature;
-that is the largest owed sweep before publication.
+[Anthropic's original sparse crosscoder](https://transformer-circuits.pub/2024/crosscoders/index.html)
+is the direct parent of the multi-site topology. It sums affine site-encoder
+contributions before one ReLU code and reconstructs each site with its own
+decoder. Its L1 penalty weights activation by the sum of sitewise decoder
+norms. The report establishes the architecture and several cross-layer
+topologies, but does not disclose enough runtime detail for numerical
+reproduction. It is therefore an exact architecture bridge with adapted
+training values.
 
-The combination is not a mechanical tensor-product extension. Blocks absorb
-within-subspace rotation that fragments scalar crosscoder latents, while a
-crosscoder solves cross-layer block identity by construction. The one shared
-code supplies presence and position; per-site frames supply the changing
-embedding and depth profile.
+[BatchTopK](https://arxiv.org/abs/2412.06410) replaces a fixed per-token count
+with a fixed batch-global event budget and calibrates a threshold for
+single-example inference. [Minder et al.](https://arxiv.org/abs/2504.02922)
+show why L1 shrinkage can corrupt decoder-norm interpretations and supply two
+useful mechanisms: score crosscoder activations by summed decoder norm before
+BatchTopK, and revive token-horizon-dead latents through residual
+reconstruction. This project adapts those mechanics to layers of one model and
+does not import the source task or its exclusivity claims.
 
-## Parent 1: block-sparse features
+## 2. Sparse-inference controls
 
-Fel et al., *Structuring Sparsity: Block-Sparse Featurizers Capture Visual
-Concept Manifolds* (arXiv:2606.25234), generalize a sparse dictionary from
-scalar atoms to width-`b` blocks and impose sparsity over block norms. A unit
-then exposes both presence (`||z_g||`) and within-feature position (`z_g`).
-Their vision experiments recover transformation manifolds and motivate the
-support-cost advantage of transmitting one block identity rather than `b`
-independent scalar identities.
+- [TopK SAE scaling](https://arxiv.org/abs/2406.04093) supplies the fixed-count
+  scalar baseline, dead-latent handling, and scale comparisons.
+- [Gated SAEs](https://arxiv.org/abs/2404.16014) separate support selection from
+  magnitude estimation, clarifying when shrinkage rather than dictionary
+  geometry causes a failure.
+- [SoftSAE](https://arxiv.org/abs/2605.06610) predicts an input-dependent scalar
+  feature count with a dynamic-sparsity MLP, trains through differentiable Soft
+  Top-K under an expected-count budget, and switches to hard TopK late in
+  training and at inference. Its paper also exposes the two main adaptation
+  hazards: tiny nonzero soft weights can hide information and the differentiable
+  selector becomes expensive at large dictionaries. A signed-block version
+  would be new and must constrain mean packet bits, not merely mean block count.
+- [JumpReLU](https://arxiv.org/abs/2407.14435) supplies a direct L0-oriented
+  threshold baseline.
+- [Compute-optimal inference and the amortisation gap](https://arxiv.org/abs/2411.13117)
+  proves that a one-pass linear/nonlinear SAE encoder can fail at sparse-code
+  inference even when the learned dictionary makes the inverse problem
+  solvable, and reports gains from more expressive iterative inference at
+  modest extra compute. This motivates a decoder-frozen, truth-known Phase-1
+  diagnostic: compare the amortized encoder with a short group-IHT/residual
+  refinement path before attributing a miss to dictionary geometry. It does
+  not justify placing an unrolled encoder in the live matrix without a measured
+  amortization gap.
+- [Projecting Assumptions / SpaDE](https://arxiv.org/abs/2503.01822) makes the
+  geometry of sparse projection explicit: ReLU, TopK, and BatchTopK impose
+  different receptive-field assumptions. Batch-global allocation solves
+  heterogeneous count, not heterogeneous shape.
+- [Cosine-scored SAEs](https://arxiv.org/abs/2606.15054) warn that raw norm can
+  dominate support selection, but also find pure cosine scoring insufficient.
+  Any block/multi-site extension would be a new mechanism requiring its own
+  score and codec ablation.
+- [Orthogonal SAEs](https://arxiv.org/abs/2509.22033) penalize high decoder-vector
+  cosine similarities to reduce absorption and composition. Extending that
+  scalar penalty to signed block subspaces requires a projector/principal-angle
+  definition and a truth-known control where correlated factors are legitimate.
+- [Matryoshka SAEs](https://arxiv.org/abs/2503.17547) train several nested
+  dictionary prefixes to reconstruct independently. A block version could
+  yield one broad-rate codebook, but prefix order breaks group-permutation
+  symmetry and must be compared with independently trained dictionaries at
+  every exact packet rate.
 
-Important limits on attribution:
+These papers justify strong scalar controls and selector diagnostics. They do
+not establish that one selector dominates for signed vector blocks.
 
-- their MDL calculation includes support, amplitudes, residual, and
-  amortized dictionary bits; this project's declared activation codec omits
-  parameter bits and is an activation rate–distortion comparison, not a Fel
-  replication;
-- their useful widths cluster around one to four with an explicit warning
-  to trust the direction, not a single optimum. Width four here is a tested
-  design choice, not a literature-derived natural constant;
-- their authors explicitly hedge that video/language may require a
-  different structured prior.
+[Data Whitening Improves Sparse Autoencoder Learning](https://arxiv.org/abs/2511.13981)
+reports improved sparse probing and disentanglement after PCA whitening despite
+small reconstruction losses. This is evidence that an FVU-only normalization
+choice can select the wrong representation for interpretability. The project
+therefore keeps whitening in a frozen confirmation view, reports semantic
+endpoints alongside raw-space distortion, and treats scalar RMS as the explicit
+deployment gauge rather than claiming it is empirically optimal for every
+endpoint.
 
-Dalili and Mahdavi, *Subspace-Aware Sparse Autoencoders* (SASA,
-arXiv:2606.06333), bring grouped subspaces to GPT-2 and Mistral. Their theory
-shows why reconstructing a multidimensional feature with scalar atoms can
-require exponentially many directions; their nuclear penalty acts on the
-end-to-end encoder/decoder product and is gauge-invariant. SASA supplies the
-dead-group auxiliary-loss starting point and a rank-adaptive single-site
-comparison. It does not share one vector code across layers or models and
-contains no intervention experiments.
+[End-to-end learned compression](https://arxiv.org/abs/1611.01704) supplies the
+general precedent for optimizing a differentiable rate-distortion surrogate
+through quantization. It does not justify making packet-aware training part of
+the identification search: a crosscoder adaptation belongs after structural
+selection and must validate actual integer packets plus every entropy-model or
+quantizer byte.
 
-## Parent 2: cross-site scalar codes
+## 3. Manifold and local-geometry alternatives
 
-Anthropic's 2024 sparse crosscoder learns one scalar latent across layers or
-models, with per-site encoder/decoder weights and a free site-norm profile.
-It resolves repeated scalar features across depth and made model diffing a
-central application.
+[Not all language-model features are one-dimensionally linear](https://arxiv.org/abs/2405.14860)
+and [SAE scaling in the presence of feature manifolds](https://arxiv.org/abs/2509.02565)
+motivate a representation whose primitive can have intrinsic dimension above
+one. The following methods test competing ontologies:
 
-Minder et al., *Overcoming Sparsity Artifacts in Crosscoders to Interpret
-Chat-Tuning* (arXiv:2504.02922), identify Complete Shrinkage and Latent
-Decoupling under L1 training. BatchTopK mitigates rather than eliminates
-these pathologies, and Latent Scaling remains the diagnostic. Their causal
-patching protocol—including None/All/reconstruction-error controls and the
-stronger early-token KL readout—anchors this project's future cross-model
-phase.
+- [SMIXAE](https://arxiv.org/abs/2605.09224) uses a sparse mixture of nonlinear
+  low-dimensional expert autoencoders. It is a non-additive manifold control.
+- [Mixtures of factor analyzers](https://arxiv.org/abs/2602.02464) model local
+  probabilistic low-rank regions rather than a globally additive factor sum.
+- [Bilinear autoencoders](https://arxiv.org/abs/2605.08891) add quadratic
+  interactions and can represent curved manifolds that a linear block cannot.
+- [SpaDE](https://arxiv.org/abs/2503.01822) uses learned prototypes and a local
+  sparse projection rather than global directions.
+- [Dense low-rank scaffolds](https://arxiv.org/abs/2606.14040) place a dense
+  low-rank path beside the sparse residual path, testing whether common dense
+  variance is being forced into sparse events.
 
-Jiralerspong and Bricken, *Cross-Architecture Model Diffing with
-Crosscoders* (arXiv:2602.11729), learn scalar shared/exclusive partitions
-across architectures and validate them with model stitching and cross-model
-steering. Their Dedicated Feature Crosscoder is the Phase-3 scalar
-comparison point; it does not occupy the block/cross-site cell.
+These are falsifiers for the BSC ontology, not switches to cross with every BSC
+hyperparameter. They enter only after a common truth-known or operational
+endpoint makes a meaningful comparison executable.
 
-Ge et al. (arXiv:2509.17196) extend crosscoding over pretraining
-checkpoints. Gorton, *Group Crosscoders for Mechanistic Analysis of
-Symmetry* (arXiv:2410.24184), crosscodes scalar features across
-transformation-indexed inputs in vision. Both are adjacent cross-site
-geometry, but neither uses one sparse multidimensional vector unit.
+## 4. Evaluation literature
 
-## Evidence that one-dimensional units are insufficient
+[SAEBench](https://arxiv.org/abs/2503.09532) evaluates more than 200 SAEs across
+proxy, interpretability, disentanglement, and application metrics and finds that
+proxy improvements do not reliably transfer to practical utility. The later
+[benchmark reliability audit](https://arxiv.org/abs/2605.18229) further finds
+material reseed noise and weak discriminability among variants of the same
+architecture; two canonical benchmark metrics fail several reliability checks.
+Together these results rule out selecting small design changes by a single
+semantic score. Phase 2 therefore freezes semantic and behavioral endpoints as
+non-selecting diagnostics with reseed uncertainty, while fixed-rate raw-space
+distortion remains the common selection endpoint. Ordinary rounds retain their
+parent unless a child clears a preregistered minimum effect; compressed
+site-axis ranks use noninferiority plus parsimony.
 
-Engels et al., *Not All Language Model Features Are One-Dimensionally
-Linear* (arXiv:2405.14860), find weekday and month rings by clustering SAE
-decoder directions and causally test homologous geometry in Mistral and
-Llama. GPT-2 supplies an observational positive control, not a successful
-causal task result. Their restricted reconstruction, plane scan, cone,
-separability, mixture, stability, and null controls informed the Phase-0
-discovery battery.
+[Do Sparse Autoencoders Capture Concept Manifolds?](https://arxiv.org/abs/2604.28119)
+shows why reconstruction alone is insufficient. Capture, tiling, shattering,
+dilution, receptive-field coverage, and isolated contribution distinguish one
+coherent feature from many locally useful fragments. Phase 1 therefore binds
+support, subspace, and coordinates to the same learned block and reports
+split/merge pathologies. Its confirmation panel also separates shared
+rank-one/rank-two site-map families from independent-map negative controls,
+one/two/all-site factor spans, uniform from Zipf-alpha-one occurrence, and
+independent from paired coactivation. One-site factors cannot support a
+shared-feature claim. Independent maps remain eligible when support and
+coordinates are shared across several sites; they test whether low-rank
+site-axis factorization is necessary, not whether the cross-layer factor
+exists.
 
-Michaud et al. (arXiv:2509.02565) analyze SAE scaling in the presence of
-feature manifolds. Their tiling regime is possible, not established as the
-universal behavior of real SAEs; radial thickness changes the economics.
-This motivated both hollow and thickened synthetic controls.
+[Feature Flow](https://arxiv.org/abs/2502.03032) motivates downstream
+interpretation/steering endpoints for layerwise features. It is an analysis
+endpoint after a code qualifies, not a training objective in the live matrix.
 
-Bhalla et al., *Do Sparse Autoencoders Capture Concept Manifolds?*
-(arXiv:2604.28119), motivate activation-dependence discovery and explicit
-capture/shattering/dilution measures. Dooms et al., *Bilinear Autoencoders
-Find Interpretable Manifolds* (arXiv:2605.08891), motivate measuring seed
-stability at the global recovered-subspace level rather than by individual
-unit identity alone.
+[Interactions Between Crosscoder Features](https://arxiv.org/abs/2606.09940)
+adds an interaction metric, clustering procedure, and loss aimed at
+computational sparsity. That question concerns interactions among qualified
+features; it does not precede basic factor identification and is not a live
+training axis.
 
-Hindupur, Lubana, Fel, and Ba, *Projecting Assumptions*, argue that sparse
-architecture determines the concept geometries a model can expose. It is
-cited from a secondary record here and remains an owed full read once a
-stable primary identifier is located.
+## 5. Other multi-representation topologies
 
-## Why BSC and the consumer artifact line up
+- [Universal Sparse Autoencoders](https://arxiv.org/abs/2502.03714) encode one
+  source representation at a time and decode its scalar TopK code into several
+  targets. This motivates the source-only control but is not joint evidence
+  aggregation.
+- [RouteSAE](https://arxiv.org/abs/2503.08200) routes examples through a shared
+  dictionary and offers an efficiency alternative to a fully parameterized
+  cross-layer encoder.
+- [Group Crosscoders](https://arxiv.org/abs/2410.24184) treat transformed
+  versions of an input as sites and test equivariance. Decoder slices indexed
+  by a group action are not the same object as a vector-valued sparse block.
+- [Group-SAE](https://arxiv.org/abs/2410.21508) groups layers for training
+  efficiency; the name does not imply vector blocks.
+- [Multimodal group-sparse autoencoders](https://arxiv.org/abs/2601.20028)
+  encourage paired scalar supports across modalities. Shared event support
+  does not establish shared within-block coordinates.
+- [fmxcoders](https://arxiv.org/abs/2605.09438) factorize layer-axis weights and
+  use stochastic layer masking to encourage one-layer-to-all-layer functional
+  coherence. The live same-model adaptation first retains the exact selected
+  parent, then tests Tucker-style site-axis ranks `1,2,4` against an
+  unfactorized free four-layer carrier subject to frozen carrier
+  noninferiority. Masking compares Bernoulli probabilities
+  `0,.02,.05,.10` with exactly-one-hidden and exactly-one-retained draws after
+  rank selection. It preserves the sparse
+  block and coordinate axes, masks encoder evidence only, reconstructs clean
+  targets at every site, and reports all-site plus every site-only-to-all-site
+  endpoint. This transfers the mechanisms; it does not claim to reproduce the
+  paper's tensor factorization.
+- [Procrustes-conditioned joint SAEs](https://arxiv.org/abs/2607.08499)
+  prealign representation spaces before learning a joint TopK code. In a
+  same-model cross-layer setting this motivates a prealignment diagnostic, but
+  it risks moving part of the scientific result into an unpriced dense map.
 
-The discovered object has the same structure as saklas's manifold artifact:
+## 6. Scope boundary
 
-| BSC | consumer concept |
-|---|---|
-| one shared block code | presence plus position coordinates |
-| per-site decoder frame | per-layer subspace embedding |
-| contribution-energy profile | per-layer share |
-| active-code density | manifold support and thickness estimator |
-| code topology | ring, line, map, or packed structure |
+Model-comparison methods that separate or track differences among distinct
+models, fine-tunes, architectures, or snapshots answer a different question
+from finding multidimensional factors across layers of one model. Their
+partitions, difference losses, and alignment procedures therefore do not enter
+the executable anchors, matrix axes, gates, gauges, or recommendations.
 
-This is only a structural correspondence. The post-publication bridge must
-translate the training whitener into the consumer whitener, retain the full
-per-site coordinate map, and separately validate origins, density modes,
-labels, thickness, and causal behavior. A successful file import would not
-by itself establish naturalness.
+## 7. Synthesis
 
-## Source ledger
+The reviewed literature supports the following decomposition:
 
-Primary reference metadata is machine-readable in
-[`references/refs.yaml`](../references/refs.yaml). Full-text local copies are
-gitignored and can be refreshed with the workspace reference fetcher.
+1. BSF/SASA establish whether vector blocks recover multidimensional factors;
+2. the original crosscoder establishes same-model joint layer encoding;
+3. BatchTopK and decoder-weighted scoring test support allocation without L1
+   shrinkage;
+4. manifold papers supply truth-known failure modes and evaluation language;
+5. source-only and masked-site mechanisms provide live topology/robustness
+   tests, while routing and prealignment remain future candidates;
+6. local/nonlinear and dense-scaffold methods remain ontology falsifiers.
 
-1. Fel et al., *Structuring Sparsity: Block-Sparse Featurizers Capture
-   Visual Concept Manifolds*, arXiv:2606.25234.
-2. Dalili and Mahdavi, *Subspace-Aware Sparse Autoencoders*,
-   arXiv:2606.06333.
-3. Anthropic, *Sparse Crosscoders for Cross-Layer Features and Model
-   Diffing*, 2024.
-4. Minder et al., *Overcoming Sparsity Artifacts in Crosscoders to Interpret
-   Chat-Tuning*, arXiv:2504.02922.
-5. Jiralerspong and Bricken, *Cross-Architecture Model Diffing with
-   Crosscoders*, arXiv:2602.11729.
-6. Engels et al., *Not All Language Model Features Are One-Dimensionally
-   Linear*, arXiv:2405.14860.
-7. Michaud et al., *SAE Scaling in the Presence of Feature Manifolds*,
-   arXiv:2509.02565.
-8. Gorton, *Group Crosscoders for Mechanistic Analysis of Symmetry*,
-   arXiv:2410.24184.
-9. Laptev et al., *Analyze Feature Flow to Enhance Interpretation and
-   Steering*, arXiv:2502.03032.
-10. Ge et al., *Evolution of Concepts in Language Model Pre-Training*,
-    arXiv:2509.17196.
-11. *Group-SAE*, arXiv:2410.21508.
-12. Bhalla et al., *Do Sparse Autoencoders Capture Concept Manifolds?*,
-    arXiv:2604.28119.
-13. Dooms et al., *Bilinear Autoencoders Find Interpretable Manifolds*,
-    arXiv:2605.08891.
-
-## Owed work before an external novelty claim
-
-Search the older multi-view/coupled/joint/group-sparse dictionary-learning
-literature and read the predecessor trail surfaced by Group-SAE, including
-Yun (arXiv:2103.15949), Lawson (arXiv:2409.04185), SMixAE,
-Hindupur/SPADE, Mishra-Sharma, Shafran et al., and any public
-Baskaran–Sklar crosscoder work. External prose should continue to use the
-narrow formulation until that sweep is complete.
-
-The verbatim 2026-07 review record behind this condensation remains available
-at Git commit `ed5816e12d20589727e1a0cc4ec7e80e36d6ea2e`.
+The BSC is the controlled intersection of items 1 and 2. Every other mechanism
+must enter as a named derived candidate with its own nearest-parent ablation,
+not as an unbounded frontier-method Cartesian product.

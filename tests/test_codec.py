@@ -1,11 +1,22 @@
 """Offline tests for the preregistered R-D codec (tranche 3)."""
 
+import copy
+from dataclasses import replace
+
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from block_crosscoder_experiment.codec import CodecSpec, evaluate_rd, fit_codec
+from block_crosscoder_experiment.codec import (
+    CodecSpec,
+    _artifact_digest,
+    _packet_from_output,
+    decode_batch,
+    encode_batch,
+    evaluate_rd,
+    fit_codec,
+)
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 
 G, B, S, D = 8, 4, 3, 16
@@ -26,6 +37,20 @@ def batches_of(x, n=4):
     return list(x.split(x.shape[0] // n))
 
 
+def rotate_blocks_(model, seed):
+    """Represent the same untied model in an independently rotated block gauge."""
+    generator = torch.Generator().manual_seed(seed)
+    block_dim = model.cfg.block_dim
+    with torch.no_grad():
+        for block in range(model.cfg.n_blocks):
+            q, r = torch.linalg.qr(
+                torch.randn(block_dim, block_dim, generator=generator)
+            )
+            rotation = (q * torch.sign(torch.diagonal(r))).to(model.D.device)
+            model.D[:, block] = torch.einsum("bc,scd->sbd", rotation, model.D[:, block])
+            model.E[:, block] = torch.einsum("bc,scd->sbd", rotation, model.E[:, block])
+
+
 def test_codec_fits_and_evaluates():
     torch.manual_seed(0)
     m = calibrated(make_model(), torch.randn(2048, S, D))
@@ -44,6 +69,18 @@ def test_codec_fits_and_evaluates():
     lo, hi = p4["fvu_ci95"]
     assert lo <= p4["fvu_pooled"] <= hi
     assert len(p4["fvu_per_site"]) == S
+    assert res["rate_model"] == "fixed_width_decodable_payload_bits_v1"
+    assert res["zero_rate"]["fvu_pooled"] == 1.0
+    assert p4["rate_bits_per_token"] >= p4["amplitude_bits_per_token"]
+    assert len(p4["rate_bits_ci95"]) == 2
+
+
+def test_codec_calibration_memory_ceiling_fails_without_sampling():
+    torch.manual_seed(101)
+    model = calibrated(make_model(), torch.randn(128, S, D))
+    spec = CodecSpec(qs=(4,), floor=1, n_bootstrap=2, max_calibration_event_bytes=1)
+    with pytest.raises(MemoryError, match="memory ceiling"):
+        fit_codec(model, [torch.randn(16, S, D)], spec)
 
 
 def test_high_q_approaches_unquantized():
@@ -69,11 +106,35 @@ def test_high_q_approaches_unquantized():
     assert abs(res["points"]["12"]["fvu_pooled"] - err / tot) < 5e-3
 
 
-def test_gauge_rotation_invariance():
-    """R13: rotating a block's decoder/encoder/code gauge must not move
-    the codec's R-D point — the canonical orientation absorbs it."""
-    from block_crosscoder_experiment.battery import rotate_blocks_
+def test_sequence_bootstrap_uses_stored_ids_across_batch_boundaries():
+    torch.manual_seed(102)
+    model = calibrated(make_model(), torch.randn(256, S, D))
+    codec = fit_codec(
+        model,
+        batches_of(torch.randn(256, S, D)),
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=8),
+    )
+    x = torch.randn(12, S, D)
+    sequence_ids = torch.tensor([7] * 3 + [8] * 5 + [11] * 4)
+    row_ids = torch.stack((sequence_ids, torch.arange(12)), dim=1)
+    pairs = [
+        (x[:4], row_ids[:4]),
+        (x[4:9], row_ids[4:9]),
+        (x[9:], row_ids[9:]),
+    ]
+    result = evaluate_rd(model, codec, pairs)
+    assert result["n_rows"] == 3
+    assert result["sequence_grouping"] == "stored_sequence_ids"
+    assert result["row_len"] is None
 
+    bad = [(x[:6], row_ids[:6]), (x[6:], row_ids[6:].flip(0))]
+    with pytest.raises(ValueError, match="strictly increasing"):
+        evaluate_rd(model, codec, bad)
+
+
+def test_gauge_rotation_invariance():
+    """Rotating a block's decoder/encoder/code gauge must not move
+    the codec's R-D point — the canonical orientation absorbs it."""
     torch.manual_seed(2)
     calib = torch.randn(4096, S, D)
     ev = torch.randn(2048, S, D)
@@ -86,10 +147,12 @@ def test_gauge_rotation_invariance():
     with torch.no_grad():
         assert torch.allclose(m1(ev[:64]).xhat, m2(ev[:64]).xhat, atol=1e-4)
 
-    r1 = evaluate_rd(m1, fit_codec(m1, batches_of(calib), spec),
-                     batches_of(ev), row_len=128)
-    r2 = evaluate_rd(m2, fit_codec(m2, batches_of(calib), spec),
-                     batches_of(ev), row_len=128)
+    r1 = evaluate_rd(
+        m1, fit_codec(m1, batches_of(calib), spec), batches_of(ev), row_len=128
+    )
+    r2 = evaluate_rd(
+        m2, fit_codec(m2, batches_of(calib), spec), batches_of(ev), row_len=128
+    )
     f1, f2 = r1["points"]["4"]["fvu_pooled"], r2["points"]["4"]["fvu_pooled"]
     assert abs(f1 - f2) < 5e-3, (f1, f2)
     assert abs(r1["support_bits_per_token"] - r2["support_bits_per_token"]) < 1e-6
@@ -127,10 +190,62 @@ def test_codec_serialization_roundtrip(tmp_path):
     assert loaded.calib_tokens == codec.calib_tokens
     assert loaded.meta == codec.meta
     for name in (
-        "included", "rotation", "lo", "hi", "count_log2p",
-        "bernoulli_log2p", "bernoulli_log2q", "calib_events", "calib_mean",
+        "included",
+        "rank_to_block",
+        "rotation",
+        "lo",
+        "hi",
+        "count_log2p",
+        "bernoulli_log2p",
+        "bernoulli_log2q",
+        "calib_events",
+        "calib_mean",
     ):
         assert torch.equal(getattr(loaded, name), getattr(codec, name))
+
+
+def test_rehashed_codec_bytes_still_require_semantic_validity():
+    torch.manual_seed(144)
+    model = calibrated(make_model(), torch.randn(256, S, D))
+    codec = fit_codec(
+        model,
+        [torch.randn(256, S, D)],
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=2),
+    )
+    pristine = codec.to_payload()
+
+    def authenticated(mutated):
+        unsigned = {
+            key: value for key, value in mutated.items() if key != "artifact_sha256"
+        }
+        mutated["artifact_sha256"] = _artifact_digest(unsigned)
+        return mutated
+
+    extra = copy.deepcopy(pristine)
+    extra["ignored_future_field"] = 1
+    extra = authenticated(extra)
+    with pytest.raises(ValueError, match="payload keys mismatch"):
+        type(codec).from_payload(extra)
+
+    nonorthogonal = copy.deepcopy(pristine)
+    nonorthogonal["rotation"][0].zero_()
+    with pytest.raises(ValueError, match="not orthonormal"):
+        type(codec).from_payload(authenticated(nonorthogonal))
+
+    inverted_range = copy.deepcopy(pristine)
+    inverted_range["hi"][0, 0] = inverted_range["lo"][0, 0] - 1
+    with pytest.raises(ValueError, match="ceiling is below"):
+        type(codec).from_payload(authenticated(inverted_range))
+
+    bad_probability = copy.deepcopy(pristine)
+    bad_probability["count_log2p"].zero_()
+    with pytest.raises(ValueError, match="not normalized"):
+        type(codec).from_payload(authenticated(bad_probability))
+
+    wrong_dtype = copy.deepcopy(pristine)
+    wrong_dtype["lo"] = wrong_dtype["lo"].double()
+    with pytest.raises(TypeError, match="lo dtype"):
+        type(codec).from_payload(authenticated(wrong_dtype))
 
 
 def test_count_model_is_fit_after_floor_exclusion():
@@ -146,8 +261,11 @@ def test_count_model_is_fit_after_floor_exclusion():
             z = torch.ones(4, 3, 1, device=x.device)
             z_selected = z * masks.unsqueeze(-1)
             return SimpleNamespace(
-                xhat=torch.zeros_like(x), z=z, z_selected=z_selected,
-                scores=z.squeeze(-1), mask=masks,
+                xhat=torch.zeros_like(x),
+                z=z,
+                z_selected=z_selected,
+                scores=z.squeeze(-1),
+                mask=masks,
             )
 
     codec = fit_codec(
@@ -157,10 +275,43 @@ def test_count_model_is_fit_after_floor_exclusion():
     )
     assert codec.included.tolist() == [True, True, False]
     probs = codec.count_log2p.exp2()
-    # Included counts are [2,1,1,0], so add-one-smoothed masses are 2,3,2.
-    assert probs[0] == pytest.approx(2 / 17)
-    assert probs[1] == pytest.approx(3 / 17)
-    assert probs[2] == pytest.approx(2 / 17)
+    # Included counts are [2,1,1,0]. The complete legal alphabet is 0..2,
+    # so add-one-smoothed masses are exactly 2,3,2 (no tail-clamp aliases).
+    assert probs[0] == pytest.approx(2 / 7)
+    assert probs[1] == pytest.approx(3 / 7)
+    assert probs[2] == pytest.approx(2 / 7)
+
+
+def test_packet_compacts_noncontiguous_included_block_ids():
+    torch.manual_seed(104)
+    model = calibrated(make_model(b=1, g=16, k=2.0), torch.randn(256, S, D))
+    codec = fit_codec(
+        model,
+        [torch.randn(256, S, D)],
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=2),
+    )
+    included = torch.zeros(16, dtype=torch.bool)
+    included[[0, 15]] = True
+    codec = replace(
+        codec,
+        included=included,
+        rank_to_block=torch.tensor([0, 15], dtype=torch.long),
+        count_log2p=torch.zeros(3, dtype=torch.float64),
+    )
+    mask = included.view(1, -1)
+    z = torch.full((1, 16, 1), 0.5)
+    out = SimpleNamespace(mask=mask, z_selected=z * mask.unsqueeze(-1))
+    packet = _packet_from_output(model, codec, out, q=4)
+    assert packet.block_ids.tolist() == [0, 1]
+    assert codec.rank_to_block[packet.block_ids.long()].tolist() == [0, 15]
+    # Two compact IDs require one bit each. Pricing raw dictionary IDs would
+    # incorrectly need four bits and is not the packet this codec decodes.
+    assert (codec.n_included - 1).bit_length() == 1
+    assert decode_batch(model, codec, packet).shape == (1, S, D)
+
+    bad = replace(packet, block_ids=torch.tensor([0, 2], dtype=torch.int32))
+    with pytest.raises(ValueError, match="block rank"):
+        decode_batch(model, codec, bad)
 
 
 def test_scalar_b1_path():
@@ -175,11 +326,39 @@ def test_scalar_b1_path():
     assert abs(p["amplitude_bits_per_token"] - 6 * res["avg_count"]) < 1e-9
 
 
-def test_count_model_prices_unseen_counts():
+def test_count_model_prices_every_legal_count_and_rejects_impossible_counts():
     torch.manual_seed(6)
     m = calibrated(make_model(), torch.randn(2048, S, D))
     spec = CodecSpec(qs=(4,), floor=1, n_bootstrap=8)
     codec = fit_codec(m, batches_of(torch.randn(2048, S, D)), spec)
-    k = torch.tensor([0, 1, 10**6])
+    k = torch.arange(codec.n_included + 1)
     lp = codec.log2_count_prob(k)
     assert torch.isfinite(lp).all()  # smoothing: no -inf anywhere
+    with pytest.raises(ValueError, match="outside"):
+        codec.log2_count_prob(torch.tensor([codec.n_included + 1]))
+
+
+def test_explicit_sparse_packet_round_trip():
+    cfg = BSCConfig(
+        n_blocks=6,
+        block_dim=2,
+        n_sites=2,
+        d_model=5,
+        k=2,
+    )
+    model = BlockCrosscoder(cfg)
+    x = torch.randn(96, 2, 5)
+    model.fit_threshold_([x[:48]], target_avg_blocks=2)
+    codec = fit_codec(model, [x[:48]], CodecSpec(qs=(4,), floor=1, n_bootstrap=4))
+    packet = encode_batch(model, codec, x[48:], 4)
+    decoded = decode_batch(model, codec, packet)
+    assert decoded.shape == x[48:].shape
+    assert torch.isfinite(decoded).all()
+    assert packet.amplitude_symbols.dtype == torch.int32
+    with pytest.raises(ValueError, match="length"):
+        decode_batch(model, codec, replace(packet, block_ids=packet.block_ids[:-1]))
+    if packet.block_ids.numel():
+        bad_symbols = packet.amplitude_symbols.clone()
+        bad_symbols[0, 0] = 1 << packet.q
+        with pytest.raises(ValueError, match="alphabet"):
+            decode_batch(model, codec, replace(packet, amplitude_symbols=bad_symbols))

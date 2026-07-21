@@ -5,7 +5,7 @@ All functions operate on decoder/encoder stacks of shape ``[S, G, b, d]``
 The layout is chosen so ``reshape(S, G*b, d)`` is a free view for the
 encode/decode batched matmuls.
 
-The load-bearing constraint (design v2.2, *Architecture spec*): per block,
+The load-bearing constraint is, per block,
 the concatenated decoder Gram is the identity,
 
     M_g = sum_s D_g^s D_g^s^T = I_b.
@@ -38,11 +38,13 @@ __all__ = [
     "block_gram",
     "gram_residual",
     "retract_",
+    "qr_retract_",
     "site_singular_values",
-    "rank_penalty",
-    "site_profile_penalty",
     "map_nuclear_penalty",
+    "decoder_nuclear_penalty",
     "project_block_frobenius_",
+    "normalize_block_frobenius_",
+    "project_latent_rows_",
     "site_frobenius_shares",
     "init_decoder_stack",
 ]
@@ -95,8 +97,7 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
         raise TypeError(f"retraction operates on fp32 master weights, got {D.dtype}")
     floor_hits = 0
     chunk_size = (
-        D.shape[1]
-        if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
+        D.shape[1] if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
     )
     for start in range(0, D.shape[1], chunk_size):
         chunk = D[:, start : start + chunk_size]
@@ -104,13 +105,27 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
         evals, evecs = torch.linalg.eigh(M)
         floor_hits += int((evals < eig_floor).sum().item())
         evals = evals.clamp_min(eig_floor)
-        inv_sqrt = (
-            evecs
-            @ torch.diag_embed(evals.rsqrt())
-            @ evecs.transpose(-1, -2)
-        )
+        inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
         chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
     return floor_hits
+
+
+@torch.no_grad()
+def qr_retract_(D: torch.Tensor) -> int:
+    """Thin-QR Stiefel retraction used by the BSF Grassmannian procedure.
+
+    Each block's site-concatenated decoder is a ``b x sum(d_s)`` matrix.  QR
+    on its transpose produces orthonormal columns, which are transposed back
+    to orthonormal decoder rows.  This is not silently interchangeable with
+    the symmetric polar retraction in :func:`retract_`; both are executable
+    choices in the matrix.
+    """
+
+    sites, groups, block_dim, width = D.shape
+    concatenated = D.permute(1, 0, 3, 2).reshape(groups, sites * width, block_dim)
+    q, _ = torch.linalg.qr(concatenated, mode="reduced")
+    D.copy_(q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2))
+    return 0
 
 
 def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
@@ -157,25 +172,6 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     return (evals.clamp_min(0.0) + eps).sqrt()
 
 
-def rank_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
-    """Backward-compatible alias for :func:`site_profile_penalty`."""
-    return site_profile_penalty(D, eps=eps)
-
-
-def site_profile_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
-    """Normalized site-profile nuclear penalty.
-
-    R_profile = mean_g (sum_s ||D_g^s||_* - b) / b. Under the concatenated
-    Gram constraint this ranges over [0, sqrt(S)-1]. It is deliberately not
-    called a rank penalty: the full concatenated decoder remains rank b, and
-    the zero set includes orthogonal coordinate-wise partitions across sites.
-    """
-    sv = site_singular_values(D, eps=eps)  # [S, G, b]
-    b = D.shape[2]
-    nuc = sv.sum(dim=(0, 2))  # [G]
-    return ((nuc - b) / b).mean()
-
-
 def map_nuclear_penalty(
     D: torch.Tensor, E: torch.Tensor, *, eps: float = 1e-8
 ) -> torch.Tensor:
@@ -190,18 +186,42 @@ def map_nuclear_penalty(
     free decoders without ever materializing an ``(S*d) x (S*d)`` map.
     """
     if D.shape != E.shape:
-        raise ValueError(f"D and E must have identical shape, got {D.shape} and {E.shape}")
+        raise ValueError(
+            f"D and E must have identical shape, got {D.shape} and {E.shape}"
+        )
     Df, Ef = D.float(), E.float()
+    if eps < 0:
+        raise ValueError("eps must be nonnegative")
     md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
     me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
-    evals_d, evecs_d = torch.linalg.eigh(md)
-    sqrt_md = (
-        evecs_d
-        @ torch.diag_embed(evals_d.clamp_min(0.0).sqrt())
-        @ evecs_d.transpose(-1, -2)
-    )
-    squared_sv = torch.linalg.eigvalsh(sqrt_md @ me @ sqrt_md).clamp_min(0.0)
-    return (squared_sv.add(eps).sqrt().sum(dim=-1) / E.shape[2]).mean()
+
+    # Cholesky only the decoder Gram: if M_D = L L.T, the squared non-zero
+    # singular values of Dbar.T @ Ebar are the eigenvalues of L.T M_E L.
+    # Unlike a second Cholesky this remains defined for rank-deficient encoder
+    # blocks, and unlike an eigendecomposition-based square root of M_D it
+    # avoids undefined eigenvector gradients when the Grassmann constraint
+    # deliberately makes all decoder-Gram eigenvalues equal to one.
+    ld, info_d = torch.linalg.cholesky_ex(md)
+    if bool((info_d != 0).any()):
+        raise ValueError(
+            "map nuclear regularization requires full-row-rank decoder blocks"
+        )
+    squared_singular_values = torch.linalg.eigvalsh(
+        ld.transpose(-1, -2) @ me @ ld
+    ).clamp_min(0.0)
+    terms = (squared_singular_values + eps).sqrt()
+    return (terms.sum(dim=-1) / E.shape[2]).mean()
+
+
+def decoder_nuclear_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    """Mean decoder-block nuclear norm used by the inspected SASA release.
+
+    This is intentionally separate from SASA's paper objective
+    ``||D_g.T @ E_g||_*``.  For multi-site tensors the mean is over every
+    site/block pair; the released-code bridge itself is single-site.
+    """
+
+    return site_singular_values(D, eps=eps).sum(dim=-1).mean()
 
 
 @torch.no_grad()
@@ -215,6 +235,44 @@ def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
     scale = (max_norm / norms.clamp_min(1e-12)).clamp(max=1.0)
     D.mul_(scale.to(D.dtype).view(1, -1, 1, 1))
     return int((norms > max_norm).sum().item())
+
+
+@torch.no_grad()
+def normalize_block_frobenius_(D: torch.Tensor, *, target_norm: float = 1.0) -> int:
+    """Normalize every site-concatenated decoder block to one Frobenius norm.
+
+    This is the exact scale control used by the pinned BSF release trainer for
+    its free-decoder Vanilla and Group-Lasso implementations.  It is distinct
+    from the paper's Vanilla unit-ball projection: blocks below the target are
+    expanded here and left unchanged by :func:`project_block_frobenius_`.
+    """
+
+    if target_norm <= 0:
+        raise ValueError("target_norm must be positive")
+    norms = D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()
+    D.mul_((target_norm / norms.clamp_min(1e-12)).to(D.dtype).view(1, -1, 1, 1))
+    return int((norms > 0).sum().item())
+
+
+@torch.no_grad()
+def project_latent_rows_(W: torch.Tensor, *, target_norm: float = 1.0) -> int:
+    """Normalize every scalar latent row over its input/output coordinates.
+
+    ``W`` has shape ``[site, block, coordinate, activation]``.  This matches
+    the inspected SASA implementation's decoder-row and encoder-column
+    normalization after translating its ``[activation, latent]`` encoder
+    orientation into this package's row-major latent orientation.
+    """
+
+    norms = W.float().norm(dim=-1, keepdim=True)
+    nonzero = norms > 0
+    scale = torch.where(
+        nonzero,
+        torch.full_like(norms, target_norm) / norms.clamp_min(1e-12),
+        torch.ones_like(norms),
+    )
+    W.mul_(scale.to(W.dtype))
+    return int(nonzero.sum().item())
 
 
 def site_frobenius_shares(D: torch.Tensor) -> torch.Tensor:
@@ -236,11 +294,11 @@ def init_decoder_stack(
     *,
     generator: torch.Generator | None = None,
     device: torch.device | str | None = None,
+    preconditioning: str = "concatenated_gram_retraction",
 ) -> torch.Tensor:
-    """Gaussian init followed by one retraction (design: *Sparsity hygiene*).
-
-    Gives approximately equal site shares (1/S) at init. Always fp32.
-    """
+    """Seeded ``N(0, 1/d)`` init with an explicit optional preconditioner."""
+    if preconditioning not in {"concatenated_gram_retraction", "none"}:
+        raise ValueError(f"unsupported decoder preconditioning {preconditioning!r}")
     D = torch.randn(
         n_sites,
         n_blocks,
@@ -251,5 +309,6 @@ def init_decoder_stack(
         dtype=torch.float32,
     )
     D /= math.sqrt(d_model)
-    retract_(D)
+    if preconditioning == "concatenated_gram_retraction":
+        retract_(D)
     return D

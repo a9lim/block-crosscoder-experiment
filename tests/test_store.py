@@ -51,7 +51,7 @@ def test_whitener_whitens():
 
 
 def test_site_rms_scalars_restore_unit_power():
-    """F7 renorm arm: at production shrinkage (ridge_scale 1.0), sites
+    """At the declared shrinkage (ridge_scale 1.0), sites
     with different anisotropy retain different whitened power; the RMS
     scalars restore ~unit mean per-dim power at every site."""
     gen = torch.Generator().manual_seed(7)
@@ -80,8 +80,10 @@ def test_production_whitener_folds_site_renorm_once():
     acc = WhitenerAccumulator(S, D)
     acc.update(x)
     w = acc.finalize(
-        sites=list(range(S)), meta={"campaign": "test"},
-        ridge_scale=1.0, site_renorm=True,
+        sites=list(range(S)),
+        meta={"campaign": "test"},
+        ridge_scale=1.0,
+        site_renorm=True,
     )
     power = w.apply(x).pow(2).mean(dim=(0, 2))
     assert torch.allclose(power, torch.ones(S), atol=0.02)
@@ -90,15 +92,43 @@ def test_production_whitener_folds_site_renorm_once():
     assert torch.equal(w.site_rms_scalars(), torch.ones(S))
 
 
-@pytest.mark.parametrize("mode", ["none", "scalar", "layer", "whiten"])
-def test_phase05_normalization_modes(mode):
+def test_rectangular_site_renorm_ignores_padded_coordinates():
+    gen = torch.Generator().manual_seed(82)
+    widths = (3, 7)
+    x = torch.zeros(30_000, 2, max(widths))
+    x[:, 0, : widths[0]] = torch.randn(
+        x.shape[0], widths[0], generator=gen
+    ) * torch.tensor([1.0, 0.2, 0.05])
+    x[:, 1, : widths[1]] = torch.randn(
+        x.shape[0], widths[1], generator=gen
+    ) * torch.linspace(1.0, 0.05, widths[1])
+    acc = WhitenerAccumulator(2, max(widths))
+    acc.update(x)
+    transform = acc.finalize(
+        sites=(0, 1),
+        meta={"site_dims": list(widths)},
+        ridge_scale=1.0,
+        site_renorm=True,
+    )
+    y = transform.apply(x)
+    power = torch.stack(
+        [y[:, site, :width].pow(2).mean() for site, width in enumerate(widths)]
+    )
+    assert torch.allclose(power, torch.ones(2), atol=0.02)
+    assert torch.count_nonzero(y[:, 0, widths[0] :]) == 0
+
+
+@pytest.mark.parametrize("mode", ["none", "scalar_rms", "layer", "whiten"])
+def test_normalization_modes(mode):
     batches, _ = gaussian_batches(n_batches=8)
     acc = WhitenerAccumulator(S, D)
     for x in batches:
         acc.update(x)
     w = acc.finalize(
-        sites=list(range(S)), meta={"campaign": "phase05-test"},
-        ridge_scale=1e-3, mode=mode,
+        sites=list(range(S)),
+        meta={"campaign": "store-test"},
+        ridge_scale=1e-3,
+        mode=mode,
     )
     x = torch.cat(batches)
     y = w.apply(x)
@@ -106,11 +136,9 @@ def test_phase05_normalization_modes(mode):
     assert torch.isfinite(y).all()
     if mode == "none":
         assert torch.equal(y, x.float())
-    elif mode == "scalar":
+    elif mode == "scalar_rms":
         assert y.mean(dim=0).abs().max() < 0.08
-        assert torch.allclose(
-            y.pow(2).mean(dim=(0, 2)), torch.ones(S), atol=0.08
-        )
+        assert torch.allclose(y.pow(2).mean(dim=(0, 2)), torch.ones(S), atol=0.08)
     elif mode == "layer":
         assert y.mean(dim=-1).abs().max() < 1e-5
         assert torch.allclose(y.pow(2).mean(dim=-1), torch.ones(y.shape[:2]), atol=1e-4)
@@ -120,15 +148,141 @@ def test_phase05_normalization_modes(mode):
         assert y.mean(dim=0).abs().max() < 0.08
 
 
+@pytest.mark.parametrize("mode", ["none", "scalar_rms", "sqrt_d"])
+def test_diagonal_modes_never_build_or_apply_dense_covariance(monkeypatch, mode):
+    batches, _ = gaussian_batches(n_batches=4)
+    x = torch.cat(batches)
+    accumulator = WhitenerAccumulator(S, D, track_covariance=False)
+    for batch in batches:
+        accumulator.update(batch)
+    centered_norm = None
+    if mode == "sqrt_d":
+        mean = x.double().mean(dim=0)
+        centered_norm = (x.double() - mean).norm(dim=-1).mean(dim=0)
+    transform = accumulator.finalize(
+        sites=range(S),
+        meta={"site_dims": [D] * S},
+        mode=mode,
+        mean_centered_norm=centered_norm,
+    )
+    assert accumulator.outer is None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("diagonal normalization called a dense kernel")
+
+    monkeypatch.setattr(torch, "einsum", forbidden)
+    monkeypatch.setattr(torch.linalg, "inv", forbidden)
+    normalized = transform.apply(x)
+    assert torch.allclose(transform.unapply(normalized), x.float(), atol=2e-5)
+
+
+def test_writer_resume_rebuilds_exact_ordered_stream(tmp_path):
+    values = torch.arange(1, 13 * 2 * 3 + 1).reshape(13, 2, 3).float()
+    row_ids = torch.stack((torch.arange(13), torch.arange(13) + 100), dim=1)
+    writer = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="resume",
+        sites=(1, 2),
+        d_model=3,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+    )
+    writer.add(values[:8], row_ids[:8])
+    assert writer.persisted_tokens == 8
+    with pytest.raises(ValueError, match="incomplete"):
+        StoreReader(tmp_path, "train")
+
+    resumed = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="resume",
+        sites=(1, 2),
+        d_model=3,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+        resume=True,
+    )
+    assert resumed.persisted_tokens == 8
+    resumed.add(values[8:], row_ids[8:])
+    manifest = resumed.close()
+    reader = StoreReader(tmp_path, "train")
+    observed_x = []
+    observed_ids = []
+    for x, ids in reader.sequential_batches_with_ids(5):
+        observed_x.append(x)
+        observed_ids.append(ids)
+    assert torch.equal(torch.cat(observed_x), values.to(torch.bfloat16))
+    assert torch.equal(torch.cat(observed_ids), row_ids)
+    assert reader.verify() == 13
+    assert manifest["format_version"] == 3
+    assert manifest["row_ids_dtype"] == "int64"
+
+
+def test_writer_rejects_non_int64_row_ids_and_duplicate_sites(tmp_path):
+    with pytest.raises(ValueError, match="nonempty and unique"):
+        ShardWriter(
+            tmp_path,
+            "bad",
+            whitener_hash="x",
+            sites=(1, 1),
+            d_model=2,
+        )
+    writer = ShardWriter(
+        tmp_path,
+        "good",
+        whitener_hash="x",
+        sites=(1,),
+        d_model=2,
+        free_space_floor_frac=0,
+    )
+    with pytest.raises(TypeError, match="int64 exactly"):
+        writer.add(torch.ones(2, 1, 2), torch.ones(2, 1, dtype=torch.int32))
+
+
+def test_sqrt_d_uses_exact_centered_mean_norm():
+    batches, _ = gaussian_batches(n_batches=8)
+    x = torch.cat(batches)
+    acc = WhitenerAccumulator(S, D)
+    for batch in batches:
+        acc.update(batch)
+    mean = x.double().mean(dim=0)
+    centered_mean_norm = (x.double() - mean).norm(dim=-1).mean(dim=0)
+    sqrt_d = acc.finalize(
+        sites=list(range(S)),
+        meta={"site_dims": [D] * S},
+        mode="sqrt_d",
+        mean_centered_norm=centered_mean_norm,
+    )
+    transformed = sqrt_d.apply(x)
+    assert torch.allclose(
+        transformed.norm(dim=-1).mean(dim=0),
+        torch.full((S,), D**0.5),
+        atol=2e-4,
+    )
+
+
+def test_rectangular_layer_norm_ignores_padding():
+    gen = torch.Generator().manual_seed(81)
+    x = torch.zeros(128, 2, 5)
+    x[:, 0, :3] = torch.randn(128, 3, generator=gen)
+    x[:, 1, :5] = torch.randn(128, 5, generator=gen)
+    acc = WhitenerAccumulator(2, 5)
+    acc.update(x)
+    transform = acc.finalize(sites=(0, 1), meta={"site_dims": [3, 5]}, mode="layer")
+    y = transform.apply(x)
+    assert y[:, 0, :3].mean(dim=-1).abs().max() < 1e-5
+    assert y[:, 1, :5].mean(dim=-1).abs().max() < 1e-5
+    assert torch.count_nonzero(y[:, 0, 3:]) == 0
+
+
 def test_site_renorm_only_valid_with_whitening():
     batches, _ = gaussian_batches(n_batches=2)
     acc = WhitenerAccumulator(S, D)
     for x in batches:
         acc.update(x)
     with pytest.raises(ValueError, match="only for mode='whiten'"):
-        acc.finalize(
-            sites=list(range(S)), meta={}, mode="scalar", site_renorm=True
-        )
+        acc.finalize(sites=list(range(S)), meta={}, mode="scalar_rms", site_renorm=True)
 
 
 def test_whitener_roundtrip_and_hash(tmp_path):
@@ -147,16 +301,24 @@ def test_transform_hash_covers_eigenvalues_and_fit_count():
     batches, _ = gaussian_batches(n_batches=3)
     w = fit_whitener(batches)
     altered_eigs = Whitener(
-        mean=w.mean, W=w.W, ridge=w.ridge,
-        eigenvalues=w.eigenvalues.clone(), sites=w.sites,
-        n_fit_tokens=w.n_fit_tokens, meta=dict(w.meta),
+        mean=w.mean,
+        W=w.W,
+        ridge=w.ridge,
+        eigenvalues=w.eigenvalues.clone(),
+        sites=w.sites,
+        n_fit_tokens=w.n_fit_tokens,
+        meta=dict(w.meta),
     )
     altered_eigs.eigenvalues[0, 0] += 1
     assert altered_eigs.hash != w.hash
     altered_n = Whitener(
-        mean=w.mean, W=w.W, ridge=w.ridge,
-        eigenvalues=w.eigenvalues, sites=w.sites,
-        n_fit_tokens=w.n_fit_tokens + 1, meta=dict(w.meta),
+        mean=w.mean,
+        W=w.W,
+        ridge=w.ridge,
+        eigenvalues=w.eigenvalues,
+        sites=w.sites,
+        n_fit_tokens=w.n_fit_tokens + 1,
+        meta=dict(w.meta),
     )
     assert altered_n.hash != w.hash
 
@@ -206,22 +368,49 @@ def test_writer_reader_round_trip(tmp_path):
     seq = torch.cat(list(reader.sequential_batches(64)), dim=0)
     assert torch.equal(token_ids(seq), torch.arange(1000))  # stored order kept
 
-    # Shuffled epoch: batch shapes constant, no token repeated, coverage
-    # near-complete (partial batches at buffer boundaries may drop).
+    # Shuffled epoch: no token repeated and exact coverage, including the
+    # final partial batch.
     got = list(reader.shuffled_batches(64, seed=5, epochs=1, buffer_tokens=256))
     ids = torch.cat([token_ids(b) for b in got])
-    assert all(b.shape == (64, 3, D) for b in got)
+    assert all(b.shape[1:] == (3, D) and 0 < b.shape[0] <= 64 for b in got)
     assert ids.unique().numel() == ids.numel()
-    assert ids.numel() >= 1000 - 64
+    assert ids.numel() == 1000
     # Same seed -> identical order; different seed -> different order.
     again = torch.cat(
-        [token_ids(b) for b in reader.shuffled_batches(64, seed=5, epochs=1, buffer_tokens=256)]
+        [
+            token_ids(b)
+            for b in reader.shuffled_batches(64, seed=5, epochs=1, buffer_tokens=256)
+        ]
     )
     assert torch.equal(ids, again)
     other = torch.cat(
-        [token_ids(b) for b in reader.shuffled_batches(64, seed=6, epochs=1, buffer_tokens=256)]
+        [
+            token_ids(b)
+            for b in reader.shuffled_batches(64, seed=6, epochs=1, buffer_tokens=256)
+        ]
     )
     assert not torch.equal(ids, other)
+
+
+def test_shuffled_reader_applies_exact_prefix_before_permutation(tmp_path):
+    write_store(tmp_path, n_tokens=160, tokens_per_shard=37)
+    reader = StoreReader(tmp_path, "train")
+    batches = list(
+        reader.shuffled_batches(
+            16,
+            seed=9,
+            epochs=2,
+            buffer_tokens=48,
+            prefix_tokens=80,
+        )
+    )
+    observed = torch.cat([token_ids(batch) for batch in batches])
+    assert observed.numel() == 160
+    assert int(observed.max()) < 80
+    assert set(observed[:80].tolist()) == set(range(80))
+    assert set(observed[80:].tolist()) == set(range(80))
+    with pytest.raises(ValueError, match="prefix_tokens"):
+        list(reader.shuffled_batches(16, seed=1, prefix_tokens=161))
 
 
 def test_reader_rejects_wrong_whitener(tmp_path):
@@ -243,8 +432,13 @@ def test_reader_detects_corruption(tmp_path):
 
 def test_writer_audits(tmp_path):
     writer = ShardWriter(
-        tmp_path, "train", whitener_hash="abc", sites=[0], d_model=D,
-        tokens_per_shard=8, free_space_floor_frac=0.0,
+        tmp_path,
+        "train",
+        whitener_hash="abc",
+        sites=[0],
+        d_model=D,
+        tokens_per_shard=8,
+        free_space_floor_frac=0.0,
     )
     bad = torch.randn(8, 1, D)
     bad[0, 0, 0] = float("nan")
@@ -276,7 +470,7 @@ def test_site_subset_view_matches_sliced_full_stream(tmp_path):
 
     kw = dict(seed=5, epochs=1, buffer_tokens=256)
     for xf, xs in zip(full.shuffled_batches(64, **kw), sub.shuffled_batches(64, **kw)):
-        assert xs.shape == (64, 1, D)
+        assert xs.shape == (xf.shape[0], 1, D)
         assert torch.equal(xs, xf[:, 1:2])
 
     seq_full = torch.cat(list(full.sequential_batches(64)), dim=0)
@@ -341,49 +535,3 @@ def test_prefetch_close_cancels_early_exit():
     next(it)
     it.close()
     assert source_closed.wait(timeout=2.0)
-
-
-def test_merged_manifest_reads_across_splits(tmp_path):
-    """E6: a merged manifest whose shard entries point into sibling split
-    dirs (../train/...) reads as one logical split — the epochs-vs-fresh
-    12M arm's access path."""
-    write_store(tmp_path, n_tokens=500)
-    gen = torch.Generator().manual_seed(2)
-    w = ShardWriter(
-        tmp_path, "train_ext", whitener_hash="abc", sites=[7, 10, 13],
-        d_model=D, tokens_per_shard=128, free_space_floor_frac=0.0,
-    )
-    ext = 0.01 * torch.randn(300, 3, D, generator=gen)
-    ids = torch.arange(500, 800)
-    ext[:, 0, 0] = (ids // 256).float() + 1
-    ext[:, 0, 1] = (ids % 256).float() + 1
-    w.add(ext)
-    ext_manifest = w.close()
-
-    train_manifest = json.loads((tmp_path / "train" / "split.json").read_text())
-    merged_dir = tmp_path / "train_all"
-    merged_dir.mkdir()
-    merged = {
-        "split": "train_all",
-        "whitener_hash": "abc",
-        "sites": [7, 10, 13],
-        "d_model": D,
-        "n_tokens": 800,
-        "shards": (
-            [{"file": f"../train/{s['file']}", "n_tokens": s["n_tokens"]}
-             for s in train_manifest["shards"]]
-            + [{"file": f"../train_ext/{s['file']}", "n_tokens": s["n_tokens"]}
-               for s in ext_manifest["shards"]]
-        ),
-        "meta": {},
-    }
-    (merged_dir / "split.json").write_text(json.dumps(merged))
-
-    reader = StoreReader(tmp_path, "train_all", expected_whitener_hash="abc")
-    assert reader.verify() == 800
-    seq = torch.cat(list(reader.sequential_batches(50)), dim=0)
-    assert torch.equal(token_ids(seq), torch.arange(800))
-    got = torch.cat(
-        [token_ids(b) for b in reader.shuffled_batches(50, seed=3, epochs=1, buffer_tokens=200)]
-    )
-    assert got.unique().numel() == got.numel()

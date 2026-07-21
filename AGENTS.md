@@ -1,108 +1,160 @@
 # AGENTS.md
 
-Research repository for **block-sparse crosscoders (BSCs)**: sparse
-dictionary learning whose unit is a subspace with one code shared across
-sites. This is a phased experiment with explicit go/no-go gates, not a
-general-purpose library.
-
-**Phase 0.5** is the active evidentiary reset (opened 2026-07-20). Phase-0
-results, winner pointers, evidence, and figures are withdrawn. Do not describe
-Phase 1 as ready or use a former block/checkpoint identity.
+This repository runs a staged experiment on **block-sparse crosscoders**: one
+sparse block support with signed vector coordinates shared across activation
+sites in a single model. It is not a general-purpose library and it is not a
+model-comparison project.
 
 ## Read first
 
-- [`docs/audit_2026-07-20.md`](docs/audit_2026-07-20.md): flaw/remediation
-  ledger.
-- [`docs/paper_comparison.md`](docs/paper_comparison.md): exact paper bridges,
-  hyperparameter comparison, and staged matrix.
-- [`docs/design.md`](docs/design.md): normative Phase-0.5 architecture and
-  operating contract.
-- [`docs/findings-phase0.md`](docs/findings-phase0.md): withdrawal notice.
+- `docs/design.md` — normative scientific, data, metric, and execution contract;
+- `docs/paper_comparison.md` — exact source bridges and live conditional matrix;
+- `docs/papers/block_methods.md` and `docs/papers/crosscoders.md` — primary-source
+  procedure ledgers;
+- `docs/audit.md` — launch and adversarial-review gates;
+- `docs/findings.md` — evidence-bound reporting format.
 
-## Status (2026-07-20)
+## Three phases
 
-The training, checkpoint, codec, normalization, provenance, and trained-
-endpoint stacks have been remediated. The old large runs/stores on `jobe` and
-all committed evidence/figures derived from them were removed. The executable
-Phase-0.5 matrix declares an 80-cell paper-bridge screen followed, only if the
-screen has no failures, by 68,220 recipe-valid factorial cells.
+1. Phase 1 uses truth-known synthetic factors to test identification,
+   paper/mechanism bridges, capability evidence, and the universal method
+   contract. It does not export synthetic numeric hyperparameter winners.
+2. Phase 2 uses a pinned GPT-2 Small four-hook capture and owns model-, hook-,
+   scale-, optimizer-, and rate-dependent tuning on development evidence,
+   followed by confirmation.
+3. Phase 3 freezes one Phase-2 finalist plus seven declared comparators and
+   trains the five-seed Gemma publication panel without further tuning.
 
-The active screen uses five aligned normalization stores (`none`, `scalar`,
-token `layer`, shrinkage `whiten`, and `whiten_renorm`) and explicitly includes
-`lr=1e-4`, longer training, lambda, selector, encoder-bias, constraint,
-regularizer, Aux, dead-window, and cap factors. No configuration is promoted
-until saved-codec, raw-FVU, shared-code, used-span, safety, and provenance
-gates pass.
+Later conditional stages do not exist until a complete, hash-bound selection
+artifact from the preceding stage is verified.
+Phase 2 additionally requires the complete authenticated Phase-1 go/no-go and
+`bsc-phase1-transfer-v2` envelope. Its blueprint binds both the Phase-1
+decision ID and transfer ID; prose, a cell ID, a copied metric, or an unbound
+preview cannot authorize registration.
 
-The purchased 4 TB NVMe is still not installed. The current `/data` disk can
-hold the reduced Phase-0.5 stores and sequential one-checkpoint-at-a-time
-matrix, but not the former 2.171 TB production plan. Record the new mount point
-here, `docs/design.md`, and the workspace-root `AGENTS.md` before a later
-production harvest.
+## Evidence rules
 
-## Code and commands
+- Every decision is `exact`, `adapted`, `engineering`, or `novel`.
+- Paper, inspected release, and local adaptation are separate recipes.
+- Adapted or novel scientific choices require a rationale and named ablation.
+- Use one/few-factor conditional rounds, not an incoherent Cartesian product.
+- Phase-1 width/capacity/activity, retraction, site-axis rank, missing-site
+  fusion, site masking, score, and selector rounds are capability panels. Only
+  their declared carriers advance; challenger outcomes are authenticated
+  diagnostics and never prune real-model options.
+- Decoded energy on the Stiefel carrier is the fixed provisional Phase-1 score.
+  The three scores—code norm, decoded energy, and isolated squared-loss
+  decrease—run both on the Stiefel equality control and on one common
+  nonpromotable free decoder. Isolated loss decrease may use only observed
+  sites, preserves signed negative gains, and requires a bias-free quadratic
+  reconstruction carrier.
+- Phase 2 does not retune observation-site/evidence topology or missing-site
+  fusion. It does retune model architecture, site-axis rank, and masking on
+  real evidence, revisits rank after masking, evaluates the complete three-
+  score by two-hard-selector interaction, and tests learned group thresholding
+  only as a bundled method at three coefficients. Its source-only model is a
+  descriptive nonpromotable anchor, while the sharing guard compares all-view
+  with partial-view inference on the same candidate.
+- Phase-1 confirmation includes standardized Student-t df=3 coordinate tails
+  and paired 30-degree factor-subspace overlap as separate one-delta stresses.
+- A candidate must have every declared seed; aggregate candidates by median,
+  then worst seed, then content ID.
+- Phase 1 selection uses the worst normalized truth-identification margin. FVU
+  is a guardrail, not proof of factor recovery.
+- Phase 2 selection uses mean raw-space FVU at the exact 256, 384, and 512
+  total-bit/token budgets, including fixed-width packet bits and amortized
+  deployable-codec bytes. Use the lower convex envelope only, execute any
+  selected time-sharing schedule on paired raw rows, and never extrapolate.
+- Qualification records integrity-complete positive and negative results.
+  Scientific-outcome pass and promotion eligibility are distinct gates.
+- Phase-2 sharing admission is conjunctive for both site-only and leave-one-out
+  inference: worst-site decoded-coordinate Lin concordance in the all-site
+  decoder-Gram geometry, with the mean-offset penalty, is at least `.80`;
+  worst-site support-intersection recall is at least `.75`; decoded-energy
+  coverage is at least `.90`; and the parent/root-relative partial-view FVU,
+  support-IoU, and absolute-FVU safety gates pass. All-view FVU advantage is
+  descriptive only.
+- Winner-changing practical-effect, noninferiority, and sharing thresholds are
+  novel preregistered project policies, not paper values. Applicable selection
+  policies content-bind the complete threshold-sensitivity grid, and each
+  scientific selection artifact reports the marginal counterfactual pass sets
+  without retuning the center policy.
+- Comparator-family calibration reports the same sharing endpoints but does
+  not require the BSC sharing gate; otherwise a deliberately non-sharing paper
+  or control method could be filtered out before the frozen comparison panel.
+- Decoder norm is not specificity; decoder capacity is not used dimension;
+  aggregate reconstruction is not manifold recovery.
+- Development, confirmation, and final evaluation are disjoint. Never tune on
+  confirmation or final evidence.
+- The default Phase-1 blueprint declares and executes 198 cells at seeds 0/1/2.
+  The Phase-2 blueprint has a 414-cell pre-elision ceiling at seeds 0/1: 176
+  main-chain plus 238 family-chain cells. Materialization deterministically
+  records and elides execution-equivalent parent/center cells; if zero
+  Bernoulli masking wins, the rank revisit emits only its exact parent. Report
+  the realized count, not the ceiling, as executed work.
 
-All implementations live inside `block_crosscoder_experiment/`; `bsc` is the
+## Code surface
+
+All implementation lives under `block_crosscoder_experiment/`; `bsc` is the
 only executable surface.
 
 ```bash
-bsc --help
-bsc harvest --help
-bsc train --help
-bsc train-single-site --help
-bsc verify-store --help
-bsc validate-codec --help
-bsc reproduce-papers --help
-bsc phase05-matrix --help
-bsc trained-endpoints --help
-bsc refresh-analysis --help
+bsc matrix --help
+bsc data --help
+bsc cell --help
 ```
 
-`discovery/` owns SAE discovery, topology/null tests, and the sealed panel.
-`analysis/` owns trained endpoints, family probes, winner-scoped extraction,
-and figures. `cli/` owns entry points. Core model/trainer/store/codec modules
-remain at package root. Do not recreate a parallel `scripts/` package.
+- `studies.py`: recipes, decisions, blueprints, selection policies, and resource
+  estimates;
+- `campaign.py`: append-only state machine, artifact verification, selection,
+  and frozen-panel production;
+- `phase1.py`: stateless truth-known generators;
+- `model.py`, `trainer.py`: shared model and training kernels;
+- `store.py`, `codec.py`, `evaluation.py`: immutable data, deployable codec,
+  raw-space rate–distortion, and shared-code endpoints;
+- `cli/`: the only command entry points.
 
-## Data and repository conventions
+Do not add paper-specific scripts, mutable promotion pointers, or a parallel
+analysis package.
+
+## Data and artifacts
+
+- Capture raw activations once with whole-sequence split allocation and stable
+  `(sequence, position, token_id)` identities.
+- Fit normalization, encoder scale, and codec calibration only on their named
+  splits. Derived views preserve the raw row stream exactly.
+- Site dimensions and ordered hook names are part of every cell/store binding;
+  padding is structural and masked.
+- Checkpoints, stores, reports, generated references, logs, and evaluations are
+  ignored local artifacts. Committed `data/` contains placeholders only.
+- Every promotion is an immutable content-addressed decision artifact.
+- Never delete a checkpoint until qualification and retention are durably
+  recorded.
+
+## Runtime
 
 - Use shared plain Python 3.12; no project venv and no `uv`.
-- `data/evidence/` stays empty until corrected Phase-0.5 evidence qualifies.
-  `data/analysis/` and `logs/` are ignored regenerated artifacts.
-- Absence of `data/winner.json` and `data/showcase.json` is the valid
-  pre-promotion state; analysis commands must fail clearly or require an
-  explicit run rather than import-time crash.
-- Generated figures remain absent until promotion. After a valid winner,
-  `bsc refresh-analysis` regenerates source artifacts and figures; `bsc
-  figures` is render-only.
-- Decoder capacity must never be labeled used/effective dimension. Figures use
-  activation-weighted contribution/centered spans and explicit eligibility.
-- The Phase-2 consumer bridge remains deferred and belongs in saklas.
+- Training/capture run on `jobe`; use plain `python` there and pass
+  `PIP_CONSTRAINT=~/.venv/constraints.txt` for installations.
+- fp16 is forbidden in capture/store. Phase 1 uses fp32 reference execution;
+  real campaigns use declared bf16 only after parity checks.
+- Only declared Adam/AdamW recipes are scientific cells. No automatic optimizer
+  resolution is permitted.
+- Do not load evaluation checkpoints concurrently with training on the 24 GB
+  GPU.
+- Recheck `/data` headroom before launch. Planner token, parameter, peak-VRAM,
+  peak-host-RAM, storage, and compute ceilings are hard refusal gates.
 
-## Campaign operations
+## Verification
+
+Before calling the campaign launch-ready, run:
 
 ```bash
-bsc phase05-matrix status --root /data/runs/bcc-phase05
-bsc phase05-matrix campaign \
-  --root /data/runs/bcc-phase05 \
-  --store-root /data/stores/bcc-phase05
+python -m pytest -q
+python -m compileall -q block_crosscoder_experiment
+git diff --check
 ```
 
-The campaign is resumable. `campaign_state.json`, `harvest_state.json`, and
-`state.json` are authoritative. Screen failure stops the full factorial.
-Successful non-promoted cells retain reports/logs/manifests and discard only
-their large `latest.pt`. Never delete a non-final checkpoint unless the job
-report is complete.
-
-## Hardware
-
-- Training/harvest run on `jobe`'s RTX 4090. Mac MPS is suitable for smaller
-  analysis; long loops need synchronization and zero-row guards.
-- fp16 is banned in harvest/store. Use model bf16, store bf16, transform fp32,
-  statistics fp64.
-- Never load checkpoints concurrently with training on the 24 GB GPU.
-- Sequential buffered reads only; no token-random mmap. Every shard carries a
-  frozen transform hash.
-- `prefetch=4` is queue depth, with producer/current-shard residency in
-  addition; early exit must close the iterator.
-- Exact eight-site bf16 store rate is 40,960 bytes/token. Host RAM is 61 GB;
-  calibration and eval stream.
+Also run a schema-complete CPU cell through prepare, train, calibrate, evaluate,
+and qualify. Corrupt-artifact refusal, exact resume, selected-parent binding,
+and frozen-panel forgery tests must remain green.

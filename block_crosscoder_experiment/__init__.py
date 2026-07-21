@@ -1,6 +1,6 @@
 """Block-sparse crosscoders and their controlled evaluation stack.
 
-See ``docs/design.md`` for the normative architecture and Phase-1 protocol.
+See ``docs/design.md`` for the normative three-phase architecture and protocol.
 The post-publication consumer bridge lands in saklas, not this package.
 """
 
@@ -10,9 +10,7 @@ from .gram import (
     init_decoder_stack,
     map_nuclear_penalty,
     project_block_frobenius_,
-    rank_penalty,
     retract_,
-    site_profile_penalty,
     site_frobenius_shares,
     site_singular_values,
 )
@@ -24,7 +22,12 @@ from .model import (
     bsc_loss,
     token_topk_mask,
 )
-from .synthetic import BlockSpec, ExactKPlantedModel, PlantedModel, SyntheticBatch
+from .phase1 import (
+    FelSyntheticConfig,
+    LadderSyntheticConfig,
+    Phase1Batch,
+    Phase1Dataset,
+)
 from .trainer import DeadTracker, TrainConfig, Trainer, aux_loss, tensor_batches
 
 __version__ = "0.1.0"
@@ -33,11 +36,11 @@ __all__ = [
     "BSCConfig",
     "BSCOutput",
     "BlockCrosscoder",
-    "BlockSpec",
     "DeadTracker",
-    "ExactKPlantedModel",
-    "PlantedModel",
-    "SyntheticBatch",
+    "FelSyntheticConfig",
+    "LadderSyntheticConfig",
+    "Phase1Batch",
+    "Phase1Dataset",
     "TrainConfig",
     "Trainer",
     "aux_loss",
@@ -50,9 +53,7 @@ __all__ = [
     "init_decoder_stack",
     "map_nuclear_penalty",
     "project_block_frobenius_",
-    "rank_penalty",
     "retract_",
-    "site_profile_penalty",
     "site_frobenius_shares",
     "site_singular_values",
     "__version__",

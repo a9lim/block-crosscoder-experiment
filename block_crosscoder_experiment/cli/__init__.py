@@ -1,4 +1,4 @@
-"""Unified command line for training, stores, validation, and analysis."""
+"""Small, explicit command surface for the staged experiment."""
 
 from __future__ import annotations
 
@@ -6,131 +6,17 @@ import importlib
 import sys
 
 COMMANDS: dict[str, tuple[str, str]] = {
-    "train": ("block_crosscoder_experiment.cli.train_bsc", "train a joint BSC"),
-    "train-single-site": (
-        "block_crosscoder_experiment.cli.train_single_site",
-        "train the factorial single-site controls",
+    "matrix": (
+        "block_crosscoder_experiment.cli.matrix",
+        "plan, estimate, run, and reconcile staged studies",
     ),
-    "harvest": ("block_crosscoder_experiment.cli.harvest_store", "harvest a store"),
-    "verify-store": (
-        "block_crosscoder_experiment.cli.verify_store",
-        "verify manifests, shards, and checksums",
+    "data": (
+        "block_crosscoder_experiment.cli.data",
+        "capture raw activations and derive/verify aligned views",
     ),
-    "drill-resume": (
-        "block_crosscoder_experiment.cli.drill_store_resume",
-        "exercise interrupted-harvest recovery",
-    ),
-    "battery": (
-        "block_crosscoder_experiment.cli.run_battery",
-        "run the synthetic recovery battery",
-    ),
-    "reproduce-papers": (
-        "block_crosscoder_experiment.cli.reproduce_papers",
-        "run paper-faithful synthetic bridge experiments",
-    ),
-    "sweep-bundle": (
-        "block_crosscoder_experiment.cli.sweep_bundle",
-        "sweep synthetic bundle controls",
-    ),
-    "sweep-capture": (
-        "block_crosscoder_experiment.cli.sweep_capture",
-        "sweep synthetic capture conditions",
-    ),
-    "sweep-manifolds": (
-        "block_crosscoder_experiment.cli.sweep_manifolds",
-        "run the pre-NVMe real-manifold tuning screen",
-    ),
-    "phase05-matrix": (
-        "block_crosscoder_experiment.cli.phase05_matrix",
-        "plan, run, and inspect the Phase-0.5 paper-bridge matrix",
-    ),
-    "validate-codec": (
-        "block_crosscoder_experiment.cli.validate_codec",
-        "validate the rate-distortion codec",
-    ),
-    "validate-revival": (
-        "block_crosscoder_experiment.cli.validate_revival",
-        "validate rare-feature revival",
-    ),
-    "validate-theta": (
-        "block_crosscoder_experiment.cli.validate_theta",
-        "validate streaming threshold fitting",
-    ),
-    "capture-zoo": (
-        "block_crosscoder_experiment.analysis.capture_zoo",
-        "capture the descriptive zoo activation sample",
-    ),
-    "probe-families": (
-        "block_crosscoder_experiment.analysis.probe_families",
-        "evaluate descriptive family capture",
-    ),
-    "eval-manifolds": (
-        "block_crosscoder_experiment.analysis.eval_manifolds",
-        "score held-out operational manifold fidelity",
-    ),
-    "eval-stream-manifolds": (
-        "block_crosscoder_experiment.analysis.eval_stream_manifolds",
-        "gate tuning rings on held-out source-model geometry",
-    ),
-    "eval-manifold-sweep": (
-        "block_crosscoder_experiment.cli.eval_manifold_sweep",
-        "evaluate every completed manifold-sweep cell",
-    ),
-    "probe-crossarm": (
-        "block_crosscoder_experiment.analysis.probe_crossarm",
-        "compare primary and renorm codes",
-    ),
-    "extract-geometry": (
-        "block_crosscoder_experiment.analysis.extract_geometry",
-        "extract winner weight-space geometry",
-    ),
-    "activation-stats": (
-        "block_crosscoder_experiment.analysis.eval_activation_stats",
-        "stream evaluation activation statistics",
-    ),
-    "trained-endpoints": (
-        "block_crosscoder_experiment.analysis.trained_endpoints",
-        "validate trained shared codes and effective spans",
-    ),
-    "dump-frames": (
-        "block_crosscoder_experiment.analysis.dump_block_frames",
-        "export selected decoder frames",
-    ),
-    "derive-showcase": (
-        "block_crosscoder_experiment.analysis.derive_showcase",
-        "derive mega-block-gated showcase identities",
-    ),
-    "place-single-site": (
-        "block_crosscoder_experiment.analysis.place_single_site_rd",
-        "place single-site controls on the R-D plane",
-    ),
-    "figures": (
-        "block_crosscoder_experiment.analysis.figures",
-        "regenerate the winner-scoped figure catalog",
-    ),
-    "fig-sweep-frames": (
-        "block_crosscoder_experiment.analysis.render_sweep_frames",
-        "render temporary split-B sweep frame figures",
-    ),
-    "fig-capture": (
-        "block_crosscoder_experiment.analysis.fig_capture",
-        "regenerate global capture and allocation summaries",
-    ),
-    "fig-geometry": (
-        "block_crosscoder_experiment.analysis.fig_geometry",
-        "regenerate dictionary geometry summaries",
-    ),
-    "fig-rd-frontier": (
-        "block_crosscoder_experiment.analysis.fig_rd_frontier",
-        "regenerate the rate-distortion frontier",
-    ),
-    "fig-rd-tying": (
-        "block_crosscoder_experiment.analysis.fig_rd_tying",
-        "regenerate the tying-rate comparison",
-    ),
-    "refresh-analysis": (
-        "block_crosscoder_experiment.analysis.pipeline",
-        "refresh winner artifacts and every canonical figure",
+    "cell": (
+        "block_crosscoder_experiment.cli.run_cell",
+        "execute one resolved cell stage",
     ),
 }
 
@@ -151,8 +37,7 @@ def main() -> None:
     command = sys.argv[1]
     if command not in COMMANDS:
         raise SystemExit(f"unknown command {command!r}\n\n{_usage()}")
-    module_name = COMMANDS[command][0]
-    module = importlib.import_module(module_name)
+    module = importlib.import_module(COMMANDS[command][0])
     sys.argv = [f"bsc {command}", *sys.argv[2:]]
     module.main()
 
