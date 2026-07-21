@@ -123,6 +123,33 @@ def test_bf16_forward_copy_stays_in_sync(device):
     assert trainer.history[-1]["rec"] < 0.7 * trainer.history[0]["rec"]
 
 
+def test_bf16_threshold_cache_survives_steps_and_revalidates_resume(
+    device,
+    tmp_path,
+):
+    cfg = BSCConfig(**{**CFG.__dict__, "selection": "threshold"})
+    model = BlockCrosscoder(cfg).to(device)
+    model.theta.fill_(0.0)
+    trainer = Trainer(model, train_cfg(total_steps=3, forward_dtype="bf16"))
+    batches = planted_batches(device, n_batches=3, seed=211)
+
+    initial_version = trainer.fwd.theta._version
+    trainer.step(batches[0])
+    validated_key = trainer.fwd._validated_theta_key
+    assert validated_key is not None
+    trainer.step(batches[1])
+    assert trainer.fwd._validated_theta_key == validated_key
+    assert trainer.fwd.theta._version == initial_version
+    assert torch.equal(trainer.fwd.theta, trainer.master.theta.to(torch.bfloat16))
+
+    checkpoint = tmp_path / "threshold-cache.pt"
+    trainer.save_checkpoint(checkpoint)
+    resumed = Trainer.load_checkpoint(checkpoint, device=device)
+    assert resumed.fwd._validated_theta_key is None
+    resumed.step(batches[2])
+    assert resumed.fwd._validated_theta_key is not None
+
+
 def test_dead_tracker_criteria(device):
     B = 64
     tracker = DeadTracker(n_blocks=4, capacity=8, device=device, max_tokens=6 * B)

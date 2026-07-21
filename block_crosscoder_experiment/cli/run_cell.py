@@ -3621,9 +3621,23 @@ def _apply_encoder_scale_calibration(
         )
     total = torch.zeros((), dtype=torch.float64, device=model.parameter_device)
     count = 0
+    decoder = model.decoder_tensor()
+    encoder = (
+        decoder * model.log_gamma.exp()
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    score_geometry = model._frozen_score_geometry(decoder)
     for batch in _encoder_scale_fit_batches(ctx, preparation):
         x = batch.to(device=model.parameter_device, dtype=torch.float32)
-        scores = model.scores(model.encode(x), x=x)
+        z, keep = model._encode_with_tensor(x, encoder)
+        scores = model.scores(
+            z,
+            x=x,
+            _decoder=decoder,
+            _observation_keep=keep,
+            _score_geometry=score_geometry,
+        )
         total += scores.double().sum()
         count += scores.numel()
     if count == 0:
@@ -4284,9 +4298,26 @@ def _calibrate(
     achieved_events = 0
     achieved_tokens = 0
     with torch.no_grad():
+        calibration_decoder = model.decoder_tensor()
+        calibration_encoder = (
+            calibration_decoder * model.log_gamma.exp()
+            if model.cfg.encoder_mode == "tied"
+            else model.encoder_tensor()
+        )
+        calibration_score_geometry = model._frozen_score_geometry(
+            calibration_decoder
+        )
         for batch in _evaluation_batches(ctx, preparation, "calibration"):
             x = batch.to(device=_device(ctx), dtype=torch.float32)
-            selected = model(x, mode="threshold").mask
+            z, keep = model._encode_with_tensor(x, calibration_encoder)
+            scores = model.scores(
+                z,
+                x=x,
+                _decoder=calibration_decoder,
+                _observation_keep=keep,
+                _score_geometry=calibration_score_geometry,
+            )
+            selected = model._select_scores(scores, mode="threshold", z=z)
             achieved_events += int(selected.sum())
             achieved_tokens += len(x)
     if achieved_tokens == 0:
@@ -4553,6 +4584,28 @@ def _synthetic_recovery(
     if calibration_stop <= calibration_start or evaluation_stop <= evaluation_start:
         raise CellExecutionError("synthetic recovery ranges must be nonempty")
 
+    materialized_decoder = model.decoder_tensor()
+    materialized_encoder = (
+        materialized_decoder * model.log_gamma.exp()
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    score_geometry = model._frozen_score_geometry(materialized_decoder)
+
+    def frozen_forward(
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+    ):
+        return model.forward_with_materialized(
+            x,
+            mode=selection_mode,
+            observed=observed,
+            _decoder=materialized_decoder,
+            _encoder=materialized_encoder,
+            _score_geometry=score_geometry,
+        )[0]
+
     dataset = evaluation_dataset
     n_factors = len(dataset.factors)
     n_groups = model.cfg.n_blocks
@@ -4566,9 +4619,8 @@ def _synthetic_recovery(
         stop=calibration_stop,
     ):
         matching_x = _apply_normalization(matching_batch.x, normalization).to(device)
-        matching_out = model(
+        matching_out = frozen_forward(
             matching_x,
-            mode=selection_mode,
             observed=matching_batch.observed.to(device),
         )
         truth = matching_batch.active.bool().cpu()
@@ -4656,7 +4708,7 @@ def _synthetic_recovery(
             isolated = _apply_normalization(
                 matching_batch.contributions, zero_mean_normalization
             ).to(device)
-            isolated_out = model(isolated, mode=selection_mode)
+            isolated_out = frozen_forward(isolated)
             selected_codes = isolated_out.z_selected.detach().cpu().double()
             for factor in matching_batch.event_factor.unique().tolist():
                 rows = torch.nonzero(
@@ -4710,14 +4762,14 @@ def _synthetic_recovery(
         model.cfg.d_model,
         device=device,
     )
-    zero_prediction = model(zero_input, mode=selection_mode).xhat
+    zero_prediction = frozen_forward(zero_input).xhat
     for batch in evaluation_dataset.batches(
         batch_size,
         start=evaluation_start,
         stop=evaluation_stop,
     ):
         x = _apply_normalization(batch.x, normalization).to(device)
-        out = model(x, mode=selection_mode, observed=batch.observed.to(device))
+        out = frozen_forward(x, observed=batch.observed.to(device))
         truth_active = batch.active.bool().cpu()
         block_mask = out.mask.bool().cpu()
         alive |= block_mask.any(dim=0)
@@ -4745,7 +4797,7 @@ def _synthetic_recovery(
             isolated = _apply_normalization(
                 batch.contributions, zero_mean_normalization
             ).to(device)
-            isolated_out = model(isolated, mode=selection_mode)
+            isolated_out = frozen_forward(isolated)
             isolated_hat = isolated_out.xhat - zero_prediction
             event_error = (
                 (isolated_hat - isolated).double().square().sum(dim=(1, 2)).cpu()
@@ -5086,6 +5138,13 @@ def _evaluate_native_selector(
     """Evaluate the method's training-native selector, separately from codec threshold."""
 
     model = model.to(device).eval()
+    materialized_decoder = model.decoder_tensor()
+    materialized_encoder = (
+        materialized_decoder * model.log_gamma.exp()
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    score_geometry = model._frozen_score_geometry(materialized_decoder)
     sites, width = model.cfg.n_sites, model.cfg.d_model
     coordinate_mask = (
         model.coordinate_mask[:, 0, 0].to(device).double()
@@ -5126,7 +5185,14 @@ def _evaluate_native_selector(
             if model.cfg.selection_score == "isolated_loss_decrease"
             else None
         )
-        out = model(x, mode=selection_mode, observed=observed)
+        out = model.forward_with_materialized(
+            x,
+            mode=selection_mode,
+            observed=observed,
+            _decoder=materialized_decoder,
+            _encoder=materialized_encoder,
+            _score_geometry=score_geometry,
+        )[0]
         residual = (x - out.xhat).double()
         if coordinate_mask is not None:
             residual = residual * coordinate_mask
@@ -5744,6 +5810,9 @@ def _evaluate_raw_space(
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
+    materialized_score_geometry = model._frozen_score_geometry(
+        materialized_decoder
+    )
     materialized_decoder_matrix = materialized_decoder.permute(1, 2, 0, 3).reshape(
         model.cfg.n_latents,
         model.cfg.n_sites * model.cfg.d_model,
@@ -5946,6 +6015,7 @@ def _evaluate_raw_space(
                 x_normalized,
                 _decoder=materialized_decoder,
                 _encoder=materialized_encoder,
+                _score_geometry=materialized_score_geometry,
             )
             del threshold_output
             token_errors: dict[int, torch.Tensor] = {}

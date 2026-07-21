@@ -53,6 +53,29 @@ def test_shared_code_endpoints_work_for_tied_and_untied_encoders() -> None:
         assert len(result["used_contribution_eigenvalues"]) == 2
 
 
+def test_shared_code_builds_frozen_score_geometry_once(monkeypatch) -> None:
+    model = BlockCrosscoder(
+        BSCConfig(8, 2, 2, 6, 2, selection_score="decoded_energy")
+    )
+    original = model._frozen_score_geometry
+    calls = 0
+
+    def counted(decoder):
+        nonlocal calls
+        calls += 1
+        return original(decoder)
+
+    monkeypatch.setattr(model, "_frozen_score_geometry", counted)
+    x = torch.randn(40, 2, 6)
+    result = evaluate_shared_code(
+        model,
+        [x[:20], x[20:]],
+        selection_mode="topk",
+    )
+    assert result["n_tokens"] == 40
+    assert calls == 1
+
+
 def test_shared_code_block_chunking_preserves_complete_payload(monkeypatch) -> None:
     torch.manual_seed(123)
     model = BlockCrosscoder(

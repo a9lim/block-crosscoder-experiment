@@ -465,6 +465,15 @@ class BSCOutput(NamedTuple):
     mask: torch.Tensor  # [B, G] bool, selected blocks
 
 
+class _ScoreGeometry(NamedTuple):
+    """Frozen decoder-only score tensors bound to one materialization."""
+
+    decoder_key: tuple[object, ...]
+    decoder_weight: torch.Tensor | None
+    decoder_gram: torch.Tensor | None
+    site_decoder_gram: torch.Tensor | None
+
+
 def _site_axis_factorize(
     tensor: torch.Tensor,
     rank: int,
@@ -686,7 +695,12 @@ class BlockCrosscoder(nn.Module):
         )
         # Inference threshold theta: fit on the calibration split, frozen and
         # serialized with the codec. NaN until calibrated.
-        self.register_buffer("theta", torch.tensor(float("nan")))
+        self.register_buffer("theta", torch.tensor(float("nan"), device=D.device))
+        # Device scalar validation synchronizes CUDA. Cache only the exact
+        # tensor mutation/device identity which passed; state loading, fill_,
+        # deepcopy, and module conversion all invalidate at least one key
+        # component without adding any serialized state.
+        self._validated_theta_key: tuple[object, ...] | None = None
 
     # -- core ops ---------------------------------------------------------
 
@@ -819,6 +833,51 @@ class BlockCrosscoder(nn.Module):
         z, _ = self._encode_with_tensor(x, self.encoder_tensor(), observed=observed)
         return z
 
+    @staticmethod
+    def _decoder_binding_key(decoder: torch.Tensor) -> tuple[object, ...]:
+        return (
+            id(decoder),
+            decoder._version,
+            decoder.device,
+            decoder.dtype,
+            decoder.data_ptr(),
+            tuple(decoder.shape),
+            tuple(decoder.stride()),
+        )
+
+    def _frozen_score_geometry(self, decoder: torch.Tensor) -> _ScoreGeometry:
+        """Precompute decoder-only score terms for a frozen no-grad pass."""
+
+        if torch.is_grad_enabled():
+            raise RuntimeError("frozen score geometry requires no-grad execution")
+        D = decoder.float()
+        decoder_weight = None
+        decoder_gram = None
+        site_decoder_gram = None
+        if self.cfg.selection_score == "decoder_weighted":
+            per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
+            if self.cfg.decoder_norm_geometry == "sum_l2":
+                decoder_weight = per_site.sum(dim=0)
+            else:
+                decoder_weight = per_site.pow(2).sum(dim=0).sqrt()
+        elif self.cfg.selection_score == "decoded_energy":
+            decoder_gram = torch.einsum("sgbd,sgcd->gbc", D, D)
+        elif self.cfg.selection_score == "isolated_loss_decrease":
+            # Preserve the original per-site contraction exactly rather than
+            # relying on a different batched kernel to choose the same sums.
+            site_decoder_gram = torch.stack(
+                [
+                    torch.einsum("gbd,gcd->gbc", D[site], D[site])
+                    for site in range(self.cfg.n_sites)
+                ]
+            )
+        return _ScoreGeometry(
+            self._decoder_binding_key(decoder),
+            decoder_weight,
+            decoder_gram,
+            site_decoder_gram,
+        )
+
     def scores(
         self,
         z: torch.Tensor,
@@ -827,6 +886,7 @@ class BlockCrosscoder(nn.Module):
         observed: torch.Tensor | None = None,
         _decoder: torch.Tensor | None = None,
         _observation_keep: torch.Tensor | None = None,
+        _score_geometry: _ScoreGeometry | None = None,
     ) -> torch.Tensor:
         """Configured sparse-event score.
 
@@ -834,26 +894,43 @@ class BlockCrosscoder(nn.Module):
         decoded energy.  Minder's scalar BatchTopK crosscoder instead uses a
         ReLU activation multiplied by the sum of its site decoder norms.
         """
+        decoder = _decoder
+        if decoder is None and (
+            _score_geometry is not None or self.cfg.selection_score != "code_norm"
+        ):
+            decoder = self.decoder_tensor()
+        if _score_geometry is not None:
+            if torch.is_grad_enabled():
+                raise RuntimeError("frozen score geometry cannot be used with grad")
+            assert decoder is not None
+            if _score_geometry.decoder_key != self._decoder_binding_key(decoder):
+                raise ValueError("score geometry is not bound to this decoder tensor")
         if self.cfg.selection_score in {"code_norm", "decoder_weighted"}:
             score = z.norm(dim=-1)
         if self.cfg.selection_score == "decoder_weighted":
-            D = (
-                self.decoder_tensor() if _decoder is None else _decoder
-            ).float()
-            per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
-            if self.cfg.decoder_norm_geometry == "sum_l2":
-                site_norms = per_site.sum(dim=0)
+            if _score_geometry is None:
+                assert decoder is not None
+                D = decoder.float()
+                per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
+                if self.cfg.decoder_norm_geometry == "sum_l2":
+                    site_norms = per_site.sum(dim=0)
+                else:
+                    site_norms = per_site.pow(2).sum(dim=0).sqrt()
             else:
-                site_norms = per_site.pow(2).sum(dim=0).sqrt()
+                assert _score_geometry.decoder_weight is not None
+                site_norms = _score_geometry.decoder_weight
             score = score * site_norms.to(score.dtype).unsqueeze(0)
         elif self.cfg.selection_score == "decoded_energy":
             # Isolated decoded contribution energy. Unlike code_norm this is
             # invariant to reciprocal within-block encoder/decoder gauges, and
             # unlike decoder_weighted it preserves vector-coordinate geometry.
-            D = (
-                self.decoder_tensor() if _decoder is None else _decoder
-            ).float()
-            gram = torch.einsum("sgbd,sgcd->gbc", D, D)
+            if _score_geometry is None:
+                assert decoder is not None
+                D = decoder.float()
+                gram = torch.einsum("sgbd,sgcd->gbc", D, D)
+            else:
+                assert _score_geometry.decoder_gram is not None
+                gram = _score_geometry.decoder_gram
             code = z.float()
             energy_sq = torch.einsum("ngb,gbc,ngc->ng", code, gram, code)
             score = energy_sq.clamp_min(0).sqrt().to(z.dtype)
@@ -881,9 +958,8 @@ class BlockCrosscoder(nn.Module):
             )
             coordinate_mask = self.coordinate_mask[:, 0, 0].to(x.dtype)
             residual = x * keep * coordinate_mask
-            decoder = (
-                self.decoder_tensor() if _decoder is None else _decoder
-            ).float()
+            assert decoder is not None
+            decoder = decoder.float()
             code = z.float()
             projected = torch.zeros_like(code)
             energy_sq = torch.zeros(z.shape[:2], dtype=torch.float32, device=z.device)
@@ -893,7 +969,13 @@ class BlockCrosscoder(nn.Module):
                     residual[:, site].float(),
                     decoder[site],
                 )
-                site_gram = torch.einsum("gbd,gcd->gbc", decoder[site], decoder[site])
+                if _score_geometry is None:
+                    site_gram = torch.einsum(
+                        "gbd,gcd->gbc", decoder[site], decoder[site]
+                    )
+                else:
+                    assert _score_geometry.site_decoder_gram is not None
+                    site_gram = _score_geometry.site_decoder_gram[site]
                 site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
                 energy_sq = (
                     energy_sq + keep[:, site, 0].float().unsqueeze(1) * site_energy
@@ -914,8 +996,7 @@ class BlockCrosscoder(nn.Module):
             if self.cfg.selection == "token_topk":
                 return token_topk_mask(p, self.cfg.k)
             if self.cfg.selection == "threshold":
-                if torch.isnan(self.theta):
-                    raise RuntimeError("training threshold not calibrated")
+                self._require_calibrated_threshold("training")
                 return p > self.theta
             if z is None:
                 raise ValueError(
@@ -928,10 +1009,24 @@ class BlockCrosscoder(nn.Module):
             # score>0 gate to learned group shrinkage.
             return z.norm(dim=-1) > 0
         if mode == "threshold":
-            if torch.isnan(self.theta):
-                raise RuntimeError("inference threshold not calibrated")
+            self._require_calibrated_threshold("inference")
             return p > self.theta
         raise ValueError(f"unknown selection mode {mode!r}")
+
+    def _require_calibrated_threshold(self, context: str) -> None:
+        theta = self.theta
+        key = (
+            id(theta),
+            theta._version,
+            theta.device,
+            theta.dtype,
+            theta.data_ptr(),
+        )
+        if key == self._validated_theta_key:
+            return
+        if not bool(torch.isfinite(theta)):
+            raise RuntimeError(f"{context} threshold not calibrated")
+        self._validated_theta_key = key
 
     def select(
         self,
@@ -999,6 +1094,7 @@ class BlockCrosscoder(nn.Module):
         validate_observed: bool = True,
         _decoder: torch.Tensor | None = None,
         _encoder: torch.Tensor | None = None,
+        _score_geometry: _ScoreGeometry | None = None,
     ) -> tuple[BSCOutput, torch.Tensor, torch.Tensor]:
         """Forward plus the exact structured weights used by that pass.
 
@@ -1027,6 +1123,7 @@ class BlockCrosscoder(nn.Module):
             observed=observed,
             _decoder=decoder,
             _observation_keep=keep,
+            _score_geometry=_score_geometry,
         )
         mask = self._select_scores(scores, mode=mode, z=z)
         z_selected = z * mask.unsqueeze(-1)
@@ -1202,6 +1299,24 @@ class BlockCrosscoder(nn.Module):
         |Δ avg-blocks| <= 0.1.
         """
         q = 1.0 - target_avg_blocks / self.cfg.n_blocks
+        decoder = self.decoder_tensor()
+        encoder = (
+            decoder * self.log_gamma.exp()
+            if self.cfg.encoder_mode == "tied"
+            else self.encoder_tensor()
+        )
+        score_geometry = self._frozen_score_geometry(decoder)
+
+        def batch_scores(value: torch.Tensor) -> torch.Tensor:
+            z, keep = self._encode_with_tensor(value, encoder)
+            return self.scores(
+                z,
+                x=value,
+                _decoder=decoder,
+                _observation_keep=keep,
+                _score_geometry=score_geometry,
+            )
+
         if method == "streaming":
             histogram_type = (
                 SignedStreamingScoreQuantile
@@ -1211,14 +1326,14 @@ class BlockCrosscoder(nn.Module):
             hist = histogram_type(device=self.parameter_device)
             for x in batches:
                 value = x.to(self.parameter_device, self.parameter_dtype)
-                hist.update(self.scores(self.encode(value), x=value))
+                hist.update(batch_scores(value))
             theta = hist.quantile(q)
         elif method == "exact":
             score_batches = []
             for x in batches:
                 value = x.to(self.parameter_device, self.parameter_dtype)
                 score_batches.append(
-                    self.scores(self.encode(value), x=value).flatten().float().cpu()
+                    batch_scores(value).flatten().float().cpu()
                 )
             scores = torch.cat(score_batches)
             n = scores.numel()

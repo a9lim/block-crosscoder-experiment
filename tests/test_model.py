@@ -2,6 +2,8 @@
 and gradient masking, init conventions, and a smoke test of the full
 step -> retract loop on tiny synthetic data."""
 
+import copy
+
 import pytest
 import torch
 
@@ -331,6 +333,122 @@ def test_threshold_mode_requires_calibration(device):
     model.theta.fill_(model.scores(model.encode(x)).median())
     out = model(x, mode="threshold")
     assert out.mask.any() and not out.mask.all()
+
+
+def test_threshold_validation_cache_tracks_buffer_lifecycle(device, monkeypatch):
+    model = BlockCrosscoder(CFG, device=device)
+    assert model.theta.device == model.parameter_device
+    state_keys = set(model.state_dict())
+    scores = torch.ones(2, CFG.n_blocks, device=device)
+    original_isfinite = torch.isfinite
+    validation_calls = 0
+
+    def tracked_isfinite(value):
+        nonlocal validation_calls
+        if value is model.theta:
+            validation_calls += 1
+        return original_isfinite(value)
+
+    monkeypatch.setattr(torch, "isfinite", tracked_isfinite)
+    with pytest.raises(RuntimeError, match="not calibrated"):
+        model._select_scores(scores, mode="threshold")
+    assert validation_calls == 1
+
+    model.theta.fill_(0.0)
+    model._select_scores(scores, mode="threshold")
+    model._select_scores(scores, mode="threshold")
+    assert validation_calls == 2
+
+    model.theta.fill_(float("inf"))
+    with pytest.raises(RuntimeError, match="not calibrated"):
+        model._select_scores(scores, mode="threshold")
+    model.theta.fill_(0.0)
+    model._select_scores(scores, mode="threshold")
+    assert validation_calls == 4
+
+    nan_state = {name: value.clone() for name, value in model.state_dict().items()}
+    nan_state["theta"].fill_(float("nan"))
+    model.load_state_dict(nan_state)
+    with pytest.raises(RuntimeError, match="not calibrated"):
+        model._select_scores(scores, mode="threshold")
+    finite_state = {name: value.clone() for name, value in nan_state.items()}
+    finite_state["theta"].fill_(0.25)
+    model.load_state_dict(finite_state)
+    model._select_scores(scores, mode="threshold")
+    assert validation_calls == 6
+
+    cloned = copy.deepcopy(model)
+    cloned._select_scores(scores, mode="threshold")
+    assert cloned._validated_theta_key is not None
+    assert cloned._validated_theta_key[0] == id(cloned.theta)
+    converted = copy.deepcopy(model).to(dtype=torch.float64)
+    converted._select_scores(scores.double(), mode="threshold")
+    assert converted._validated_theta_key is not None
+    assert converted._validated_theta_key[3] == torch.float64
+    assert set(model.state_dict()) == state_keys
+
+
+@pytest.mark.parametrize(
+    "selection_score",
+    ("code_norm", "decoder_weighted", "decoded_energy", "isolated_loss_decrease"),
+)
+def test_frozen_score_geometry_is_exact_and_decoder_bound(device, selection_score):
+    overrides = {"selection_score": selection_score}
+    if selection_score == "decoder_weighted":
+        overrides["code_activation"] = "relu"
+    if selection_score == "isolated_loss_decrease":
+        overrides["decoder_bias"] = False
+    model = make_model(device, **overrides)
+    x = whitened_batch(device, n=17, seed=313)
+    observed = torch.ones(17, CFG.n_sites, dtype=torch.bool, device=device)
+    observed[::2, -1] = False
+
+    with torch.no_grad():
+        decoder = model.decoder_tensor()
+        encoder = model.encoder_tensor()
+        reference = model.forward_with_materialized(
+            x,
+            observed=observed,
+            _decoder=decoder,
+            _encoder=encoder,
+        )[0]
+        geometry = model._frozen_score_geometry(decoder)
+        cached = model.forward_with_materialized(
+            x,
+            observed=observed,
+            _decoder=decoder,
+            _encoder=encoder,
+            _score_geometry=geometry,
+        )[0]
+        for actual, expected in zip(cached, reference, strict=True):
+            assert torch.equal(actual, expected)
+        with pytest.raises(ValueError, match="not bound"):
+            model.forward_with_materialized(
+                x,
+                observed=observed,
+                _decoder=decoder.clone(),
+                _encoder=encoder,
+                _score_geometry=geometry,
+            )
+
+    with pytest.raises(RuntimeError, match="no-grad"):
+        model._frozen_score_geometry(model.decoder_tensor())
+
+
+def test_threshold_fit_builds_score_geometry_once(device, monkeypatch):
+    model = make_model(device, selection_score="decoded_energy")
+    original = model._frozen_score_geometry
+    calls = 0
+
+    def counted(decoder):
+        nonlocal calls
+        calls += 1
+        return original(decoder)
+
+    monkeypatch.setattr(model, "_frozen_score_geometry", counted)
+    x = whitened_batch(device, n=48, seed=317)
+    model.fit_threshold_(list(x.split(12)), CFG.k, method="exact")
+    assert calls == 1
 
 
 def test_fixed_threshold_training_selector_has_variable_counts(device):

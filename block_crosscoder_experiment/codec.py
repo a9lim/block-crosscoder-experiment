@@ -557,6 +557,7 @@ def _threshold_forward(
     x: torch.Tensor,
     decoder: torch.Tensor | None,
     encoder: torch.Tensor | None,
+    score_geometry=None,
 ):
     if decoder is None or encoder is None:
         return model(x, mode="threshold")
@@ -565,6 +566,7 @@ def _threshold_forward(
         mode="threshold",
         _decoder=decoder,
         _encoder=encoder,
+        _score_geometry=score_geometry,
     )[0]
 
 
@@ -632,7 +634,10 @@ def encode_batch(model, codec: Codec, x: torch.Tensor, q: int) -> EncodedBatch:
     device = next(model.parameters()).device
     x = x.to(device, torch.float32)
     decoder, encoder = _materialized_model_tensors(model)
-    out = _threshold_forward(model, x, decoder, encoder)
+    score_geometry = (
+        None if decoder is None else model._frozen_score_geometry(decoder)
+    )
+    out = _threshold_forward(model, x, decoder, encoder, score_geometry)
     return _packet_from_output(model, codec, out, q)
 
 
@@ -644,13 +649,22 @@ def _encode_batch_events(
     *,
     _decoder: torch.Tensor | None = None,
     _encoder: torch.Tensor | None = None,
+    _score_geometry=None,
 ) -> tuple[object, _PacketEvents]:
     """Run threshold inference once and retain its trusted sparse event stream."""
     device = next(model.parameters()).device
     x = x.to(device, torch.float32, non_blocking=True)
     if _decoder is None or _encoder is None:
         _decoder, _encoder = _materialized_model_tensors(model)
-    out = _threshold_forward(model, x, _decoder, _encoder)
+    if _score_geometry is None and _decoder is not None:
+        _score_geometry = model._frozen_score_geometry(_decoder)
+    out = _threshold_forward(
+        model,
+        x,
+        _decoder,
+        _encoder,
+        _score_geometry,
+    )
     events = _packet_events_from_output(model, codec, out)
     return out, events
 
@@ -664,6 +678,7 @@ def _encode_batch_all_q_events(
     *,
     _decoder: torch.Tensor | None = None,
     _encoder: torch.Tensor | None = None,
+    _score_geometry=None,
 ) -> tuple[object, _PacketEvents, dict[int, EncodedBatch]]:
     """Run threshold inference once and materialize public packets for all q."""
     out, events = _encode_batch_events(
@@ -672,6 +687,7 @@ def _encode_batch_all_q_events(
         x,
         _decoder=_decoder,
         _encoder=_encoder,
+        _score_geometry=_score_geometry,
     )
     requested = codec.spec.qs if qs is None else tuple(qs)
     packets = {q: _packet_from_events(codec, events, q) for q in requested}
@@ -1203,6 +1219,11 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     selected_events = 0
     estimated_peak_bytes = 0
     materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
+    score_geometry = (
+        None
+        if materialized_decoder is None
+        else model._frozen_score_geometry(materialized_decoder)
+    )
 
     for raw_x in batches:
         x = raw_x.to(device, torch.float32, non_blocking=True)
@@ -1211,6 +1232,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
             x,
             materialized_decoder,
             materialized_encoder,
+            score_geometry,
         )
         mask = out.mask
         z_sel = out.z_selected
@@ -1420,6 +1442,11 @@ def evaluate_rd(
     current_sequence: int | None = None
     fallback_token_offset = 0
     materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
+    score_geometry = (
+        None
+        if materialized_decoder is None
+        else model._frozen_score_geometry(materialized_decoder)
+    )
     materialized_decoder_matrix = (
         None
         if materialized_decoder is None
@@ -1465,6 +1492,7 @@ def evaluate_rd(
             x,
             materialized_decoder,
             materialized_encoder,
+            score_geometry,
         )
         raw_mask = out.mask
         mask = raw_mask & inc.unsqueeze(0)

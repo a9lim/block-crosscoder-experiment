@@ -1188,6 +1188,12 @@ def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():
         json.loads(json.dumps(blueprint.to_manifest()))
     )
     assert restored_blueprint == blueprint
+    stale_estimator = json.loads(json.dumps(blueprint.to_manifest()))
+    stale_estimator["resource_contract"]["estimator"] = (
+        "dense-linear-memory-v3-q2-c512-t256"
+    )
+    with pytest.raises(StudyError, match="resource contract mismatch"):
+        Phase3Blueprint.from_manifest(stale_estimator)
     with pytest.raises(StudyError, match="requires a frozen Phase-2 panel decision"):
         build_phase3_plan()
     decision = _panel_decision(blueprint)
@@ -1446,7 +1452,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v3"
+        "dense-linear-memory-v4"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1489,6 +1495,7 @@ def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
         "total_dim": 96,
         "operational_decoder_elements": groups * 2 * 96,
         "sites": 3,
+        "selection_score": "decoded_energy",
     }
     one_q = _evaluation_workspace_bytes(quantizer_count=1, **common)
     saturated = _evaluation_workspace_bytes(
@@ -1502,6 +1509,22 @@ def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
     assert one_q > 0
     assert saturated >= one_q
     assert extra_qs == saturated
+    by_score = {
+        score: _evaluation_workspace_bytes(
+            quantizer_count=TRUSTED_DECODE_Q_CHUNK,
+            **{**common, "selection_score": score},
+        )
+        for score in (
+            "code_norm",
+            "decoder_weighted",
+            "decoded_energy",
+            "isolated_loss_decrease",
+        )
+    }
+    base = by_score["code_norm"]
+    assert by_score["decoder_weighted"] - base == groups * 4
+    assert by_score["decoded_energy"] - base == groups * 2**2 * 4
+    assert by_score["isolated_loss_decrease"] - base == 3 * groups * 2**2 * 4
 
 
 def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():

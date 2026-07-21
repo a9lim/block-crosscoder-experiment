@@ -30,7 +30,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v3"
+    "dense-linear-memory-v4"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3736,6 +3736,7 @@ def _evaluation_workspace_bytes(
     operational_decoder_elements: int,
     quantizer_count: int,
     sites: int,
+    selection_score: str,
 ) -> int:
     """Conservative peak for the fixed-shape CUDA evaluation kernels.
 
@@ -3793,7 +3794,15 @@ def _evaluation_workspace_bytes(
         + decoder_gram_bytes
         + accumulator_bytes
     )
-    return max(trusted_decode_bytes, shared_code_bytes)
+    if selection_score == "decoded_energy":
+        score_geometry_bytes = groups * block_width**2 * 4
+    elif selection_score == "isolated_loss_decrease":
+        score_geometry_bytes = sites * groups * block_width**2 * 4
+    elif selection_score == "decoder_weighted":
+        score_geometry_bytes = groups * 4
+    else:
+        score_geometry_bytes = 0
+    return max(trusted_decode_bytes, shared_code_bytes) + score_geometry_bytes
 
 
 def _estimate_components(
@@ -3906,6 +3915,7 @@ def _estimate_components(
         operational_decoder_elements=operational_decoder_elements,
         quantizer_count=len(quantizer_bits),
         sites=len(site_dims),
+        selection_score=str(values["model.selection_score"]),
     )
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0

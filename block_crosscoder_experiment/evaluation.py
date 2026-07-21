@@ -144,6 +144,7 @@ def evaluate_shared_code(
         if cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
+    score_geometry = model._frozen_score_geometry(materialized_decoder)
     # A publication-scale decoder can be several GiB in fp32.  Keeping a
     # complete fp64 copy alive for evaluation can therefore exceed the 24 GiB
     # device even though the Gram products themselves are tiny.  Materialize
@@ -270,6 +271,7 @@ def evaluate_shared_code(
             mode=selection_mode,
             _decoder=materialized_decoder,
             _encoder=materialized_encoder,
+            _score_geometry=score_geometry,
         )
         accumulate_target_statistics(x)
         full_sse += squared_error_by_site(x, full.xhat)
@@ -329,6 +331,7 @@ def evaluate_shared_code(
                     validate_observed=False,
                     _decoder=materialized_decoder,
                     _encoder=materialized_encoder,
+                    _score_geometry=score_geometry,
                 )[0]
             return model.forward_with_materialized(
                 x,
@@ -337,6 +340,7 @@ def evaluate_shared_code(
                 validate_observed=False,
                 _decoder=materialized_decoder,
                 _encoder=materialized_encoder,
+                _score_geometry=score_geometry,
             )[0]
 
         for source in range(S):

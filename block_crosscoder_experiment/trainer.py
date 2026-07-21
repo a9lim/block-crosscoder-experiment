@@ -1053,7 +1053,9 @@ class Trainer:
             with torch.no_grad():
                 for m, f in zip(self.master.parameters(), self.fwd.parameters()):
                     f.copy_(m)
-                self.fwd.theta.copy_(self.master.theta)
+                # theta is a frozen calibration buffer, not optimizer state.
+                # The forward copy is created after checkpoint loading, so a
+                # per-step copy only invalidates its CUDA validation cache.
         if cfg.aux_variant not in {"none", "fel"}:
             self.tracker.update(
                 out.mask,
