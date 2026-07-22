@@ -1700,6 +1700,17 @@ class Trainer:
                 parts["aux"] = l_aux
                 parts["total"] = parts["total"] + alpha * l_aux
 
+        tracker_mask = out.mask if cfg.aux_variant not in {"none", "fel"} else None
+        tracker_coordinate_activity = (
+            (out.z_selected != 0) if cfg.aux_variant == "sasa_release" else None
+        )
+        # The loss graph owns every tensor its backward still needs.  Dropping
+        # the aggregate forward result here releases dead score/preselection
+        # branches before backward instead of retaining them until the end of
+        # the optimizer step.  Decoder/encoder materializations are likewise
+        # retained only when a regularizer or backward formula saved them.
+        del out, decoder, encoder
+
         if self.fwd is self.master:
             self.opt.zero_grad(set_to_none=True)
         parts["total"].backward()
@@ -1830,11 +1841,10 @@ class Trainer:
                 # The forward copy is created after checkpoint loading, so a
                 # per-step copy only invalidates its CUDA validation cache.
         if cfg.aux_variant not in {"none", "fel"}:
+            assert tracker_mask is not None
             self.tracker.update(
-                out.mask,
-                coordinate_activity=(
-                    (out.z_selected != 0) if cfg.aux_variant == "sasa_release" else None
-                ),
+                tracker_mask,
+                coordinate_activity=tracker_coordinate_activity,
             )
         self.accepted_tokens += int(x.shape[0])
 

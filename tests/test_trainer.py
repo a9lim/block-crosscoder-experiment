@@ -2,6 +2,7 @@
 
 import copy
 import math
+import weakref
 from dataclasses import asdict
 
 import pytest
@@ -154,6 +155,43 @@ def test_fp32_step_ordering_loss_falls(device):
     assert history[-1]["rec"] < 0.5 * history[0]["rec"]
     assert all(rec["floor_hits"] == 0 for rec in history)
     assert history[-1]["decoder_constraint_residual_master"] < 1e-4
+
+
+def test_step_releases_dead_forward_branches_before_backward(monkeypatch):
+    trainer = Trainer(BlockCrosscoder(CFG), train_cfg(total_steps=2))
+    original_forward = trainer.fwd.forward_with_materialized
+    original_loss = trainer_module.bsc_loss
+    references: dict[str, weakref.ReferenceType[torch.Tensor]] = {}
+    checked = False
+
+    def observed_forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        output = result[0]
+        references["z"] = weakref.ref(output.z)
+        references["scores"] = weakref.ref(output.scores)
+        references["z_selected"] = weakref.ref(output.z_selected)
+        return result
+
+    def observed_loss(*args, **kwargs):
+        nonlocal checked
+        parts = original_loss(*args, **kwargs)
+
+        def assert_lifetimes(gradient):
+            nonlocal checked
+            assert references["z"]() is None
+            assert references["scores"]() is None
+            # Decode backward still needs the selected code at this point.
+            assert references["z_selected"]() is not None
+            checked = True
+            return gradient
+
+        parts["total"].register_hook(assert_lifetimes)
+        return parts
+
+    monkeypatch.setattr(trainer.fwd, "forward_with_materialized", observed_forward)
+    monkeypatch.setattr(trainer_module, "bsc_loss", observed_loss)
+    trainer.step(torch.randn(16, S, D_MODEL), materialize_record=False)
+    assert checked
 
 
 def test_optimizer_numerics_are_explicitly_frozen():
