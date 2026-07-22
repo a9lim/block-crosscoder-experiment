@@ -1311,9 +1311,10 @@ def _decode_trusted_packet_events_q_chunks(
             raise ValueError("trusted packet amplitude shape is invalid")
     device = next(model.parameters()).device
     G, b = model.cfg.n_blocks, model.cfg.block_dim
-    ids = codec._tensor_on("rank_to_block", device, dtype=torch.long)[
-        events.block_ids.long()
-    ]
+    # This is the encoder's own trusted event stream: ``original_ids`` already
+    # carries the dictionary-space IDs from the selection mask.  Avoid mapping
+    # the compact packet IDs back through ``rank_to_block`` on every decode.
+    ids = events.original_ids
     counts = events.counts
     lo = codec._tensor_on("lo", device)[ids]
     span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
@@ -1328,13 +1329,23 @@ def _decode_trusted_packet_events_q_chunks(
         ids.unsqueeze(1) * b
         + torch.arange(b, dtype=torch.long, device=device).unsqueeze(0)
     ).reshape(-1)
+    max_chunk = min(q_chunk_size, len(requested))
+    all_levels = torch.tensor(
+        [(1 << q) - 1 for q in requested],
+        dtype=torch.float32,
+        device=device,
+    ).view(-1, 1, 1)
+    crow_max = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long, device=device),
+            expanded_counts.repeat(max_chunk).cumsum(dim=0),
+        )
+    )
+    columns_max = event_columns.repeat(max_chunk)
     for start in range(0, len(requested), q_chunk_size):
         chunk_qs = requested[start : start + q_chunk_size]
-        levels = torch.tensor(
-            [(1 << q) - 1 for q in chunk_qs],
-            dtype=torch.float32,
-            device=device,
-        ).view(-1, 1, 1)
+        chunk_len = len(chunk_qs)
+        levels = all_levels[start : start + chunk_len]
         if packets is None:
             assert normalized_codes is not None
             symbols = torch.round(normalized_codes.unsqueeze(0) * levels).to(
@@ -1347,13 +1358,8 @@ def _decode_trusted_packet_events_q_chunks(
             event_rotation,
             z_can,
         )
-        crow = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.long, device=device),
-                expanded_counts.repeat(len(chunk_qs)).cumsum(dim=0),
-            )
-        )
-        columns = event_columns.repeat(len(chunk_qs))
+        crow = crow_max[: chunk_len * events.n_tokens + 1]
+        columns = columns_max[: chunk_len * event_columns.numel()]
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",

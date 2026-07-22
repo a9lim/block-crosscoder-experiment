@@ -745,14 +745,38 @@ def test_all_q_encoding_runs_one_selection_and_matches_packets(
     sparse_calls = 0
     tensor_on = codec._tensor_on
     rotation_lookups = 0
+    rank_to_block_lookups = 0
 
     def counted_tensor_on(name, *args, **kwargs):
-        nonlocal rotation_lookups
+        nonlocal rotation_lookups, rank_to_block_lookups
         if name == "rotation":
             rotation_lookups += 1
+        elif name == "rank_to_block":
+            rank_to_block_lookups += 1
         return tensor_on(name, *args, **kwargs)
 
     monkeypatch.setattr(codec, "_tensor_on", counted_tensor_on)
+    sparse_csr_tensor = torch.sparse_csr_tensor
+    csr_structure_ptrs = []
+    mapped_ids = codec.rank_to_block[events.block_ids.long()]
+    assert torch.equal(events.original_ids, mapped_ids)
+    expected_columns = (
+        mapped_ids.unsqueeze(1) * model.cfg.block_dim
+        + torch.arange(model.cfg.block_dim).unsqueeze(0)
+    ).reshape(-1)
+    expanded_counts = events.counts.long() * model.cfg.block_dim
+
+    def counted_sparse_csr(crow, columns, values, *args, **kwargs):
+        csr_structure_ptrs.append((crow.data_ptr(), columns.data_ptr()))
+        n_q = (crow.numel() - 1) // events.n_tokens
+        expected_crow = torch.cat(
+            (torch.zeros(1, dtype=torch.long), expanded_counts.repeat(n_q).cumsum(0))
+        )
+        assert torch.equal(crow, expected_crow)
+        assert torch.equal(columns, expected_columns.repeat(n_q))
+        return sparse_csr_tensor(crow, columns, values, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "sparse_csr_tensor", counted_sparse_csr)
     trusted = {}
     for chunk in _decode_trusted_packet_events_q_chunks(
         model,
@@ -764,6 +788,9 @@ def test_all_q_encoding_runs_one_selection_and_matches_packets(
         trusted.update(chunk)
     assert sparse_calls == 2
     assert rotation_lookups == 1
+    assert rank_to_block_lookups == 0
+    assert len(set(csr_structure_ptrs)) == 1
+    monkeypatch.setattr(torch, "sparse_csr_tensor", sparse_csr_tensor)
     monkeypatch.setattr(codec, "_tensor_on", tensor_on)
     rows = torch.repeat_interleave(
         torch.arange(events.n_tokens, device=events.counts.device),
