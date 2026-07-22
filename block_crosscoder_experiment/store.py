@@ -1111,10 +1111,11 @@ class StoreReader:
         # factorial's matched-data guarantee: a single-site cell sees exactly
         # the joint run's token stream, sliced. Stored order is preserved;
         # reordering is refused rather than silently permuting frames.
+        self._site_sel: slice | torch.Tensor | None
         if sites is None:
             self.sites = tuple(stored_sites)
             self.site_dims = tuple(int(v) for v in stored_site_dims)
-            self._site_sel: torch.Tensor | None = None
+            self._site_sel = None
         else:
             req = [int(s) for s in sites]
             missing = [s for s in req if s not in stored_sites]
@@ -1130,13 +1131,22 @@ class StoreReader:
                 )
             self.sites = tuple(req)
             self.site_dims = tuple(int(stored_site_dims[i]) for i in idx)
-            self._site_sel = torch.tensor(idx, dtype=torch.long)
+            full_axis = idx == list(range(len(stored_sites)))
+            contiguous = bool(idx) and idx == list(range(idx[0], idx[-1] + 1))
+            if full_axis:
+                self._site_sel = None
+            elif contiguous:
+                self._site_sel = slice(idx[0], idx[-1] + 1)
+            else:
+                self._site_sel = torch.tensor(idx, dtype=torch.long)
         self.n_sites = len(self.sites)
         self.d_model = self.manifest["d_model"]
 
     def _subset(self, acts: torch.Tensor) -> torch.Tensor:
         if self._site_sel is None:
             return acts
+        if isinstance(self._site_sel, slice):
+            return acts[:, self._site_sel]
         return acts.index_select(1, self._site_sel)
 
     def _shard_payload(

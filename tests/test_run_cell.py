@@ -2126,6 +2126,77 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
         _resolve_real_store(values)
 
 
+def test_training_batches_do_not_copy_aligned_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = [
+        torch.full((8, 2, 3), float(index))
+        for index in range(4)
+    ]
+
+    class Reader:
+        def shuffled_batches(self, *args, **kwargs):
+            yield from chunks
+
+    monkeypatch.setattr(run_cell_module, "_store_reader", lambda *args: Reader())
+    values = {
+        "optimizer.batch_tokens": 8,
+        "data.train_tokens": 32,
+        "data.unique_tokens": 32,
+        "random.train_data_seed": 7,
+    }
+    preparation = {"data": {"kind": "activation_store"}}
+    batches = list(
+        _training_batches(
+            SimpleNamespace(values=values),
+            preparation,
+            start_token=0,
+            apply_transform=False,
+        )
+    )
+    assert len(batches) == len(chunks)
+    assert all(
+        batch.untyped_storage().data_ptr() == chunk.untyped_storage().data_ptr()
+        for batch, chunk in zip(batches, chunks)
+    )
+
+    tails = [torch.arange(60).reshape(10, 2, 3).float() + 60 * i for i in range(3)]
+    monkeypatch.setattr(
+        run_cell_module,
+        "_store_reader",
+        lambda *args: type(
+            "TailReader",
+            (),
+            {"shuffled_batches": lambda self, *a, **kw: iter(tails)},
+        )(),
+    )
+    values.update(
+        {
+            "data.train_tokens": 23,
+            "data.unique_tokens": 10,
+        }
+    )
+    full = list(
+        _training_batches(
+            SimpleNamespace(values=values),
+            preparation,
+            start_token=0,
+            apply_transform=False,
+        )
+    )
+    resumed = list(
+        _training_batches(
+            SimpleNamespace(values=values),
+            preparation,
+            start_token=16,
+            apply_transform=False,
+        )
+    )
+    assert [len(batch) for batch in full] == [8, 8, 7]
+    assert [len(batch) for batch in resumed] == [7]
+    assert torch.equal(torch.cat(full)[16:], torch.cat(resumed))
+
+
 def test_released_and_adapted_mechanics_reach_declared_config_branches() -> None:
     base = _cell()
     sasa = RELEASE_DIAGNOSTIC_RECIPES["sasa_released_code_drift"]

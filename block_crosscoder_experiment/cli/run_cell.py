@@ -3429,7 +3429,9 @@ def _training_batches(
         carry = chunk if carry is None else torch.cat((carry, chunk), dim=0)
         if len(carry) < batch_size:
             continue
-        batch, carry = carry[:batch_size], carry[batch_size:]
+        batch = carry[:batch_size]
+        remainder = carry[batch_size:]
+        carry = remainder if len(remainder) else None
         if consumed + len(batch) <= start_token:
             consumed += len(batch)
             continue

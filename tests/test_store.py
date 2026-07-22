@@ -484,6 +484,34 @@ def test_site_subset_view_matches_sliced_full_stream(tmp_path):
     assert pair.verify() == 1000
 
 
+def test_site_subset_avoids_materializing_contiguous_axes(tmp_path):
+    write_store(tmp_path)
+    acts = torch.randn(11, 3, D)
+    storage = acts.untyped_storage().data_ptr()
+
+    explicit_full = StoreReader(tmp_path, "train", sites=[7, 10, 13])
+    full_view = explicit_full._subset(acts)
+    assert full_view is acts
+
+    contiguous = StoreReader(tmp_path, "train", sites=[10, 13])
+    contiguous_view = contiguous._subset(acts)
+    assert torch.equal(contiguous_view, acts[:, 1:3])
+    assert contiguous_view.untyped_storage().data_ptr() == storage
+
+    singleton = StoreReader(tmp_path, "train", sites=[10])
+    singleton_view = singleton._subset(acts)
+    assert torch.equal(singleton_view, acts[:, 1:2])
+    assert singleton_view.untyped_storage().data_ptr() == storage
+
+    noncontiguous = StoreReader(tmp_path, "train", sites=[7, 13])
+    compact = noncontiguous._subset(acts)
+    assert torch.equal(compact, acts[:, [0, 2]])
+    assert compact.untyped_storage().data_ptr() != storage
+
+    empty = StoreReader(tmp_path, "train", sites=[])
+    assert empty._subset(acts).shape == (len(acts), 0, D)
+
+
 def test_site_subset_rejects_bad_requests(tmp_path):
     write_store(tmp_path)
     with pytest.raises(ValueError, match="not in store"):
