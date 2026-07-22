@@ -525,6 +525,79 @@ def _site_axis_factorize(
     return site, core
 
 
+# The smallest Phase-2 selector pool is 2048 optimizer tokens by 2048 blocks,
+# four times this fixed gate. Keep smaller CUDA calls eager so calibration
+# tails, Phase-1 cells, and tests do not pay Inductor compilation churn. The
+# complete existing TopK/comparison/integer tie-finalization interior is
+# compiled without changing the policy or operation order.
+_CUDA_SELECTOR_FUSION_MIN_ELEMENTS = 1 << 20
+
+
+def _eager_batch_topk_interior(
+    scores: torch.Tensor,
+    n_keep: int,
+) -> torch.Tensor:
+    B, G = scores.shape
+    flat = scores.reshape(-1)
+    cutoff = flat.topk(n_keep, sorted=False).values.min()
+    strictly_above = flat > cutoff
+    remaining = n_keep - strictly_above.sum()
+    tied = flat == cutoff
+    # Row-major flattening is the declared candidate index for BatchTopK.
+    tie_rank = tied.to(torch.int32).cumsum(dim=0, dtype=torch.int32)
+    mask = strictly_above | (tied & (tie_rank <= remaining))
+    return mask.view(B, G)
+
+
+def _eager_token_topk_interior(
+    scores: torch.Tensor,
+    n_keep: int,
+) -> torch.Tensor:
+    cutoff = (
+        scores.topk(n_keep, dim=1, sorted=False)
+        .values.min(dim=1, keepdim=True)
+        .values
+    )
+    strictly_above = scores > cutoff
+    remaining = n_keep - strictly_above.sum(dim=1, keepdim=True)
+    tied = scores == cutoff
+    # Within each token, block index is the declared candidate index.
+    tie_rank = tied.to(torch.int32).cumsum(dim=1, dtype=torch.int32)
+    return strictly_above | (tied & (tie_rank <= remaining))
+
+
+@cache
+def _compiled_cuda_batch_topk_interior():
+    return torch.compile(
+        _eager_batch_topk_interior,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=True,
+    )
+
+
+@cache
+def _compiled_cuda_token_topk_interior():
+    return torch.compile(
+        _eager_token_topk_interior,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=True,
+    )
+
+
+def _batch_topk_interior(scores: torch.Tensor, n_keep: int) -> torch.Tensor:
+    if scores.is_cuda and scores.numel() >= _CUDA_SELECTOR_FUSION_MIN_ELEMENTS:
+        return _compiled_cuda_batch_topk_interior()(scores, n_keep)
+    return _eager_batch_topk_interior(scores, n_keep)
+
+
+def _token_topk_interior(scores: torch.Tensor, n_keep: int) -> torch.Tensor:
+    if scores.is_cuda and scores.numel() >= _CUDA_SELECTOR_FUSION_MIN_ELEMENTS:
+        return _compiled_cuda_token_topk_interior()(scores, n_keep)
+    return _eager_token_topk_interior(scores, n_keep)
+
+
 def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     """BatchTopK over blocks: keep the top round(k*B) block-activations
     batch-wide. Fractional k sets the budget below one block per token —
@@ -539,15 +612,7 @@ def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
         return torch.zeros(B, G, dtype=torch.bool, device=scores.device)
     if n_keep == B * G:
         return torch.ones(B, G, dtype=torch.bool, device=scores.device)
-    flat = scores.reshape(-1)
-    cutoff = flat.topk(n_keep, sorted=False).values.min()
-    strictly_above = flat > cutoff
-    remaining = n_keep - strictly_above.sum()
-    tied = flat == cutoff
-    # Row-major flattening is the declared candidate index for BatchTopK.
-    tie_rank = tied.to(torch.int32).cumsum(dim=0, dtype=torch.int32)
-    mask = strictly_above | (tied & (tie_rank <= remaining))
-    return mask.view(B, G)
+    return _batch_topk_interior(scores, n_keep)
 
 
 def token_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
@@ -558,15 +623,7 @@ def token_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
         return torch.zeros(B, G, dtype=torch.bool, device=scores.device)
     if n_keep == G:
         return torch.ones(B, G, dtype=torch.bool, device=scores.device)
-    cutoff = (
-        scores.topk(n_keep, dim=1, sorted=False).values.min(dim=1, keepdim=True).values
-    )
-    strictly_above = scores > cutoff
-    remaining = n_keep - strictly_above.sum(dim=1, keepdim=True)
-    tied = scores == cutoff
-    # Within each token, block index is the declared candidate index.
-    tie_rank = tied.to(torch.int32).cumsum(dim=1, dtype=torch.int32)
-    return strictly_above | (tied & (tie_rank <= remaining))
+    return _token_topk_interior(scores, n_keep)
 
 
 class BlockCrosscoder(nn.Module):

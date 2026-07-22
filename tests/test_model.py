@@ -869,6 +869,126 @@ def test_topk_exact_ties_use_lowest_declared_candidate_index(device):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_compiled_cuda_selectors_match_eager_over_adversarial_surfaces(dtype):
+    device = torch.device("cuda")
+    batch, groups = 512, 2048
+    assert batch * groups == model_module._CUDA_SELECTOR_FUSION_MIN_ELEMENTS
+    generator = torch.Generator(device="cpu").manual_seed(1881)
+    random_scores = torch.randn(batch, groups, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    )
+    repeated_signed = torch.arange(batch * groups, device=device) % 17 - 8
+    repeated_signed = repeated_signed.reshape(batch, groups).to(dtype)
+    nonfinite = random_scores.clone()
+    nonfinite[0, :3] = torch.tensor(
+        (float("nan"), float("inf"), float("-inf")),
+        device=device,
+        dtype=dtype,
+    )
+    noncontiguous = torch.randn(groups, batch, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    ).transpose(0, 1)
+    assert not noncontiguous.is_contiguous()
+    patterns = {
+        "random": random_scores,
+        "all_equal": torch.ones_like(random_scores),
+        "repeated_signed": repeated_signed,
+        "nonfinite": nonfinite,
+        "noncontiguous": noncontiguous,
+    }
+
+    for name, scores in patterns.items():
+        for k in (7, 7.4):
+            n_keep = min(max(round(k), 0), groups)
+            expected = model_module._eager_token_topk_interior(scores, n_keep)
+            actual = token_topk_mask(scores, k)
+            assert torch.equal(actual, expected), (name, k)
+        for k in (3.0, 0.5):
+            n_keep = min(round(k * batch), batch * groups)
+            expected = model_module._eager_batch_topk_interior(scores, n_keep)
+            actual = batch_topk_mask(scores, k)
+            assert torch.equal(actual, expected), (name, k)
+
+    # Bind the secondary ordering independently of the eager implementation.
+    tied = patterns["all_equal"]
+    token_mask = token_topk_mask(tied, 7)
+    assert token_mask[:, :7].all() and not token_mask[:, 7:].any()
+    batch_mask = batch_topk_mask(tied, 0.5).reshape(-1)
+    assert batch_mask[: batch // 2].all() and not batch_mask[batch // 2 :].any()
+
+    # Torch 2.8 specializes Python integer arguments under static compilation
+    # and refuses after eight graph variants. Bind enough distinct budgets to
+    # prove the dynamic n_keep graph remains exact beyond that failure mode.
+    for n_keep in range(1, 37):
+        assert torch.equal(
+            token_topk_mask(random_scores, n_keep),
+            model_module._eager_token_topk_interior(random_scores, n_keep),
+        )
+        batch_k = n_keep / batch
+        assert round(batch_k * batch) == n_keep
+        assert torch.equal(
+            batch_topk_mask(random_scores, batch_k),
+            model_module._eager_batch_topk_interior(random_scores, n_keep),
+        )
+
+
+def test_cuda_selector_compile_wrappers_are_lazy_cached_and_boundary_gated(
+    device, monkeypatch
+):
+    compile_calls: list[tuple[str, dict[str, object]]] = []
+    compiled_calls = {"batch": 0, "token": 0}
+
+    def fake_compile(function, **options):
+        name = "batch" if "batch" in function.__name__ else "token"
+        compile_calls.append((name, options))
+
+        def compiled(*args):
+            compiled_calls[name] += 1
+            return function(*args)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model_module._compiled_cuda_batch_topk_interior.cache_clear()
+    model_module._compiled_cuda_token_topk_interior.cache_clear()
+    try:
+        batch, groups = 512, 2048
+        large = torch.arange(batch * groups, device=device).reshape(batch, groups)
+        large = large.to(torch.float32)
+        for _ in range(2):
+            token_topk_mask(large, 7)
+            batch_topk_mask(large, 3.0)
+
+        # Small tensors and public zero/all boundary cases never enter either
+        # compiled interior.
+        small = large[:16, :16]
+        token_topk_mask(small, 3)
+        batch_topk_mask(small, 3.0)
+        token_topk_mask(large, 0)
+        token_topk_mask(large, groups)
+        batch_topk_mask(large, 0)
+        batch_topk_mask(large, groups)
+
+        if device.type == "cuda":
+            options = {
+                "backend": "inductor",
+                "fullgraph": True,
+                "dynamic": True,
+            }
+            assert compile_calls == [("token", options), ("batch", options)]
+            assert compiled_calls == {"batch": 2, "token": 2}
+        else:
+            assert compile_calls == []
+            assert compiled_calls == {"batch": 0, "token": 0}
+    finally:
+        model_module._compiled_cuda_batch_topk_interior.cache_clear()
+        model_module._compiled_cuda_token_topk_interior.cache_clear()
+
+
 def test_selector_tie_policy_is_content_bound():
     assert CFG.selector_tie_break == "lowest_flat_index_at_cutoff"
     with pytest.raises(ValueError, match="selector_tie_break"):

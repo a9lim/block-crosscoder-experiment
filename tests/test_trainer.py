@@ -1027,6 +1027,86 @@ def test_compiled_quadratic_trainer_state_and_resume_match_eager_exactly(
     assert resumed.data_cursor == eager.data_cursor
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+@pytest.mark.parametrize("selector", ("token_topk", "batch_topk"))
+def test_compiled_selector_trainer_state_and_resume_match_eager_exactly(
+    tmp_path, monkeypatch, selector
+):
+    device = torch.device("cuda")
+    batch, groups, n_sites, d_model = 512, 2048, 2, 16
+    assert batch * groups == model_module._CUDA_SELECTOR_FUSION_MIN_ELEMENTS
+    cfg = BSCConfig(
+        n_blocks=groups,
+        block_dim=1,
+        n_sites=n_sites,
+        d_model=d_model,
+        k=8,
+        seed=1811,
+        selection=selector,
+        decoder_constraint="free",
+        reconstruction_loss="mean_squared",
+    )
+    training = train_cfg(
+        total_steps=4,
+        forward_dtype="bf16",
+        warmup_steps=1,
+        log_every=1,
+        retract_every=100,
+    )
+    generator = torch.Generator(device="cpu").manual_seed(1812)
+    batches = [
+        torch.randn(batch, n_sites, d_model, generator=generator).to(device)
+        for _ in range(training.total_steps)
+    ]
+    interior_name = f"_{selector.removesuffix('_topk')}_topk_interior"
+    eager_name = f"_eager_{selector.removesuffix('_topk')}_topk_interior"
+    compiled_name = (
+        f"_compiled_cuda_{selector.removesuffix('_topk')}_topk_interior"
+    )
+
+    with monkeypatch.context() as eager_patch:
+        eager_patch.setattr(
+            model_module,
+            interior_name,
+            getattr(model_module, eager_name),
+        )
+        eager = Trainer(BlockCrosscoder(cfg).to(device), training)
+        eager_records = [eager.step(batch_tensor) for batch_tensor in batches]
+
+    compiled_getter = getattr(model_module, compiled_name)
+    compiled_getter.cache_clear()
+    compiled_kernel = compiled_getter()
+    compiled_calls = 0
+
+    def counted_compiled(scores: torch.Tensor, n_keep: int) -> torch.Tensor:
+        nonlocal compiled_calls
+        compiled_calls += 1
+        return compiled_kernel(scores, n_keep)
+
+    monkeypatch.setattr(model_module, compiled_name, lambda: counted_compiled)
+    compiled = Trainer(BlockCrosscoder(cfg).to(device), training)
+    compiled_records = [compiled.step(batch_tensor) for batch_tensor in batches[:2]]
+    checkpoint = tmp_path / f"compiled-{selector}.pt"
+    compiled.save_checkpoint(checkpoint)
+    resumed = Trainer.load_checkpoint(checkpoint, device=device)
+    compiled_records.extend(
+        resumed.step(batch_tensor) for batch_tensor in batches[2:]
+    )
+
+    assert compiled_calls == training.total_steps
+    _assert_nested_exact(compiled_records, eager_records)
+    _assert_nested_exact(resumed.master.state_dict(), eager.master.state_dict())
+    _assert_nested_exact(resumed.fwd.state_dict(), eager.fwd.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), eager.opt.state_dict())
+    _assert_nested_exact(resumed.sched.state_dict(), eager.sched.state_dict())
+    _assert_nested_exact(resumed.tracker.state_dict(), eager.tracker.state_dict())
+    _assert_nested_exact(resumed.history, eager.history)
+    _assert_nested_exact(resumed._prev_shares, eager._prev_shares)
+    assert resumed.step_idx == eager.step_idx
+    assert resumed.accepted_tokens == eager.accepted_tokens
+    assert resumed.data_cursor == eager.data_cursor
+
+
 def test_clean_target_site_mask_zero_probability_is_exact_rng_identity():
     trainer = Trainer(
         BlockCrosscoder(CFG),
