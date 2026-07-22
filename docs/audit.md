@@ -70,6 +70,12 @@ exit is not evidence by itself.
   Adam/AdamW, QR/polar, trajectory-drift, support, and allocation gates use the
   fixed measurements and bounds in `design.md`; the planner takes no fused
   memory credit.
+- Bf16 forward-copy gradients are released immediately after transfer to fp32
+  masters. A previously used parameter missing from the next graph receives an
+  explicit zero master gradient, preserving Adam moment and weight-decay
+  semantics. Tests require no retained forward gradients, the missing-gradient
+  zero update, exact resume, and the bitwise trajectory/RTX 4090 gates in
+  `design.md`; the planner takes no memory credit.
 - The multi-quantizer CUDA codec rotation uses broadcast row-vector matmul only
   for block widths of at least two. Its 65,536-event standardized fixtures pass
   the fixed maximum-absolute and relative-L2 drift bounds in `design.md` for

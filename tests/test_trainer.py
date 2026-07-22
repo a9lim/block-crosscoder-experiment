@@ -247,6 +247,29 @@ def test_bf16_forward_copy_stays_in_sync(device):
     assert trainer.history[-1]["rec"] < 0.7 * trainer.history[0]["rec"]
 
 
+def test_bf16_forward_gradients_are_released_without_skipping_zero_updates(device):
+    cfg = BSCConfig(**{**CFG.__dict__, "encoder_bias": True})
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=3, forward_dtype="bf16", optimizer="adamw"),
+    )
+    batches = planted_batches(device, n_batches=2, seed=210)
+    trainer.step(batches[0], materialize_record=False)
+    assert all(parameter.grad is None for parameter in trainer.fwd.parameters())
+    assert trainer.master.a is not None and trainer.fwd.a is not None
+    first_step = trainer.opt.state[trainer.master.a]["step"].detach().clone()
+
+    # Simulate a parameter used by an earlier graph becoming absent from the
+    # next one. The historical retained buffer supplied an explicit zero to
+    # Adam, so releasing bf16 gradients must preserve that update semantics.
+    trainer.fwd.a.requires_grad_(False)
+    trainer.step(batches[1], materialize_record=False)
+    assert trainer.master.a.grad is not None
+    assert torch.count_nonzero(trainer.master.a.grad) == 0
+    assert trainer.opt.state[trainer.master.a]["step"] == first_step + 1
+    assert all(parameter.grad is None for parameter in trainer.fwd.parameters())
+
+
 def test_bf16_threshold_cache_survives_steps_and_revalidates_resume(
     device,
     tmp_path,

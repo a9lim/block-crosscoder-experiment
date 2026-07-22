@@ -980,6 +980,18 @@ improve from `15.986` to `13.887 ms` (`13.12%`); QR peak allocation falls by
 trajectory changes are authorized before the first experiment run. The
 resource planner remains conservative and grants no fused-kernel memory credit.
 
+For bf16 training, each leaf gradient is copied into its persistent fp32 master
+buffer and immediately released. If a parameter used by an earlier graph is
+absent from a later graph, the master buffer is explicitly zeroed so Adam
+moment advancement and decoupled weight decay remain identical to the former
+retained-gradient behavior. On jobe at the rank-one Phase-2 shape this reduces
+median step time from `4.168` to `4.029 ms` (`3.32%`) and p95 from `4.187` to
+`4.043 ms`; rank four falls from `13.280` to `12.823 ms` (`3.44%`). Inter-step
+allocated memory falls `24.0 MiB` and `96.0 MiB`, respectively, while absolute
+step peak falls `12.0 MiB` and `48.0 MiB`. Twenty-four-step model, optimizer,
+support, and loss hashes remain bitwise identical at ranks one and four. The
+planner retains its larger pre-optimization gradient allowance.
+
 Decoder retraction has a separate serialized implementation identity. Canonical
 QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar cells derive
 `symmetric_polar_eigh_floor_v1`, and other decoder carriers derive

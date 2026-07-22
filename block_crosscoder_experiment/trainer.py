@@ -1702,23 +1702,24 @@ class Trainer:
 
         if self.fwd is self.master:
             self.opt.zero_grad(set_to_none=True)
-        else:
-            # Retain the bf16 leaf-gradient allocations across steps.  The
-            # fp32 master gradients below are likewise overwritten, so no
-            # master zero-fill is needed before the copy.
-            for p in self.fwd.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
         parts["total"].backward()
 
         if self.fwd is not self.master:
             for m, f in zip(self.master.parameters(), self.fwd.parameters()):
                 if f.grad is None:
-                    m.grad = None
+                    # Retained bf16 gradients historically became explicit
+                    # zeros when a previously used parameter was absent from a
+                    # later graph. Preserve its Adam/moment/weight-decay step.
+                    if m.grad is not None:
+                        m.grad.zero_()
                     continue
                 if m.grad is None:
                     m.grad = torch.empty_like(m)
                 m.grad.copy_(f.grad.detach())
+                # The fp32 master now owns the gradient. Releasing the bf16
+                # leaf allocation avoids zero-filling and retaining a second
+                # full gradient set between backward passes.
+                f.grad = None
         parameters = [p for p in self.master.parameters() if p.grad is not None]
         gradients = [p.grad for p in parameters]
         if not gradients:
