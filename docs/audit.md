@@ -162,6 +162,15 @@ exit is not evidence by itself.
   length equals its explicit manifest count.
 - Every shard and split manifest binds content, row stream, source, transform,
   ordered sites, dimensions, dtype, count, and shard index.
+- The one-deep shard writer owns no more than one detached pending payload plus
+  one producer staging payload; the exact padded bf16 activation and int64 row-ID
+  residency estimate passes its pre-output refusal gate.
+- The persistence worker audits finite values and zero rows before writing any
+  bytes, mutates no live writer state, and a synchronization failure poisons the
+  writer while `close`/`abort` still joins its executor.
+- Capture progress advances only from the post-manifest-fsync durable callback;
+  crash/resume accepts at most one verified next-shard orphan and reproduces
+  uninterrupted row order and stream hashes.
 - Physical schema v3 is named `activation-store-v3-derived-views` in Phase 2
   and `activation-store-v3-single-view` in Phase 3 across cells, capture CLI,
   source manifests, and documentation; stale v2 aliases are refused.

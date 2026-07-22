@@ -15,6 +15,7 @@ from block_crosscoder_experiment.cli.data import (
     capture,
     derive_views,
     estimate_store_bytes,
+    estimate_writer_residency_bytes,
     fit_transform_artifacts,
     load_pinned_tokenizer,
     parse_capture_split_sizes,
@@ -224,6 +225,16 @@ def test_split_parser_and_estimate():
         ["normalization_fit=2", "calibration=3", "eval=5", "train=7"]
     )
     assert estimate_store_bytes(splits, (4, 6), n_views=2) == 17 * 44 * 2
+    writer = estimate_writer_residency_bytes(
+        (4, 6), tokens_per_shard=10, row_id_width=3
+    )
+    assert writer == {
+        "bytes_per_token": 48,
+        "shard_payload_bytes": 480,
+        "pending_shard_bytes": 480,
+        "staging_shard_bytes": 480,
+        "writer_residency_bytes": 960,
+    }
     with pytest.raises(ValueError):
         parse_split_sizes(["train=2"])
     with pytest.raises(ValueError, match="explicitly"):
@@ -469,8 +480,7 @@ def _mock_capture_runtime(monkeypatch):
         ):
             assert return_type is None
             expected_layers = [
-                int(item["hook"].split(".")[1])
-                for item in expected_source["sources"]
+                int(item["hook"].split(".")[1]) for item in expected_source["sources"]
             ]
             assert stop_at_layer == max(expected_layers) + 1
             cache = {}
@@ -630,6 +640,42 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
             right_acts, right_ids = right._shard_payload(shard, verify=True)
             assert torch.equal(left_acts, right_acts)
             assert torch.equal(left_ids, right_ids)
+
+
+def test_capture_refuses_writer_residency_before_creating_output(tmp_path, monkeypatch):
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+    out = tmp_path / "refused"
+    args = make_args(out)
+    args.max_writer_residency_bytes = 1
+    with pytest.raises(ValueError, match="writer residency.*required=.*limit=1"):
+        capture(args)
+    assert not out.exists()
+
+
+def test_capture_streams_slices_without_torch_cat(tmp_path, monkeypatch):
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+
+    def forbidden_cat(*args, **kwargs):
+        raise AssertionError("capture assembled transient concatenation")
+
+    monkeypatch.setattr(torch, "cat", forbidden_cat)
+    manifest = capture(make_args(tmp_path / "direct-slices"))
+    assert manifest["split_order"][-1] == "train"
+
+
+def test_derive_refuses_writer_residency_before_creating_output(tmp_path):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    out = tmp_path / "refused-views"
+    with pytest.raises(ValueError, match="writer residency.*required=.*limit=1"):
+        derive_views(
+            raw,
+            out,
+            ("none",),
+            batch_size=13,
+            max_writer_residency_bytes=1,
+        )
+    assert not out.exists()
 
 
 def test_capture_resume_adopts_first_shard_rename_before_first_manifest(

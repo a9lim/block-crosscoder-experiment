@@ -53,6 +53,7 @@ TOKENIZER_PREFLIGHTS = {
 }
 CAPTURE_STATE_NAME = "capture.state.json"
 CAPTURE_MANIFEST_NAME = "capture.json"
+DEFAULT_MAX_WRITER_RESIDENCY_BYTES = 8 * 1024**3
 CAPTURE_PROFILE_SPLITS = {
     "phase2": (
         "normalization_fit",
@@ -336,6 +337,51 @@ def estimate_store_bytes(
     return sum(split_sizes.values()) * per_token * n_views
 
 
+def estimate_writer_residency_bytes(
+    site_dims: Iterable[int],
+    *,
+    tokens_per_shard: int = 150_000,
+    row_id_width: int = 3,
+) -> dict[str, int]:
+    """Return the exact one-deep writer payload and peak residency bounds.
+
+    Stores are physically padded to ``max(site_dims)``.  The async contract
+    owns at most one detached shard while the producer fills one staging
+    shard, so the refusal bound is exactly two full physical payloads.
+    """
+
+    dimensions = tuple(int(width) for width in site_dims)
+    if not dimensions or any(width <= 0 for width in dimensions):
+        raise ValueError("site dimensions must be nonempty and positive")
+    if tokens_per_shard <= 0:
+        raise ValueError("tokens_per_shard must be positive")
+    if row_id_width <= 0:
+        raise ValueError("row_id_width must be positive")
+    per_token = 2 * len(dimensions) * max(dimensions) + 8 * row_id_width
+    shard_payload = tokens_per_shard * per_token
+    return {
+        "bytes_per_token": per_token,
+        "shard_payload_bytes": shard_payload,
+        "pending_shard_bytes": shard_payload,
+        "staging_shard_bytes": shard_payload,
+        "writer_residency_bytes": 2 * shard_payload,
+    }
+
+
+def _enforce_writer_residency(
+    estimate: dict[str, int], *, max_writer_residency_bytes: int
+) -> None:
+    if max_writer_residency_bytes <= 0:
+        raise ValueError("max_writer_residency_bytes must be positive")
+    required = estimate["writer_residency_bytes"]
+    if required > max_writer_residency_bytes:
+        raise ValueError(
+            "one-deep shard writer residency exceeds the configured refusal "
+            f"limit: required={required} bytes, "
+            f"limit={max_writer_residency_bytes} bytes"
+        )
+
+
 def whole_sequence_split_plan(
     split_sizes: dict[str, int], tokens_per_sequence: int
 ) -> dict[str, dict[str, int]]:
@@ -408,6 +454,8 @@ def derive_views(
     modes: Iterable[str],
     *,
     batch_size: int = 4096,
+    tokens_per_shard: int = 150_000,
+    max_writer_residency_bytes: int = DEFAULT_MAX_WRITER_RESIDENCY_BYTES,
 ) -> dict[str, dict]:
     """Fit transforms once and derive byte-aligned views from a raw store."""
     modes = tuple(modes)
@@ -433,6 +481,15 @@ def derive_views(
     fit_reader.verify()
     if fit_reader.whitener_hash != f"raw:{source_hash}":
         raise ValueError("normalization-fit split is not bound to capture source")
+    writer_residency = estimate_writer_residency_bytes(
+        fit_reader.site_dims,
+        tokens_per_shard=tokens_per_shard,
+        row_id_width=int(fit_reader.manifest["row_id_width"]),
+    )
+    _enforce_writer_residency(
+        writer_residency,
+        max_writer_residency_bytes=max_writer_residency_bytes,
+    )
     fit_tokens = _normalization_fit_requested_tokens(capture, fit_reader)
     accumulator = WhitenerAccumulator(
         fit_reader.n_sites,
@@ -504,6 +561,11 @@ def derive_views(
                 "source_split_manifest_sha256": reader.manifest["manifest_sha256"],
                 "row_stream_sha256": reader.manifest["row_stream_sha256"],
                 "normalization": mode,
+                "writer_pipeline": {
+                    "contract": "one_pending_shard_v1",
+                    **writer_residency,
+                    "max_writer_residency_bytes": max_writer_residency_bytes,
+                },
             }
             writer = ShardWriter(
                 view_root,
@@ -512,10 +574,21 @@ def derive_views(
                 sites=reader.sites,
                 d_model=reader.d_model,
                 meta=meta,
+                tokens_per_shard=tokens_per_shard,
             )
-            for x, row_ids in reader.sequential_batches_with_ids(batch_size):
-                writer.add(transform.apply(x), row_ids)
-            manifest = writer.close()
+            try:
+                for x, row_ids in reader.sequential_batches_with_ids(batch_size):
+                    writer.add(transform.apply(x), row_ids)
+                manifest = writer.close()
+            except BaseException as producer_error:  # noqa: BLE001
+                try:
+                    writer.abort()
+                except BaseException as drain_error:  # noqa: BLE001
+                    raise BaseExceptionGroup(
+                        "derived-view production and shard persistence both failed",
+                        [producer_error, drain_error],
+                    ) from None
+                raise
             if manifest["row_stream_sha256"] != reader.manifest["row_stream_sha256"]:
                 raise RuntimeError("derived view changed row identity")
             StoreReader(
@@ -524,6 +597,11 @@ def derive_views(
             view_splits[split] = manifest
         results[mode] = {
             "whitener_hash": transform.hash,
+            "writer_pipeline": {
+                "contract": "one_pending_shard_v1",
+                **writer_residency,
+                "max_writer_residency_bytes": max_writer_residency_bytes,
+            },
             "splits": view_splits,
         }
     return results
@@ -783,6 +861,22 @@ def capture(
     if d_model <= 0:
         raise ValueError("model d_model must be positive")
     site_dims = [d_model] * len(hooks)
+    max_writer_residency_bytes = int(
+        getattr(
+            args,
+            "max_writer_residency_bytes",
+            DEFAULT_MAX_WRITER_RESIDENCY_BYTES,
+        )
+    )
+    writer_residency = estimate_writer_residency_bytes(
+        site_dims,
+        tokens_per_shard=args.tokens_per_shard,
+        row_id_width=3,
+    )
+    _enforce_writer_residency(
+        writer_residency,
+        max_writer_residency_bytes=max_writer_residency_bytes,
+    )
 
     corpus_info = hf.dataset_info(args.corpus, revision=args.corpus_revision)
     corpus_revision = _immutable_revision(
@@ -847,6 +941,11 @@ def capture(
         "batch_rows": args.batch_rows,
         "write_batch_tokens": args.write_batch_tokens,
         "tokens_per_shard": args.tokens_per_shard,
+        "writer_pipeline": {
+            "contract": "one_pending_shard_v1",
+            **writer_residency,
+            "max_writer_residency_bytes": max_writer_residency_bytes,
+        },
     }
     binding_sha256 = _canonical_hash(binding)
     state_path = args.out / CAPTURE_STATE_NAME
@@ -907,7 +1006,11 @@ def capture(
             "ordered_split_allocation": split_order,
         }
 
-    def resume_split_writer(split: str) -> ShardWriter:
+    def resume_split_writer(
+        split: str,
+        *,
+        on_durable_shard: Callable[[int], None] | None = None,
+    ) -> ShardWriter:
         """Recover only the exact durable tail permitted by ShardWriter."""
 
         return ShardWriter(
@@ -919,6 +1022,7 @@ def capture(
             meta=split_meta(split),
             tokens_per_shard=args.tokens_per_shard,
             resume=True,
+            on_durable_shard=on_durable_shard,
         )
 
     def verified_reader(split: str, *, allow_incomplete: bool = False) -> StoreReader:
@@ -1143,10 +1247,10 @@ def capture(
     pending_x: torch.Tensor | None = None
     pending_ids: torch.Tensor | None = None
 
-    def take(n_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def take_slices(n_tokens: int) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Yield exact stream slices without concatenating a transient batch."""
+
         nonlocal pending_x, pending_ids
-        chunks_x: list[torch.Tensor] = []
-        chunks_ids: list[torch.Tensor] = []
         remaining = n_tokens
         while remaining:
             if pending_x is None or not pending_x.shape[0]:
@@ -1158,11 +1262,9 @@ def capture(
                     ) from exc
             assert pending_ids is not None
             count = min(remaining, pending_x.shape[0])
-            chunks_x.append(pending_x[:count])
-            chunks_ids.append(pending_ids[:count])
+            yield pending_x[:count], pending_ids[:count]
             pending_x, pending_ids = pending_x[count:], pending_ids[count:]
             remaining -= count
-        return torch.cat(chunks_x), torch.cat(chunks_ids)
 
     capture_splits: dict[str, dict[str, object]] = dict(complete_splits)
     for split in split_order:
@@ -1172,8 +1274,18 @@ def capture(
             continue
         split_dir = args.out / split
         resume_split = (split_dir / "split.json").is_file()
+
+        def durable_progress(after: int, *, active_split: str = split) -> None:
+            # ShardWriter invokes this only after the incomplete split
+            # manifest and its directory entry are durable.  This callback is
+            # therefore the single deterministic capture-progress edge.
+            state["progress"][active_split] = after
+            _atomic_json(state_path, state)
+            if failure_injector is not None:
+                failure_injector(active_split, after)
+
         writer = (
-            resume_split_writer(split)
+            resume_split_writer(split, on_durable_shard=durable_progress)
             if resume_split
             else ShardWriter(
                 args.out,
@@ -1183,6 +1295,7 @@ def capture(
                 d_model=d_model,
                 meta=split_meta(split),
                 tokens_per_shard=args.tokens_per_shard,
+                on_durable_shard=durable_progress,
             )
         )
         if writer.persisted_tokens != persisted:
@@ -1190,19 +1303,22 @@ def capture(
                 f"split {split!r} resume cursor changed after verification"
             )
         remaining = n_tokens - persisted
-        while remaining:
-            count = min(remaining, args.write_batch_tokens)
-            x, row_ids = take(count)
-            before = writer.persisted_tokens
-            writer.add(x, row_ids)
-            remaining -= count
-            after = writer.persisted_tokens
-            if after != before:
-                state["progress"][split] = after
-                _atomic_json(state_path, state)
-                if failure_injector is not None:
-                    failure_injector(split, after)
-        manifest = writer.close()
+        try:
+            while remaining:
+                count = min(remaining, args.write_batch_tokens)
+                for x, row_ids in take_slices(count):
+                    writer.add(x, row_ids)
+                remaining -= count
+            manifest = writer.close()
+        except BaseException as producer_error:  # noqa: BLE001
+            try:
+                writer.abort()
+            except BaseException as drain_error:  # noqa: BLE001
+                raise BaseExceptionGroup(
+                    "capture production and shard persistence both failed",
+                    [producer_error, drain_error],
+                ) from None
+            raise
         reader = verified_reader(split)
         verify_sequence_identity(split, reader)
         state["progress"][split] = manifest["n_tokens"]
@@ -1287,6 +1403,12 @@ def main(argv: Iterable[str] | None = None) -> None:
     cap.add_argument("--write-batch-tokens", type=int, default=65_536)
     cap.add_argument("--tokens-per-shard", type=int, default=150_000)
     cap.add_argument(
+        "--max-writer-residency-bytes",
+        type=int,
+        default=DEFAULT_MAX_WRITER_RESIDENCY_BYTES,
+        help="refuse capture if staging plus one pending shard exceeds this bound",
+    )
+    cap.add_argument(
         "--profile",
         choices=tuple(CAPTURE_PROFILE_SPLITS),
         required=True,
@@ -1308,6 +1430,13 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--mode", action="append", choices=NORMALIZATION_MODES, required=True
     )
     derive.add_argument("--batch-size", type=int, default=4096)
+    derive.add_argument("--tokens-per-shard", type=int, default=150_000)
+    derive.add_argument(
+        "--max-writer-residency-bytes",
+        type=int,
+        default=DEFAULT_MAX_WRITER_RESIDENCY_BYTES,
+        help="refuse derivation if staging plus one pending shard exceeds this bound",
+    )
 
     fit_transform = sub.add_parser("fit-transform")
     fit_transform.add_argument("--raw", type=Path, required=True)
@@ -1324,13 +1453,20 @@ def main(argv: Iterable[str] | None = None) -> None:
     estimate.add_argument("--split", action="append", required=True)
     estimate.add_argument("--site-dim", action="append", type=int, required=True)
     estimate.add_argument("--views", type=int, default=1)
+    estimate.add_argument("--tokens-per-shard", type=int, default=150_000)
+    estimate.add_argument("--row-id-width", type=int, default=3)
 
     args = parser.parse_args(argv)
     if args.command == "capture":
         capture(args)
     elif args.command == "derive":
         payload = derive_views(
-            args.raw, args.out, args.mode, batch_size=args.batch_size
+            args.raw,
+            args.out,
+            args.mode,
+            batch_size=args.batch_size,
+            tokens_per_shard=args.tokens_per_shard,
+            max_writer_residency_bytes=args.max_writer_residency_bytes,
         )
         print(json.dumps(payload, indent=2))
     elif args.command == "fit-transform":
@@ -1352,7 +1488,21 @@ def main(argv: Iterable[str] | None = None) -> None:
     else:
         split_sizes = parse_split_sizes(args.split)
         nbytes = estimate_store_bytes(split_sizes, args.site_dim, n_views=args.views)
-        print(json.dumps({"bytes": nbytes, "gib": nbytes / 2**30}, indent=2))
+        writer_residency = estimate_writer_residency_bytes(
+            args.site_dim,
+            tokens_per_shard=args.tokens_per_shard,
+            row_id_width=args.row_id_width,
+        )
+        print(
+            json.dumps(
+                {
+                    "bytes": nbytes,
+                    "gib": nbytes / 2**30,
+                    "writer": writer_residency,
+                },
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":

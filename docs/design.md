@@ -407,6 +407,20 @@ Physical store schema v3 requires `int64` row identities in the manifest,
 every shard record, metadata header, and tensor payload. It records an
 incomplete self-hashed manifest after each durable shard; resume reconstructs
 the prefix only from reverified shards and refuses any changed binding.
+Shard persistence is a fixed one-deep pipeline: the producer may fill one CPU
+staging shard while one detached shard is owned by a single persistence worker.
+Before any bytes are written, that worker's first operation performs the
+finite/zero-row integrity audit; detection may therefore be delayed until the
+next submit or explicit synchronization barrier, but invalid payloads are never
+published. The worker returns immutable shard evidence and never mutates live
+writer state. The producer alone installs ordered-stream hashes, atomically
+writes and directory-fsyncs the incomplete manifest, then advances capture
+progress through its durable-progress callback. A crash can consequently leave
+at most the one exact next canonical shard orphan already admitted by verified
+resume. Capture and materialized-view derivation refuse before output creation
+when two physical shard payloads (bf16 padded activations plus int64 row IDs)
+exceed the configured writer-residency ceiling; shard geometry and that exact
+estimate are bound into capture state.
 The content-bound Phase-2 name is
 `activation-store-v3-derived-views`; Phase 3 uses the distinct
 `activation-store-v3-single-view` contract. No v2 alias is accepted.

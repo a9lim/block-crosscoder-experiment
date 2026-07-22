@@ -29,9 +29,10 @@ import json
 import math
 import os
 import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import torch
 
@@ -80,6 +81,119 @@ def _fsync_directory(path: Path) -> None:
 def _tensor_byte_view(tensor: torch.Tensor) -> memoryview:
     """Zero-copy byte view for hashing a contiguous CPU tensor."""
     return memoryview(tensor.contiguous().view(torch.uint8).numpy())
+
+
+@dataclass(frozen=True, slots=True)
+class _ShardWriteContract:
+    """Immutable inputs shared with the one-deep persistence worker."""
+
+    directory: Path
+    split: str
+    whitener_hash: str
+    sites: tuple[int, ...]
+    d_model: int
+    meta_json: str
+    free_space_floor_frac: float
+    max_zero_row_frac: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ShardWriteResult:
+    """Immutable durable-file evidence returned by the worker."""
+
+    file: str
+    index: int
+    n_tokens: int
+    content_sha256: str
+    row_ids_sha256: str
+    row_id_width: int
+
+
+@dataclass(slots=True)
+class _PendingShardWrite:
+    """One worker future and its private candidate ordered-stream states."""
+
+    future: Future[_ShardWriteResult]
+    content_stream_hasher: Any
+    row_stream_hasher: Any
+
+
+def _persist_shard(
+    contract: _ShardWriteContract,
+    index: int,
+    acts: torch.Tensor,
+    row_ids: torch.Tensor,
+    content_stream_hasher: Any,
+    row_stream_hasher: Any,
+) -> _ShardWriteResult:
+    """Audit and durably publish one detached shard without writer mutation."""
+
+    # This is deliberately the worker's first operation. Bad tensors may be
+    # detected one producer batch later, but they can never reach a published
+    # path or an ordered-stream digest installed by the live writer.
+    if not bool(torch.isfinite(acts).all()):
+        raise ValueError("non-finite activations reached the shard writer")
+    zero_rows = (~(acts != 0).any(dim=(1, 2))).float().mean()
+    if float(zero_rows) > contract.max_zero_row_frac:
+        raise ValueError(
+            f"zero-row fraction {float(zero_rows):.2e} exceeds "
+            f"{contract.max_zero_row_frac:.0e} — suspect the capture path"
+        )
+
+    from safetensors.torch import save_file
+
+    nbytes = (
+        acts.numel() * acts.element_size() + row_ids.numel() * row_ids.element_size()
+    )
+    usage = shutil.disk_usage(contract.directory)
+    if usage.free - nbytes < contract.free_space_floor_frac * usage.total:
+        raise RuntimeError(
+            f"write would breach the {contract.free_space_floor_frac:.0%} "
+            f"free-space floor ({usage.free / 1e9:.1f} GB free, "
+            f"shard {nbytes / 1e9:.2f} GB)"
+        )
+
+    content_bytes = _tensor_byte_view(acts)
+    row_bytes = _tensor_byte_view(row_ids)
+    checksum = hashlib.sha256(content_bytes).hexdigest()
+    row_checksum = hashlib.sha256(row_bytes).hexdigest()
+    # Candidate states belong exclusively to this worker. They are installed
+    # by the producer only after both the shard and its directory entry are
+    # durable; on any failure the candidates are simply discarded.
+    content_stream_hasher.update(content_bytes)
+    row_stream_hasher.update(row_bytes)
+    header = {
+        "whitener_hash": contract.whitener_hash,
+        "split": contract.split,
+        "shard_index": str(index),
+        "n_tokens": str(acts.shape[0]),
+        "sites": json.dumps(list(contract.sites)),
+        "d_model": str(contract.d_model),
+        "dtype": "bfloat16",
+        "content_sha256": checksum,
+        "row_ids_sha256": row_checksum,
+        "row_id_width": str(row_ids.shape[1]),
+        "row_ids_dtype": ROW_IDS_DTYPE_NAME,
+        "meta": contract.meta_json,
+    }
+    path = contract.directory / f"shard_{index:05d}.safetensors"
+    tmp = path.with_suffix(".tmp")
+    save_file(
+        {"acts": acts, "row_ids": row_ids},
+        tmp,
+        metadata=header,
+    )
+    _fsync_file(tmp)
+    os.replace(tmp, path)
+    _fsync_directory(contract.directory)
+    return _ShardWriteResult(
+        file=path.name,
+        index=index,
+        n_tokens=int(acts.shape[0]),
+        content_sha256=checksum,
+        row_ids_sha256=row_checksum,
+        row_id_width=int(row_ids.shape[1]),
+    )
 
 
 class WhitenerAccumulator:
@@ -427,6 +541,7 @@ class ShardWriter:
         free_space_floor_frac: float = 0.15,
         max_zero_row_frac: float = 1e-4,
         resume: bool = False,
+        on_durable_shard: Callable[[int], None] | None = None,
     ) -> None:
         if not split or Path(split).name != split:
             raise ValueError("split must be one nonempty path component")
@@ -449,6 +564,7 @@ class ShardWriter:
         self.tokens_per_shard = tokens_per_shard
         self.free_floor = free_space_floor_frac
         self.max_zero_row_frac = max_zero_row_frac
+        self._on_durable_shard = on_durable_shard
         self._buffer: torch.Tensor | None = None
         self._row_id_buffer: torch.Tensor | None = None
         self._buffered = 0
@@ -457,6 +573,20 @@ class ShardWriter:
         self._content_stream_hasher = hashlib.sha256()
         self._row_stream_hasher = hashlib.sha256()
         self._next_row_id = 0
+        self._executor: ThreadPoolExecutor | None = None
+        self._pending: _PendingShardWrite | None = None
+        self._poison: BaseException | None = None
+        self._closed = False
+        self._write_contract = _ShardWriteContract(
+            directory=self.dir,
+            split=self.split,
+            whitener_hash=self.whitener_hash,
+            sites=self.sites,
+            d_model=self.d_model,
+            meta_json=json.dumps(self.meta, sort_keys=True),
+            free_space_floor_frac=self.free_floor,
+            max_zero_row_frac=self.max_zero_row_frac,
+        )
         existing = tuple(self.dir.iterdir())
         if resume:
             self._resume_existing_split()
@@ -465,9 +595,30 @@ class ShardWriter:
 
     @property
     def persisted_tokens(self) -> int:
-        """Rows durably committed to verified shards (excludes RAM buffer)."""
+        """Rows installed in the fsynced manifest, excluding pending I/O."""
 
         return sum(int(shard["n_tokens"]) for shard in self.shards)
+
+    def _ensure_open(self) -> None:
+        if self._poison is not None:
+            raise RuntimeError("shard writer is poisoned by an earlier failure") from (
+                self._poison
+            )
+        if self._closed:
+            raise RuntimeError("shard writer is closed")
+
+    def _worker(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"bsc-shard-{self.split}",
+            )
+        return self._executor
+
+    def _shutdown_worker(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
 
     def _resume_existing_split(self) -> None:
         manifest_path = self.dir / MANIFEST_NAME
@@ -538,7 +689,7 @@ class ShardWriter:
     def _adopt_orphan_shard(self, path: Path) -> None:
         """Verify and manifest one shard published just before process death.
 
-        ``_write`` publishes and fsyncs the safetensors file before advancing
+        The persistence worker publishes and fsyncs the safetensors file before advancing
         ``split.json``.  A crash in that narrow interval therefore leaves one
         canonical tail file.  Recovery accepts only that exact shape: the next
         shard index, the frozen writer contract, exact tensor/header sets, and
@@ -702,6 +853,7 @@ class ShardWriter:
         synthetic/tests convenient but is not sufficient provenance for a
         real-model capture.
         """
+        self._ensure_open()
         if x.dtype in FORBIDDEN_DTYPES:
             raise TypeError("fp16 is forbidden in the harvest/store path")
         if x.ndim != 3 or x.shape[0] <= 0:
@@ -765,78 +917,69 @@ class ShardWriter:
         self._buffer = None
         self._row_id_buffer = None
         self._buffered = 0
-        self._write(out, out_ids)
+        self._submit(out.detach(), out_ids.detach())
 
-    def _write(self, acts: torch.Tensor, row_ids: torch.Tensor) -> None:
-        from safetensors.torch import save_file
+    def _submit(self, acts: torch.Tensor, row_ids: torch.Tensor) -> None:
+        """Transfer one complete detached buffer to the one-deep worker."""
 
-        # Audit before bytes hit disk: all-finite, near-zero rows bounded.
-        if not torch.isfinite(acts).all():
-            raise ValueError("non-finite activations reached the shard writer")
-        zero_rows = (~(acts != 0).any(dim=(1, 2))).float().mean()
-        if float(zero_rows) > self.max_zero_row_frac:
-            raise ValueError(
-                f"zero-row fraction {float(zero_rows):.2e} exceeds "
-                f"{self.max_zero_row_frac:.0e} — suspect the capture path"
+        self._ensure_open()
+        if self._pending is not None:
+            self.synchronize()
+        index = len(self.shards)
+        content_stream_hasher = self._content_stream_hasher.copy()
+        row_stream_hasher = self._row_stream_hasher.copy()
+        future = self._worker().submit(
+            _persist_shard,
+            self._write_contract,
+            index,
+            acts,
+            row_ids,
+            content_stream_hasher,
+            row_stream_hasher,
+        )
+        self._pending = _PendingShardWrite(
+            future=future,
+            content_stream_hasher=content_stream_hasher,
+            row_stream_hasher=row_stream_hasher,
+        )
+
+    def synchronize(self) -> int:
+        """Install the pending durable shard into an fsynced manifest.
+
+        At most one worker-owned shard exists. Until this barrier succeeds,
+        ``persisted_tokens`` deliberately excludes it; a process death in that
+        interval leaves the one exact orphan accepted by resume validation.
+        """
+
+        self._ensure_open()
+        pending = self._pending
+        if pending is None:
+            return self.persisted_tokens
+        try:
+            result = pending.future.result()
+            self._pending = None
+            self._content_stream_hasher = pending.content_stream_hasher
+            self._row_stream_hasher = pending.row_stream_hasher
+            self.shards.append(
+                {
+                    "file": result.file,
+                    "index": result.index,
+                    "n_tokens": result.n_tokens,
+                    "content_sha256": result.content_sha256,
+                    "row_ids_sha256": result.row_ids_sha256,
+                    "row_id_width": result.row_id_width,
+                    "row_ids_dtype": ROW_IDS_DTYPE_NAME,
+                }
             )
-        nbytes = (
-            acts.numel() * acts.element_size()
-            + row_ids.numel() * row_ids.element_size()
-        )
-        usage = shutil.disk_usage(self.dir)
-        if usage.free - nbytes < self.free_floor * usage.total:
-            raise RuntimeError(
-                f"write would breach the {self.free_floor:.0%} free-space floor "
-                f"({usage.free / 1e9:.1f} GB free, shard {nbytes / 1e9:.2f} GB)"
-            )
-        idx = len(self.shards)
-        acts = acts.contiguous()
-        row_ids = row_ids.contiguous()
-        content_bytes = _tensor_byte_view(acts)
-        row_bytes = _tensor_byte_view(row_ids)
-        checksum = hashlib.sha256(content_bytes).hexdigest()
-        row_checksum = hashlib.sha256(row_bytes).hexdigest()
-        header = {
-            "whitener_hash": self.whitener_hash,
-            "split": self.split,
-            "shard_index": str(idx),
-            "n_tokens": str(acts.shape[0]),
-            "sites": json.dumps(list(self.sites)),
-            "d_model": str(self.d_model),
-            "dtype": "bfloat16",
-            "content_sha256": checksum,
-            "row_ids_sha256": row_checksum,
-            "row_id_width": str(row_ids.shape[1]),
-            "row_ids_dtype": ROW_IDS_DTYPE_NAME,
-            "meta": json.dumps(self.meta, sort_keys=True),
-        }
-        path = self.dir / f"shard_{idx:05d}.safetensors"
-        tmp = path.with_suffix(".tmp")
-        save_file(
-            {"acts": acts, "row_ids": row_ids},
-            tmp,
-            metadata=header,
-        )
-        _fsync_file(tmp)
-        os.replace(tmp, path)
-        _fsync_directory(self.dir)
-        # Ordered-stream state advances only after the shard is durable.  A
-        # failed write therefore remains exactly resumable from the preceding
-        # manifest instead of poisoning the in-process digest.
-        self._content_stream_hasher.update(content_bytes)
-        self._row_stream_hasher.update(row_bytes)
-        self.shards.append(
-            {
-                "file": path.name,
-                "index": idx,
-                "n_tokens": int(acts.shape[0]),
-                "content_sha256": checksum,
-                "row_ids_sha256": row_checksum,
-                "row_id_width": int(row_ids.shape[1]),
-                "row_ids_dtype": ROW_IDS_DTYPE_NAME,
-            }
-        )
-        self._write_manifest(complete=False)
+            self._write_manifest(complete=False)
+            persisted = self.persisted_tokens
+            if self._on_durable_shard is not None:
+                self._on_durable_shard(persisted)
+            return persisted
+        except BaseException as exc:  # noqa: BLE001 - poison and re-raise exactly
+            self._pending = None
+            self._poison = exc
+            raise
 
     def _manifest_payload(self, *, complete: bool) -> dict:
         if self._row_id_width is None:
@@ -875,21 +1018,57 @@ class ShardWriter:
         return manifest
 
     def close(self) -> dict:
-        """Flush the remainder and write the split manifest."""
-        if self._buffered:
-            self._flush(self._buffered)
-        if not self.shards:
-            raise ValueError("cannot close an empty activation-store split")
-        manifest = self._manifest_payload(complete=True)
-        expected_row_digest = self.meta.get("row_stream_sha256")
-        if (
-            expected_row_digest is not None
-            and expected_row_digest != manifest["row_stream_sha256"]
-        ):
-            raise ValueError(
-                "derived store row identities do not match the declared raw stream digest"
-            )
-        return self._write_manifest(complete=True)
+        """Flush, synchronize, and publish the complete split manifest."""
+
+        try:
+            # Keep this inside the lifecycle guard: close() is also the final
+            # executor join after an earlier synchronize/callback failure.
+            self._ensure_open()
+            if self._buffered:
+                self._flush(self._buffered)
+            self.synchronize()
+            if not self.shards:
+                raise ValueError("cannot close an empty activation-store split")
+            manifest = self._manifest_payload(complete=True)
+            expected_row_digest = self.meta.get("row_stream_sha256")
+            if (
+                expected_row_digest is not None
+                and expected_row_digest != manifest["row_stream_sha256"]
+            ):
+                raise ValueError(
+                    "derived store row identities do not match the declared raw "
+                    "stream digest"
+                )
+            result = self._write_manifest(complete=True)
+            self._closed = True
+            return result
+        except BaseException as exc:  # noqa: BLE001 - preserve exact cause
+            if self._poison is None:
+                self._poison = exc
+            self._closed = True
+            raise
+        finally:
+            self._shutdown_worker()
+
+    def abort(self) -> int:
+        """Drain active persistence but discard the unsubmitted RAM tail.
+
+        The split remains incomplete and resumable. A persistence or durable-
+        progress callback failure is re-raised after the executor is joined.
+        """
+
+        if self._closed:
+            return self.persisted_tokens
+        try:
+            if self._pending is not None:
+                self.synchronize()
+            return self.persisted_tokens
+        finally:
+            self._buffer = None
+            self._row_id_buffer = None
+            self._buffered = 0
+            self._closed = True
+            self._shutdown_worker()
 
 
 def prefetch_batches(

@@ -189,7 +189,9 @@ def test_writer_resume_rebuilds_exact_ordered_stream(tmp_path):
         free_space_floor_frac=0,
     )
     writer.add(values[:8], row_ids[:8])
+    writer.synchronize()
     assert writer.persisted_tokens == 8
+    writer.abort()
     with pytest.raises(ValueError, match="incomplete"):
         StoreReader(tmp_path, "train")
 
@@ -442,12 +444,39 @@ def test_writer_audits(tmp_path):
     )
     bad = torch.randn(8, 1, D)
     bad[0, 0, 0] = float("nan")
+    writer.add(bad)
     with pytest.raises(ValueError, match="non-finite"):
-        writer.add(bad)
+        writer.synchronize()
+    assert not tuple((tmp_path / "train").glob("*.safetensors"))
+    with pytest.raises(RuntimeError, match="poisoned"):
+        writer.close()
+    assert writer._executor is None
+
+    zero_writer = ShardWriter(
+        tmp_path,
+        "zeros",
+        whitener_hash="abc",
+        sites=[0],
+        d_model=D,
+        tokens_per_shard=8,
+        free_space_floor_frac=0.0,
+    )
+    zero_writer.add(torch.zeros(8, 1, D))
     with pytest.raises(ValueError, match="zero-row"):
-        writer.add(torch.zeros(8, 1, D))
+        zero_writer.synchronize()
+    zero_writer.abort()
+
+    type_writer = ShardWriter(
+        tmp_path,
+        "type",
+        whitener_hash="abc",
+        sites=[0],
+        d_model=D,
+        free_space_floor_frac=0.0,
+    )
     with pytest.raises(TypeError, match="fp16"):
-        writer.add(torch.randn(4, 1, D).half())
+        type_writer.add(torch.randn(4, 1, D).half())
+    type_writer.abort()
 
 
 def test_manifest_contents(tmp_path):

@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import threading
 
 import pytest
 import torch
@@ -106,6 +107,7 @@ def _leave_durable_tail_orphan(root: Path, monkeypatch) -> tuple[dict, torch.Ten
         free_space_floor_frac=0.0,
     )
     writer.add(values[:4])
+    writer.synchronize()
     prior_manifest = json.loads((root / "train" / "split.json").read_text())
 
     def crash_before_manifest(*, complete: bool) -> dict:
@@ -113,9 +115,123 @@ def _leave_durable_tail_orphan(root: Path, monkeypatch) -> tuple[dict, torch.Ten
         raise RuntimeError("injected after durable shard rename")
 
     monkeypatch.setattr(writer, "_write_manifest", crash_before_manifest)
+    writer.add(values[4:8])
     with pytest.raises(RuntimeError, match="durable shard rename"):
-        writer.add(values[4:8])
+        writer.synchronize()
+    writer.abort()
     return prior_manifest, values
+
+
+def test_one_deep_writer_blocks_second_publish_until_first_is_installed(
+    tmp_path, monkeypatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+    second_add_done = threading.Event()
+    calls: list[int] = []
+    errors: list[BaseException] = []
+    original = store_module._persist_shard
+
+    def blocked(contract, index, acts, row_ids, content_hasher, row_hasher):
+        calls.append(index)
+        if index == 0:
+            entered.set()
+            assert release.wait(timeout=5)
+        return original(contract, index, acts, row_ids, content_hasher, row_hasher)
+
+    monkeypatch.setattr(store_module, "_persist_shard", blocked)
+    writer = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="one-deep",
+        sites=SITES,
+        d_model=D_MODEL,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+    )
+    values = (
+        torch.arange(1, 8 * len(SITES) * D_MODEL + 1)
+        .reshape(8, len(SITES), D_MODEL)
+        .float()
+    )
+    writer.add(values[:4])
+    assert entered.wait(timeout=5)
+    assert writer.persisted_tokens == 0
+
+    def add_second() -> None:
+        try:
+            writer.add(values[4:])
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            second_add_done.set()
+
+    thread = threading.Thread(target=add_second)
+    thread.start()
+    assert not second_add_done.wait(timeout=0.05)
+    assert calls == [0]
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors
+    assert writer.persisted_tokens == 4
+    manifest = writer.close()
+    assert calls == [0, 1]
+    assert manifest["n_tokens"] == 8
+
+
+def test_callback_failure_poisons_writer_but_close_still_joins_executor(tmp_path):
+    def fail_progress(persisted: int) -> None:
+        raise RuntimeError(f"progress failed after {persisted}")
+
+    writer = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="callback",
+        sites=SITES,
+        d_model=D_MODEL,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+        on_durable_shard=fail_progress,
+    )
+    writer.add(torch.ones(4, len(SITES), D_MODEL))
+    with pytest.raises(RuntimeError, match="progress failed after 4"):
+        writer.synchronize()
+    assert writer._executor is not None
+    with pytest.raises(RuntimeError, match="poisoned"):
+        writer.close()
+    assert writer._executor is None
+    assert writer._closed is True
+    manifest = json.loads((tmp_path / "train" / "split.json").read_text())
+    assert manifest["complete"] is False
+    assert manifest["n_tokens"] == 4
+
+
+def test_durable_callback_observes_fsynced_incomplete_manifest(tmp_path):
+    observations: list[int] = []
+
+    def observe(persisted: int) -> None:
+        manifest = json.loads((tmp_path / "train" / "split.json").read_text())
+        assert manifest["complete"] is False
+        assert manifest["n_tokens"] == persisted
+        observations.append(persisted)
+
+    writer = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="callback",
+        sites=SITES,
+        d_model=D_MODEL,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+        on_durable_shard=observe,
+    )
+    writer.add(torch.ones(8, len(SITES), D_MODEL))
+    assert observations == [4]
+    assert writer.persisted_tokens == 4
+    writer.synchronize()
+    assert observations == [4, 8]
+    writer.close()
 
 
 def test_resume_adopts_one_verified_durable_tail_and_fsyncs_manifest(
