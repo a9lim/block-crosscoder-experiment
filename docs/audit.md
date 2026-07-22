@@ -96,7 +96,9 @@ exit is not evidence by itself.
   complete decoded prediction.
 - The joint fp32 CUDA evaluator uses per-site CSR native reconstruction only at
   or below the fixed `1/32` support-density cap. Counts gate allocation before
-  `nonzero`; denser, non-fp32, and non-CUDA cases remain dense. Direct dense
+  `nonzero`; hard TopK passes its statically derived count and uses
+  `nonzero_static`, while threshold retains the dynamic gate. Denser, non-fp32,
+  and non-CUDA cases remain dense. Direct dense
   oracles cover both hard selectors, all full/site-only/leave-one-out views,
   zero support, the inclusive cap and first dense event, bias, and padding at
   the prediction, SSE, and repeated-SpMM bounds in `design.md`. The estimator

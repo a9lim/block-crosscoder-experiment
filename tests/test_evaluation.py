@@ -270,6 +270,48 @@ def test_cuda_sparse_evaluation_decode_dispatches_at_exact_density_cap(
         torch.zeros_like(sparse_at_cap[:, 1, 3:]),
     )
 
+    static_calls = 0
+    nonzero_static = torch.nonzero_static
+
+    def counted_nonzero_static(tensor, *, size, fill_value=-1):
+        nonlocal static_calls
+        static_calls += 1
+        return nonzero_static(tensor, size=size, fill_value=fill_value)
+
+    monkeypatch.setattr(torch, "nonzero_static", counted_nonzero_static)
+    static_at_cap = evaluation_module._decode_selected_for_evaluation(
+        model,
+        selected,
+        mask,
+        decoder,
+        selected_count=max_events,
+    )
+    torch.testing.assert_close(static_at_cap, sparse_at_cap, rtol=0, atol=0)
+    assert static_calls == 1
+    assert nonzero_calls == 1
+    sparse_calls -= cfg.n_sites
+
+    static_zero = evaluation_module._decode_selected_for_evaluation(
+        model,
+        torch.zeros_like(selected),
+        torch.zeros_like(mask),
+        decoder,
+        selected_count=0,
+    )
+    assert torch.equal(
+        static_zero,
+        native_decode(torch.zeros_like(selected), _decoder=decoder),
+    )
+    assert static_calls == 1
+    with pytest.raises(ValueError, match="selected_count"):
+        evaluation_module._decode_selected_for_evaluation(
+            model,
+            selected,
+            mask,
+            decoder,
+            selected_count=-1,
+        )
+
     active_zero_dense = native_decode(torch.zeros_like(selected), _decoder=decoder)
     active_zero_sparse = evaluation_module._decode_selected_for_evaluation(
         model,
@@ -1108,14 +1150,14 @@ def test_shared_code_modes_releases_selected_codes_after_each_view(
     peak = 0
     original = evaluation_module._decode_selected_for_evaluation
 
-    def tracked_decode(model, selected, mask, decoder):
+    def tracked_decode(model, selected, mask, decoder, **kwargs):
         nonlocal call_count, peak
         references[:] = [ref for ref in references if ref() is not None]
         # Each view has two selector decodes. No selected code from the prior
         # view may survive into the first decode of the next one.
         if call_count % 2 == 0:
             assert not references
-        prediction = original(model, selected, mask, decoder)
+        prediction = original(model, selected, mask, decoder, **kwargs)
         references.append(weakref.ref(selected))
         peak = max(peak, len(references))
         call_count += 1

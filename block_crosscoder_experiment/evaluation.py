@@ -311,12 +311,15 @@ def _decode_selected_for_evaluation(
     selected: torch.Tensor,
     mask: torch.Tensor,
     decoder: torch.Tensor,
+    *,
+    selected_count: int | None = None,
 ) -> torch.Tensor:
     """Decode sparse CUDA support below the fixed density crossover.
 
-    The event count is resolved before ``nonzero`` allocates a dynamic event
-    stream.  Denser CUDA support and every non-CUDA device retain the native
-    dense reduction.
+    Hard TopK callers pass their statically known event count, avoiding both a
+    scalar host read and dynamic event allocation. Threshold support resolves
+    its count before ``nonzero``. Denser CUDA support and every non-CUDA device
+    retain the native dense reduction.
     """
     if (
         not selected.is_cuda
@@ -325,14 +328,23 @@ def _decode_selected_for_evaluation(
     ):
         return model.decode(selected, _decoder=decoder)
 
-    counts = mask.sum(dim=1, dtype=torch.long)
-    event_count = int(counts.sum().item())
+    if selected_count is not None:
+        if (
+            isinstance(selected_count, bool)
+            or int(selected_count) != selected_count
+            or not 0 <= selected_count <= mask.numel()
+        ):
+            raise ValueError("selected_count must be an integer in [0, mask.numel()]")
+        event_count = int(selected_count)
+    else:
+        event_count = int(mask.sum().item())
     max_block_events = mask.numel() // EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR
     if event_count > max_block_events:
         return model.decode(selected, _decoder=decoder)
 
     cfg = model.cfg
     if event_count:
+        counts = mask.sum(dim=1, dtype=torch.long)
         prediction = torch.empty(
             selected.shape[0],
             cfg.n_sites,
@@ -340,7 +352,11 @@ def _decode_selected_for_evaluation(
             dtype=selected.dtype,
             device=selected.device,
         )
-        events = mask.nonzero(as_tuple=False)
+        events = (
+            torch.nonzero_static(mask, size=event_count)
+            if selected_count is not None
+            else mask.nonzero(as_tuple=False)
+        )
         rows = events[:, 0]
         block_ids = events[:, 1]
         values = selected[rows, block_ids]
@@ -602,6 +618,12 @@ def _evaluate_code_modes(
                 selected,
                 mask,
                 materialized_decoder,
+                selected_count=(
+                    model._hard_topk_selected_count(value.shape[0])
+                    if mode == "topk"
+                    and cfg.selection in {"batch_topk", "token_topk"}
+                    else None
+                ),
             )
             result[mode] = _EvaluationViewOutput(
                 prediction,

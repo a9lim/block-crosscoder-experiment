@@ -1127,7 +1127,10 @@ campaign starts.
 Native reconstruction in the joint fp32 CUDA evaluator uses a per-site CSR
 SpMM only when the complete batch support contains at most
 `floor(tokens * groups / 32)` block events. Per-token counts and the scalar
-event count are resolved before any dynamic event tensor is allocated; support
+event count are resolved before any dynamic event tensor is allocated; hard
+token/BatchTopK instead passes its exact shape-derived event count and uses
+fixed-size row-major `nonzero_static`, so full/site-only/leave-one-out TopK
+views never read a CUDA scalar. Threshold views retain the dynamic count gate. Support
 above the inclusive cap, non-fp32 tensors, and every non-CUDA device retain the
 dense decoder. The sparse path fills one preallocated site slice at a time,
 releases that temporary before the next site, and applies the identical decoder
@@ -1143,6 +1146,10 @@ fallbacks are release fixtures. Estimator `dense-linear-memory-v14-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
+On jobe, a four-site TopK profiler removes exactly nine
+`aten::_local_scalar_dense` calls per batch (`59` to `50` total evaluator
+calls). A 512-token TopK-only pass falls from `73.058` to `72.345 ms` (`.98%`);
+the 4,096-token pass is neutral (`367.348` to `367.012 ms`).
 
 The joint selector/shared-code evaluator retains a private lean view record,
 not a training `BSCOutput`: dense selected codes are released immediately
