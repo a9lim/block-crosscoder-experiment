@@ -3677,7 +3677,13 @@ def _save_immutable_torch(path: Path, payload: Mapping[str, Any]) -> None:
     ) as handle:
         temporary = Path(handle.name)
     try:
-        torch.save(dict(payload), temporary)
+        # Saving to a path bakes the random temporary basename into every ZIP
+        # member (and therefore the externally bound artifact hash). A file
+        # object gives PyTorch the canonical ``archive/`` member prefix, so the
+        # exact same tensor/scalar payload is byte-identical across fresh and
+        # resumed executor processes.
+        with temporary.open("wb") as handle:
+            torch.save(dict(payload), handle)
         os.replace(temporary, path)
     finally:
         if temporary.exists():

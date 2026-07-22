@@ -7,11 +7,13 @@ import json
 import hashlib
 import inspect
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from block_crosscoder_experiment.campaign import (
     Campaign,
@@ -113,6 +115,50 @@ import block_crosscoder_experiment.cli.run_cell as run_cell_module
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def test_immutable_torch_save_is_byte_exact_across_fresh_processes(
+    tmp_path: Path,
+) -> None:
+    script = """
+import sys
+from pathlib import Path
+import torch
+from block_crosscoder_experiment.cli.run_cell import _save_immutable_torch
+
+payload = {
+    "schema": "deterministic-save-test-v1",
+    "model_state": {
+        "weight": torch.arange(24, dtype=torch.float32).reshape(4, 6),
+        "index": torch.tensor([7, 2, 9], dtype=torch.int64),
+    },
+    "meta": {"alpha": 0.5, "names": ["a", "b"]},
+}
+_save_immutable_torch(Path(sys.argv[1]), payload)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = (
+        str(REPO)
+        + (
+            os.pathsep + environment["PYTHONPATH"]
+            if environment.get("PYTHONPATH")
+            else ""
+        )
+    )
+    outputs = (tmp_path / "first.pt", tmp_path / "second.pt")
+    for output in outputs:
+        subprocess.run(
+            [sys.executable, "-c", script, str(output)],
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+        )
+    assert outputs[0].read_bytes() == outputs[1].read_bytes()
+    assert hashlib.sha256(outputs[0].read_bytes()).digest() == hashlib.sha256(
+        outputs[1].read_bytes()
+    ).digest()
+    with ZipFile(outputs[0]) as archive:
+        assert all(name.startswith("archive/") for name in archive.namelist())
 
 
 def test_stage_digest_cache_hashes_an_unchanged_output_exactly_once(
