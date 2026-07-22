@@ -1767,6 +1767,18 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     with pytest.raises(ValueError, match="lacks decoded_energy_implementation"):
         Trainer.load_checkpoint(missing_path, device=device)
 
+    missing_isolated = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    missing_isolated["model_cfg"].pop(
+        "isolated_loss_decrease_implementation"
+    )
+    missing_isolated_path = tmp_path / "missing-isolated-loss-id.pt"
+    torch.save(missing_isolated, missing_isolated_path)
+    with pytest.raises(
+        ValueError,
+        match="lacks isolated_loss_decrease_implementation",
+    ):
+        Trainer.load_checkpoint(missing_isolated_path, device=device)
+
     forged = {**payload, "model_cfg": dict(payload["model_cfg"])}
     forged["model_cfg"]["decoded_energy_implementation"] = (
         DECODED_ENERGY_EXACT_IMPLEMENTATION

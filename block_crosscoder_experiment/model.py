@@ -39,7 +39,11 @@ from .runtime_limits import (
     DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_IMPLEMENTATIONS,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     decoded_energy_code_norm_eligible,
+    isolated_loss_mapped_eligible,
 )
 
 __all__ = [
@@ -47,11 +51,14 @@ __all__ = [
     "BSCOutput",
     "BSCSelection",
     "BlockCrosscoder",
+    "ISOLATED_LOSS_EXACT_IMPLEMENTATION",
+    "ISOLATED_LOSS_MAPPED_IMPLEMENTATION",
     "SignedStreamingScoreQuantile",
     "StreamingScoreQuantile",
     "batch_topk_mask",
     "token_topk_mask",
     "bsc_loss",
+    "isolated_loss_mapped_eligible",
 ]
 
 
@@ -231,6 +238,12 @@ class BSCConfig:
     # serialized implementation identity permits the Stiefel equality
     # ||D_g^T z_g||_sites = ||z_g|| only under the guarded carrier below.
     decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION
+    # Isolated loss decrease remains the signed scientific score.  The mapped
+    # free-decoder implementation changes only its contraction schedule and is
+    # serialized separately so orchestration cannot select it implicitly.
+    isolated_loss_decrease_implementation: str = (
+        ISOLATED_LOSS_EXACT_IMPLEMENTATION
+    )
     decoder_constraint: str = "gram"  # plus QR, ball/equality Frobenius, row-unit, free
     encoder_constraint: str = "none"  # none | unit_latent
     regularizer: str | None = None  # plus map nuclear, crosscoder L1, group L21
@@ -298,6 +311,15 @@ class BSCConfig:
             raise ValueError(
                 "decoded_energy_implementation must be exact_decoder_gram_v1 "
                 "or stiefel_code_norm_bounded_v1"
+            )
+        if (
+            self.isolated_loss_decrease_implementation
+            not in ISOLATED_LOSS_IMPLEMENTATIONS
+        ):
+            raise ValueError(
+                "isolated_loss_decrease_implementation must be "
+                "exact_site_gram_quadratic_v1 or "
+                "mapped_free_decoder_quadratic_v1"
             )
         if self.decoder_constraint not in {
             "gram",
@@ -449,6 +471,20 @@ class BSCConfig:
                 "isolated_loss_decrease requires a bias-free quadratic "
                 "reconstruction objective"
             )
+        if (
+            self.isolated_loss_decrease_implementation
+            == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            and not isolated_loss_mapped_eligible(
+                selection_score=self.selection_score,
+                decoder_constraint=self.decoder_constraint,
+                decoder_bias=self.decoder_bias,
+                reconstruction_loss=self.reconstruction_loss,
+            )
+        ):
+            raise ValueError(
+                "mapped isolated-loss decrease requires "
+                "isolated_loss_decrease scoring and a free decoder"
+            )
         if self.site_rank is not None:
             if (
                 isinstance(self.site_rank, bool)
@@ -518,6 +554,8 @@ class _ScoreGeometry(NamedTuple):
     decoder_weight: torch.Tensor | None
     decoder_gram: torch.Tensor | None
     site_decoder_gram: torch.Tensor | None
+    isolated_loss_decoder_map: torch.Tensor | None
+    isolated_loss_all_site_gram: torch.Tensor | None
 
 
 class _FrozenEncoderSites(NamedTuple):
@@ -832,6 +870,13 @@ class BlockCrosscoder(nn.Module):
         return (
             self.cfg.decoded_energy_implementation
             == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        )
+
+    @property
+    def uses_mapped_isolated_loss_decrease(self) -> bool:
+        return (
+            self.cfg.isolated_loss_decrease_implementation
+            == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
         )
 
     @torch.no_grad()
@@ -1159,6 +1204,8 @@ class BlockCrosscoder(nn.Module):
         decoder_weight = None
         decoder_gram = None
         site_decoder_gram = None
+        isolated_loss_decoder_map = None
+        isolated_loss_all_site_gram = None
         if self.cfg.selection_score == "decoder_weighted":
             D = decoder.float()
             per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
@@ -1182,12 +1229,131 @@ class BlockCrosscoder(nn.Module):
                     for site in range(self.cfg.n_sites)
                 ]
             )
+            if self.uses_mapped_isolated_loss_decrease:
+                isolated_loss_decoder_map = D.permute(0, 3, 1, 2).reshape(
+                    self.cfg.n_sites * self.cfg.d_model,
+                    self.cfg.n_latents,
+                )
+                # Match the operational all-view contraction exactly.  A sum
+                # of cached site Grams is algebraically equal but changes the
+                # fp32 reduction tree and can move a threshold tie.
+                isolated_loss_all_site_gram = torch.einsum(
+                    "sgbd,sgcd->gbc", D, D
+                )
         return _ScoreGeometry(
             self._decoder_binding_key(decoder),
             decoder_weight,
             decoder_gram,
             site_decoder_gram,
+            isolated_loss_decoder_map,
+            isolated_loss_all_site_gram,
         )
+
+    def _exact_isolated_loss_decrease_scores(
+        self,
+        code: torch.Tensor,
+        residual: torch.Tensor,
+        keep: torch.Tensor,
+        decoder: torch.Tensor,
+        score_geometry: _ScoreGeometry | None,
+    ) -> torch.Tensor:
+        """Reference site-wise projection and three-factor quadratic."""
+
+        projected = torch.zeros_like(code)
+        energy_sq = torch.zeros(
+            code.shape[:2],
+            dtype=torch.float32,
+            device=code.device,
+        )
+        for site in range(self.cfg.n_sites):
+            projected.add_(
+                torch.einsum(
+                    "nd,gbd->ngb",
+                    residual[:, site],
+                    decoder[site],
+                )
+            )
+            if score_geometry is None:
+                site_gram = torch.einsum(
+                    "gbd,gcd->gbc", decoder[site], decoder[site]
+                )
+            else:
+                assert score_geometry.site_decoder_gram is not None
+                site_gram = score_geometry.site_decoder_gram[site]
+            site_energy = torch.einsum(
+                "ngb,gbc,ngc->ng", code, site_gram, code
+            )
+            energy_sq.add_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
+        return 2.0 * (projected * code).sum(dim=-1) - energy_sq
+
+    def _mapped_isolated_loss_decrease_scores(
+        self,
+        code: torch.Tensor,
+        residual: torch.Tensor,
+        keep: torch.Tensor,
+        decoder: torch.Tensor,
+        score_geometry: _ScoreGeometry | None,
+        *,
+        all_sites_observed: bool,
+    ) -> torch.Tensor:
+        """Mapped free-decoder quadratic without a candidate-output tensor.
+
+        The linear term is one flattened decoder-transpose GEMM.  The
+        quadratic first maps each code through its block Gram with BMM and
+        then takes the coordinate dot product.  The all-observed path sums the
+        site Grams before this map; partial/source views retain one mapped
+        quadratic per site and weight it by the exact observation mask.
+        """
+
+        cfg = self.cfg
+        if score_geometry is None:
+            decoder_map = decoder.permute(0, 3, 1, 2).reshape(
+                cfg.n_sites * cfg.d_model,
+                cfg.n_latents,
+            )
+            if all_sites_observed:
+                # Contract the site axis directly; allocating every G_s only
+                # to reduce it would retain the reference path's avoidable
+                # site-Gram stack in the dominant full-view training kernel.
+                all_site_gram = torch.einsum(
+                    "sgbd,sgcd->gbc", decoder, decoder
+                )
+                site_grams = None
+            else:
+                site_grams = torch.stack(
+                    [
+                        torch.einsum(
+                            "gbd,gcd->gbc", decoder[site], decoder[site]
+                        )
+                        for site in range(cfg.n_sites)
+                    ]
+                )
+                all_site_gram = None
+        else:
+            assert score_geometry.isolated_loss_decoder_map is not None
+            assert score_geometry.site_decoder_gram is not None
+            assert score_geometry.isolated_loss_all_site_gram is not None
+            decoder_map = score_geometry.isolated_loss_decoder_map
+            site_grams = score_geometry.site_decoder_gram
+            all_site_gram = score_geometry.isolated_loss_all_site_gram
+
+        projected = (
+            residual.reshape(residual.shape[0], cfg.n_sites * cfg.d_model)
+            @ decoder_map
+        ).reshape_as(code)
+        code_by_group = code.transpose(0, 1)
+        if all_sites_observed:
+            assert all_site_gram is not None
+            mapped = torch.bmm(code_by_group, all_site_gram).transpose(0, 1)
+            return ((2.0 * projected - mapped) * code).sum(dim=-1)
+
+        assert site_grams is not None
+        score = 2.0 * (projected * code).sum(dim=-1)
+        for site in range(cfg.n_sites):
+            mapped = torch.bmm(code_by_group, site_grams[site]).transpose(0, 1)
+            site_energy = (mapped * code).sum(dim=-1)
+            score.sub_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
+        return score
 
     def scores(
         self,
@@ -1285,26 +1451,27 @@ class BlockCrosscoder(nn.Module):
             assert decoder is not None
             decoder = decoder.float()
             code = z.float()
-            projected = torch.zeros_like(code)
-            energy_sq = torch.zeros(z.shape[:2], dtype=torch.float32, device=z.device)
-            for site in range(self.cfg.n_sites):
-                projected.add_(
-                    torch.einsum(
-                        "nd,gbd->ngb",
-                        residual[:, site].float(),
-                        decoder[site],
-                    )
+            residual = residual.float()
+            if self.uses_mapped_isolated_loss_decrease:
+                score = self._mapped_isolated_loss_decrease_scores(
+                    code,
+                    residual,
+                    keep,
+                    decoder,
+                    _score_geometry,
+                    all_sites_observed=(
+                        observed is None and self.cfg.encoder_fusion != "source"
+                    ),
                 )
-                if _score_geometry is None:
-                    site_gram = torch.einsum(
-                        "gbd,gcd->gbc", decoder[site], decoder[site]
-                    )
-                else:
-                    assert _score_geometry.site_decoder_gram is not None
-                    site_gram = _score_geometry.site_decoder_gram[site]
-                site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
-                energy_sq.add_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
-            score = (2.0 * (projected * code).sum(dim=-1) - energy_sq).to(z.dtype)
+            else:
+                score = self._exact_isolated_loss_decrease_scores(
+                    code,
+                    residual,
+                    keep,
+                    decoder,
+                    _score_geometry,
+                )
+            score = score.to(z.dtype)
         return score
 
     def _select_scores(

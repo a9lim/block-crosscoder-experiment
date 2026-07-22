@@ -20,6 +20,7 @@ from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
 )
 from .trainer import validate_run_binding
 
@@ -234,9 +235,13 @@ def load_trained_model(
 ) -> tuple[BlockCrosscoder, dict]:
     """Load the complete saved model configuration without optimizer setup."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    cfg_payload = dict(payload["model_cfg"])
-    if "decoded_energy_implementation" not in cfg_payload:
-        raise ValueError("checkpoint lacks decoded_energy_implementation identity")
+    raw_cfg_payload = payload.get("model_cfg")
+    if not isinstance(raw_cfg_payload, dict):
+        raise ValueError("checkpoint lacks model configuration")
+    cfg_payload = dict(raw_cfg_payload)
+    for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
+        if identity not in cfg_payload:
+            raise ValueError(f"checkpoint lacks {identity} identity")
     validate_run_binding(
         payload.get("run_binding"),
         {

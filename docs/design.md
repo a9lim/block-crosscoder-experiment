@@ -265,6 +265,47 @@ untied, unconstrained carrier so their difference is the score alone; they are
 capability evidence, never the Phase-1 winner. This makes gauge-aware score
 behavior visible without pretending the synthetic generator chose the pilot's
 support rule.
+
+The scientific score is unchanged by its serialized
+`implementation.isolated_loss_decrease_implementation`.  The reference
+`exact_site_gram_quadratic_v1` performs the site-wise projection and direct
+three-factor quadratic.  `mapped_free_decoder_quadratic_v1` is admissible only
+for isolated-loss-decrease scoring on a free decoder with the same bias-free
+mean-squared or squared-L2 carrier.  It never activates from device, shape, or
+ambient runtime state, and an ineligible explicit declaration is refused.
+
+The mapped implementation forms the linear term with one flattened
+decoder-transpose GEMM.  It maps the code through the block Gram with BMM and
+takes the coordinate dot product rather than asking a three-input einsum to
+choose a contraction.  When every site is observed, it contracts the decoder
+directly to one all-site Gram and performs one map.  Partial and source-only
+views retain one mapped quadratic per site and weight it by the exact observed-
+site mask.  Padding is applied before the projection, hidden clean targets are
+excluded from both terms, negative gains are retained, and neither route
+materializes `[batch, groups, sites, d_model]`.  Materialized factorized free
+decoders use the same path and retain gradients to both site and core factors.
+
+Release fixtures compare reference and mapped implementations from identical
+state across all, partial, source-only, padded, factorized, exact-threshold, and
+signed-streaming paths.  In fp32, score relative L2 drift is at most `2e-6`,
+mask-element disagreement at most `1e-6`, output and maximum parameter-gradient
+relative drift at most `2e-4`, and loss relative drift at most `2e-6`.  In
+bf16, score relative L2 drift is at most `2e-3`, mask disagreement at most
+`1e-3`, support IoU at least `.99`, output relative drift at most `.05`, loss
+relative drift at most `1e-4`, and maximum parameter-gradient relative drift at
+most `.06`.  Exact contribution, harmful-negative, observed-site, frozen-
+geometry binding, and configuration-refusal fixtures remain hard gates.
+
+On the Phase-1 campaign shape (`B=8192`, four width-128 sites, 256 groups,
+block width four, four active blocks, fp32), 31 post-warmup CUDA samples of the
+complete forward, squared-L2 loss, and backward measure `8.218 ms` for the
+reference and `2.476 ms` for the mapped implementation, a `69.9%` reduction.
+Peak CUDA allocation falls from `407,346,176` to `277,142,528` bytes
+(`124.2 MiB`).  The paired gate records score relative L2 drift `5.90e-7` and
+exact support, reconstruction, loss, and model gradients.  These are kernel
+evidence, not a scientific score change; full-Trainer planning remains bound
+to the separately versioned resource estimator.
+
 Calibration uses a deterministic signed log histogram with an explicit zero
 boundary. The implementation computes one decoder-transpose-like projection
 and block Gram terms without materializing a
@@ -805,7 +846,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v9-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v10-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -907,7 +948,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v9-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v10-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -961,7 +1002,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v9 conservatively credits only four fp32
+Estimator v10 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse

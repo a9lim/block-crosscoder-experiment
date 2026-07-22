@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 
+import block_crosscoder_experiment.studies as studies_module
 from block_crosscoder_experiment.campaign import Campaign
 from block_crosscoder_experiment.cli.run_cell import validate_cell_config
 from block_crosscoder_experiment.runtime_limits import (
@@ -13,6 +14,9 @@ from block_crosscoder_experiment.runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
     TRUSTED_DECODE_Q_CHUNK,
 )
 from block_crosscoder_experiment.studies import (
@@ -1456,7 +1460,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v9"
+        "dense-linear-memory-v10"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1630,7 +1634,7 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_v9_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v10_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -1688,6 +1692,170 @@ def test_v9_estimator_credits_only_the_explicit_fast_implementation() -> None:
         * int(values["model.block_width"]) ** 2
         * 4
     )
+
+
+def test_isolated_loss_implementation_is_derived_from_the_final_carrier() -> None:
+    blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
+    plan = _materialize_all(
+        blueprint,
+        build_phase1_plan(seeds=(0,), smoke=True),
+    )
+    stage = next(
+        stage
+        for stage in plan.stages
+        if stage.name == "selection_score_identification"
+    )
+    isolated = tuple(
+        cell
+        for cell in stage.cells
+        if cell.decision_map["model.selection_score"]
+        == "isolated_loss_decrease"
+    )
+    assert len(isolated) == 2
+    assert {
+        (
+            cell.decision_map["model.decoder"],
+            cell.decision_map[
+                "implementation.isolated_loss_decrease_implementation"
+            ],
+        )
+        for cell in isolated
+    } == {
+        ("concatenated_stiefel", ISOLATED_LOSS_EXACT_IMPLEMENTATION),
+        ("free_scale_controlled", ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
+    }
+
+
+def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
+    base = (
+        build_phase1_plan(seeds=(0,), smoke=True).cells[0]
+        if smoke
+        else build_phase1_plan().cells[0]
+    )
+    overrides = {
+        "model.selection_score": "isolated_loss_decrease",
+        "model.decoder": "free_scale_controlled",
+        "model.decoder_bias": False,
+        "objective.reconstruction": "squared_l2",
+        "implementation.isolated_loss_decrease_implementation": implementation,
+    }
+    return replace(
+        base,
+        decisions=tuple(
+            replace(decision, value=overrides[decision.name])
+            if decision.name in overrides
+            else decision
+            for decision in base.decisions
+        ),
+    )
+
+
+def test_v10_estimator_prices_mapped_isolated_loss_training_and_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapped = _isolated_loss_estimator_cell(
+        implementation=ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+        smoke=False,
+    )
+    exact = _isolated_loss_estimator_cell(
+        implementation=ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+        smoke=False,
+    )
+    # Isolate the training-residency branch of the max; the real planner also
+    # prices the larger mapped frozen-evaluation geometry below.
+    workspace_estimator = studies_module._evaluation_workspace_bytes
+    monkeypatch.setattr(
+        studies_module,
+        "_evaluation_workspace_bytes",
+        lambda **_kwargs: 0,
+    )
+    mapped_estimate = estimate_cell(mapped)
+    exact_estimate = estimate_cell(exact)
+    values = mapped.decision_map
+    expected_training_credit = (
+        ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS
+        * int(values["optimizer.batch_tokens"])
+        * int(values["model.groups"])
+        * int(values["model.block_width"])
+        * 4
+    )
+    assert (
+        exact_estimate.peak_vram_bytes - mapped_estimate.peak_vram_bytes
+        == expected_training_credit
+    )
+
+    sites = len(values["data.site_dims"])
+    site_dim = max(int(item) for item in values["data.site_dims"])
+    groups = int(values["model.groups"])
+    block_width = int(values["model.block_width"])
+    common = {
+        "batch_tokens": int(values["optimizer.batch_tokens"]),
+        "groups": groups,
+        "block_width": block_width,
+        "total_dim": sum(int(item) for item in values["data.site_dims"]),
+        "operational_decoder_elements": (
+            groups
+            * block_width
+            * sum(int(item) for item in values["data.site_dims"])
+        ),
+        "quantizer_count": len(values["codec.quantizer_bits"]),
+        "sites": sites,
+        "site_dim": site_dim,
+        "selection_score": "isolated_loss_decrease",
+    }
+    exact_workspace = workspace_estimator(
+        **common,
+        isolated_loss_decrease_implementation=(
+            ISOLATED_LOSS_EXACT_IMPLEMENTATION
+        ),
+    )
+    mapped_workspace = workspace_estimator(
+        **common,
+        isolated_loss_decrease_implementation=(
+            ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        ),
+    )
+    assert mapped_workspace - exact_workspace == 4 * (
+        groups * block_width**2
+        + sites * site_dim * groups * block_width
+    )
+
+
+@pytest.mark.parametrize(
+    ("decision_name", "decision_value", "message"),
+    (
+        (
+            "implementation.isolated_loss_decrease_implementation",
+            "ambient_cuda_default",
+            "unknown isolated-loss implementation identity",
+        ),
+        (
+            "model.decoder",
+            "concatenated_stiefel",
+            "violates its carrier predicate",
+        ),
+        (
+            "model.decoder_bias",
+            True,
+            "isolated loss-decrease scoring requires",
+        ),
+        (
+            "objective.reconstruction",
+            "mean_l2",
+            "isolated loss-decrease scoring requires",
+        ),
+    ),
+)
+def test_mapped_isolated_loss_estimator_refuses_invalid_carriers(
+    decision_name: str,
+    decision_value,
+    message: str,
+) -> None:
+    cell = _isolated_loss_estimator_cell(
+        implementation=ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    )
+    with pytest.raises(StudyError, match=message):
+        estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
 def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():

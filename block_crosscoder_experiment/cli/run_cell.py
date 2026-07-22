@@ -72,7 +72,11 @@ from block_crosscoder_experiment.store import (
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
     decoded_energy_code_norm_eligible,
+    isolated_loss_mapped_eligible,
 )
 from block_crosscoder_experiment.studies import (
     CellSpec,
@@ -2562,6 +2566,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     reconstruction = str(values["objective.reconstruction"])
     reconstruction_loss = {
         "mean_l2": "mean_l2",
+        "mean_squared": "mean_squared",
         "squared_l2": "squared_l2",
     }.get(reconstruction)
     if reconstruction_loss is None:
@@ -2614,6 +2619,27 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         raise CellExecutionError(
             "stiefel decoded-energy implementation violates its carrier predicate"
         )
+    isolated_loss_implementation = str(
+        values["implementation.isolated_loss_decrease_implementation"]
+    )
+    eligible_isolated_loss_specialization = isolated_loss_mapped_eligible(
+        selection_score=selection_score,
+        decoder_constraint=constraint,
+        decoder_bias=bool(values["model.decoder_bias"]),
+        reconstruction_loss=reconstruction_loss,
+    )
+    if isolated_loss_implementation not in {
+        ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    }:
+        raise CellExecutionError("unknown isolated-loss implementation identity")
+    if (
+        isolated_loss_implementation == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        and not eligible_isolated_loss_specialization
+    ):
+        raise CellExecutionError(
+            "mapped isolated-loss implementation violates its carrier predicate"
+        )
     return BSCConfig(
         n_blocks=total_groups,
         block_dim=int(values["model.block_width"]),
@@ -2636,6 +2662,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         code_activation=activation,
         selection_score=selection_score,
         decoded_energy_implementation=decoded_energy_implementation,
+        isolated_loss_decrease_implementation=isolated_loss_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
         site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),
@@ -3205,8 +3232,9 @@ def _load_deployable_codec(
         state = payload["model_state"]
         if not isinstance(cfg_payload, dict) or not isinstance(state, dict):
             raise TypeError("model config/state must be mappings")
-        if "decoded_energy_implementation" not in cfg_payload:
-            raise ValueError("model config lacks decoded_energy_implementation")
+        for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
+            if identity not in cfg_payload:
+                raise ValueError(f"model config lacks {identity} identity")
         model = BlockCrosscoder(BSCConfig(**cfg_payload))
         if set(cfg_payload) != set(asdict(model.cfg)):
             raise ValueError("model config does not contain the exact resolved fields")
@@ -4031,13 +4059,11 @@ def _validate_final_checkpoint(
     history = payload.get("history")
     previous_shares = payload.get("diagnostic_prev_shares")
     model_payload = payload.get("model_cfg")
-    if (
-        not isinstance(model_payload, dict)
-        or "decoded_energy_implementation" not in model_payload
-    ):
-        raise CellExecutionError(
-            "final checkpoint lacks decoded_energy_implementation identity"
-        )
+    if not isinstance(model_payload, dict):
+        raise CellExecutionError("final checkpoint lacks model configuration")
+    for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
+        if identity not in model_payload:
+            raise CellExecutionError(f"final checkpoint lacks {identity} identity")
     expected_share_shape = (
         (
             int(model_payload.get("n_sites", -1)),

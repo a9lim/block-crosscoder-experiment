@@ -50,7 +50,10 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .gram import _retract_count_tensor_, gram_residual, site_frobenius_shares
 from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
-from .runtime_limits import decoded_energy_code_norm_eligible
+from .runtime_limits import (
+    MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
+    decoded_energy_code_norm_eligible,
+)
 
 __all__ = [
     "TrainConfig",
@@ -1888,10 +1891,12 @@ class Trainer:
         expected_binding: dict | None = None,
     ) -> "Trainer":
         payload = torch.load(path, map_location=device, weights_only=True)
-        if "decoded_energy_implementation" not in payload.get("model_cfg", {}):
-            raise ValueError(
-                "checkpoint lacks decoded_energy_implementation identity"
-            )
+        model_payload = payload.get("model_cfg")
+        if not isinstance(model_payload, dict):
+            raise ValueError("checkpoint lacks model configuration")
+        for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
+            if identity not in model_payload:
+                raise ValueError(f"checkpoint lacks {identity} identity")
         accepted_tokens = payload.get("accepted_tokens")
         if (
             not isinstance(accepted_tokens, int)

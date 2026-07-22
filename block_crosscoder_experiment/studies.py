@@ -29,13 +29,17 @@ from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
     TRUSTED_DECODE_Q_CHUNK,
     decoded_energy_code_norm_eligible,
+    isolated_loss_mapped_eligible,
 )
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v9"
+    "dense-linear-memory-v10"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -575,6 +579,8 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "precision.preflight_support_iou_min",
         "inference.threshold_estimator",
         "inference.threshold_source",
+        "implementation.decoded_energy_implementation",
+        "implementation.isolated_loss_decrease_implementation",
         "qualification.profile",
         "qualification.phase1_identification_thresholds",
         "qualification.threshold_basis",
@@ -3745,6 +3751,9 @@ def _evaluation_workspace_bytes(
     site_dim: int,
     selection_score: str,
     decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    isolated_loss_decrease_implementation: str = (
+        ISOLATED_LOSS_EXACT_IMPLEMENTATION
+    ),
 ) -> int:
     """Conservative peak for the fixed-shape CUDA evaluation kernels.
 
@@ -3832,7 +3841,14 @@ def _evaluation_workspace_bytes(
     ):
         score_geometry_bytes = groups * block_width**2 * 4
     elif selection_score == "isolated_loss_decrease":
-        score_geometry_bytes = sites * groups * block_width**2 * 4
+        score_geometry_values = sites * groups * block_width**2
+        if (
+            isolated_loss_decrease_implementation
+            == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        ):
+            score_geometry_values += groups * block_width**2
+            score_geometry_values += sites * site_dim * groups * block_width
+        score_geometry_bytes = score_geometry_values * 4
     elif selection_score == "decoder_weighted":
         score_geometry_bytes = groups * 4
     else:
@@ -3903,6 +3919,34 @@ def _bind_derived_decoded_energy_implementation(
     )
 
 
+def _bind_derived_score_implementations(
+    decisions: Sequence[Decision],
+) -> tuple[Decision, ...]:
+    """Recompute implementation identities after every effective cell delta."""
+
+    bound = _bind_derived_decoded_energy_implementation(decisions)
+    values = {decision.name: decision.value for decision in bound}
+    filtered = tuple(
+        decision
+        for decision in bound
+        if decision.name
+        != "implementation.isolated_loss_decrease_implementation"
+    )
+    return merge_decisions(
+        filtered,
+        (
+            engineering(
+                "implementation.isolated_loss_decrease_implementation",
+                _derived_isolated_loss_implementation(values),
+                rationale=(
+                    "derive the mapped signed quadratic only from the final "
+                    "score, decoder, bias, and reconstruction contract"
+                ),
+            ),
+        ),
+    )
+
+
 def _resolved_decoded_energy_implementation(
     values: Mapping[str, DecisionValue],
 ) -> str:
@@ -3918,6 +3962,56 @@ def _resolved_decoded_energy_implementation(
     if declared == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION and not eligible:
         raise StudyError(
             "stiefel decoded-energy implementation violates its carrier predicate"
+        )
+    return declared
+
+
+def _isolated_loss_mapped_eligible_values(
+    values: Mapping[str, DecisionValue],
+) -> bool:
+    decoder_constraint = (
+        "free"
+        if str(values["model.decoder"])
+        in {"free_scale_controlled", "free_weight_decay", "free_per_site_affine"}
+        else "other"
+    )
+    reconstruction = {
+        "mean_squared": "mean_squared",
+        "squared_l2": "squared_l2",
+    }.get(str(values["objective.reconstruction"]), "other")
+    return isolated_loss_mapped_eligible(
+        selection_score=str(values["model.selection_score"]),
+        decoder_constraint=decoder_constraint,
+        decoder_bias=bool(values["model.decoder_bias"]),
+        reconstruction_loss=reconstruction,
+    )
+
+
+def _derived_isolated_loss_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    return (
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        if _isolated_loss_mapped_eligible_values(values)
+        else ISOLATED_LOSS_EXACT_IMPLEMENTATION
+    )
+
+
+def _resolved_isolated_loss_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    declared = str(values["implementation.isolated_loss_decrease_implementation"])
+    if declared not in {
+        ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    }:
+        raise StudyError("unknown isolated-loss implementation identity")
+    if (
+        declared == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        and not _isolated_loss_mapped_eligible_values(values)
+    ):
+        raise StudyError(
+            "mapped isolated-loss implementation violates its carrier predicate"
         )
     return declared
 
@@ -4013,6 +4107,7 @@ def _estimate_components(
         values["optimizer.batch_tokens"], "optimizer.batch_tokens"
     )
     decoded_energy_implementation = _resolved_decoded_energy_implementation(values)
+    isolated_loss_implementation = _resolved_isolated_loss_implementation(values)
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the
@@ -4023,6 +4118,10 @@ def _estimate_components(
         DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
         if decoded_energy_implementation
         == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        else 0
+    ) - (
+        ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS
+        if isolated_loss_implementation == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
         else 0
     )
     dense_workspace_values = batch_tokens * (
@@ -4044,6 +4143,7 @@ def _estimate_components(
         site_dim=max(site_dims),
         selection_score=str(values["model.selection_score"]),
         decoded_energy_implementation=decoded_energy_implementation,
+        isolated_loss_decrease_implementation=isolated_loss_implementation,
     )
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0
@@ -7263,7 +7363,7 @@ def _resolved_cell_defaults(
             rationale="no unrecorded singular-value smoothing is permitted",
         ),
     )
-    return _bind_derived_decoded_energy_implementation(
+    return _bind_derived_score_implementations(
         merge_decisions(decisions, additions)
     )
 
@@ -7600,7 +7700,7 @@ def _cell(
         decisions = merge_decisions(
             decisions, _smoke_overrides(recipe, phase, decisions)
         )
-    decisions = _bind_derived_decoded_energy_implementation(decisions)
+    decisions = _bind_derived_score_implementations(decisions)
     return CellSpec(
         name=f"{phase.value}.{stage}.{suffix}.s{seed}",
         phase=phase,
@@ -7791,7 +7891,7 @@ def derive_child_cell(
         )
     if smoke:
         decisions = merge_decisions(decisions, _derived_smoke_overrides(decisions))
-    decisions = _bind_derived_decoded_energy_implementation(decisions)
+    decisions = _bind_derived_score_implementations(decisions)
     derived_recipe_id = content_id(
         {
             "schema": BLUEPRINT_SCHEMA_VERSION,

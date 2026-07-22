@@ -165,6 +165,16 @@ def test_load_trained_model_refuses_specialization_binding_and_residual_mutation
     with pytest.raises(ValueError, match="lacks decoded_energy_implementation"):
         load_trained_model(missing_path)
 
+    missing_isolated = copy.deepcopy(payload)
+    del missing_isolated["model_cfg"]["isolated_loss_decrease_implementation"]
+    missing_isolated_path = tmp_path / "missing-isolated-loss.pt"
+    torch.save(missing_isolated, missing_isolated_path)
+    with pytest.raises(
+        ValueError,
+        match="lacks isolated_loss_decrease_implementation",
+    ):
+        load_trained_model(missing_isolated_path)
+
     drifted = copy.deepcopy(payload)
     drifted["model"]["D"].mul_(1.1)
     drifted_path = tmp_path / "drifted.pt"

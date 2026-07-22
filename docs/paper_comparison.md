@@ -194,6 +194,11 @@ It excludes hidden clean targets, requires a bias-free quadratic objective,
 retains negative gains, is invariant to reciprocal within-block gauge, and
 reduces to $\lVert z_g\rVert^2$ under unit-scale tied concatenated Stiefel. Its
 deployment threshold uses a signed deterministic histogram.
+The score definition is independent of the engineering contraction identity:
+the mapped free-decoder implementation evaluates the same signed quadratic by
+one flattened decoder projection and mapped block-Gram products, with exact
+observed-site weighting for partial and source-only views. This optimization
+is a local adaptation, not a paper value or a distinct score arm.
 
 At seeds 0, 1, and 2 the serialized variants declare and execute **198 cells**:
 51 initial, 96 capability/contract cells, and 51 confirmation cells. The score
@@ -392,7 +397,7 @@ distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
-`dense-linear-memory-v9-q2-c512-t256-s32`. Its guarded
+`dense-linear-memory-v10-q2-c512-t256-s32`. Its guarded
 `stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
 not a paper result or a different scientific score. It uses the algebraic
 decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel

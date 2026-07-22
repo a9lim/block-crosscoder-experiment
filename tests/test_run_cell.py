@@ -63,6 +63,8 @@ from block_crosscoder_experiment.model import BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
 )
 from block_crosscoder_experiment.store import ShardWriter, StoreReader
 from block_crosscoder_experiment.studies import (
@@ -151,6 +153,29 @@ def _stiefel_decoded_energy_cell(*, seed: int = 0) -> CellSpec:
     return replace(
         base,
         name=f"phase1.test.stiefel_decoded_energy.s{seed}",
+        decisions=tuple(
+            replace(decision, value=overrides[decision.name])
+            if decision.name in overrides
+            else decision
+            for decision in base.decisions
+        ),
+    )
+
+
+def _mapped_isolated_loss_cell(*, seed: int = 0) -> CellSpec:
+    base = _cell(recipe_index=0, seed=seed)
+    overrides = {
+        "model.selection_score": "isolated_loss_decrease",
+        "model.decoder": "free_scale_controlled",
+        "model.decoder_bias": False,
+        "objective.reconstruction": "squared_l2",
+        "implementation.isolated_loss_decrease_implementation": (
+            ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+        ),
+    }
+    return replace(
+        base,
+        name=f"phase1.test.mapped_isolated_loss.s{seed}",
         decisions=tuple(
             replace(decision, value=overrides[decision.name])
             if decision.name in overrides
@@ -706,6 +731,73 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         )
 
 
+def test_mapped_isolated_loss_identity_round_trips_and_refuses_forgery(
+    tmp_path: Path,
+) -> None:
+    cell = _mapped_isolated_loss_cell(seed=41)
+    campaign = _campaign(tmp_path, cell)
+    assert _runner(campaign).run(limit=1).failed_cells == 0
+    refs = campaign.record(cell.cell_id).artifact_map
+    deployment_path = refs["deployment_codec"].resolve(campaign.root)
+    payload, model, codec, _summary = _load_deployable_codec(
+        deployment_path,
+        cell_id=cell.cell_id,
+        checkpoint_hash=refs["checkpoint"].sha256,
+        calibration_hash=refs["calibration"].sha256,
+        preparation_hash=refs["preparation"].sha256,
+        device=torch.device("cpu"),
+    )
+    assert model.cfg.isolated_loss_decrease_implementation == (
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    )
+    assert payload["model_cfg"]["isolated_loss_decrease_implementation"] == (
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    )
+    assert codec.meta["model_cfg"][
+        "isolated_loss_decrease_implementation"
+    ] == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+
+    forged = copy.deepcopy(payload)
+    forged["model_cfg"]["isolated_loss_decrease_implementation"] = (
+        ISOLATED_LOSS_EXACT_IMPLEMENTATION
+    )
+    unsigned = {key: value for key, value in forged.items() if key != "artifact_sha256"}
+    forged["artifact_sha256"] = _tensor_payload_digest(unsigned)
+    forged_path = tmp_path / "forged-mapped-identity.pt"
+    torch.save(forged, forged_path)
+    with pytest.raises(CellExecutionError, match="model config|model-config"):
+        _load_deployable_codec(
+            forged_path,
+            cell_id=cell.cell_id,
+            checkpoint_hash=refs["checkpoint"].sha256,
+            calibration_hash=refs["calibration"].sha256,
+            preparation_hash=refs["preparation"].sha256,
+            device=torch.device("cpu"),
+        )
+
+    checkpoint_payload = torch.load(
+        refs["checkpoint"].resolve(campaign.root),
+        map_location="cpu",
+        weights_only=True,
+    )
+    checkpoint_payload["model_cfg"].pop(
+        "isolated_loss_decrease_implementation"
+    )
+    checkpoint_payload["run_binding"]["model_cfg"].pop(
+        "isolated_loss_decrease_implementation"
+    )
+    missing_path = tmp_path / "missing-mapped-identity.pt"
+    torch.save(checkpoint_payload, missing_path)
+    with pytest.raises(
+        CellExecutionError,
+        match="lacks isolated_loss_decrease_implementation",
+    ):
+        _validate_final_checkpoint(
+            missing_path,
+            checkpoint_payload["run_binding"],
+        )
+
+
 @pytest.mark.parametrize(
     ("decision_name", "decision_value", "message"),
     (
@@ -738,6 +830,49 @@ def test_runner_refuses_unknown_or_ineligible_decoded_energy_implementation(
     )
     with pytest.raises(CellExecutionError, match=message):
         _model_config(changed)
+
+
+def test_runner_resolves_and_refuses_mapped_isolated_loss_implementation() -> None:
+    cell = _mapped_isolated_loss_cell()
+    cfg = _model_config(cell)
+    assert cfg.isolated_loss_decrease_implementation == (
+        ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    )
+
+    for decision_name, decision_value, message in (
+        (
+            "implementation.isolated_loss_decrease_implementation",
+            "ambient_cuda_default",
+            "unknown isolated-loss implementation identity",
+        ),
+        (
+            "model.decoder",
+            "concatenated_stiefel",
+            "violates its carrier predicate",
+        ),
+    ):
+        changed = replace(
+            cell,
+            decisions=tuple(
+                replace(decision, value=decision_value)
+                if decision.name == decision_name
+                else decision
+                for decision in cell.decisions
+            ),
+        )
+        with pytest.raises(CellExecutionError, match=message):
+            _model_config(changed)
+
+    mean_squared = replace(
+        cell,
+        decisions=tuple(
+            replace(decision, value="mean_squared")
+            if decision.name == "objective.reconstruction"
+            else decision
+            for decision in cell.decisions
+        ),
+    )
+    assert _model_config(mean_squared).reconstruction_loss == "mean_squared"
 
 
 def test_decoded_energy_preflight_precedes_every_score_call(

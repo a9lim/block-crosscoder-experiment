@@ -23,10 +23,25 @@ DECODED_ENERGY_IMPLEMENTATIONS = (
 DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX = 1.0e-4
 DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX = 2.0e-3
 
-# The v9 planner removes only this conservative subset of the measured score
+# The v10 planner removes only this conservative subset of the measured score
 # graph residency.  Four fp32 [tokens, groups, block_width] buffers are less
 # than the observed Phase-2/3 peak reduction and so do not over-credit VRAM.
 DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS = 4
+
+# The mapped signed quadratic's measured net peak reduction safely supports a
+# conservative credit of three fp32 [tokens, groups, block_width] buffers.
+ISOLATED_LOSS_EXACT_IMPLEMENTATION = "exact_site_gram_quadratic_v1"
+ISOLATED_LOSS_MAPPED_IMPLEMENTATION = "mapped_free_decoder_quadratic_v1"
+ISOLATED_LOSS_IMPLEMENTATIONS = (
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+)
+ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS = 3
+
+MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
+    "decoded_energy_implementation",
+    "isolated_loss_decrease_implementation",
+)
 
 
 def decoded_energy_code_norm_eligible(
@@ -45,4 +60,21 @@ def decoded_energy_code_norm_eligible(
         and training_selector in {"token_topk", "batch_topk"}
         and site_rank is None
         and retract_every == 1
+    )
+
+
+def isolated_loss_mapped_eligible(
+    *,
+    selection_score: str,
+    decoder_constraint: str,
+    decoder_bias: bool,
+    reconstruction_loss: str,
+) -> bool:
+    """Return the complete scientific carrier for the mapped quadratic."""
+
+    return (
+        selection_score == "isolated_loss_decrease"
+        and decoder_constraint == "free"
+        and not decoder_bias
+        and reconstruction_loss in {"mean_squared", "squared_l2"}
     )

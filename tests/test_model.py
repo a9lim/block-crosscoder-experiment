@@ -13,6 +13,8 @@ from block_crosscoder_experiment.model import (
     BlockCrosscoder,
     BSCConfig,
     BSCOutput,
+    ISOLATED_LOSS_EXACT_IMPLEMENTATION,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     SignedStreamingScoreQuantile,
     batch_topk_mask,
     bsc_loss,
@@ -1787,7 +1789,13 @@ def test_stiefel_code_norm_config_fails_closed_outside_complete_carrier(override
         BSCConfig(**values)
 
 
-def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions():
+@pytest.mark.parametrize(
+    "implementation",
+    (ISOLATED_LOSS_EXACT_IMPLEMENTATION, ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
+)
+def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions(
+    implementation,
+):
     model = BlockCrosscoder(
         BSCConfig(
             n_blocks=5,
@@ -1799,6 +1807,7 @@ def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions():
             decoder_bias=False,
             reconstruction_loss="squared_l2",
             selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=implementation,
         )
     )
     generator = torch.Generator().manual_seed(483)
@@ -1863,7 +1872,369 @@ def test_isolated_loss_decrease_inplace_accumulators_preserve_exact_gradients(
     )
 
 
-def test_isolated_loss_decrease_excludes_hidden_clean_targets():
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("view", ("all", "partial", "source"))
+def test_mapped_isolated_loss_decrease_bounds_score_and_gradient_drift(
+    device,
+    dtype,
+    view,
+):
+    if dtype == torch.bfloat16 and device.type != "cuda":
+        pytest.skip("the bounded bf16 specialization is a CUDA forward path")
+    cfg_values = {
+        "n_blocks": 32,
+        "block_dim": 4,
+        "n_sites": 4,
+        "d_model": 32,
+        "site_dims": (32, 29, 26, 23),
+        "k": 4,
+        "seed": 984,
+        "selection": "token_topk",
+        "encoder_mode": "untied",
+        "encoder_fusion": "source" if view == "source" else "availability_rescaled_sum",
+        "source_site": 1,
+        "decoder_constraint": "free",
+        "decoder_bias": False,
+        "reconstruction_loss": "squared_l2",
+        "selection_score": "isolated_loss_decrease",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_EXACT_IMPLEMENTATION
+            ),
+        )
+    )
+    with torch.no_grad():
+        assert exact.D is not None
+        scale = torch.linspace(0.65, 1.35, exact.cfg.n_blocks).view(1, -1, 1, 1)
+        exact.D.mul_(scale)
+    mapped = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            ),
+        )
+    )
+    mapped.load_state_dict(exact.state_dict())
+    exact = exact.to(device=device, dtype=dtype)
+    mapped = mapped.to(device=device, dtype=dtype)
+    generator = torch.Generator().manual_seed(985)
+    x_exact = torch.randn(96, 4, 32, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    ).requires_grad_()
+    z_exact = torch.randn(96, 32, 4, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    ).requires_grad_()
+    x_mapped = x_exact.detach().clone().requires_grad_()
+    z_mapped = z_exact.detach().clone().requires_grad_()
+    observed = None
+    if view == "partial":
+        observed = torch.ones(96, 4, dtype=torch.bool, device=device)
+        observed[::2, 0] = False
+        observed[1::3, 2] = False
+
+    exact_scores = exact.scores(z_exact, x=x_exact, observed=observed)
+    mapped_scores = mapped.scores(z_mapped, x=x_mapped, observed=observed)
+    assert exact.D is not None and mapped.D is not None
+    exact_grads = torch.autograd.grad(
+        exact_scores.sum(),
+        (x_exact, z_exact, exact.D),
+    )
+    mapped_grads = torch.autograd.grad(
+        mapped_scores.sum(),
+        (x_mapped, z_mapped, mapped.D),
+    )
+    score_drift = _relative_l2(mapped_scores, exact_scores)
+    gradient_drifts = [
+        _relative_l2(actual, expected)
+        for actual, expected in zip(mapped_grads, exact_grads, strict=True)
+    ]
+    exact_mask = exact._select_scores(exact_scores, mode="topk", z=z_exact)
+    mapped_mask = mapped._select_scores(mapped_scores, mode="topk", z=z_mapped)
+    disagreement = float((mapped_mask != exact_mask).float().mean())
+    intersection = int((mapped_mask & exact_mask).sum())
+    union = int((mapped_mask | exact_mask).sum())
+    if dtype == torch.float32:
+        assert score_drift <= 2e-6
+        assert disagreement == 0.0
+        assert max(gradient_drifts) <= 5e-6
+    else:
+        assert score_drift <= 2e-3
+        assert disagreement <= 1e-3
+        assert intersection / max(union, 1) >= 0.99
+        assert max(gradient_drifts) <= 0.02
+
+
+@pytest.mark.parametrize("view", ("all", "partial"))
+def test_mapped_isolated_loss_frozen_geometry_binds_cached_map_and_grams(view):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=12,
+            block_dim=3,
+            n_sites=3,
+            d_model=9,
+            site_dims=(9, 7, 5),
+            k=3,
+            decoder_constraint="free",
+            decoder_bias=False,
+            reconstruction_loss="squared_l2",
+            selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            ),
+        )
+    )
+    x = torch.randn(31, 3, 9, generator=torch.Generator().manual_seed(986))
+    z = torch.randn(31, 12, 3, generator=torch.Generator().manual_seed(987))
+    observed = None
+    if view == "partial":
+        observed = torch.ones(31, 3, dtype=torch.bool)
+        observed[::2, 0] = False
+    with torch.no_grad():
+        decoder = model.decoder_tensor()
+        geometry = model._frozen_score_geometry(decoder)
+        assert geometry.isolated_loss_decoder_map is not None
+        assert geometry.site_decoder_gram is not None
+        assert geometry.isolated_loss_all_site_gram is not None
+        direct = model.scores(z, x=x, observed=observed, _decoder=decoder)
+        cached = model.scores(
+            z,
+            x=x,
+            observed=observed,
+            _decoder=decoder,
+            _score_geometry=geometry,
+        )
+        assert torch.equal(cached, direct)
+        with pytest.raises(ValueError, match="not bound"):
+            model.scores(
+                z,
+                x=x,
+                observed=observed,
+                _decoder=decoder.clone(),
+                _score_geometry=geometry,
+            )
+
+
+def test_mapped_isolated_loss_preserves_factorized_free_decoder_gradients():
+    cfg_values = {
+        "n_blocks": 10,
+        "block_dim": 3,
+        "n_sites": 4,
+        "d_model": 12,
+        "k": 3,
+        "seed": 990,
+        "selection": "batch_topk",
+        "encoder_mode": "untied",
+        "decoder_constraint": "free",
+        "decoder_bias": False,
+        "reconstruction_loss": "squared_l2",
+        "selection_score": "isolated_loss_decrease",
+        "site_rank": 2,
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_EXACT_IMPLEMENTATION
+            ),
+        )
+    )
+    mapped = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            ),
+        )
+    )
+    mapped.load_state_dict(exact.state_dict())
+    generator = torch.Generator().manual_seed(991)
+    x_exact = torch.randn(41, 4, 12, generator=generator).requires_grad_()
+    z_exact = torch.randn(41, 10, 3, generator=generator).requires_grad_()
+    x_mapped = x_exact.detach().clone().requires_grad_()
+    z_mapped = z_exact.detach().clone().requires_grad_()
+    observed = torch.ones(41, 4, dtype=torch.bool)
+    observed[::2, 1] = False
+
+    exact_scores = exact.scores(z_exact, x=x_exact, observed=observed)
+    mapped_scores = mapped.scores(z_mapped, x=x_mapped, observed=observed)
+    assert exact.D_site is not None and exact.D_core is not None
+    assert mapped.D_site is not None and mapped.D_core is not None
+    exact_grads = torch.autograd.grad(
+        exact_scores.sum(),
+        (x_exact, z_exact, exact.D_site, exact.D_core),
+    )
+    mapped_grads = torch.autograd.grad(
+        mapped_scores.sum(),
+        (x_mapped, z_mapped, mapped.D_site, mapped.D_core),
+    )
+    assert _relative_l2(mapped_scores, exact_scores) <= 2e-6
+    assert max(
+        _relative_l2(actual, expected)
+        for actual, expected in zip(mapped_grads, exact_grads, strict=True)
+    ) <= 5e-6
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    (
+        (
+            {"isolated_loss_decrease_implementation": "runtime_default"},
+            "isolated_loss_decrease_implementation",
+        ),
+        (
+            {
+                "selection_score": "code_norm",
+                "isolated_loss_decrease_implementation": (
+                    ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+                ),
+            },
+            "mapped isolated-loss decrease",
+        ),
+        (
+            {
+                "decoder_constraint": "gram",
+                "isolated_loss_decrease_implementation": (
+                    ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+                ),
+            },
+            "mapped isolated-loss decrease",
+        ),
+    ),
+)
+def test_mapped_isolated_loss_config_fails_closed(overrides, match):
+    values = {
+        "n_blocks": 8,
+        "block_dim": 2,
+        "n_sites": 2,
+        "d_model": 5,
+        "k": 2,
+        "selection_score": "isolated_loss_decrease",
+        "decoder_constraint": "free",
+        "decoder_bias": False,
+        "reconstruction_loss": "squared_l2",
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=match):
+        BSCConfig(**values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
+def test_cuda_mapped_isolated_loss_campaign_shape_bounds_full_step_drift(
+    dtype,
+    selection,
+):
+    cfg_values = {
+        "n_blocks": 256,
+        "block_dim": 4,
+        "n_sites": 4,
+        "d_model": 128,
+        "k": 4,
+        "seed": 988,
+        "selection": selection,
+        "encoder_mode": "untied",
+        "encoder_fusion": "availability_rescaled_sum",
+        "decoder_constraint": "free",
+        "decoder_bias": False,
+        "reconstruction_loss": "squared_l2",
+        "selection_score": "isolated_loss_decrease",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_EXACT_IMPLEMENTATION
+            ),
+        ),
+        device="cuda",
+    )
+    with torch.no_grad():
+        assert exact.D is not None
+        scale = torch.linspace(0.6, 1.4, exact.cfg.n_blocks, device="cuda")
+        exact.D.mul_(scale.view(1, -1, 1, 1))
+    mapped = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            ),
+        ),
+        device="cuda",
+    )
+    mapped.load_state_dict(exact.state_dict())
+    exact = exact.to(dtype=dtype)
+    mapped = mapped.to(dtype=dtype)
+    x = torch.randn(
+        8192,
+        4,
+        128,
+        generator=torch.Generator().manual_seed(989),
+    ).to(device="cuda", dtype=dtype)
+
+    exact_out, exact_decoder, exact_encoder = exact.forward_with_materialized(x)
+    mapped_out, mapped_decoder, mapped_encoder = mapped.forward_with_materialized(x)
+    exact_loss = bsc_loss(
+        exact_out,
+        x,
+        exact,
+        decoder=exact_decoder,
+        encoder=exact_encoder,
+    )["total"]
+    mapped_loss = bsc_loss(
+        mapped_out,
+        x,
+        mapped,
+        decoder=mapped_decoder,
+        encoder=mapped_encoder,
+    )["total"]
+    exact_loss.backward()
+    mapped_loss.backward()
+
+    score_drift = _relative_l2(mapped_out.scores, exact_out.scores)
+    output_drift = _relative_l2(mapped_out.xhat, exact_out.xhat)
+    loss_drift = abs(float((mapped_loss - exact_loss).detach())) / max(
+        abs(float(exact_loss.detach())), 1e-12
+    )
+    mask_disagreement = float((mapped_out.mask != exact_out.mask).float().mean())
+    intersection = int((mapped_out.mask & exact_out.mask).sum())
+    union = int((mapped_out.mask | exact_out.mask).sum())
+    exact_parameters = dict(exact.named_parameters())
+    gradient_drifts = {}
+    for name, parameter in mapped.named_parameters():
+        actual_gradient = parameter.grad
+        expected_gradient = exact_parameters[name].grad
+        if actual_gradient is None or expected_gradient is None:
+            assert actual_gradient is None and expected_gradient is None, name
+            continue
+        gradient_drifts[name] = _relative_l2(actual_gradient, expected_gradient)
+
+    if dtype == torch.float32:
+        assert score_drift <= 2e-6
+        assert mask_disagreement <= 1e-6
+        assert output_drift <= 2e-4
+        assert loss_drift <= 2e-6
+        assert max(gradient_drifts.values()) <= 2e-4
+    else:
+        assert score_drift <= 2e-3
+        assert mask_disagreement <= 1e-3
+        assert intersection / max(union, 1) >= 0.99
+        assert output_drift <= 0.05
+        assert loss_drift <= 1e-4
+        assert max(gradient_drifts.values()) <= 0.06
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    (ISOLATED_LOSS_EXACT_IMPLEMENTATION, ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
+)
+def test_isolated_loss_decrease_excludes_hidden_clean_targets(implementation):
     model = BlockCrosscoder(
         BSCConfig(
             n_blocks=4,
@@ -1875,6 +2246,7 @@ def test_isolated_loss_decrease_excludes_hidden_clean_targets():
             decoder_bias=False,
             reconstruction_loss="squared_l2",
             selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=implementation,
         )
     )
     x = torch.randn(9, 3, 5, generator=torch.Generator().manual_seed(484))
@@ -1943,7 +2315,11 @@ def test_isolated_loss_decrease_is_reciprocal_block_gauge_invariant():
     )
 
 
-def test_isolated_loss_decrease_preserves_harmful_negative_scores():
+@pytest.mark.parametrize(
+    "implementation",
+    (ISOLATED_LOSS_EXACT_IMPLEMENTATION, ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
+)
+def test_isolated_loss_decrease_preserves_harmful_negative_scores(implementation):
     model = BlockCrosscoder(
         BSCConfig(
             n_blocks=1,
@@ -1955,6 +2331,7 @@ def test_isolated_loss_decrease_preserves_harmful_negative_scores():
             decoder_bias=False,
             reconstruction_loss="squared_l2",
             selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=implementation,
         )
     )
     with torch.no_grad():
@@ -2006,7 +2383,14 @@ def test_signed_streaming_quantile_matches_exact_and_is_order_independent(device
         assert abs(approximate - exact) / max(abs(exact), 1e-9) < 1e-3
 
 
-def test_isolated_loss_decrease_streaming_threshold_matches_exact(device):
+@pytest.mark.parametrize(
+    "implementation",
+    (ISOLATED_LOSS_EXACT_IMPLEMENTATION, ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
+)
+def test_isolated_loss_decrease_streaming_threshold_matches_exact(
+    device,
+    implementation,
+):
     model = BlockCrosscoder(
         BSCConfig(
             n_blocks=16,
@@ -2018,6 +2402,7 @@ def test_isolated_loss_decrease_streaming_threshold_matches_exact(device):
             decoder_bias=False,
             reconstruction_loss="squared_l2",
             selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=implementation,
         )
     ).to(device)
     generator = torch.Generator().manual_seed(488)

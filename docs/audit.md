@@ -90,7 +90,7 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v9 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v10 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
@@ -134,6 +134,15 @@ exit is not evidence by itself.
   reciprocal within-block gauge, and reduces to squared code norm for the
   unit-scale tied concatenated-Stiefel carrier. Exact and signed-streaming
   threshold calibration agree within the frozen support-rate tolerance.
+- Isolated-loss decrease has an explicit serialized contraction identity. The
+  mapped quadratic is admitted only for the free, bias-free quadratic carrier;
+  every ineligible declaration is refused rather than falling back. Direct
+  contribution oracles and paired exact/mapped gates cover full, partial,
+  source-only, padded, factorized, fp32, bf16, threshold-calibration, support,
+  loss, and gradient paths at the fixed bounds in `design.md`. The dominant
+  all-observed route constructs one all-site Gram directly; partial/source
+  routes retain exact site masking. Any predicate, contraction, or bound change
+  requires a new clean implementation identity and campaign-shape benchmark.
 - Synthetic subspace and aligned-code metrics use the same block chosen by
   support association.
 - Synthetic map-rank, site-span, frequency, and coactivation axes alter only
@@ -394,7 +403,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v9-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v10-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks.
