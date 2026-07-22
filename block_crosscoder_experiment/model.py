@@ -1110,10 +1110,12 @@ class BlockCrosscoder(nn.Module):
             projected = torch.zeros_like(code)
             energy_sq = torch.zeros(z.shape[:2], dtype=torch.float32, device=z.device)
             for site in range(self.cfg.n_sites):
-                projected = projected + torch.einsum(
-                    "nd,gbd->ngb",
-                    residual[:, site].float(),
-                    decoder[site],
+                projected.add_(
+                    torch.einsum(
+                        "nd,gbd->ngb",
+                        residual[:, site].float(),
+                        decoder[site],
+                    )
                 )
                 if _score_geometry is None:
                     site_gram = torch.einsum(
@@ -1123,8 +1125,8 @@ class BlockCrosscoder(nn.Module):
                     assert _score_geometry.site_decoder_gram is not None
                     site_gram = _score_geometry.site_decoder_gram[site]
                 site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
-                energy_sq = (
-                    energy_sq + keep[:, site, 0].float().unsqueeze(1) * site_energy
+                energy_sq.add_(
+                    keep[:, site, 0].float().unsqueeze(1) * site_energy
                 )
             score = (2.0 * (projected * code).sum(dim=-1) - energy_sq).to(z.dtype)
         return score
@@ -1655,12 +1657,12 @@ def bsc_loss(
             # Fel Group-Lasso BSF: mean over examples of the sum of activated
             # block norms.  The learned group soft threshold lives in encode.
             reg = out.z.float().norm(dim=-1).sum(dim=1).mean()
-            if (
-                cfg.group_lasso_target_k is not None
-                and float(out.mask.float().sum(dim=1).mean())
-                <= cfg.group_lasso_target_k
-            ):
-                reg = reg * 0.0
+            if cfg.group_lasso_target_k is not None:
+                mean_active = out.mask.float().sum(dim=1).mean()
+                above_target = mean_active.to(torch.float64) > float(
+                    cfg.group_lasso_target_k
+                )
+                reg = reg * above_target.to(reg.dtype)
         else:  # guarded by BSCConfig
             raise AssertionError(cfg.regularizer)
         parts["regularizer"] = reg

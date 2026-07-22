@@ -453,6 +453,30 @@ def test_group_lasso_bridge_has_positive_learned_threshold(device):
     assert model.log_threshold.grad is not None
 
 
+def test_group_lasso_target_gate_keeps_exact_boundary_semantics(device):
+    model = make_model(
+        device,
+        selection="dense",
+        code_activation="group_soft_threshold",
+        decoder_constraint="free",
+        regularizer="group_l21",
+        lambda_regularizer=1e-3,
+        group_lasso_target_k=0.01,
+    )
+    x = whitened_batch(device, n=32)
+    out = model(x)
+    active = float(out.mask.float().sum(dim=1).mean())
+    model.cfg.group_lasso_target_k = 0.01
+    above = bsc_loss(out, x, model)["regularizer"]
+    model.cfg.group_lasso_target_k = active
+    at_boundary = bsc_loss(out, x, model)["regularizer"]
+    model.cfg.group_lasso_target_k = active + 1.0
+    below = bsc_loss(out, x, model)["regularizer"]
+    assert above > 0
+    assert at_boundary == 0
+    assert below == 0
+
+
 def test_group_threshold_training_mask_is_independent_of_endpoint_score(device):
     model = BlockCrosscoder(
         BSCConfig(
@@ -858,6 +882,66 @@ def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions():
         "nsd,nsgd->ng", x, contribution
     ) - contribution.square().sum(dim=(1, 3))
     assert torch.allclose(model.scores(z, x=x), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_isolated_loss_decrease_inplace_accumulators_preserve_exact_gradients(
+    device,
+):
+    config = BSCConfig(
+        n_blocks=5,
+        block_dim=3,
+        n_sites=3,
+        d_model=7,
+        k=2,
+        decoder_constraint="free",
+        decoder_bias=False,
+        reconstruction_loss="squared_l2",
+        selection_score="isolated_loss_decrease",
+    )
+    actual_model = BlockCrosscoder(config).to(device)
+    reference_model = copy.deepcopy(actual_model)
+    generator = torch.Generator().manual_seed(983)
+    x_actual = torch.randn(11, 3, 7, generator=generator).to(device).requires_grad_()
+    z_actual = torch.randn(11, 5, 3, generator=generator).to(device).requires_grad_()
+    x_reference = x_actual.detach().clone().requires_grad_()
+    z_reference = z_actual.detach().clone().requires_grad_()
+
+    actual = actual_model.scores(z_actual, x=x_actual)
+    assert actual_model.D is not None
+    actual_grads = torch.autograd.grad(
+        actual.sum(), (x_actual, z_actual, actual_model.D)
+    )
+
+    assert reference_model.D is not None
+    decoder = reference_model.D.float()
+    code = z_reference.float()
+    projected = torch.zeros_like(code)
+    energy_sq = torch.zeros(
+        z_reference.shape[:2], dtype=torch.float32, device=device
+    )
+    for site in range(config.n_sites):
+        projected = projected + torch.einsum(
+            "nd,gbd->ngb", x_reference[:, site].float(), decoder[site]
+        )
+        site_gram = torch.einsum(
+            "gbd,gcd->gbc", decoder[site], decoder[site]
+        )
+        site_energy = torch.einsum(
+            "ngb,gbc,ngc->ng", code, site_gram, code
+        )
+        energy_sq = energy_sq + site_energy
+    expected = 2.0 * (projected * code).sum(dim=-1) - energy_sq
+    expected_grads = torch.autograd.grad(
+        expected.sum(), (x_reference, z_reference, reference_model.D)
+    )
+
+    assert torch.equal(actual, expected)
+    assert all(
+        torch.equal(actual_grad, expected_grad)
+        for actual_grad, expected_grad in zip(
+            actual_grads, expected_grads, strict=True
+        )
+    )
 
 
 def test_isolated_loss_decrease_excludes_hidden_clean_targets():
