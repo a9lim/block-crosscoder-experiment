@@ -100,6 +100,40 @@ def test_codec_fits_and_evaluates():
     assert len(p4["rate_bits_ci95"]) == 2
 
 
+def test_factorized_codec_pipeline_never_materializes_site_weights(monkeypatch):
+    torch.manual_seed(1901)
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=16,
+            block_dim=2,
+            n_sites=3,
+            d_model=12,
+            k=3,
+            decoder_constraint="free",
+            site_rank=2,
+        )
+    )
+    calibration = torch.randn(512, 3, 12)
+    model.fit_threshold_(list(calibration.split(128)), 3, method="exact")
+
+    def refuse_materialization():
+        raise AssertionError("direct factorized codec must stay in rank space")
+
+    monkeypatch.setattr(model, "decoder_tensor", refuse_materialization)
+    monkeypatch.setattr(model, "encoder_tensor", refuse_materialization)
+    spec = CodecSpec(qs=(4, 8), floor=1, n_bootstrap=8)
+    codec = fit_codec(model, list(calibration.split(128)), spec)
+    evaluation = torch.randn(256, 3, 12)
+    packet = encode_batch(model, codec, evaluation[:64], q=4)
+    decoded = decode_batch(model, codec, packet)
+    assert decoded.shape == evaluation[:64].shape
+    _, packets = encode_batch_all_q(model, codec, evaluation[:64])
+    decoded_all = decode_batch_all_q(model, codec, packets)
+    assert set(decoded_all) == {4, 8}
+    result = evaluate_rd(model, codec, list(evaluation.split(64)), row_len=32)
+    assert result["n_rows"] == 8
+
+
 def test_codec_threshold_packets_preserve_stiefel_score_mode_after_reload(tmp_path):
     cfg_values = {
         "n_blocks": 16,

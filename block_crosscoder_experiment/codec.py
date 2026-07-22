@@ -597,6 +597,12 @@ def _materialized_model_tensors(
         model, "forward_with_materialized"
     ):
         return decoder, encoder
+    if getattr(model, "uses_direct_factorized_execution", False):
+        if decoder is not None or encoder is not None:
+            raise ValueError(
+                "direct factorized codec execution refuses materialized weights"
+            )
+        return None, None
     if decoder is None:
         decoder = model.decoder_tensor()
     if encoder is None:
@@ -615,16 +621,17 @@ def _threshold_select(
     encoder: torch.Tensor | None,
     score_geometry=None,
 ):
+    if hasattr(model, "select_with_materialized"):
+        kwargs = {}
+        if decoder is not None:
+            kwargs["_decoder"] = decoder
+        if encoder is not None:
+            kwargs["_encoder"] = encoder
+        if score_geometry is not None:
+            kwargs["_score_geometry"] = score_geometry
+        return model.select_with_materialized(x, mode="threshold", **kwargs)[0]
     if decoder is None or encoder is None:
         return model(x, mode="threshold")
-    if hasattr(model, "select_with_materialized"):
-        return model.select_with_materialized(
-            x,
-            mode="threshold",
-            _decoder=decoder,
-            _encoder=encoder,
-            _score_geometry=score_geometry,
-        )[0]
     # Preserve the duck-typed codec surface for external reference models.
     return model.forward_with_materialized(
         x,
@@ -780,9 +787,54 @@ def encode_batch_all_q(
     )
     if not isinstance(selection, BSCSelection):
         return selection, packets
-    assert _decoder is not None
     xhat = model.decode(selection.z_selected, _decoder=_decoder)
     return BSCOutput(xhat, *selection), packets
+
+
+def _decode_sparse_rows(
+    model,
+    sparse_code: torch.Tensor,
+    *,
+    _decoder: torch.Tensor | None = None,
+    _decoder_matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode CSR rows through either the full-site or direct rank carrier."""
+
+    if (
+        getattr(model, "uses_direct_factorized_execution", False)
+        and _decoder is None
+        and _decoder_matrix is None
+    ):
+        cfg = model.cfg
+        assert cfg.site_rank is not None
+        assert model.D_site is not None and model.D_core is not None
+        rank_output = torch.sparse.mm(
+            sparse_code,
+            model._decoder_factor_core_map(),
+        ).reshape(-1, cfg.site_rank, cfg.d_model)
+        xhat = torch.matmul(
+            rank_output.transpose(1, 2),
+            model.D_site.transpose(0, 1),
+        ).transpose(1, 2)
+    else:
+        if _decoder_matrix is None:
+            decoder = model.decoder_tensor() if _decoder is None else _decoder
+            decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
+                model.cfg.n_blocks * model.cfg.block_dim,
+                model.cfg.n_sites * model.cfg.d_model,
+            )
+        else:
+            decoder_matrix = _decoder_matrix
+        xhat = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+            -1,
+            model.cfg.n_sites,
+            model.cfg.d_model,
+        )
+    if model.cfg.decoder_bias:
+        xhat = xhat + model.c.unsqueeze(0)
+    if model._has_padded_coordinates:
+        xhat = xhat * model.coordinate_mask[:, 0, 0].to(xhat.dtype)
+    return xhat
 
 
 @torch.no_grad()
@@ -905,24 +957,12 @@ def decode_batch(
             device=device,
             check_invariants=False,
         )
-    if _decoder_matrix is None:
-        decoder = model.decoder_tensor() if _decoder is None else _decoder
-        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
-            G * b,
-            model.cfg.n_sites * model.cfg.d_model,
-        )
-    else:
-        decoder_matrix = _decoder_matrix
-    xhat = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
-        packet.n_tokens,
-        model.cfg.n_sites,
-        model.cfg.d_model,
+    return _decode_sparse_rows(
+        model,
+        sparse_code,
+        _decoder=_decoder,
+        _decoder_matrix=_decoder_matrix,
     )
-    if model.cfg.decoder_bias:
-        xhat = xhat + model.c.unsqueeze(0)
-    if model._has_padded_coordinates:
-        xhat = xhat * model.coordinate_mask[:, 0, 0].to(xhat.dtype)
-    return xhat
 
 
 def _rotate_multi_q_events(
@@ -1117,31 +1157,17 @@ def decode_batch_all_q(
             device=device,
             check_invariants=False,
         )
-    if _decoder_matrix is None:
-        decoder = model.decoder_tensor() if _decoder is None else _decoder
-        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
-            G * b,
-            model.cfg.n_sites * model.cfg.d_model,
-        )
-    else:
-        decoder_matrix = _decoder_matrix
-    predictions = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+    predictions = _decode_sparse_rows(
+        model,
+        sparse_code,
+        _decoder=_decoder,
+        _decoder_matrix=_decoder_matrix,
+    ).reshape(
         len(requested),
         n_tokens,
         model.cfg.n_sites,
         model.cfg.d_model,
     )
-    if model.cfg.decoder_bias:
-        predictions = predictions + model.c.view(
-            1,
-            1,
-            model.cfg.n_sites,
-            model.cfg.d_model,
-        )
-    if model._has_padded_coordinates:
-        predictions = predictions * model.coordinate_mask[:, 0, 0].to(
-            predictions.dtype
-        ).unsqueeze(0)
     return {q: predictions[index] for index, q in enumerate(requested)}
 
 
@@ -1212,15 +1238,6 @@ def _decode_trusted_packet_events_q_chunks(
         ids.unsqueeze(1) * b
         + torch.arange(b, dtype=torch.long, device=device).unsqueeze(0)
     ).reshape(-1)
-    if _decoder_matrix is None:
-        decoder = model.decoder_tensor() if _decoder is None else _decoder
-        decoder_matrix = decoder.permute(1, 2, 0, 3).reshape(
-            G * b,
-            model.cfg.n_sites * model.cfg.d_model,
-        )
-    else:
-        decoder_matrix = _decoder_matrix
-
     for start in range(0, len(requested), q_chunk_size):
         chunk_qs = requested[start : start + q_chunk_size]
         levels = torch.tensor(
@@ -1261,23 +1278,17 @@ def _decode_trusted_packet_events_q_chunks(
                 device=device,
                 check_invariants=False,
             )
-        predictions = torch.sparse.mm(sparse_code, decoder_matrix).reshape(
+        predictions = _decode_sparse_rows(
+            model,
+            sparse_code,
+            _decoder=_decoder,
+            _decoder_matrix=_decoder_matrix,
+        ).reshape(
             len(chunk_qs),
             events.n_tokens,
             model.cfg.n_sites,
             model.cfg.d_model,
         )
-        if model.cfg.decoder_bias:
-            predictions = predictions + model.c.view(
-                1,
-                1,
-                model.cfg.n_sites,
-                model.cfg.d_model,
-            )
-        if model._has_padded_coordinates:
-            predictions = predictions * model.coordinate_mask[:, 0, 0].to(
-                predictions.dtype
-            ).unsqueeze(0)
         decoded_chunk = {q: predictions[index] for index, q in enumerate(chunk_qs)}
         yield decoded_chunk
         # The consumer deletes its chunk before requesting the next one.  Drop

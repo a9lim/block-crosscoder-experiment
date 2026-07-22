@@ -147,8 +147,8 @@ exit is not evidence by itself.
   `direct_rank_space_sparse_topk_cuda_v3`; unfactorized cells derive
   `not_applicable_v1`, and `materialized_prepacked_core_reference_v2` is an
   explicit release oracle only. Canonical rank-space encode, every score
-  geometry, threshold fitting, and decode must not materialize a full site tensor. Encoder and
-  decoder cores use their declared contiguous contraction-ready physical
+  geometry, threshold fitting, and decode must not materialize a full site
+  tensor. Encoder and decoder cores use their declared contiguous physical
   layouts; stale v1/v2 identities refuse. Low-density bf16 hard-TopK decode
   uses the content-bound Triton forward/backward only at batch size at least
   2,048 and density at most `1/32`; every other carrier retains dense
@@ -159,7 +159,9 @@ exit is not evidence by itself.
   state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
   use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
-  grants no runtime credit for this optimization.
+  remains conservative and grants no runtime credit for this optimization.
+  Codec fitting, packet encoding, public packet decode, and trusted multi-q
+  decode must also remain in rank space.
 - Phase-1 masking has a preceding scale-control panel: literal sum at `p=0`,
   nonpromotable literal sum at `p=.10`, and availability-rescaled sum at
   `p=.10`. Its fixed rescaled carrier enters the subsequent
