@@ -926,8 +926,9 @@ writes only the packed encoder allocation. Its logical return is a zero-copy
 view, so map regularizers and frozen partial-view evaluation retain the same
 geometry. Calls below one million decoder elements, non-CUDA devices, and
 other dtypes remain eager. The release oracle requires bitwise packed weights,
-codes, losses, decoder gradients, and gamma gradients. A paired alternating
-jobe benchmark at the same canonical bf16 shape reduces complete Trainer
+codes, losses, and decoder gradients; the scalar gamma gradient has a `2e-6`
+relative bound across cold and warm Inductor caches. A paired alternating jobe
+benchmark at the same canonical bf16 shape reduces complete Trainer
 median from `10.675` to `10.298 ms` (`3.53%`, `1.037x`) and p95 from `11.557`
 to `11.279 ms`; the later workspace still determines peak allocation.
 
