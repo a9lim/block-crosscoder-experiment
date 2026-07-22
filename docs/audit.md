@@ -55,6 +55,11 @@ exit is not evidence by itself.
   uses the direct kernel exactly; only declared partial views use the cached
   per-site reduction. Any kernel or bound change requires a new clean
   implementation identity before launch.
+- The compiled large-CUDA fp32 quadratic reduction is compared with its eager
+  oracle at the fixed loss, prediction/target-gradient, multi-step
+  model/optimizer-state, and selector-support bounds in `design.md`. Masked,
+  padded, nonquadratic, small, and non-CUDA paths remain eager, and exact
+  checkpoint resume is tested inside the compiled path.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.

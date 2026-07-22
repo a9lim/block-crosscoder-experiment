@@ -554,9 +554,7 @@ def _eager_token_topk_interior(
     n_keep: int,
 ) -> torch.Tensor:
     cutoff = (
-        scores.topk(n_keep, dim=1, sorted=False)
-        .values.min(dim=1, keepdim=True)
-        .values
+        scores.topk(n_keep, dim=1, sorted=False).values.min(dim=1, keepdim=True).values
     )
     strictly_above = scores > cutoff
     remaining = n_keep - strictly_above.sum(dim=1, keepdim=True)
@@ -1201,9 +1199,7 @@ class BlockCrosscoder(nn.Module):
                     assert _score_geometry.site_decoder_gram is not None
                     site_gram = _score_geometry.site_decoder_gram[site]
                 site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
-                energy_sq.add_(
-                    keep[:, site, 0].float().unsqueeze(1) * site_energy
-                )
+                energy_sq.add_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
             score = (2.0 * (projected * code).sum(dim=-1) - energy_sq).to(z.dtype)
         return score
 
@@ -1631,9 +1627,7 @@ class BlockCrosscoder(nn.Module):
             score_batches = []
             for x in batches:
                 value = x.to(self.parameter_device, self.parameter_dtype)
-                score_batches.append(
-                    batch_scores(value).flatten().float().cpu()
-                )
+                score_batches.append(batch_scores(value).flatten().float().cpu())
             scores = torch.cat(score_batches)
             n = scores.numel()
             idx = min(max(int(round(q * n)), 1), n)
@@ -1644,12 +1638,13 @@ class BlockCrosscoder(nn.Module):
         return theta
 
 
-# A compiled static elementwise graph becomes worthwhile well below the
+# A compiled static quadratic reduction becomes worthwhile well below the
 # smallest Phase-2 batch (2048 * 4 * 768 = 6,291,456 values).  Keep a fixed
 # one-megavalue gate so tiny Phase-1 cells, calibration tails, and unit tests do
-# not pay shape-specialized TorchInductor compilation churn.  The compiled
-# boundary deliberately ends before the fp32 reduction: changing that sum's
-# kernel changes the experiment's loss and trained state.
+# not pay shape-specialized TorchInductor compilation churn.  Compiling the
+# reduction changes its parallel summation order, so the release gate bounds
+# loss, input-gradient, optimizer-trajectory, and selector-support drift rather
+# than claiming bit-exact parity with the eager reduction.
 _CUDA_QUADRATIC_FUSION_MIN_ELEMENTS = 1 << 20
 
 
@@ -1660,68 +1655,44 @@ def _eager_fp32_squared_error_elements(
     return (prediction.float() - target.float()).pow(2)
 
 
+def _eager_fp32_squared_error_reduction(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    denominator: int,
+) -> torch.Tensor:
+    return _eager_fp32_squared_error_elements(prediction, target).sum() / denominator
+
+
 @cache
-def _compiled_cuda_fp32_squared_error_elements():
+def _compiled_cuda_fp32_squared_error_reduction():
     """Create one Torch 2.8 Inductor wrapper; it caches static CUDA graphs."""
 
     return torch.compile(
-        _eager_fp32_squared_error_elements,
+        _eager_fp32_squared_error_reduction,
         backend="inductor",
         fullgraph=True,
         dynamic=False,
     )
 
 
-class _ExactCompiledSquaredError(torch.autograd.Function):
-    """Compile the forward without changing the eager autograd layout.
-
-    Torch 2.8 AOTAutograd returns a contiguous prediction gradient for this
-    graph even when the decoder output has its native transposed site-major
-    stride.  The values are equal, but feeding a different gradient layout to
-    the decoder GEMM changes its accumulation and therefore the trained state.
-    Retain the compiled elementwise forward while spelling the ordinary eager
-    derivative here so both gradient values and strides remain exact.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(prediction, target)
-        return _compiled_cuda_fp32_squared_error_elements()(prediction, target)
-
-    @staticmethod
-    def backward(
-        ctx,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        prediction, target = ctx.saved_tensors
-        residual = prediction.float() - target.float()
-        gradient = 2.0 * residual * grad_output
-        prediction_gradient = (
-            gradient.to(prediction.dtype) if ctx.needs_input_grad[0] else None
-        )
-        target_gradient = (
-            (-gradient).to(target.dtype) if ctx.needs_input_grad[1] else None
-        )
-        return prediction_gradient, target_gradient
-
-
-def _fp32_squared_error_elements(
+def _fp32_squared_error_reduction(
     prediction: torch.Tensor,
     target: torch.Tensor,
+    denominator: int,
 ) -> torch.Tensor:
-    """Exact fp32 elementwise quadratic, fused only for large CUDA tensors."""
+    """Fp32 quadratic objective, compiled only for the dominant CUDA path."""
 
     if (
         prediction.is_cuda
         and target.is_cuda
         and prediction.numel() >= _CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
     ):
-        return _ExactCompiledSquaredError.apply(prediction, target)
-    return _eager_fp32_squared_error_elements(prediction, target)
+        return _compiled_cuda_fp32_squared_error_reduction()(
+            prediction,
+            target,
+            denominator,
+        )
+    return _eager_fp32_squared_error_reduction(prediction, target, denominator)
 
 
 def bsc_loss(
@@ -1758,22 +1729,21 @@ def bsc_loss(
 
     def reconstruction(target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         # The dominant real-model objective is all-observed, rectangular, and
-        # quadratic. Fuse only its elementwise fp32 casts/subtract/square, then
-        # retain the exact eager sum and division below. Missingness, padding,
-        # nonquadratic objectives, small tensors, and non-CUDA devices keep the
-        # ordinary eager implementation.
+        # quadratic. Fuse its fp32 casts/subtract/square/sum together with the
+        # declared normalization division. Missingness, padding, nonquadratic
+        # objectives, small tensors, and non-CUDA devices keep the ordinary
+        # eager implementation.
         if (
             all_observed
             and not model._has_padded_coordinates
             and cfg.reconstruction_loss in {"mean_squared", "squared_l2"}
         ):
-            squared_error = _fp32_squared_error_elements(pred, target)
             denominator = (
                 target.shape[0]
                 if cfg.reconstruction_loss == "squared_l2"
                 else target.shape[0] * sum(cfg.site_dims)
             )
-            return squared_error.sum() / denominator
+            return _fp32_squared_error_reduction(pred, target, denominator)
 
         residual = pred.float() - target.float()
         if model._has_padded_coordinates:

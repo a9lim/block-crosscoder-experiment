@@ -103,15 +103,12 @@ def _loss_output(prediction: torch.Tensor, n_blocks: int, block_dim: int) -> BSC
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
 @pytest.mark.parametrize("reconstruction_loss", ("mean_squared", "squared_l2"))
-def test_compiled_cuda_quadratic_elements_loss_and_output_gradient_are_exact(
+def test_compiled_cuda_quadratic_reduction_bounds_loss_and_input_gradient_drift(
     dtype, reconstruction_loss
 ):
     device = torch.device("cuda")
     batch, n_sites, d_model = 256, 4, 1024
-    assert (
-        batch * n_sites * d_model
-        == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
-    )
+    assert batch * n_sites * d_model == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
     cfg = BSCConfig(
         n_blocks=2,
         block_dim=2,
@@ -128,37 +125,54 @@ def test_compiled_cuda_quadratic_elements_loss_and_output_gradient_are_exact(
         device=device,
         dtype=dtype,
     )
-    repeats = (batch * n_sites * d_model + len(finite_values) - 1) // len(
-        finite_values
-    )
+    repeats = (batch * n_sites * d_model + len(finite_values) - 1) // len(finite_values)
     prediction = finite_values.repeat(repeats)[: batch * n_sites * d_model]
     prediction = prediction.reshape(batch, n_sites, d_model)
     prediction = prediction.transpose(0, 1).contiguous().transpose(0, 1)
     prediction.requires_grad_()
     assert prediction.stride() == (d_model, batch * d_model, 1)
     target = finite_values.flip(0).repeat(repeats)[: batch * n_sites * d_model]
-    target = target.reshape(batch, n_sites, d_model).clone()
+    target = target.reshape(batch, n_sites, d_model).clone().requires_grad_()
     reference_prediction = prediction.detach().clone().requires_grad_()
+    reference_target = target.detach().clone().requires_grad_()
 
-    actual_elements = model_module._fp32_squared_error_elements(prediction, target)
-    expected_elements = model_module._eager_fp32_squared_error_elements(
-        reference_prediction,
+    denominator = batch if reconstruction_loss == "squared_l2" else target.numel()
+    actual_loss = model_module._fp32_squared_error_reduction(
+        prediction,
         target,
+        denominator,
     )
-    assert torch.equal(actual_elements, expected_elements)
+    expected_loss = model_module._eager_fp32_squared_error_reduction(
+        reference_prediction,
+        reference_target,
+        denominator,
+    )
+    direct_loss_relative_error = abs(
+        float((actual_loss - expected_loss).detach())
+    ) / max(abs(float(expected_loss.detach())), 1e-30)
+    assert direct_loss_relative_error <= 2e-6
 
-    actual_loss = bsc_loss(
+    bsc_actual_loss = bsc_loss(
         _loss_output(prediction, cfg.n_blocks, cfg.block_dim),
         target,
         model,
     )["rec"]
-    denominator = batch if reconstruction_loss == "squared_l2" else target.numel()
-    expected_loss = expected_elements.sum() / denominator
-    assert torch.equal(actual_loss, expected_loss)
-    actual_gradient = torch.autograd.grad(actual_loss, prediction)[0]
-    expected_gradient = torch.autograd.grad(expected_loss, reference_prediction)[0]
-    assert torch.equal(actual_gradient, expected_gradient)
-    assert actual_gradient.stride() == expected_gradient.stride()
+    loss_relative_error = abs(float((bsc_actual_loss - expected_loss).detach())) / max(
+        abs(float(expected_loss.detach())), 1e-30
+    )
+    assert loss_relative_error <= 2e-6
+    actual_prediction_gradient, actual_target_gradient = torch.autograd.grad(
+        bsc_actual_loss,
+        (prediction, target),
+    )
+    expected_prediction_gradient, expected_target_gradient = torch.autograd.grad(
+        expected_loss,
+        (reference_prediction, reference_target),
+    )
+    assert (
+        _relative_l2(actual_prediction_gradient, expected_prediction_gradient) <= 2e-6
+    )
+    assert _relative_l2(actual_target_gradient, expected_target_gradient) <= 2e-6
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
@@ -167,7 +181,7 @@ def test_compiled_cuda_quadratic_preserves_nonfinite_refusal_surface(dtype):
     device = torch.device("cuda")
     n = model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
     prediction = torch.zeros(n, device=device, dtype=dtype, requires_grad=True)
-    target = torch.zeros_like(prediction)
+    target = torch.zeros_like(prediction, requires_grad=True)
     with torch.no_grad():
         prediction[:3] = torch.tensor(
             (float("nan"), float("inf"), float("-inf")),
@@ -175,32 +189,39 @@ def test_compiled_cuda_quadratic_preserves_nonfinite_refusal_surface(dtype):
             dtype=dtype,
         )
     reference_prediction = prediction.detach().clone().requires_grad_()
-    actual = model_module._fp32_squared_error_elements(prediction, target)
-    expected = model_module._eager_fp32_squared_error_elements(
-        reference_prediction,
+    reference_target = target.detach().clone().requires_grad_()
+    actual_loss = model_module._fp32_squared_error_reduction(
+        prediction,
         target,
+        n,
+    )
+    expected_loss = model_module._eager_fp32_squared_error_reduction(
+        reference_prediction,
+        reference_target,
+        n,
     )
 
-    for predicate in (torch.isnan, torch.isposinf, torch.isneginf):
-        assert torch.equal(predicate(actual), predicate(expected))
-    finite = torch.isfinite(expected)
-    assert torch.equal(actual[finite], expected[finite])
-    actual_loss = actual.sum() / n
-    expected_loss = expected.sum() / n
     assert torch.isnan(actual_loss) and torch.isnan(expected_loss)
-    actual_gradient = torch.autograd.grad(actual_loss, prediction)[0]
-    expected_gradient = torch.autograd.grad(expected_loss, reference_prediction)[0]
-    for predicate in (torch.isnan, torch.isposinf, torch.isneginf):
-        assert torch.equal(
-            predicate(actual_gradient),
-            predicate(expected_gradient),
-        )
-    finite_gradient = torch.isfinite(expected_gradient)
-    assert torch.equal(
-        actual_gradient[finite_gradient],
-        expected_gradient[finite_gradient],
+    actual_gradients = torch.autograd.grad(actual_loss, (prediction, target))
+    expected_gradients = torch.autograd.grad(
+        expected_loss,
+        (reference_prediction, reference_target),
     )
-    assert actual_gradient.stride() == expected_gradient.stride()
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        for predicate in (torch.isnan, torch.isposinf, torch.isneginf):
+            assert torch.equal(
+                predicate(actual_gradient),
+                predicate(expected_gradient),
+            )
+        finite_gradient = torch.isfinite(expected_gradient)
+        assert torch.equal(
+            actual_gradient[finite_gradient],
+            expected_gradient[finite_gradient],
+        )
 
 
 def test_cuda_quadratic_compile_wrapper_is_lazy_cached_and_size_gated(
@@ -220,21 +241,30 @@ def test_cuda_quadratic_compile_wrapper_is_lazy_cached_and_size_gated(
         return compiled
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
+    model_module._compiled_cuda_fp32_squared_error_reduction.cache_clear()
     try:
         n = model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
         large = torch.linspace(-2.0, 2.0, n, device=device)
         target = large.flip(0)
         for _ in range(2):
-            actual = model_module._fp32_squared_error_elements(large, target)
-            expected = model_module._eager_fp32_squared_error_elements(large, target)
-            assert torch.equal(actual, expected)
+            actual = model_module._fp32_squared_error_reduction(large, target, n)
+            expected = model_module._eager_fp32_squared_error_reduction(
+                large,
+                target,
+                n,
+            )
+            assert torch.allclose(actual, expected, rtol=2e-6, atol=1e-6)
         small = large[: n - 1]
         assert torch.equal(
-            model_module._fp32_squared_error_elements(small, target[: n - 1]),
-            model_module._eager_fp32_squared_error_elements(
+            model_module._fp32_squared_error_reduction(
                 small,
                 target[: n - 1],
+                n - 1,
+            ),
+            model_module._eager_fp32_squared_error_reduction(
+                small,
+                target[: n - 1],
+                n - 1,
             ),
         )
         if device.type == "cuda":
@@ -250,7 +280,7 @@ def test_cuda_quadratic_compile_wrapper_is_lazy_cached_and_size_gated(
             assert compile_calls == []
             assert compiled_calls == 0
     finally:
-        model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
+        model_module._compiled_cuda_fp32_squared_error_reduction.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -285,7 +315,7 @@ def test_quadratic_compilation_excludes_non_dominant_loss_paths(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("non-dominant reconstruction entered compiled helper")
 
-    monkeypatch.setattr(model_module, "_fp32_squared_error_elements", forbidden)
+    monkeypatch.setattr(model_module, "_fp32_squared_error_reduction", forbidden)
     loss = bsc_loss(
         _loss_output(prediction, cfg.n_blocks, cfg.block_dim),
         target,
@@ -606,9 +636,7 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
         _decoder=decoder,
         _encoder=encoder,
     )
-    for expected_tensor, selected_tensor in zip(
-        actual[1:], selected, strict=True
-    ):
+    for expected_tensor, selected_tensor in zip(actual[1:], selected, strict=True):
         assert torch.equal(expected_tensor, selected_tensor)
     assert selected_decoder is decoder
     assert selected_encoder is encoder
@@ -888,10 +916,14 @@ def test_compiled_cuda_selectors_match_eager_over_adversarial_surfaces(dtype):
         device=device,
         dtype=dtype,
     )
-    noncontiguous = torch.randn(groups, batch, generator=generator).to(
-        device=device,
-        dtype=dtype,
-    ).transpose(0, 1)
+    noncontiguous = (
+        torch.randn(groups, batch, generator=generator)
+        .to(
+            device=device,
+            dtype=dtype,
+        )
+        .transpose(0, 1)
+    )
     assert not noncontiguous.is_contiguous()
     patterns = {
         "random": random_scores,
@@ -1575,19 +1607,13 @@ def test_isolated_loss_decrease_inplace_accumulators_preserve_exact_gradients(
     decoder = reference_model.D.float()
     code = z_reference.float()
     projected = torch.zeros_like(code)
-    energy_sq = torch.zeros(
-        z_reference.shape[:2], dtype=torch.float32, device=device
-    )
+    energy_sq = torch.zeros(z_reference.shape[:2], dtype=torch.float32, device=device)
     for site in range(config.n_sites):
         projected = projected + torch.einsum(
             "nd,gbd->ngb", x_reference[:, site].float(), decoder[site]
         )
-        site_gram = torch.einsum(
-            "gbd,gcd->gbc", decoder[site], decoder[site]
-        )
-        site_energy = torch.einsum(
-            "ngb,gbc,ngc->ng", code, site_gram, code
-        )
+        site_gram = torch.einsum("gbd,gcd->gbc", decoder[site], decoder[site])
+        site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
         energy_sq = energy_sq + site_energy
     expected = 2.0 * (projected * code).sum(dim=-1) - energy_sq
     expected_grads = torch.autograd.grad(
@@ -1597,9 +1623,7 @@ def test_isolated_loss_decrease_inplace_accumulators_preserve_exact_gradients(
     assert torch.equal(actual, expected)
     assert all(
         torch.equal(actual_grad, expected_grad)
-        for actual_grad, expected_grad in zip(
-            actual_grads, expected_grads, strict=True
-        )
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True)
     )
 
 

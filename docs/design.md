@@ -865,6 +865,16 @@ gates, not a tunable scientific matrix row; changing either kernel or bound
 requires a new clean implementation identity and a fresh audit before any
 campaign starts.
 
+The dominant all-observed, unpadded CUDA quadratic objective compiles the fp32
+cast, residual, square, scalar sum, and declared normalization division as one
+static reduction. That parallel reduction is an authorized implementation-order
+change, not a new scientific objective. Its eager-oracle release gate requires
+relative loss and prediction/target-gradient drift at most `2e-6`, multi-step
+model and optimizer state relative L2 drift at most `1e-5`, and hard-support
+disagreement at most `1e-4`. Masked, padded, nonquadratic, small, and non-CUDA
+objectives retain the eager reduction. Any kernel or bound change requires a
+new clean implementation identity and a fresh audit before launch.
+
 Atomic checkpoints include model, optimizer, scheduler, retraction/dead-state,
 attempted and accepted tokens, data cursor, Python/NumPy/Torch/accelerator RNG
 states, and all content bindings. Resume validates the bindings and continues

@@ -1,5 +1,6 @@
 """Trainer checks for update ordering, precision copies, Aux, and replay."""
 
+import math
 from dataclasses import asdict
 
 import pytest
@@ -80,6 +81,63 @@ def _assert_nested_exact(actual, expected) -> None:
     assert actual == expected
 
 
+def _nested_relative_l2(actual, expected) -> float:
+    """Relative L2 over floating leaves while checking all other state exactly."""
+
+    numerator = 0.0
+    denominator = 0.0
+
+    def visit(actual_value, expected_value) -> None:
+        nonlocal numerator, denominator
+        if torch.is_tensor(actual_value):
+            assert torch.is_tensor(expected_value)
+            assert actual_value.dtype == expected_value.dtype
+            if actual_value.device != expected_value.device:
+                actual_value = actual_value.cpu()
+                expected_value = expected_value.cpu()
+            if not (actual_value.is_floating_point() or actual_value.is_complex()):
+                assert torch.equal(actual_value, expected_value)
+                return
+            actual_nan = torch.isnan(actual_value)
+            expected_nan = torch.isnan(expected_value)
+            assert torch.equal(actual_nan, expected_nan)
+            actual_finite = torch.where(
+                actual_nan,
+                torch.zeros_like(actual_value),
+                actual_value,
+            ).double()
+            expected_finite = torch.where(
+                expected_nan,
+                torch.zeros_like(expected_value),
+                expected_value,
+            ).double()
+            assert torch.isfinite(actual_finite).all()
+            assert torch.isfinite(expected_finite).all()
+            numerator += float((actual_finite - expected_finite).square().sum())
+            denominator += float(expected_finite.square().sum())
+            return
+        if isinstance(actual_value, dict):
+            assert isinstance(expected_value, dict)
+            assert actual_value.keys() == expected_value.keys()
+            for key in actual_value:
+                visit(actual_value[key], expected_value[key])
+            return
+        if isinstance(actual_value, (list, tuple)):
+            assert type(actual_value) is type(expected_value)
+            assert len(actual_value) == len(expected_value)
+            for actual_item, expected_item in zip(
+                actual_value,
+                expected_value,
+                strict=True,
+            ):
+                visit(actual_item, expected_item)
+            return
+        assert actual_value == expected_value
+
+    visit(actual, expected)
+    return math.sqrt(numerator / max(denominator, 1e-30))
+
+
 def test_fp32_step_ordering_loss_falls(device):
     model = BlockCrosscoder(CFG).to(device)
     trainer = Trainer(model, train_cfg(total_steps=60))
@@ -116,7 +174,9 @@ def test_gradient_clipping_updates_master_gradients_and_reports_both_norms(devic
         if parameter.grad is not None
     ]
     actual = torch.linalg.vector_norm(
-        torch.stack([torch.linalg.vector_norm(gradient.float()) for gradient in gradients])
+        torch.stack(
+            [torch.linalg.vector_norm(gradient.float()) for gradient in gradients]
+        )
     )
     assert record["grad_norm_unclipped"] > clip
     assert float(actual) <= clip * 1.001
@@ -346,9 +406,7 @@ def test_dead_tracker_policy_updates_only_exact_required_state(device, policy):
     elif policy == "long_horizon":
         forged["last_fire"] = torch.zeros(1, dtype=torch.int64, device=device)
     elif policy == "decoder_weighted_token_horizon":
-        forged["tokens_since_fired"] = torch.zeros(
-            1, dtype=torch.int64, device=device
-        )
+        forged["tokens_since_fired"] = torch.zeros(1, dtype=torch.int64, device=device)
     else:
         forged["coordinate_passes_since_fired"] = torch.zeros(
             1, dtype=torch.int64, device=device
@@ -431,7 +489,9 @@ def test_sasa_sparse_and_bitpacked_history_match_dense_reference(
             active_blocks=active_blocks,
         )
         restored.load_state_dict(tracker.state_dict())
-        assert torch.equal(restored.frequency(len(dense)), tracker.frequency(len(dense)))
+        assert torch.equal(
+            restored.frequency(len(dense)), tracker.frequency(len(dense))
+        )
         tracker = restored
 
     if tracker.representation != "fixed_batch_indices":
@@ -943,15 +1003,12 @@ def test_checkpoint_resume_matches(device, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
-def test_compiled_quadratic_trainer_state_and_resume_match_eager_exactly(
+def test_compiled_quadratic_trainer_bounds_trajectory_and_support_drift(
     tmp_path, monkeypatch
 ):
     device = torch.device("cuda")
     batch, n_sites, d_model = 512, 4, 512
-    assert (
-        batch * n_sites * d_model
-        == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
-    )
+    assert batch * n_sites * d_model == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
     cfg = BSCConfig(
         n_blocks=8,
         block_dim=2,
@@ -975,56 +1032,128 @@ def test_compiled_quadratic_trainer_state_and_resume_match_eager_exactly(
         for _ in range(training.total_steps)
     ]
 
-    # The oracle changes only the large-CUDA elementwise producer back to its
-    # intentional eager fallback; every trainer and checkpoint operation is
-    # otherwise identical.
+    def post_step_support(trainer: Trainer, batch_tensor: torch.Tensor) -> torch.Tensor:
+        dtype = next(trainer.fwd.parameters()).dtype
+        with torch.no_grad():
+            return trainer.fwd(batch_tensor.to(dtype=dtype)).mask.detach().cpu()
+
+    def run_steps(
+        trainer: Trainer,
+        step_batches: list[torch.Tensor],
+    ) -> tuple[list[dict], list[torch.Tensor]]:
+        records = []
+        supports = []
+        for batch_tensor in step_batches:
+            record = trainer.step(batch_tensor)
+            assert record is not None
+            records.append(record)
+            supports.append(post_step_support(trainer, batch_tensor))
+        return records, supports
+
+    # The oracle changes only the large-CUDA reduction back to its eager
+    # implementation; every trainer and checkpoint operation is otherwise
+    # identical.
     with monkeypatch.context() as eager_patch:
         eager_patch.setattr(
             model_module,
-            "_fp32_squared_error_elements",
-            model_module._eager_fp32_squared_error_elements,
+            "_fp32_squared_error_reduction",
+            model_module._eager_fp32_squared_error_reduction,
         )
         eager = Trainer(BlockCrosscoder(cfg).to(device), training)
-        eager_records = [eager.step(batch_tensor) for batch_tensor in batches]
+        eager_records, eager_supports = run_steps(eager, batches)
 
-    model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
-    compiled_kernel = model_module._compiled_cuda_fp32_squared_error_elements()
+    compiled_getter = model_module._compiled_cuda_fp32_squared_error_reduction
+    compiled_getter.cache_clear()
     compiled_calls = 0
 
     def counted_compiled(
         prediction: torch.Tensor,
         target: torch.Tensor,
+        denominator: int,
     ) -> torch.Tensor:
         nonlocal compiled_calls
         compiled_calls += 1
-        return compiled_kernel(prediction, target)
+        return compiled_getter()(prediction, target, denominator)
 
     monkeypatch.setattr(
         model_module,
-        "_compiled_cuda_fp32_squared_error_elements",
+        "_compiled_cuda_fp32_squared_error_reduction",
         lambda: counted_compiled,
     )
     compiled = Trainer(BlockCrosscoder(cfg).to(device), training)
-    compiled_records = [compiled.step(batch_tensor) for batch_tensor in batches[:2]]
-    checkpoint = tmp_path / "compiled-quadratic.pt"
-    compiled.save_checkpoint(checkpoint)
-    resumed = Trainer.load_checkpoint(checkpoint, device=device)
-    compiled_records.extend(
-        resumed.step(batch_tensor) for batch_tensor in batches[2:]
-    )
+    compiled_records, compiled_supports = run_steps(compiled, batches)
 
-    assert compiled_calls == training.total_steps
-    _assert_nested_exact(compiled_records, eager_records)
-    _assert_nested_exact(resumed.master.state_dict(), eager.master.state_dict())
-    _assert_nested_exact(resumed.fwd.state_dict(), eager.fwd.state_dict())
-    _assert_nested_exact(resumed.opt.state_dict(), eager.opt.state_dict())
-    _assert_nested_exact(resumed.sched.state_dict(), eager.sched.state_dict())
-    _assert_nested_exact(resumed.tracker.state_dict(), eager.tracker.state_dict())
-    _assert_nested_exact(resumed.history, eager.history)
-    _assert_nested_exact(resumed._prev_shares, eager._prev_shares)
-    assert resumed.step_idx == eager.step_idx
-    assert resumed.accepted_tokens == eager.accepted_tokens
-    assert resumed.data_cursor == eager.data_cursor
+    resumable = Trainer(BlockCrosscoder(cfg).to(device), training)
+    resumed_records, resumed_supports = run_steps(resumable, batches[:2])
+    checkpoint = tmp_path / "compiled-quadratic.pt"
+    resumable.save_checkpoint(checkpoint)
+    compiled_getter.cache_clear()
+    resumed = Trainer.load_checkpoint(checkpoint, device=device)
+    continued_records, continued_supports = run_steps(resumed, batches[2:])
+    resumed_records.extend(continued_records)
+    resumed_supports.extend(continued_supports)
+
+    assert compiled_calls == 2 * training.total_steps
+    _assert_nested_exact(resumed_records, compiled_records)
+    _assert_nested_exact(resumed_supports, compiled_supports)
+    _assert_nested_exact(resumed.master.state_dict(), compiled.master.state_dict())
+    _assert_nested_exact(resumed.fwd.state_dict(), compiled.fwd.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), compiled.opt.state_dict())
+    _assert_nested_exact(resumed.sched.state_dict(), compiled.sched.state_dict())
+    _assert_nested_exact(resumed.tracker.state_dict(), compiled.tracker.state_dict())
+    _assert_nested_exact(resumed.history, compiled.history)
+    _assert_nested_exact(resumed._prev_shares, compiled._prev_shares)
+    assert resumed.step_idx == compiled.step_idx
+    assert resumed.accepted_tokens == compiled.accepted_tokens
+    assert resumed.data_cursor == compiled.data_cursor
+
+    for actual_record, expected_record in zip(
+        compiled_records,
+        eager_records,
+        strict=True,
+    ):
+        for name in ("rec", "total"):
+            relative_error = abs(actual_record[name] - expected_record[name]) / max(
+                abs(expected_record[name]),
+                1e-30,
+            )
+            assert relative_error <= 2e-6
+    support_disagreement = sum(
+        int((actual != expected).sum())
+        for actual, expected in zip(
+            compiled_supports,
+            eager_supports,
+            strict=True,
+        )
+    ) / max(
+        sum(
+            int(actual.sum() + expected.sum())
+            for actual, expected in zip(
+                compiled_supports,
+                eager_supports,
+                strict=True,
+            )
+        ),
+        1,
+    )
+    assert support_disagreement <= 1e-4
+    assert (
+        _nested_relative_l2(
+            compiled.master.state_dict(),
+            eager.master.state_dict(),
+        )
+        <= 1e-5
+    )
+    assert (
+        _nested_relative_l2(
+            compiled.fwd.state_dict(),
+            eager.fwd.state_dict(),
+        )
+        <= 1e-5
+    )
+    assert (
+        _nested_relative_l2(compiled.opt.state_dict(), eager.opt.state_dict()) <= 1e-5
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
@@ -1060,9 +1189,7 @@ def test_compiled_selector_trainer_state_and_resume_match_eager_exactly(
     ]
     interior_name = f"_{selector.removesuffix('_topk')}_topk_interior"
     eager_name = f"_eager_{selector.removesuffix('_topk')}_topk_interior"
-    compiled_name = (
-        f"_compiled_cuda_{selector.removesuffix('_topk')}_topk_interior"
-    )
+    compiled_name = f"_compiled_cuda_{selector.removesuffix('_topk')}_topk_interior"
 
     with monkeypatch.context() as eager_patch:
         eager_patch.setattr(
@@ -1089,9 +1216,7 @@ def test_compiled_selector_trainer_state_and_resume_match_eager_exactly(
     checkpoint = tmp_path / f"compiled-{selector}.pt"
     compiled.save_checkpoint(checkpoint)
     resumed = Trainer.load_checkpoint(checkpoint, device=device)
-    compiled_records.extend(
-        resumed.step(batch_tensor) for batch_tensor in batches[2:]
-    )
+    compiled_records.extend(resumed.step(batch_tensor) for batch_tensor in batches[2:])
 
     assert compiled_calls == training.total_steps
     _assert_nested_exact(compiled_records, eager_records)
@@ -1408,9 +1533,7 @@ def test_post_step_nonfinite_refuses_run(device, monkeypatch):
         trainer.step(planted_batches(device, n_batches=1, seed=43)[0])
 
 
-def test_nonlogging_unclipped_fast_step_keeps_only_finite_scans(
-    device, monkeypatch
-):
+def test_nonlogging_unclipped_fast_step_keeps_only_finite_scans(device, monkeypatch):
     trainer = Trainer(
         BlockCrosscoder(CFG).to(device),
         train_cfg(
@@ -1482,9 +1605,7 @@ def test_nonlogging_fast_step_refuses_nonfinite_gradient_before_optimizer(
 
 
 @pytest.mark.parametrize("magnitude", (1e30, 1e38))
-def test_fast_gradient_guard_matches_historical_finite_l2_refusal(
-    device, magnitude
-):
+def test_fast_gradient_guard_matches_historical_finite_l2_refusal(device, magnitude):
     gradients = [torch.full((4096,), magnitude, device=device)]
     historical = torch.linalg.vector_norm(
         torch.stack(
