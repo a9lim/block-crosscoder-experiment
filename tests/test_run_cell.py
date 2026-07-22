@@ -131,6 +131,8 @@ def test_calibrate_prefetches_and_closes_all_three_cuda_traversals() -> None:
         "",
     )
     assert source.count("with closing(") == 3
+    assert "achieved_events_device.add_(" in source
+    assert "achieved_events += int(selected.sum())" not in source
 
 
 @pytest.mark.parametrize("target", ("cpu", "cuda"))

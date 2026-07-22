@@ -4564,7 +4564,11 @@ def _calibrate(
         "quantile_method": quantile_method,
         "target_avg_blocks": target,
     }
-    achieved_events = 0
+    achieved_events_device = torch.zeros(
+        (),
+        dtype=torch.int64,
+        device=_device(ctx),
+    )
     achieved_tokens = 0
     with torch.no_grad():
         calibration_decoder = model.decoder_tensor()
@@ -4588,10 +4592,11 @@ def _calibrate(
                     _score_geometry=calibration_score_geometry,
                 )
                 selected = model._select_scores(scores, mode="threshold", z=z)
-                achieved_events += int(selected.sum())
+                achieved_events_device.add_(selected.sum(dtype=torch.int64))
                 achieved_tokens += len(x)
     if achieved_tokens == 0:
         raise CellExecutionError("calibration split is empty")
+    achieved_events = int(achieved_events_device)
     achieved_avg_blocks = achieved_events / achieved_tokens
     threshold_error = abs(achieved_avg_blocks - target)
     if ctx.values["codec.bootstrap_seed_source"] != "random.eval_data_seed":
