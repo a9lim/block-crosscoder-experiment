@@ -602,6 +602,84 @@ def test_decoder_weighted_token_horizon_uses_scaled_rank_and_unscaled_values(dev
 
 
 @pytest.mark.parametrize(
+    "reconstruction_loss",
+    (
+        "mean_l2",
+        "mean_squared",
+        "squared_l2",
+        "squared_l2_over_residual_variance",
+    ),
+)
+@pytest.mark.parametrize("masked_sites", (False, True))
+def test_auxiliary_reconstruction_fast_paths_match_definition(
+    device,
+    monkeypatch,
+    reconstruction_loss,
+    masked_sites,
+):
+    cfg = BSCConfig(
+        n_blocks=4,
+        block_dim=1,
+        n_sites=2,
+        d_model=3,
+        site_dims=(2, 3),
+        k=1,
+        seed=79,
+        decoder_constraint="free",
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    x = torch.randn(5, 2, 3, generator=torch.Generator().manual_seed(83)).to(device)
+    coord = model.coordinate_mask[:, 0, 0]
+    x = x * coord
+    out = model(x)
+    observed = None
+    if masked_sites:
+        observed = torch.tensor(
+            [[True, False], [True, True], [False, True], [True, True], [True, False]],
+            device=device,
+        )
+    monkeypatch.setattr(
+        model,
+        "decode",
+        lambda z, *, add_bias=True, _decoder=None: torch.zeros_like(x),
+    )
+
+    actual = aux_loss(
+        model,
+        x,
+        out,
+        "sasa_release",
+        torch.ones(cfg.n_blocks, cfg.block_dim, dtype=torch.bool, device=device),
+        s_aux=1,
+        observation_mask=observed,
+        reconstruction_loss=reconstruction_loss,
+    )
+    assert actual is not None
+
+    residual = (x - out.xhat).detach().float() * coord
+    site_mask = (
+        torch.ones(len(x), cfg.n_sites, 1, device=device)
+        if observed is None
+        else observed.float().unsqueeze(-1)
+    )
+    masked = residual * site_mask
+    if reconstruction_loss == "mean_l2":
+        expected = masked.norm(dim=-1).sum() / site_mask.squeeze(-1).sum()
+    elif reconstruction_loss == "mean_squared":
+        expected = masked.square().sum() / (coord * site_mask).sum()
+    elif reconstruction_loss == "squared_l2":
+        expected = masked.square().sum() / len(x)
+    else:
+        target = residual * site_mask
+        mean = target.sum(dim=0) / site_mask.sum(dim=0).clamp_min(1.0)
+        centered = (target - mean.unsqueeze(0)) * site_mask
+        expected = (masked.square().sum() / len(x)) / (
+            centered.square().sum() / len(x)
+        ).clamp_min(1e-30)
+    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize(
     "variant",
     (
         "sasa",

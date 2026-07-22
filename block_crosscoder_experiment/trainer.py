@@ -965,9 +965,10 @@ def aux_loss(
     Returns None when the variant has nothing to train on this step.
     """
     B, G = out.scores.shape
+    all_observed = observation_mask is None
     site_mask = (
-        torch.ones(B, model.cfg.n_sites, 1, device=x.device, dtype=x.dtype)
-        if observation_mask is None
+        None
+        if all_observed
         else observation_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
     )
 
@@ -975,13 +976,30 @@ def aux_loss(
         error: torch.Tensor,
         residual_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        coord = model.coordinate_mask[:, 0, 0].to(error.device)
-        masked = error.float() * coord * site_mask
+        coord = (
+            model.coordinate_mask[:, 0, 0].to(error.device)
+            if model._has_padded_coordinates
+            else None
+        )
+        masked = error.float()
+        if coord is not None:
+            masked = masked * coord
+        if site_mask is not None:
+            masked = masked * site_mask
         if reconstruction_loss == "mean_l2":
-            denominator = site_mask.squeeze(-1).sum().clamp_min(1.0)
+            denominator = (
+                B * model.cfg.n_sites
+                if all_observed
+                else site_mask.squeeze(-1).sum().clamp_min(1.0)
+            )
             return masked.norm(dim=-1).sum() / denominator
         if reconstruction_loss == "mean_squared":
-            denominator = (coord * site_mask).sum().clamp_min(1.0)
+            if all_observed:
+                denominator = B * sum(model.cfg.site_dims)
+            elif coord is None:
+                denominator = (site_mask.sum() * model.cfg.d_model).clamp_min(1.0)
+            else:
+                denominator = (coord * site_mask).sum().clamp_min(1.0)
             return masked.pow(2).sum() / denominator
         if reconstruction_loss != "squared_l2":
             if reconstruction_loss != "squared_l2_over_residual_variance":
@@ -992,9 +1010,18 @@ def aux_loss(
                 raise ValueError(
                     "normalized auxiliary loss requires the residual target"
                 )
-            target = residual_target.float() * coord * site_mask
-            observed_values = target.sum(dim=0) / site_mask.sum(dim=0).clamp_min(1.0)
-            centered = (target - observed_values.unsqueeze(0)) * site_mask
+            target = residual_target.float()
+            if coord is not None:
+                target = target * coord
+            if site_mask is not None:
+                target = target * site_mask
+                observation_count = site_mask.sum(dim=0).clamp_min(1.0)
+            else:
+                observation_count = B
+            observed_values = target.sum(dim=0) / observation_count
+            centered = target - observed_values.unsqueeze(0)
+            if site_mask is not None:
+                centered = centered * site_mask
             residual_variance = centered.pow(2).sum() / B
             return (masked.pow(2).sum() / B) / residual_variance.clamp_min(1e-30)
         return masked.pow(2).sum() / B
