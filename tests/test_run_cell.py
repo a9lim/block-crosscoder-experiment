@@ -591,6 +591,16 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
             checkpoint_payload["run_binding"],
         )
 
+    forged_optimizer = copy.deepcopy(checkpoint_payload)
+    forged_optimizer["optimizer"]["param_groups"][0]["fused"] = True
+    forged_optimizer_path = tmp_path / "forged-optimizer-kernel.pt"
+    torch.save(forged_optimizer, forged_optimizer_path)
+    with pytest.raises(CellExecutionError, match="optimizer contract"):
+        _validate_final_checkpoint(
+            forged_optimizer_path,
+            checkpoint_payload["run_binding"],
+        )
+
     nested_identity_mismatch = copy.deepcopy(payload)
     nested_codec = Codec.from_payload(
         nested_identity_mismatch["codec_payload"],

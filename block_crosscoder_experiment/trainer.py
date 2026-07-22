@@ -6,7 +6,7 @@ Implements the load-bearing step ordering:
     regenerate bf16 forward copy -> log post-cast Gram residual
 
 with explicitly parameterized Adam or AdamW groups, independently declared
-encoder/decoder/bias decay, frozen foreach/fused arithmetic, declared warmup
+encoder/decoder/bias decay, explicit scalar/fused arithmetic, declared warmup
 and decay schedules, and AuxK dead-block machinery in explicit paper/release
 and adapted variants:
 
@@ -61,6 +61,7 @@ __all__ = [
     "Trainer",
     "aux_loss",
     "tensor_batches",
+    "validate_optimizer_state_config",
     "validate_run_binding",
 ]
 
@@ -159,8 +160,10 @@ class TrainConfig:
             raise ValueError("unsupported optimizer")
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("optimizer eps must be finite and positive")
-        if self.foreach is not False or self.fused is not False:
-            raise ValueError("portable training requires foreach=False and fused=False")
+        if self.foreach is not False:
+            raise ValueError("training requires foreach=False")
+        if type(self.fused) is not bool:
+            raise ValueError("fused must be an exact boolean")
         if (
             min(
                 self.encoder_weight_decay,
@@ -1125,6 +1128,12 @@ def build_optimizer(
 ) -> tuple[torch.optim.Optimizer, str]:
     """Build explicitly resolved paper or engineering optimizer groups."""
     kind = cfg.optimizer
+    parameters = tuple(model.parameters())
+    if cfg.fused and any(
+        parameter.device.type != "cuda" or parameter.dtype != torch.float32
+        for parameter in parameters
+    ):
+        raise ValueError("fused optimizer requires fp32 CUDA master parameters")
     decoder_names = {"D", "D_site", "D_core"}
     bias_names = {"a", "c", "log_threshold"}
     grouped: dict[float, list[torch.nn.Parameter]] = {}
@@ -1166,6 +1175,91 @@ def build_optimizer(
             fused=cfg.fused,
         ), kind
     raise ValueError(f"unknown optimizer {kind!r}")
+
+
+_OPTIMIZER_IMMUTABLE_GROUP_FIELDS = (
+    "foreach",
+    "fused",
+    "betas",
+    "eps",
+    "weight_decay",
+    "amsgrad",
+    "maximize",
+    "capturable",
+    "differentiable",
+)
+
+
+def _optimizer_group_contract(
+    optimizer_state: object,
+    optimizer_kind: object,
+) -> tuple[object, ...]:
+    """Canonical immutable optimizer-kernel and hyperparameter contract."""
+
+    if optimizer_kind not in {"adam", "adamw"}:
+        raise ValueError("checkpoint has an invalid optimizer kind")
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("checkpoint lacks optimizer state")
+    groups = optimizer_state.get("param_groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("checkpoint lacks optimizer parameter groups")
+    result: list[tuple[object, ...]] = []
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"optimizer parameter group {index} is malformed")
+        missing = set(_OPTIMIZER_IMMUTABLE_GROUP_FIELDS).difference(group)
+        params = group.get("params")
+        if missing or not isinstance(params, list) or not params:
+            raise ValueError(f"optimizer parameter group {index} is incomplete")
+        result.append(
+            (
+                len(params),
+                *(
+                    tuple(group[field])
+                    if field == "betas"
+                    else group[field]
+                    for field in _OPTIMIZER_IMMUTABLE_GROUP_FIELDS
+                ),
+            )
+        )
+    return (optimizer_kind, tuple(result))
+
+
+def validate_optimizer_state_config(
+    optimizer_state: object,
+    cfg: TrainConfig,
+    optimizer_kind: object,
+) -> tuple[object, ...]:
+    """Fail closed when serialized groups disagree with the train config."""
+
+    contract = _optimizer_group_contract(optimizer_state, optimizer_kind)
+    if optimizer_kind != cfg.optimizer:
+        raise ValueError("optimizer kind disagrees with the train config")
+    groups = optimizer_state["param_groups"]
+    allowed_weight_decay = {
+        cfg.encoder_weight_decay,
+        cfg.decoder_weight_decay,
+        cfg.bias_weight_decay,
+    }
+    weight_decays: list[float] = []
+    for index, group in enumerate(groups):
+        if group["foreach"] is not cfg.foreach:
+            raise ValueError(f"optimizer group {index} changes foreach identity")
+        if group["fused"] is not cfg.fused:
+            raise ValueError(f"optimizer group {index} changes fused identity")
+        if tuple(group["betas"]) != cfg.betas:
+            raise ValueError(f"optimizer group {index} changes betas")
+        if group["eps"] != cfg.eps:
+            raise ValueError(f"optimizer group {index} changes epsilon")
+        weight_decay = float(group["weight_decay"])
+        if weight_decay not in allowed_weight_decay:
+            raise ValueError(f"optimizer group {index} changes weight decay")
+        weight_decays.append(weight_decay)
+    if weight_decays != sorted(set(weight_decays)):
+        raise ValueError("optimizer weight-decay groups are not canonical")
+    if cfg.optimizer == "adam" and any(weight_decays):
+        raise ValueError("Adam optimizer state contains decoupled weight decay")
+    return contract
 
 
 def _lr_factor(cfg: TrainConfig):
@@ -1354,6 +1448,11 @@ class Trainer:
         if self.fwd is not self.master:
             self.fwd.validate_decoded_energy_implementation()
         self.opt, self.optimizer_kind = build_optimizer(self.master, cfg)
+        self._optimizer_contract = validate_optimizer_state_config(
+            self.opt.state_dict(),
+            cfg,
+            self.optimizer_kind,
+        )
         self.sched = LambdaLR(self.opt, _lr_factor(cfg))
         tracker_selector: str | None = None
         tracker_active_blocks: float | None = None
@@ -1827,10 +1926,20 @@ class Trainer:
         self.master.validate_decoded_energy_implementation()
         if self.fwd is not self.master:
             self.fwd.validate_decoded_energy_implementation()
+        optimizer_state = self.opt.state_dict()
+        if (
+            validate_optimizer_state_config(
+                optimizer_state,
+                self.cfg,
+                self.optimizer_kind,
+            )
+            != self._optimizer_contract
+        ):
+            raise RuntimeError("live optimizer implementation contract changed")
         np_state = np.random.get_state()
         payload = {
             "model": self.master.state_dict(),
-            "optimizer": self.opt.state_dict(),
+            "optimizer": optimizer_state,
             "scheduler": self.sched.state_dict(),
             "tracker": self.tracker.state_dict(),
             "step_idx": self.step_idx,
@@ -1897,6 +2006,21 @@ class Trainer:
         for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
             if identity not in model_payload:
                 raise ValueError(f"checkpoint lacks {identity} identity")
+        train_payload = payload.get("train_cfg")
+        if not isinstance(train_payload, dict):
+            raise ValueError("checkpoint lacks train configuration")
+        cfg = TrainConfig(
+            **{
+                **train_payload,
+                "betas": tuple(train_payload["betas"]),
+            }
+        )
+        optimizer_kind = payload.get("optimizer_kind")
+        validate_optimizer_state_config(
+            payload.get("optimizer"),
+            cfg,
+            optimizer_kind,
+        )
         accepted_tokens = payload.get("accepted_tokens")
         if (
             not isinstance(accepted_tokens, int)
@@ -1926,16 +2050,30 @@ class Trainer:
         if expected_binding is not None:
             validate_run_binding(stored_binding, expected_binding)
         model_cfg = BSCConfig(**payload["model_cfg"])
-        cfg = TrainConfig(
-            **{
-                **payload["train_cfg"],
-                "betas": tuple(payload["train_cfg"]["betas"]),
-            }
-        )
         model = BlockCrosscoder(model_cfg).to(device)
         model.load_state_dict(payload["model"])
         trainer = cls(model, cfg, run_binding=stored_binding)
+        if optimizer_kind != trainer.optimizer_kind:
+            raise ValueError("checkpoint optimizer kind disagrees with constructor")
+        if (
+            validate_optimizer_state_config(
+                payload["optimizer"],
+                cfg,
+                optimizer_kind,
+            )
+            != trainer._optimizer_contract
+        ):
+            raise ValueError("checkpoint optimizer group contract mismatch")
         trainer.opt.load_state_dict(payload["optimizer"])
+        if (
+            validate_optimizer_state_config(
+                trainer.opt.state_dict(),
+                cfg,
+                trainer.optimizer_kind,
+            )
+            != trainer._optimizer_contract
+        ):
+            raise ValueError("optimizer load changed its implementation contract")
         trainer.sched.load_state_dict(payload["scheduler"])
         trainer.tracker.load_state_dict(payload["tracker"])
         trainer.step_idx = step_idx

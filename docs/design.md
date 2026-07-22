@@ -911,6 +911,26 @@ constraint, retraction cadence, objective reduction, regularizer, Aux bundle,
 deadness unit, selector tie behavior, and inference-threshold estimator. Only
 Adam and AdamW are scientific optimizer choices in the live recipes.
 
+Every non-smoke CUDA cell executes its declared Adam or AdamW with
+`foreach=False, fused=True`; CPU smoke executes `foreach=False, fused=False`.
+This is a content-addressed engineering choice, not an ambient PyTorch default
+or a fallback. Fused construction refuses non-CUDA or non-fp32 master
+parameters. Checkpoint save, load, exact resume, and final validation bind the
+optimizer kind plus each parameter group's fused/foreach flags, betas, epsilon,
+weight decay, and immutable Adam controls. This is necessary because PyTorch's
+optimizer loader otherwise permits serialized group flags to replace the
+constructor's kernel choice silently.
+
+On jobe, isolated optimizer steps are `2.10x` faster for Adam and `2.37x` for
+AdamW. In the final wired AdamW gate, complete Phase-2-shaped QR Trainer steps
+improve from `101.296` to `99.214 ms` (`2.06%`), while polar-carrier steps
+improve from `15.986` to `13.887 ms` (`13.12%`); QR peak allocation falls by
+`92.8 MiB`. The standardized 20-step QR comparison records support IoU
+`.997927`, loss relative difference `1.73e-4`, parameter relative difference
+`.0381`, and optimizer-state relative difference `.0209`. These bounded
+trajectory changes are authorized before the first experiment run. The
+resource planner remains conservative and grants no fused-kernel memory credit.
+
 The shared kernels also retain guarded configuration values used only by unit
 fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted

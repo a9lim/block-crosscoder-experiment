@@ -226,6 +226,11 @@ from that evidence, while an unbound preview remains non-runnable.
 Default pilot seeds are 0 and 1. Every cell uses the same pinned four-layer
 GPT-2 raw task and an actual saved-codec round trip. Site count is a later
 robustness question, not an architecture-search confound.
+All non-smoke CUDA recipes execute their named Adam/AdamW procedure through
+the explicitly bound fused kernel with `foreach=False`; CPU smoke uses the
+explicit scalar kernel. This changes engineering arithmetic, not the paper
+optimizer name or hyperparameters, and its standardized scalar-versus-fused
+trajectory sensitivity is reported rather than treated as a matrix factor.
 
 | Stage | Budget and split | Recipes/variants |
 |---|---|---|

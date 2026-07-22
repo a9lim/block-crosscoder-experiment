@@ -966,12 +966,20 @@ class CellSpec:
             or float(epsilon) <= 0.0
         ):
             raise StudyError("optimizer.epsilon must be finite and positive")
-        if (
-            values["optimizer.foreach"] is not False
-            or values["optimizer.fused"] is not False
-        ):
+        foreach = values["optimizer.foreach"]
+        fused = values["optimizer.fused"]
+        if type(foreach) is not bool or type(fused) is not bool:
+            raise StudyError("optimizer foreach/fused decisions must be exact booleans")
+        if foreach:
+            raise StudyError("the optimizer contract freezes foreach=False")
+        runtime_device = str(values["runtime.device"])
+        smoke = values["runtime.smoke"]
+        if type(smoke) is not bool:
+            raise StudyError("runtime.smoke must be an exact boolean")
+        expected_fused = runtime_device.split(":", 1)[0] == "cuda" and not smoke
+        if fused is not expected_fused:
             raise StudyError(
-                "the portable optimizer contract freezes foreach=False and fused=False"
+                "optimizer.fused must be true only for non-smoke CUDA cells"
             )
         batch_tokens = values["optimizer.batch_tokens"]
         train_tokens = values["data.train_tokens"]
@@ -4555,12 +4563,14 @@ def _paper_runtime(citation: str) -> tuple[Decision, ...]:
         engineering(
             "optimizer.foreach",
             False,
-            rationale="freeze the portable scalar-kernel optimizer path across CPU and CUDA",
+            rationale="the fused CUDA optimizer still excludes foreach dispatch",
         ),
         engineering(
             "optimizer.fused",
-            False,
-            rationale="exclude backend-dependent fused optimizer arithmetic from method comparisons",
+            True,
+            rationale=(
+                "use the explicit fused CUDA Adam or AdamW kernel for production cells"
+            ),
         ),
         engineering(
             "optimizer.weight_decay",
@@ -7450,6 +7460,11 @@ def _smoke_overrides(
             rationale="the content ID records the explicit smoke reduction",
         ),
         engineering(
+            "optimizer.fused",
+            False,
+            rationale="CPU smoke retains the explicit scalar optimizer kernel",
+        ),
+        engineering(
             "codec.max_calibration_event_bytes",
             67_108_864,
             rationale="64 MiB bounds exact smoke calibration materialization",
@@ -7658,6 +7673,11 @@ def _derived_smoke_overrides(decisions: Sequence[Decision]) -> tuple[Decision, .
         tiny("optimizer.warmup_fraction", 0.0, "retain zero smoke warmup"),
         tiny(
             "optimizer.warmup_steps", 0, "the smoke child cannot support a paper warmup"
+        ),
+        tiny(
+            "optimizer.fused",
+            False,
+            "derived CPU smoke retains the scalar optimizer kernel",
         ),
     ]
     if "auxiliary.count" in values:

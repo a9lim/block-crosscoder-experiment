@@ -1,5 +1,6 @@
 """Trainer checks for update ordering, precision copies, Aux, and replay."""
 
+import copy
 import math
 from dataclasses import asdict
 
@@ -163,6 +164,29 @@ def test_optimizer_numerics_are_explicitly_frozen():
     assert all(group["fused"] is False for group in optimizer.param_groups)
     with pytest.raises(ValueError, match="foreach=False"):
         train_cfg(total_steps=1, foreach=True)
+    with pytest.raises(ValueError, match="exact boolean"):
+        train_cfg(total_steps=1, fused=1)
+
+
+@pytest.mark.parametrize("optimizer_name", ("adam", "adamw"))
+def test_fused_optimizer_refuses_cpu_master_parameters(optimizer_name):
+    with pytest.raises(ValueError, match="fp32 CUDA master"):
+        build_optimizer(
+            BlockCrosscoder(CFG),
+            train_cfg(total_steps=1, optimizer=optimizer_name, fused=True),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("optimizer_name", ("adam", "adamw"))
+def test_fused_optimizer_binds_every_cuda_parameter_group(optimizer_name):
+    optimizer, kind = build_optimizer(
+        BlockCrosscoder(CFG).to("cuda"),
+        train_cfg(total_steps=1, optimizer=optimizer_name, fused=True),
+    )
+    assert kind == optimizer_name
+    assert all(group["fused"] is True for group in optimizer.param_groups)
+    assert all(group["foreach"] is False for group in optimizer.param_groups)
 
 
 def test_gradient_clipping_updates_master_gradients_and_reports_both_norms(device):
@@ -1655,6 +1679,147 @@ def test_expected_binding_rejects_legacy_checkpoint(device, tmp_path):
         Trainer.load_checkpoint(
             path, device=device, expected_binding={"whitener_hash": "abc"}
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("foreach", True),
+        ("fused", True),
+        ("betas", (0.8, 0.9)),
+        ("eps", 7e-7),
+        ("weight_decay", 0.125),
+    ),
+)
+def test_checkpoint_refuses_optimizer_group_contract_forgery(
+    device,
+    tmp_path,
+    field,
+    value,
+):
+    trainer = Trainer(BlockCrosscoder(CFG).to(device), train_cfg(total_steps=2))
+    path = tmp_path / "optimizer-contract.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["optimizer"]["param_groups"][0][field] = value
+    forged = tmp_path / f"forged-{field}.pt"
+    torch.save(payload, forged)
+    with pytest.raises(ValueError, match="optimizer|foreach|fused|betas|epsilon|decay"):
+        Trainer.load_checkpoint(forged, device=device)
+
+
+def test_checkpoint_refuses_optimizer_kind_forgery(device, tmp_path):
+    trainer = Trainer(BlockCrosscoder(CFG).to(device), train_cfg(total_steps=2))
+    path = tmp_path / "optimizer-kind.pt"
+    trainer.save_checkpoint(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["optimizer_kind"] = "adam"
+    forged = tmp_path / "forged-kind.pt"
+    torch.save(payload, forged)
+    with pytest.raises(ValueError, match="optimizer kind"):
+        Trainer.load_checkpoint(forged, device=device)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("optimizer_name", ("adam", "adamw"))
+def test_fused_cuda_optimizer_resumes_bit_exactly(
+    tmp_path,
+    optimizer_name,
+):
+    cfg = BSCConfig(
+        n_blocks=32,
+        block_dim=4,
+        n_sites=4,
+        d_model=32,
+        k=4,
+        seed=1661,
+        decoder_constraint="free",
+    )
+    training = train_cfg(
+        total_steps=4,
+        optimizer=optimizer_name,
+        fused=True,
+        retract_every=100,
+        log_every=1,
+    )
+    base = BlockCrosscoder(cfg).to("cuda")
+    uninterrupted = Trainer(copy.deepcopy(base), training)
+    split = Trainer(copy.deepcopy(base), training)
+    batches = planted_batches("cuda", n_batches=4, batch=64, seed=1662)
+    uninterrupted_records = [uninterrupted.step(batch) for batch in batches]
+    split_records = [split.step(batch) for batch in batches[:2]]
+    path = tmp_path / f"fused-{optimizer_name}.pt"
+    split.save_checkpoint(path)
+    resumed = Trainer.load_checkpoint(path, device="cuda")
+    split_records.extend(resumed.step(batch) for batch in batches[2:])
+    _assert_nested_exact(split_records, uninterrupted_records)
+    _assert_nested_exact(resumed.master.state_dict(), uninterrupted.master.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), uninterrupted.opt.state_dict())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_cuda_optimizer_bounds_scalar_trajectory_and_support():
+    cfg = BSCConfig(
+        n_blocks=256,
+        block_dim=4,
+        n_sites=4,
+        d_model=128,
+        k=8,
+        seed=1663,
+        selection="token_topk",
+        encoder_mode="untied",
+        decoder_constraint="qr",
+    )
+    common = {
+        "total_steps": 20,
+        "optimizer": "adamw",
+        "lr": 3e-4,
+        "retract_every": 1,
+        "forward_dtype": "bf16",
+        "log_every": 1,
+    }
+    base = BlockCrosscoder(cfg).to("cuda")
+    scalar = Trainer(copy.deepcopy(base), train_cfg(**common, fused=False))
+    fused = Trainer(copy.deepcopy(base), train_cfg(**common, fused=True))
+    generator = torch.Generator().manual_seed(1664)
+    batches = [
+        torch.randn(512, 4, 128, generator=generator).to("cuda")
+        for _ in range(20)
+    ]
+    scalar_records = []
+    fused_records = []
+    intersections = 0
+    unions = 0
+    for batch in batches:
+        scalar_records.append(scalar.step(batch))
+        fused_records.append(fused.step(batch))
+        with torch.no_grad():
+            scalar_mask = scalar.fwd(batch.to(torch.bfloat16)).mask
+            fused_mask = fused.fwd(batch.to(torch.bfloat16)).mask
+        intersections += int((scalar_mask & fused_mask).sum())
+        unions += int((scalar_mask | fused_mask).sum())
+
+    maximum_loss_drift = max(
+        abs(actual["total"] - expected["total"])
+        / max(abs(expected["total"]), 1e-30)
+        for actual, expected in zip(fused_records, scalar_records, strict=True)
+    )
+    assert maximum_loss_drift <= 5e-4
+    assert intersections / max(unions, 1) >= 0.99
+    assert (
+        _nested_relative_l2(
+            fused.master.state_dict(),
+            scalar.master.state_dict(),
+        )
+        <= 0.05
+    )
+    assert (
+        _nested_relative_l2(
+            fused.opt.state_dict()["state"],
+            scalar.opt.state_dict()["state"],
+        )
+        <= 0.03
+    )
 
 
 def _fast_decoded_energy_cfg() -> BSCConfig:

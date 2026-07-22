@@ -392,6 +392,36 @@ def test_phase1_blueprint_is_an_honest_conditional_one_factor_campaign():
     assert restored == blueprint
 
 
+def test_cuda_cells_bind_fused_optimizer_and_all_smoke_descendants_are_scalar():
+    for plan in (build_phase1_plan(), build_phase2_plan()):
+        assert all(
+            cell.decision_map["runtime.device"] == "cuda"
+            and cell.decision_map["runtime.smoke"] is False
+            and cell.decision_map["optimizer.foreach"] is False
+            and cell.decision_map["optimizer.fused"] is True
+            for cell in plan.cells
+        )
+
+    for blueprint, prefix in (
+        (
+            build_phase1_blueprint(seeds=(0,), smoke=True),
+            build_phase1_plan(seeds=(0,), smoke=True),
+        ),
+        (
+            build_phase2_blueprint(seeds=(0,), smoke=True),
+            build_phase2_plan(seeds=(0,), smoke=True),
+        ),
+    ):
+        plan = _materialize_all(blueprint, prefix)
+        assert all(
+            cell.decision_map["runtime.device"] == "cpu"
+            and cell.decision_map["runtime.smoke"] is True
+            and cell.decision_map["optimizer.foreach"] is False
+            and cell.decision_map["optimizer.fused"] is False
+            for cell in plan.cells
+        )
+
+
 def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
     phase1 = build_phase1_blueprint()
     phase2 = build_phase2_blueprint()
@@ -1250,6 +1280,12 @@ def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():
         decision.panel_id
     }
     assert all(
+        cell.decision_map["runtime.device"] == "cuda"
+        and cell.decision_map["optimizer.foreach"] is False
+        and cell.decision_map["optimizer.fused"] is True
+        for cell in plan.cells
+    )
+    assert all(
         cell.decision_map["qualification.promotable"] is False
         and cell.decision_map["precision.preflight_contract"] == "not_applicable"
         and cell.decision_map["evaluation.fixed_rate_budgets_bits_per_token"]
@@ -1436,6 +1472,11 @@ def test_cell_validation_rejects_hidden_or_incoherent_resolved_values():
         )
     with pytest.raises(StudyError, match="clipping quantiles"):
         _replace_decision(cell, "codec.clip_lower_quantile", 1.0)
+    with pytest.raises(StudyError, match="optimizer.fused"):
+        _replace_decision(cell, "optimizer.fused", False)
+    smoke = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
+    with pytest.raises(StudyError, match="optimizer.fused"):
+        _replace_decision(smoke, "optimizer.fused", True)
 
 
 def test_manifests_are_deterministic_round_trip_and_tamper_evident():

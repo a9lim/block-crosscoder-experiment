@@ -60,6 +60,14 @@ exit is not evidence by itself.
   model/optimizer-state, and selector-support bounds in `design.md`. Masked,
   padded, nonquadratic, small, and non-CUDA paths remain eager, and exact
   checkpoint resume is tested inside the compiled path.
+- Every production CUDA cell binds fused Adam/AdamW and every CPU smoke cell
+  binds the scalar kernel, with `foreach=False` in both. Construction refuses
+  fused non-CUDA/non-fp32 masters. Checkpoint save, post-load exact resume, and
+  final-checkpoint validation compare optimizer kind and immutable parameter-
+  group fields so a serialized optimizer cannot replace the declared kernel.
+  Adam/AdamW, QR/polar, trajectory-drift, support, and allocation gates use the
+  fixed measurements and bounds in `design.md`; the planner takes no fused
+  memory credit.
 - The multi-quantizer CUDA codec rotation uses broadcast row-vector matmul only
   for block widths of at least two. Its 65,536-event standardized fixtures pass
   the fixed maximum-absolute and relative-L2 drift bounds in `design.md` for

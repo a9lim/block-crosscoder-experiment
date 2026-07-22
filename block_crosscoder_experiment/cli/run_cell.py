@@ -96,7 +96,12 @@ from block_crosscoder_experiment.studies import (
     build_phase3_plan,
     canonical_json,
 )
-from block_crosscoder_experiment.trainer import TrainConfig, Trainer, validate_run_binding
+from block_crosscoder_experiment.trainer import (
+    TrainConfig,
+    Trainer,
+    validate_optimizer_state_config,
+    validate_run_binding,
+)
 
 
 EVALUATION_SCHEMA = "bsc-evaluation-v1"
@@ -4056,6 +4061,25 @@ def _validate_final_checkpoint(
     optimizer_kind = payload.get("optimizer_kind")
     if not isinstance(optimizer_kind, str) or not optimizer_kind:
         raise CellExecutionError("final checkpoint lacks resolved optimizer identity")
+    train_payload = payload.get("train_cfg")
+    if not isinstance(train_payload, dict):
+        raise CellExecutionError("final checkpoint lacks train configuration")
+    try:
+        train_cfg = TrainConfig(
+            **{
+                **train_payload,
+                "betas": tuple(train_payload["betas"]),
+            }
+        )
+        validate_optimizer_state_config(
+            payload.get("optimizer"),
+            train_cfg,
+            optimizer_kind,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CellExecutionError(
+            f"final checkpoint optimizer contract is invalid: {exc}"
+        ) from exc
     history = payload.get("history")
     previous_shares = payload.get("diagnostic_prev_shares")
     model_payload = payload.get("model_cfg")
