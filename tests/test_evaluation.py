@@ -1088,6 +1088,50 @@ def test_shared_code_modes_releases_partial_outputs_between_views(
     assert peak == 4
 
 
+def test_shared_code_modes_releases_selected_codes_after_each_view(
+    monkeypatch,
+) -> None:
+    config = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=3,
+        d_model=6,
+        k=2,
+        encoder_fusion="availability_rescaled_sum",
+    )
+    model = BlockCrosscoder(config)
+    x = torch.randn(17, config.n_sites, config.d_model)
+    model.fit_threshold_([x], target_avg_blocks=2)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+    call_count = 0
+    peak = 0
+    original = evaluation_module._decode_selected_for_evaluation
+
+    def tracked_decode(model, selected, mask, decoder):
+        nonlocal call_count, peak
+        references[:] = [ref for ref in references if ref() is not None]
+        # Each view has two selector decodes. No selected code from the prior
+        # view may survive into the first decode of the next one.
+        if call_count % 2 == 0:
+            assert not references
+        prediction = original(model, selected, mask, decoder)
+        references.append(weakref.ref(selected))
+        peak = max(peak, len(references))
+        call_count += 1
+        return prediction
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "_decode_selected_for_evaluation",
+        tracked_decode,
+    )
+    evaluate_shared_code_modes(model, [x])
+
+    assert call_count == 2 * (1 + 2 * config.n_sites)
+    assert peak == 2
+    assert not any(reference() is not None for reference in references)
+
+
 @pytest.mark.parametrize(
     ("config", "expected_bmm_calls"),
     (

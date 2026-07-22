@@ -91,6 +91,10 @@ exit is not evidence by itself.
   the prediction, SSE, and repeated-SpMM bounds in `design.md`. The estimator
   version content-binds the density denominator and exactly prices the capped
   live tensors and one released-per-site output.
+- Internal evaluator view records must never retain dense selected codes after
+  reconstruction. Weak-reference tests require all selected codes from the
+  preceding view and batch to be released, while payload-equality, selector-
+  sharing, and call-count tests preserve every endpoint and decode.
 - Rate-distortion artifacts bind `joint_transformed_raw_packet_v1` under
   evaluation schema v2 and executor schema v5. One paired stream, one threshold
   selection, one packet-event construction, and `ceil(Q/2)` trusted decodes

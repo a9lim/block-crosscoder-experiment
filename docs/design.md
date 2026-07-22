@@ -1120,6 +1120,17 @@ content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
 
+The joint selector/shared-code evaluator retains a private lean view record,
+not a training `BSCOutput`: dense selected codes are released immediately
+after their selector-specific decode because every later concordance endpoint
+uses the raw code and mask. A weak-reference release gate permits at most the
+two current selector decode inputs and requires every prior view's selected
+codes to be gone. On the canonical Phase-2 evaluation shape (`B=4096`, four
+width-768 sites, 2,048 groups, block width four), jobe peak allocation falls
+from `4,893.567` to `4,765.567 MiB` (`128.0 MiB`), while median complete
+shared-code evaluation is neutral (`495.063` to `493.950 ms`). No arithmetic
+operation or endpoint schema changes.
+
 Rate-distortion evaluation serializes
 `evaluation_execution_implementation=joint_transformed_raw_packet_v1` under
 evaluation schema v2 and executor schema v5. One paired evaluation stream now

@@ -15,7 +15,7 @@ from typing import Iterable, NamedTuple
 
 import torch
 
-from .model import BSCConfig, BSCOutput, BlockCrosscoder
+from .model import BSCConfig, BlockCrosscoder
 from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
@@ -61,6 +61,20 @@ class _ModeConcordanceReductions(NamedTuple):
     full_code_sum: torch.Tensor
     partial_code_sum: torch.Tensor
     intersection_full_energy: torch.Tensor
+
+
+class _EvaluationViewOutput(NamedTuple):
+    """Lean evaluator state retained after one selector decode.
+
+    The dense selected code is a decode input, not an endpoint dependency.
+    Keeping a public ``BSCOutput`` here retained one full ``[N,G,b]`` tensor
+    per selector and view until the concordance reductions completed.
+    """
+
+    xhat: torch.Tensor
+    z: torch.Tensor
+    scores: torch.Tensor
+    mask: torch.Tensor
 
 
 def _raw_quadratic_terms(
@@ -558,7 +572,7 @@ def _evaluate_code_modes(
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
         encoder_sites=None,
-    ) -> dict[str, BSCOutput]:
+    ) -> dict[str, _EvaluationViewOutput]:
         selection, _, _ = model.select_with_materialized(
             value,
             mode=primary_mode,
@@ -569,7 +583,7 @@ def _evaluate_code_modes(
             _score_geometry=score_geometry,
             _encoder_sites=encoder_sites,
         )
-        result: dict[str, BSCOutput] = {}
+        result: dict[str, _EvaluationViewOutput] = {}
         for mode in selection_modes:
             if mode == primary_mode:
                 mask = selection.mask
@@ -587,13 +601,13 @@ def _evaluate_code_modes(
                 mask,
                 materialized_decoder,
             )
-            result[mode] = BSCOutput(
+            result[mode] = _EvaluationViewOutput(
                 prediction,
                 selection.z,
-                selected,
                 selection.scores,
                 mask,
             )
+        del selected, selection
         return result
 
     for raw in batches:
@@ -717,7 +731,7 @@ def _evaluate_code_modes(
         ):
             del selector_scores
         zero_x: torch.Tensor | None = None
-        null_outputs: dict[str, BSCOutput] | None = None
+        null_outputs: dict[str, _EvaluationViewOutput] | None = None
 
         def run_view(
             view_observed: torch.Tensor,
@@ -725,7 +739,7 @@ def _evaluate_code_modes(
             source_missing: bool,
             empty: bool,
             frozen_encoder_sites,
-        ) -> dict[str, BSCOutput]:
+        ) -> dict[str, _EvaluationViewOutput]:
             """Run one mode-independent partial encoding and both selectors."""
             if source_missing or empty:
                 nonlocal zero_x, null_outputs
@@ -752,7 +766,7 @@ def _evaluate_code_modes(
             )
 
         def accumulate_coordinate_concordance_modes(
-            partial_outputs: dict[str, BSCOutput],
+            partial_outputs: dict[str, _EvaluationViewOutput],
             index: int,
             *,
             prefix: str,
