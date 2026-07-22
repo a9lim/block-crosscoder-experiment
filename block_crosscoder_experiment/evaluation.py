@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
@@ -63,7 +63,8 @@ class _ModeConcordanceReductions(NamedTuple):
     intersection_full_energy: torch.Tensor
 
 
-class _EvaluationViewOutput(NamedTuple):
+@dataclass(slots=True)
+class _EvaluationViewOutput:
     """Lean evaluator state retained after one selector decode.
 
     The dense selected code is a decode input, not an endpoint dependency.
@@ -71,10 +72,11 @@ class _EvaluationViewOutput(NamedTuple):
     per selector and view until the concordance reductions completed.
     """
 
-    xhat: torch.Tensor
+    xhat: torch.Tensor | None
     z: torch.Tensor
     scores: torch.Tensor
     mask: torch.Tensor
+    sse: torch.Tensor | None = None
 
 
 def _raw_quadratic_terms(
@@ -685,7 +687,9 @@ def _evaluate_code_modes(
             # Dense reconstruction SSE remains intentionally per mode.  It is
             # not interchangeable with a sparse quadratic shortcut when the
             # decoder has a bias or padded coordinates.
-            state["full_sse"] += squared_error_by_site(x, full.xhat)
+            assert full.xhat is not None
+            full.sse = squared_error_by_site(x, full.xhat)
+            state["full_sse"] += full.sse
             if include_selector_payloads:
                 assert selector_states is not None
                 selector_state = selector_states[mode]
@@ -702,6 +706,7 @@ def _evaluate_code_modes(
                     minlength=G + 1,
                 )
                 del selector_residual, selector_counts, selector_state
+            full.xhat = None
         full_mask_count64 = full_mode_masks.sum(dim=1).double()
         all_full_energy64 = torch.zeros(
             len(selection_modes),
@@ -838,7 +843,11 @@ def _evaluate_code_modes(
             )
             for mode, only in only_outputs.items():
                 state = states[mode]
-                state["site_sse"][source] += squared_error_by_site(x, only.xhat)
+                if only.sse is None:
+                    assert only.xhat is not None
+                    only.sse = squared_error_by_site(x, only.xhat)
+                    only.xhat = None
+                state["site_sse"][source] += only.sse
             only_mode_masks = accumulate_coordinate_concordance_modes(
                 only_outputs,
                 source,
@@ -873,7 +882,11 @@ def _evaluate_code_modes(
                 )
             for mode, missing in missing_outputs.items():
                 state = states[mode]
-                state["loo_sse"][source] += squared_error_by_site(x, missing.xhat)
+                if missing.sse is None:
+                    assert missing.xhat is not None
+                    missing.sse = squared_error_by_site(x, missing.xhat)
+                    missing.xhat = None
+                state["loo_sse"][source] += missing.sse
             missing_mode_masks = accumulate_coordinate_concordance_modes(
                 missing_outputs,
                 source,

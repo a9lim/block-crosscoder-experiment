@@ -1083,9 +1083,9 @@ def test_shared_code_modes_releases_partial_outputs_between_views(
     )
     evaluator(model, [x[:17], x[17:]])
 
-    # Two selector-specific full outputs and two outputs for the current
-    # partial view coexist; prior views and batches must be gone.
-    assert peak == 4
+    # Only the two selector predictions for the current view may coexist.
+    # Full-view predictions are reduced and released before partial views.
+    assert peak == 2
 
 
 def test_shared_code_modes_releases_selected_codes_after_each_view(
