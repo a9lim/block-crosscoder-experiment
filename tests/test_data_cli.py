@@ -7,6 +7,7 @@ import shutil
 import sys
 import types
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ import torch
 from block_crosscoder_experiment.cli.data import (
     _overlap_cuda_capture_copies,
     _canonical_hash,
+    _producer_lock,
     capture,
     derive_views,
     estimate_capture_pipeline_residency_bytes,
@@ -35,6 +37,7 @@ from block_crosscoder_experiment.cli import data as data_module
 from block_crosscoder_experiment.cli import matrix as matrix_module
 from block_crosscoder_experiment.cli.matrix import (
     _resolve_phase2_view_dispatch,
+    _run_with_optional_view_dispatch,
     _storage_preflight,
     _verified_existing_input_storage,
 )
@@ -43,6 +46,7 @@ from block_crosscoder_experiment.cli.run_cell import _expected_real_source_contr
 from block_crosscoder_experiment.store import ShardWriter, StoreReader, Whitener
 from block_crosscoder_experiment.studies import (
     FrozenSelection,
+    Phase,
     StudyError,
     build_phase2_blueprint,
     build_phase2_plan,
@@ -102,31 +106,23 @@ def test_capture_cli_requires_profile_and_complete_profile_roles(tmp_path):
         data_module.main([*common, "--profile", "phase2"])
 
 
-def _raw_store(root, *, offset=0.0, authenticated_profile=None):
+def _raw_store(root, *, offset=0.0, authenticated_profile="phase2"):
     root.mkdir(parents=True, exist_ok=True)
     source = {
         "store_contract_version": "activation-store-v3-single-view",
         "site_dims": [5, 5],
+        "drop_positions": 0,
     }
     source_hash = hashlib.sha256(
         json.dumps(source, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    split_sizes = (
-        {
-            "normalization_fit": 2,
-            "calibration": 2,
-            "development": 2,
-            "confirmation": 2,
-            "train": 2,
-        }
-        if authenticated_profile == "phase2"
-        else {
-            "normalization_fit": 64,
-            "calibration": 48,
-            "eval": 32,
-            "train": 80,
-        }
-    )
+    split_sizes = {
+        "normalization_fit": 64,
+        "calibration": 48,
+        "development": 32,
+        "confirmation": 32,
+        "train": 80,
+    }
     split_plan = whole_sequence_split_plan(split_sizes, 1)
     capture_payload = {
         "source": source,
@@ -135,6 +131,7 @@ def _raw_store(root, *, offset=0.0, authenticated_profile=None):
         "split_plan": split_plan,
         "splits": split_plan,
     }
+    binding_sha256 = None
     if authenticated_profile is not None:
         implementation = {
             "schema": "bsc-capture-implementation-v1",
@@ -157,35 +154,56 @@ def _raw_store(root, *, offset=0.0, authenticated_profile=None):
             "writer_pipeline": {"contract": "test"},
             "capture_transfer_pipeline": {"contract": "test"},
         }
+        binding_sha256 = hashlib.sha256(
+            json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         capture_payload.update(
             {
                 "schema": "bsc-capture-manifest-v1",
                 "capture_implementation": implementation,
                 "capture_binding": binding,
-                "capture_binding_sha256": hashlib.sha256(
-                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest(),
+                "capture_binding_sha256": binding_sha256,
             }
         )
     (root / "capture.json").write_text(json.dumps(capture_payload) + "\n")
     gen = torch.Generator().manual_seed(4)
     for split, n in split_sizes.items():
+        allocation = split_plan[split]
+        meta = {
+            "site_dims": [5, 5],
+            "split_requested_tokens": n,
+            "split_actual_tokens": n,
+        }
+        if binding_sha256 is not None:
+            meta.update(
+                {
+                    **source,
+                    "sequence_start": allocation["sequence_start"],
+                    "sequence_stop_exclusive": allocation["sequence_stop_exclusive"],
+                    "tokens_per_sequence": allocation["tokens_per_sequence"],
+                    "sequence_allocation": "whole_packed_contexts_v1",
+                    "capture_binding_sha256": binding_sha256,
+                    "ordered_split_allocation": list(split_sizes),
+                }
+            )
         writer = ShardWriter(
             root,
             split,
             whitener_hash=f"raw:{source_hash}",
             sites=(0, 1),
             d_model=5,
-            meta={
-                "site_dims": [5, 5],
-                "split_requested_tokens": n,
-                "split_actual_tokens": n,
-            },
+            meta=meta,
             tokens_per_shard=17,
             free_space_floor_frac=0,
         )
         x = torch.randn(n, 2, 5, generator=gen) + offset
-        ids = torch.stack((torch.arange(n), torch.arange(n) % 7), dim=1)
+        ids = torch.stack(
+            (
+                torch.arange(n) + allocation["sequence_start"],
+                torch.zeros(n, dtype=torch.int64),
+            ),
+            dim=1,
+        )
         writer.add(x, ids)
         writer.close()
 
@@ -201,11 +219,156 @@ def test_derive_views_preserves_row_identity(tmp_path):
         batch_size=13,
     )
     aligned = verify_alignment((out / "none", out / "scalar_rms", out / "sqrt_d"))
-    assert aligned["eval"]["n_tokens"] == 32
+    assert aligned["development"]["n_tokens"] == 32
     assert (
         StoreReader(raw, "train").manifest["row_stream_sha256"]
         == StoreReader(out / "scalar_rms", "train").manifest["row_stream_sha256"]
     )
+    verified = verify_store_root(out / "scalar_rms")
+    assert set(verified) == {
+        "normalization_fit",
+        "calibration",
+        "development",
+        "confirmation",
+        "train",
+    }
+
+
+@pytest.mark.parametrize("producer", [derive_views, fit_transform_artifacts])
+def test_transform_producers_require_authenticated_capture_manifest(tmp_path, producer):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    capture_path = raw / "capture.json"
+    capture_payload = json.loads(capture_path.read_text())
+    capture_payload["capture_binding"]["d_model"] = 4
+    capture_path.write_text(json.dumps(capture_payload) + "\n")
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="capture binding digest mismatch"):
+        producer(raw, output, ("none",))
+    assert not output.exists()
+
+
+def test_derived_view_root_manifest_detects_missing_or_divergent_members(tmp_path):
+    raw = tmp_path / "raw"
+    views = tmp_path / "views"
+    _raw_store(raw)
+    derive_views(raw, views, ("none",))
+    view = views / "none"
+    manifest_path = view / data_module.VIEW_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["splits"]["train"]["n_tokens"] -= 1
+    unsigned = dict(manifest)
+    unsigned.pop("view_manifest_sha256")
+    manifest["view_manifest_sha256"] = data_module._canonical_hash(unsigned)
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    with pytest.raises(ValueError, match="train.*root manifest"):
+        verify_store_root(view)
+
+    derive_views(raw, tmp_path / "fresh", ("none",))
+    fresh_view = tmp_path / "fresh" / "none"
+    shutil.rmtree(fresh_view / "confirmation")
+    with pytest.raises(ValueError, match="entries differ"):
+        verify_store_root(fresh_view)
+
+    evidence_views = tmp_path / "evidence"
+    derive_views(raw, evidence_views, ("none",))
+    evidence_view = evidence_views / "none"
+    evidence_manifest_path = evidence_view / data_module.VIEW_MANIFEST_NAME
+    evidence_manifest = json.loads(evidence_manifest_path.read_text())
+    evidence_manifest["source_capture"]["capture_binding"]["d_model"] = 4
+    evidence_unsigned = dict(evidence_manifest)
+    evidence_unsigned.pop("view_manifest_sha256")
+    evidence_manifest["view_manifest_sha256"] = data_module._canonical_hash(
+        evidence_unsigned
+    )
+    evidence_manifest_path.write_text(json.dumps(evidence_manifest) + "\n")
+    with pytest.raises(ValueError, match="capture binding digest mismatch"):
+        verify_store_root(evidence_view)
+
+
+def test_derive_resume_reuses_complete_prefix_and_continues_missing_splits(tmp_path):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    out = tmp_path / "views"
+    original = derive_views(raw, out, ("scalar_rms",), batch_size=13)
+    view = out / "scalar_rms"
+    preserved = {
+        split: (view / split / "split.json").read_bytes()
+        for split in ("normalization_fit", "calibration")
+    }
+    shutil.rmtree(view / "development")
+    shutil.rmtree(view / "confirmation")
+    shutil.rmtree(view / "train")
+
+    resumed = derive_views(
+        raw,
+        out,
+        ("scalar_rms",),
+        batch_size=11,
+        resume=True,
+    )
+    assert (
+        resumed["scalar_rms"]["whitener_hash"]
+        == original["scalar_rms"]["whitener_hash"]
+    )
+    assert {
+        split: (view / split / "split.json").read_bytes() for split in preserved
+    } == preserved
+    for split in (
+        "normalization_fit",
+        "calibration",
+        "development",
+        "confirmation",
+        "train",
+    ):
+        StoreReader(view, split).verify()
+
+    # Fully complete resume is an idempotent verification pass.
+    assert (
+        derive_views(
+            raw,
+            out,
+            ("scalar_rms",),
+            batch_size=17,
+            resume=True,
+        )
+        == resumed
+    )
+
+
+def test_derive_resume_refuses_partial_or_divergent_prefix(tmp_path):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    partial_out = tmp_path / "partial"
+    derive_views(raw, partial_out, ("none",), batch_size=13)
+    partial_view = partial_out / "none"
+    (partial_view / "development" / "split.json").unlink()
+    shutil.rmtree(partial_view / "train")
+    with pytest.raises(ValueError, match="partial split.*remove exactly"):
+        derive_views(raw, partial_out, ("none",), resume=True)
+
+    complete_out = tmp_path / "complete"
+    derive_views(raw, complete_out, ("none",), batch_size=13)
+    with pytest.raises(ValueError, match="tokens_per_shard"):
+        derive_views(
+            raw,
+            complete_out,
+            ("none",),
+            tokens_per_shard=17,
+            resume=True,
+        )
+
+
+def test_data_producer_lock_refuses_a_concurrent_writer(tmp_path):
+    output = tmp_path / "capture"
+    with _producer_lock(output, operation="outer"):
+        with pytest.raises(ValueError, match="locked by another producer"):
+            with _producer_lock(output, operation="inner"):
+                raise AssertionError("concurrent producer unexpectedly acquired lock")
+    assert not output.exists()
+    lock_payload = json.loads((tmp_path / ".capture.bsc-producer.lock").read_text())
+    assert lock_payload["schema"] == "bsc-data-producer-lock-v1"
+    assert lock_payload["pid"] > 0
 
 
 def test_fit_transform_artifact_binds_capture_and_fit_stream_without_shards(
@@ -253,6 +416,9 @@ def test_transform_identity_is_content_addressed_not_store_path(tmp_path):
     assert (
         first["scalar_rms"]["transform_hash"] == second["scalar_rms"]["transform_hash"]
     )
+    assert hashlib.sha256(Path(first["scalar_rms"]["path"]).read_bytes()).digest() == (
+        hashlib.sha256(Path(second["scalar_rms"]["path"]).read_bytes()).digest()
+    )
 
 
 def test_alignment_refuses_different_rows(tmp_path):
@@ -260,12 +426,12 @@ def test_alignment_refuses_different_rows(tmp_path):
     _raw_store(a)
     _raw_store(b)
     # Rebuild one split with different explicit identities.
-    split = b / "eval"
+    split = b / "development"
     for child in split.iterdir():
         child.unlink()
     writer = ShardWriter(
         b,
-        "eval",
+        "development",
         whitener_hash="raw:test",
         sites=(0, 1),
         d_model=5,
@@ -277,11 +443,39 @@ def test_alignment_refuses_different_rows(tmp_path):
         verify_alignment((a, b))
 
 
+def test_alignment_refuses_different_structural_site_dimensions(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _raw_store(a)
+    _raw_store(b)
+    original = StoreReader(b, "development")
+    batches = list(original.sequential_batches_with_ids(64))
+    meta = {**original.manifest["meta"], "site_dims": [4, 5]}
+    shutil.rmtree(b / "development")
+    writer = ShardWriter(
+        b,
+        "development",
+        whitener_hash=original.whitener_hash,
+        sites=original.sites,
+        d_model=original.d_model,
+        meta=meta,
+        tokens_per_shard=17,
+        free_space_floor_frac=0,
+    )
+    for acts, row_ids in batches:
+        writer.add(acts, row_ids)
+    writer.close()
+    with pytest.raises(ValueError, match="alignment"):
+        verify_alignment((a, b))
+
+
 def test_split_parser_and_estimate():
     splits = parse_split_sizes(
         ["normalization_fit=2", "calibration=3", "eval=5", "train=7"]
     )
-    assert estimate_store_bytes(splits, (4, 6), n_views=2) == 17 * 44 * 2
+    assert estimate_store_bytes(splits, (4, 6), n_views=2) == 17 * 48 * 2
+    assert (
+        estimate_store_bytes(splits, (4, 6), n_views=2, row_id_width=5) == 17 * 64 * 2
+    )
     writer = estimate_writer_residency_bytes(
         (4, 6), tokens_per_shard=10, row_id_width=3
     )
@@ -744,6 +938,63 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
             assert torch.equal(left_ids, right_ids)
 
 
+def test_completed_capture_resume_is_idempotent_and_rebuilds_final_manifest(
+    tmp_path, monkeypatch
+):
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+    root = tmp_path / "capture"
+    completed = capture(make_args(root))
+    assert capture(make_args(root, resume=True)) == completed
+
+    (root / "capture.json").unlink()
+    rebuilt = capture(make_args(root, resume=True))
+    assert rebuilt == completed
+    assert rebuilt["capture_binding"] == completed["capture_binding"]
+    validate_capture_manifest(rebuilt)
+
+
+def test_verify_store_root_rejects_wrong_source_binding_and_row_identity(
+    tmp_path, monkeypatch
+):
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+
+    def rewrite_train(root, *, whitener_hash=None, corrupt_identity=False):
+        reader = StoreReader(root, "train")
+        batches = list(reader.sequential_batches_with_ids(512))
+        meta = reader.manifest["meta"]
+        shutil.rmtree(root / "train")
+        writer = ShardWriter(
+            root,
+            "train",
+            whitener_hash=(
+                reader.whitener_hash if whitener_hash is None else whitener_hash
+            ),
+            sites=reader.sites,
+            d_model=reader.d_model,
+            meta=meta,
+            tokens_per_shard=reader.manifest["tokens_per_shard"],
+            free_space_floor_frac=0,
+        )
+        for acts, row_ids in batches:
+            if corrupt_identity:
+                row_ids = row_ids.clone()
+                row_ids[0, 0] += 1
+            writer.add(acts, row_ids)
+        writer.close()
+
+    wrong_source = tmp_path / "wrong-source"
+    capture(make_args(wrong_source))
+    rewrite_train(wrong_source, whitener_hash="raw:" + "f" * 64)
+    with pytest.raises(ValueError, match="not bound to its capture source"):
+        verify_store_root(wrong_source)
+
+    wrong_identity = tmp_path / "wrong-identity"
+    capture(make_args(wrong_identity))
+    rewrite_train(wrong_identity, corrupt_identity=True)
+    with pytest.raises(ValueError, match="sequence differs"):
+        verify_store_root(wrong_identity)
+
+
 def test_data_verify_rejects_empty_and_incomplete_capture_role_sets(
     tmp_path, monkeypatch
 ):
@@ -999,6 +1250,42 @@ def test_capture_refuses_duplicate_hooks_and_multiple_models_before_load(
     assert not loader_calls
 
 
+def test_all_data_producers_preflight_their_actual_destinations(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    calls = []
+
+    def checked(destination, required_bytes, *, operation):
+        calls.append((Path(destination).resolve(), required_bytes, operation))
+        return {
+            "destination": str(Path(destination).resolve()),
+            "required_bytes": required_bytes,
+        }
+
+    monkeypatch.setattr(data_module, "_enforce_prewrite_storage", checked)
+    derive_views(raw, tmp_path / "views", ("none",))
+    fit_transform_artifacts(raw, tmp_path / "transforms", ("scalar_rms",))
+
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+    capture_out = tmp_path / "capture"
+    capture(make_args(capture_out))
+
+    assert any(
+        destination == (tmp_path / "views" / "none" / "whitener.pt").resolve()
+        and operation == "derive 'none' transform"
+        for destination, _, operation in calls
+    )
+    assert any(
+        "fit-transform 'scalar_rms'" == operation
+        and str(destination).startswith(str((tmp_path / "transforms").resolve()))
+        for destination, _, operation in calls
+    )
+    assert any(
+        destination == capture_out.resolve() and operation == "capture"
+        for destination, _, operation in calls
+    )
+
+
 def test_incremental_storage_preflight_credits_only_verified_inputs(
     tmp_path, monkeypatch
 ):
@@ -1015,7 +1302,7 @@ def test_incremental_storage_preflight_credits_only_verified_inputs(
     monkeypatch.setenv("BSC_RAW_STORE_ROOT", str(raw))
     verified = _verified_existing_input_storage()
     assert verified["verified_existing_input_bytes"] > 0
-    assert len(verified["inputs"][0]["splits"]) == 4
+    assert len(verified["inputs"][0]["splits"]) == 5
     free = 50
     monkeypatch.setattr(
         matrix_module.shutil,
@@ -1049,6 +1336,199 @@ def test_incremental_storage_preflight_credits_only_verified_inputs(
     shard.write_bytes(corrupted)
     with pytest.raises(StudyError, match="checksum"):
         _verified_existing_input_storage()
+
+
+def test_matrix_store_receipt_rechecks_content_when_stat_receipt_is_refreshed(
+    tmp_path, monkeypatch
+):
+    raw = tmp_path / "raw"
+    campaign_root = tmp_path / "campaign"
+    _raw_store(raw)
+    monkeypatch.setenv("BSC_RAW_STORE_ROOT", str(raw))
+    verified = _verified_existing_input_storage()
+    _storage_preflight(
+        campaign_root,
+        verified["verified_existing_input_bytes"] + 1,
+    )
+    receipts = [
+        (path, json.loads(path.read_text()))
+        for path in (campaign_root / ".store-verification").glob("*.json")
+    ]
+    receipt_path, receipt = next(
+        (path, payload) for path, payload in receipts if payload["split"] == "train"
+    )
+    assert receipt["content_probes"]
+    shard = raw / "train" / "shard_00000.safetensors"
+    body = bytearray(shard.read_bytes())
+    body[-1] ^= 1
+    shard.write_bytes(body)
+
+    # A stat-only external refresh is insufficient: the verifier-issued probe
+    # stays old, invalidates the receipt, and triggers the full store checksum.
+    status = shard.stat()
+    receipt["stat_fingerprint"]["shards"][0] = {
+        "path": str(shard.resolve()),
+        "size_bytes": status.st_size,
+        "mtime_ns": status.st_mtime_ns,
+        "ctime_ns": status.st_ctime_ns,
+        "device": status.st_dev,
+        "inode": status.st_ino,
+    }
+    receipt_path.write_text(json.dumps(receipt) + "\n")
+    with pytest.raises(StudyError, match="checksum"):
+        _storage_preflight(
+            campaign_root,
+            verified["verified_existing_input_bytes"] + 1,
+        )
+
+
+def test_prewrite_storage_gate_preserves_fifteen_percent_floor(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        data_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1_000, used=800, free=200),
+    )
+    with pytest.raises(ValueError, match="available_above_15pct_floor=50"):
+        data_module._enforce_prewrite_storage(
+            tmp_path / "destination",
+            51,
+            operation="test producer",
+        )
+    accepted = data_module._enforce_prewrite_storage(
+        tmp_path / "destination",
+        50,
+        operation="test producer",
+    )
+    assert accepted["raw_free_bytes"] == 200
+    assert accepted["free_space_floor_bytes"] == 150
+    assert accepted["available_above_floor_bytes"] == 50
+    assert accepted["device"] == tmp_path.stat().st_dev
+
+
+def test_storage_preflight_does_not_aggregate_distinct_destination_devices(
+    tmp_path, monkeypatch
+):
+    campaign_root = tmp_path / "campaign"
+    raw_root = tmp_path / "raw"
+    view_root = tmp_path / "views"
+
+    class FakeParent:
+        def __init__(self, name, device):
+            self.name = name
+            self.device = device
+
+        def stat(self):
+            return SimpleNamespace(st_dev=self.device)
+
+        def __str__(self):
+            return self.name
+
+    parents = {
+        "campaign": FakeParent("campaign-fs", 1),
+        "raw": FakeParent("raw-fs", 2),
+        "views": FakeParent("view-fs", 3),
+    }
+    monkeypatch.setattr(
+        matrix_module,
+        "_nearest_existing_parent",
+        lambda path: parents[
+            "views"
+            if "views" in str(path)
+            else "raw"
+            if "raw" in str(path)
+            else "campaign"
+        ],
+    )
+    usage = {
+        "campaign-fs": SimpleNamespace(total=1_000, used=750, free=250),
+        "raw-fs": SimpleNamespace(total=1_000, used=600, free=400),
+        "view-fs": SimpleNamespace(total=1_000, used=700, free=300),
+    }
+    monkeypatch.setattr(
+        matrix_module.shutil,
+        "disk_usage",
+        lambda parent: usage[str(parent)],
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_verified_existing_input_storage",
+        lambda **kwargs: {
+            "verified_existing_input_bytes": 800,
+            "inputs": [{"root": str(raw_root), "verified_bytes": 800}],
+        },
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_estimated_plan_input_storage_bytes",
+        lambda plan: 1_000,
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_configured_input_roots",
+        lambda explicit=(): (raw_root, view_root),
+    )
+    preflight = _storage_preflight(
+        campaign_root,
+        1_100,
+        plan=object(),
+        input_roots=(view_root,),
+    )
+    by_device = {item["device"]: item for item in preflight["filesystem_preflights"]}
+    assert by_device[1]["required_bytes"] == 100
+    # The 200-byte unmaterialized remainder is conservatively required on
+    # every declared input destination, even though the raw root supplied all
+    # existing credit. Planning may override this; scientific launch expects
+    # the verified remainder to be zero.
+    assert by_device[2]["required_bytes"] == 200
+    assert by_device[3]["required_bytes"] == 200
+    assert by_device[2]["sufficient"] is True
+    assert by_device[3]["sufficient"] is False
+    assert preflight["sufficient"] is False
+
+
+def test_storage_preflight_sums_same_device_roles(tmp_path, monkeypatch):
+    root = tmp_path / "campaign"
+    view_root = tmp_path / "views"
+
+    class SameParent:
+        def stat(self):
+            return SimpleNamespace(st_dev=7)
+
+        def __str__(self):
+            return "shared-fs"
+
+    parent = SameParent()
+    monkeypatch.setattr(matrix_module, "_nearest_existing_parent", lambda path: parent)
+    monkeypatch.setattr(
+        matrix_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=1_000, used=600, free=400),
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_verified_existing_input_storage",
+        lambda **kwargs: {"verified_existing_input_bytes": 800, "inputs": []},
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_estimated_plan_input_storage_bytes",
+        lambda plan: 1_000,
+    )
+    monkeypatch.setattr(
+        matrix_module,
+        "_configured_input_roots",
+        lambda explicit=(): (view_root,),
+    )
+    preflight = _storage_preflight(
+        root,
+        1_100,
+        plan=object(),
+        input_roots=(view_root,),
+    )
+    [shared] = preflight["filesystem_preflights"]
+    assert shared["required_bytes"] == 300
+    assert shared["available_above_floor_bytes"] == 250
+    assert shared["sufficient"] is False
 
 
 def test_storage_credit_is_plan_bound_and_phase1_is_always_zero(tmp_path, monkeypatch):
@@ -1096,8 +1576,8 @@ def test_matrix_run_rechecks_storage_and_exits_nonzero_after_cell_failure(
     monkeypatch.setattr(matrix_module, "Campaign", lambda root: campaign)
     preflight_calls = []
 
-    def checked(root, estimate, *, allow_insufficient, plan):
-        preflight_calls.append((root, allow_insufficient, plan))
+    def checked(root, estimate, *, allow_insufficient, plan, input_roots=()):
+        preflight_calls.append((root, allow_insufficient, plan, input_roots))
         return {"sufficient": True}
 
     monkeypatch.setattr(matrix_module, "_checked_storage_extension", checked)
@@ -1117,9 +1597,75 @@ def test_matrix_run_rechecks_storage_and_exits_nonzero_after_cell_failure(
     with pytest.raises(SystemExit) as exc_info:
         matrix_main(["run", "--root", str(tmp_path)])
     assert exc_info.value.code == 1
-    assert preflight_calls == [(tmp_path, False, plan)]
+    assert preflight_calls == [(tmp_path, False, plan, ())]
     output = json.loads(capsys.readouterr().out)
     assert output["run"]["failed_cells"] == 1
+
+
+def test_matrix_run_replays_current_declared_resource_budget_before_dispatch(
+    tmp_path, monkeypatch
+):
+    plan = build_phase1_plan((0,), smoke=True)
+    campaign = SimpleNamespace(plan=plan)
+    monkeypatch.setattr(matrix_module, "Campaign", lambda root: campaign)
+    monkeypatch.setattr(
+        matrix_module,
+        "enforce_plan_resources",
+        lambda loaded: (_ for _ in ()).throw(
+            matrix_module.BudgetExceeded("current plan exceeds declared budget")
+        ),
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        matrix_module,
+        "_run_with_optional_view_dispatch",
+        lambda campaign, args: dispatched.append(True),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        matrix_main(("run", "--root", str(tmp_path)))
+    assert exc_info.value.code == 2
+    assert dispatched == []
+
+
+def test_matrix_sigterm_unwinds_dispatch_and_restores_prior_handler(
+    tmp_path, monkeypatch
+):
+    plan = build_phase1_plan((0,), smoke=True)
+    campaign = SimpleNamespace(plan=plan)
+    monkeypatch.setattr(matrix_module, "Campaign", lambda root: campaign)
+    monkeypatch.setattr(matrix_module, "enforce_plan_resources", lambda plan: plan)
+    monkeypatch.setattr(
+        matrix_module,
+        "_checked_storage_extension",
+        lambda *args, **kwargs: {"sufficient": True},
+    )
+    previous = object()
+    current = {"handler": previous}
+    installs = []
+    monkeypatch.setattr(
+        matrix_module.signal,
+        "getsignal",
+        lambda signum: current["handler"],
+    )
+
+    def install(signum, handler):
+        installs.append((signum, handler))
+        prior = current["handler"]
+        current["handler"] = handler
+        return prior
+
+    monkeypatch.setattr(matrix_module.signal, "signal", install)
+
+    def terminated(campaign, args):
+        current["handler"](matrix_module.signal.SIGTERM, None)
+        raise AssertionError("SIGTERM handler returned")
+
+    monkeypatch.setattr(matrix_module, "_run_with_optional_view_dispatch", terminated)
+    with pytest.raises(SystemExit) as exc_info:
+        matrix_main(("run", "--root", str(tmp_path)))
+    assert exc_info.value.code == 128 + matrix_module.signal.SIGTERM
+    assert current["handler"] is previous
+    assert installs[-1] == (matrix_module.signal.SIGTERM, previous)
 
 
 def test_phase2_view_dispatch_is_per_cell_and_fails_closed_on_manifests(
@@ -1132,7 +1678,8 @@ def test_phase2_view_dispatch_is_per_cell_and_fails_closed_on_manifests(
     split_sizes = (
         ("normalization_fit", 64),
         ("calibration", 48),
-        ("eval", 32),
+        ("development", 32),
+        ("confirmation", 32),
         ("train", 80),
     )
     cells = {
@@ -1166,12 +1713,55 @@ def test_phase2_view_dispatch_is_per_cell_and_fails_closed_on_manifests(
     with pytest.raises(StudyError, match="does not exist"):
         _resolve_phase2_view_dispatch(views, missing)
 
+    foreign = views / "none" / "foreign.bin"
+    foreign.write_bytes(b"not part of the view")
+    with pytest.raises(StudyError, match="root entries differ"):
+        _resolve_phase2_view_dispatch(views, {"none-cell": cells["none-cell"]})
+    foreign.unlink()
+
     manifest_path = views / "none" / "train" / "split.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["n_tokens"] += 1
     manifest_path.write_text(json.dumps(manifest) + "\n")
     with pytest.raises(StudyError, match="manifest hash mismatch"):
         _resolve_phase2_view_dispatch(views, {"none-cell": cells["none-cell"]})
+
+
+def test_phase2_view_dispatch_resume_includes_running_cells(tmp_path):
+    calls = []
+
+    class FakeCampaign:
+        plan = SimpleNamespace(phase=Phase.PHASE2)
+
+        def runnable_cell_ids(self, **kwargs):
+            calls.append(kwargs)
+            return ()
+
+    args = SimpleNamespace(
+        resume=True,
+        stop_after=None,
+        view_root=tmp_path,
+        python=sys.executable,
+        module="block_crosscoder_experiment.cli.run_cell",
+        cells=None,
+        limit=None,
+    )
+    summary = _run_with_optional_view_dispatch(FakeCampaign(), args)
+    assert summary.selected_cells == 0
+    assert calls == [{"include_failed": True, "include_resume_required": True}]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--limit", "0"),
+        ("--limit", "1", "--cell", "phase1.some-cell.s0"),
+    ],
+)
+def test_matrix_run_rejects_zero_or_ambiguous_selection(extra, tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        matrix_main(("run", "--root", str(tmp_path), *extra))
+    assert exc_info.value.code == 2
 
 
 def test_matrix_cli_dispatches_complete_smoke_family_branch_lifecycle(

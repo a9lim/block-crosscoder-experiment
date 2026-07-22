@@ -104,6 +104,15 @@ one.
   \(\sum_g\lVert D_gE_g\rVert_*\) map penalty, and whole-group frequency-dead
   residual re-encoding.
 
+Any recipe that declares encoder-scale fitting uses the content-bound
+`global_fp64_mean_postactivation_block_norm` statistic, never the selector
+score. The executor replays the exact fit prefix under
+`positive_bracketed_bisection_remeasure_v1`, targets mean norm `1.0`, and
+refuses unless a final remeasurement is within `1e-3` in at most 32
+evaluations. This is required for Group Lasso because soft thresholding breaks
+the one-shot linear rescaling identity; signed isolated-loss scores are not
+admissible calibration statistics.
+
 The project retains paper and inspected-release recipes separately where their
 objectives or constraints differ. Only materializable recipes enter the
 executable matrix.
@@ -381,7 +390,27 @@ support-associated groups. The qualification gate uses the fraction of planted
 factors participating in a merge, so changing unused dictionary capacity
 cannot mechanically improve the pathology score.
 
-Each threshold is converted to a signed normalized margin. A cell's
+The raw same-block support, subspace, and aligned-code endpoints remain the
+Phase-1 headline and gate even when learner block width is smaller than the
+planted factor rank. Each factor reports the linear-information ceiling
+`min(1, block_width / truth_rank)`; the threshold is not divided by that
+ceiling and scalar controls therefore retain an honest rank-mismatch failure.
+A nonpromotable precision companion freezes exactly
+`ceil(truth_rank / block_width)` groups per factor from calibration association,
+then reports held-out union-support confusion, concatenated decoder-subspace
+overlap, aligned-code R2, and selection coverage. It diagnoses whether failure
+is allocation across several scalar groups without replacing the raw gate.
+
+Matching pathologies use primary association cutoffs `strong=.50` and
+`weak=.25`. The complete reporting-only grid `strong in {.40,.50,.60}` by
+`weak in {.20,.25,.30}` is content-bound and emitted without retuning or
+changing the primary pass. No cutoff remains an executor constant outside the
+cell contract.
+
+Each threshold is converted to a signed margin with separate failing-side
+threshold scale and passing-side available headroom to the natural unit bound;
+this prevents high-threshold endpoints from saturating earlier merely because
+of denominator choice. A cell's
 `phase1_identification_margin` is the weakest per-factor or aggregate margin.
 Candidate seeds are complete or the candidate is ineligible; ranking is
 descending median margin, then descending worst-seed margin, then candidate ID.
@@ -391,7 +420,7 @@ frozen.
 ### 5.5 Phase-1 transfer boundary
 
 Freezing Phase 1 produces both an authorization decision and a
-`bsc-phase1-transfer-v2` object. The transfer is derived again from the complete
+`bsc-phase1-transfer-v3` object. The transfer is derived again from the complete
 campaign manifest rather than copied from a winner file. It binds the source
 plan and blueprint IDs, manifest hash, seed-complete baseline candidate and
 cell IDs, every selection ID, confirmation scope narrowing, and two distinct
@@ -565,6 +594,14 @@ level in that interaction.
 Learned group-threshold training support is exactly the nonzero support of the
 post-shrinkage code. The inherited endpoint score is used only for calibrated
 deployment ranking; it cannot add an undeclared `score > 0` training gate.
+
+The BSF runner-up auxiliary uses the encoder carrier before hard selection.
+For signed hard-TopK cells that is the ordinary pre-selection code. Combining
+Appendix D with Group Lasso is an explicit adaptation because shrinkage makes
+every inactive post-shrink code exactly zero: that bundle ranks and decodes the
+affine pre-shrink code instead. Every token must have the complete declared
+runner-up count; an under-capacity row fails rather than silently changing the
+auxiliary width or its fixed `1/l` coefficient.
 
 The real architecture round retains only the narrow transfer that synthetic
 evidence cannot settle: whether untied inference or a tied Stiefel carrier is
@@ -869,7 +906,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v17-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v18-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -879,14 +916,21 @@ whole-sequence-rounded split allocation and physical max-width site padding.
 The 16-byte parameter price is explicitly checkpoint model plus Adam moments
 plus the separately persisted deployment model; a schema-derived per-cell
 envelope prices codec tensors, reports, manifests, nontrainable buffers, and
-container metadata. Estimator v17 additionally
+container metadata. Estimator v18 additionally
 prices the one-batch CUDA copy-stream lookahead at each phase's exact input
 precision and paired-stream topology; the existing host-prefetch queues remain
-inside the separately declared streamed-host headroom.
+inside the separately declared streamed-host headroom. It prices tied-encoder
+execution and the live materialized transpose map even though tying removes
+independent parameters. It also reserves the explicit tensors and opaque
+small-eigensolver workspaces used by symmetric-polar retraction and by map- and
+decoder-nuclear regularizers. Phase 1 and Phase 2 enforce the universal peak
+VRAM and streamed-host limits at construction, materialization, and launch;
+Phase 3 additionally enforces its declared aggregate token, parameter,
+storage, and dense-compute ceilings at all three boundaries.
 Site-axis factorization reduces trainable parameters, optimizer state, and
 checkpoint bytes. Canonical factorized execution contracts the site basis and
 rank core directly and does not materialize full encoder or decoder site
-tensors. Estimator v17 nevertheless retains the previous unfactorized FLOP and
+tensors. Estimator v18 nevertheless retains the previous unfactorized FLOP and
 operational-workspace prices: the measured speed and memory reduction are not
 planning credit until a separately audited estimator version prices every
 direct-rank lifetime.
@@ -1153,6 +1197,12 @@ exact-isotropic, near-degenerate, and rank-deficient release fixtures must
 produce matching rate--distortion points; generic random simple-spectrum
 coverage is insufficient.
 
+Quantizer division uses a safe denominator only to form a symbol.
+Reconstruction always multiplies by the exact serialized `hi-lo` span: a
+zero-span coordinate emits symbol zero and decodes exactly to its constant
+floor, while a positive span smaller than `1e-12` still saturates at its actual
+ceiling rather than an artificially widened interval.
+
 The multi-quantizer CUDA decoder gathers each selected event's inverse
 canonical rotation once per batch and applies every bounded quantizer chunk as
 a broadcast row-vector matmul when the block width is at least two. Scalar
@@ -1357,7 +1407,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v17-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v18-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -1409,7 +1459,7 @@ selector/shared plus R-D traversals and `116.156 ms` for the fused traversal:
 `1.0059x`, saving `0.680 ms` per batch before counting the eliminated second
 store read. Peak CUDA allocation rose from `4,795,438,080` to
 `4,896,102,400` bytes (`+96.001 MiB`) because endpoint reducers now remain
-resident during packet decodes; estimator v17 prices this overlap. Direct
+resident during packet decodes; estimator v18 prices this overlap. Direct
 packet-event comparison proved counts, block IDs, original IDs, and canonical
 codes bit-identical when gathering raw `z` at the selected positions.
 The executor composes ordered pinned-host prefetch with a one-batch-ahead
@@ -1458,7 +1508,7 @@ p95 for the former separate transformed/raw traversals and `25.707 ms` /
 execution gives maximum transformed-FVU relative disagreement `4.99e-11` and
 raw aggregate disagreement `1.25e-11`. On the same activation shape, compiled
 persisted-view validation measures `0.326 ms` versus `0.695 ms` eager (`2.13x`)
-and saves `96.0 MiB` peak. Estimator v17 explicitly prices paired raw and
+and saves `96.0 MiB` peak. Estimator v18 explicitly prices paired raw and
 transformed targets, both metric lifetimes, all-q raw errors, cached forward and
 inverse normalization operators, and the persisted-validation peak; it grants
 no speculative memory credit for the removed second traversal.
@@ -1512,7 +1562,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v17 conservatively credits only four fp32
+Estimator v18 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse
@@ -1579,17 +1629,17 @@ The qualification artifact separately records:
   cell and promotion decision;
 - `selection_metrics`: the hash-bound metrics consumed by the frozen policy.
 
-Study manifests use `bsc-study-v2`, blueprints use `bsc-blueprint-v4`,
-preparations use `bsc-preparation-v2`, and qualifications use
-`bsc-qualification-v2`. The v2 qualification binds the preparation plus every
+Study manifests use `bsc-study-v3`, blueprints use `bsc-blueprint-v5`,
+preparations use `bsc-preparation-v3`, and qualifications use
+`bsc-qualification-v3`. The v3 qualification binds the preparation plus every
 downstream input hash and repeats the preparation's complete implementation
 identity. Detached Phase-1 and Phase-2 decision replay reruns the same semantic
 qualification contract, including outcome/eligibility consistency, rather than
 accepting a self-consistent rehash. Every seed admitted to one campaign
 selection must have the same implementation-identity digest. Non-smoke cells
-also require a clean committed source tree at preparation. Legacy study-v1 and
-blueprint-v3 roots are preserved but refused with a purpose-built incompatibility
-error; they are never silently defaulted or rewritten.
+also require a clean committed source tree at preparation. Any non-current
+study or blueprint schema is refused with fresh-root guidance; it is never
+silently defaulted, migrated, or rewritten.
 
 Operational status excludes `running` cells from default runnable work and
 reports them separately as resume-required. `matrix run` repeats the live

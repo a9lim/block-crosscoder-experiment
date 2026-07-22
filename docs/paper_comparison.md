@@ -80,6 +80,12 @@ matrix therefore separates primary and Appendix-Aux recipes. The exact toy
 optimizer schedule is incompletely disclosed; transferred batch/LR/epoch
 values remain adapted even when the architecture is exact.
 
+The source does not resolve Appendix D after Group-Lasso shrinkage, whose
+inactive output codes are identically zero. That combined cell is explicitly
+adapted to rank and decode the affine pre-shrink encoder carrier, with exactly
+four available runner-ups per token or a fail-closed refusal. Vanilla and
+Grassmannian Appendix-Aux cells keep the source hard-TopK carrier unchanged.
+
 ### 3.2 SASA
 
 The defining penalty is the nuclear norm of the end-to-end map,
@@ -208,7 +214,7 @@ native-regularizer, and Aux tuning rounds do not exist.
 
 ### 4.1 Transfer to Phase 2
 
-The frozen `bsc-phase1-transfer-v2` payload separates the universal method
+The frozen `bsc-phase1-transfer-v3` payload separates the universal method
 contract, the signed-coordinate/decoded-energy provisional carrier, and all
 diagnostic capability panels; it also binds claim-scope narrowing, selection
 IDs, source plan/blueprint IDs, evidence hashes, and its own content ID. It
@@ -402,7 +408,7 @@ distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
-`dense-linear-memory-v17-q2-c512-t256-s32`. Its guarded
+`dense-linear-memory-v18-q2-c512-t256-s32`. Its guarded
 `stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
 not a paper result or a different scientific score. It uses the algebraic
 decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel
@@ -431,7 +437,7 @@ changes only the fp32 site-summation schedule of the same SASA objective and
 falls back wholesale around low-rank or ill-conditioned boundaries; the
 former site-reduced einsum remains its oracle rather than a scientific
 comparator.
-Estimator v17 conservatively retains the prior operational compute and
+Estimator v18 conservatively retains the prior operational compute and
 workspace price.
 
 Deployment evaluation binds the engineering identity

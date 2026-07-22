@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import hashlib
 import io
@@ -45,6 +46,8 @@ from block_crosscoder_experiment.cli.run_cell import (
     _expected_real_source_contract,
     _fixed_rate_raw_score,
     _gather_event_factor_blocks,
+    _gpu_lock_path,
+    _host_gpu_execution_lock,
     _lower_convex_rate_envelope,
     _load_deployable_codec,
     _load_deployment_schedule_bundle,
@@ -70,7 +73,6 @@ from block_crosscoder_experiment.cli.run_cell import (
     _time_sharing_plan_key,
     _transform_on_cuda,
     _training_batches,
-    _train_config,
     _validate_final_checkpoint,
     _verify_real_source_contract,
     _verify_store_reader_once,
@@ -122,6 +124,7 @@ from block_crosscoder_experiment.studies import (
     PHASE2_SELECTION_METRIC_PATH,
     RELEASE_DIAGNOSTIC_RECIPES,
     StageSpec,
+    StudyError,
     StudyPlan,
     build_phase1_plan,
     build_phase2_plan,
@@ -395,7 +398,9 @@ def test_model_snapshot_lineage_refuses_config_drift() -> None:
 
 def test_model_snapshot_lineage_refuses_serialized_mapping_replacement() -> None:
     _, snapshot, lineage = _normalized_model_snapshot()
-    with pytest.raises(CellExecutionError, match="replaced the serialized state mapping"):
+    with pytest.raises(
+        CellExecutionError, match="replaced the serialized state mapping"
+    ):
         _assert_serialized_snapshot_current(
             dict(snapshot),
             lineage,
@@ -494,7 +499,6 @@ def test_snapshot_bound_save_refuses_replaced_torch_save(
         )
 
 
-
 def test_model_only_handoff_clears_every_parameter_gradient() -> None:
     model = _model_only_handoff_fixture()
     for parameter in model.parameters():
@@ -514,9 +518,7 @@ def test_model_only_handoff_matches_fresh_requires_grad_schema(
     _normalize_model_only_consumer_state(model)
     assert {
         name: parameter.requires_grad for name, parameter in model.named_parameters()
-    } == {
-        name: parameter.requires_grad for name, parameter in fresh.named_parameters()
-    }
+    } == {name: parameter.requires_grad for name, parameter in fresh.named_parameters()}
     assert model.c.requires_grad is decoder_bias
 
 
@@ -550,13 +552,8 @@ payload = {
 _save_immutable_torch(Path(sys.argv[1]), payload)
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = (
-        str(REPO)
-        + (
-            os.pathsep + environment["PYTHONPATH"]
-            if environment.get("PYTHONPATH")
-            else ""
-        )
+    environment["PYTHONPATH"] = str(REPO) + (
+        os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
     )
     outputs = (tmp_path / "first.pt", tmp_path / "second.pt")
     for output in outputs:
@@ -567,9 +564,10 @@ _save_immutable_torch(Path(sys.argv[1]), payload)
             check=True,
         )
     assert outputs[0].read_bytes() == outputs[1].read_bytes()
-    assert hashlib.sha256(outputs[0].read_bytes()).digest() == hashlib.sha256(
-        outputs[1].read_bytes()
-    ).digest()
+    assert (
+        hashlib.sha256(outputs[0].read_bytes()).digest()
+        == hashlib.sha256(outputs[1].read_bytes()).digest()
+    )
     with ZipFile(outputs[0]) as archive:
         assert all(name.startswith("archive/") for name in archive.namelist())
 
@@ -1199,6 +1197,7 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     assert all(qualification["checks"].values())
     assert set(qualification["checks"]) == {
         "deployment_schedule_integrity",
+        "encoder_scale_calibration_integrity",
         "finite",
         "method_endpoints",
         "precision_preflight_integrity",
@@ -1227,9 +1226,10 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     }
     preparation = json.loads(refs["preparation"].resolve(campaign.root).read_text())
     assert qualification["implementation_identity"] == preparation["implementation"]
-    assert qualification["implementation_identity_sha256"] == preparation[
-        "implementation_sha256"
-    ]
+    assert (
+        qualification["implementation_identity_sha256"]
+        == preparation["implementation_sha256"]
+    )
     assert set(qualification["implementation_identity"]["dependencies"]) == {
         "datasets",
         "huggingface-hub",
@@ -1281,11 +1281,8 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     one_shot_refs = one_shot.record(cell.cell_id).artifact_map
     assert persistent_refs.keys() == one_shot_refs.keys()
     assert {
-        kind: (ref.sha256, ref.size_bytes)
-        for kind, ref in persistent_refs.items()
-    } == {
-        kind: (ref.sha256, ref.size_bytes) for kind, ref in one_shot_refs.items()
-    }
+        kind: (ref.sha256, ref.size_bytes) for kind, ref in persistent_refs.items()
+    } == {kind: (ref.sha256, ref.size_bytes) for kind, ref in one_shot_refs.items()}
     preparation = json.loads(
         persistent_refs["preparation"].resolve(persistent.root).read_text()
     )
@@ -1296,9 +1293,7 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     )
     assert "model_state" in durable_deployment
     assert "codec_payload" in durable_deployment
-    assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v12"
-    )
+    assert preparation["implementation"]["executor_schema"] == ("bsc-cell-executor-v12")
     assert preparation["implementation"]["executor_process_model"] == (
         "persistent_exact_snapshot_lineage_v5"
     )
@@ -1321,8 +1316,7 @@ def test_persistent_worker_restarts_are_byte_exact_from_every_stage(
         refs = campaign.record(cell.cell_id).artifact_map
         assert campaign.record(cell.cell_id).state is RunState.QUALIFIED
         return {
-            kind: (refs[kind].sha256, refs[kind].size_bytes)
-            for kind in exact_kinds
+            kind: (refs[kind].sha256, refs[kind].size_bytes) for kind in exact_kinds
         }
 
     uninterrupted = _campaign(tmp_path / "uninterrupted", cell)
@@ -1428,15 +1422,13 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
     payload = torch.load(deployment_path, map_location="cpu", weights_only=True)
     preparation_hash = refs["preparation"].sha256
 
-    loaded, model, codec, summary, verified_deployment_digest = (
-        _load_deployable_codec(
-            deployment_path,
-            cell_id=cell.cell_id,
-            checkpoint_hash=refs["checkpoint"].sha256,
-            calibration_hash=refs["calibration"].sha256,
-            preparation_hash=preparation_hash,
-            device=torch.device("cpu"),
-        )
+    loaded, model, codec, summary, verified_deployment_digest = _load_deployable_codec(
+        deployment_path,
+        cell_id=cell.cell_id,
+        checkpoint_hash=refs["checkpoint"].sha256,
+        calibration_hash=refs["calibration"].sha256,
+        preparation_hash=preparation_hash,
+        device=torch.device("cpu"),
     )
     assert verified_deployment_digest == payload["artifact_sha256"]
     assert loaded["schema"] == "bsc-deployable-codec-v2"
@@ -1493,8 +1485,7 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         weights_only=True,
     )
     assert (
-        checkpoint_payload["model_state_digest_contract"]
-        == MODEL_STATE_DIGEST_CONTRACT
+        checkpoint_payload["model_state_digest_contract"] == MODEL_STATE_DIGEST_CONTRACT
     )
     assert checkpoint_payload["model_state_sha256"] == model_state_digest(
         checkpoint_payload["model"]
@@ -2115,8 +2106,16 @@ def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
         "support_precision": 1.0,
         "support_recall": 1.0,
     }
-    native = _phase1_identification_evidence(recovery, thresholds)
-    deployed = _phase1_identification_evidence(recovery, thresholds)
+    native = _phase1_identification_evidence(
+        recovery,
+        thresholds,
+        margin_normalization_contract="piecewise_available_headroom_signed_margin_v2",
+    )
+    deployed = _phase1_identification_evidence(
+        recovery,
+        thresholds,
+        margin_normalization_contract="piecewise_available_headroom_signed_margin_v2",
+    )
     assert native["applicable"] is False
     assert native["passed"] is None
     assert native["margin"] is None
@@ -2357,8 +2356,7 @@ def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
                     decision,
                     value=FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
                 )
-                if decision.name
-                == "implementation.factorized_execution_implementation"
+                if decision.name == "implementation.factorized_execution_implementation"
                 else decision
                 for decision in cell.decisions
             ),
@@ -2673,6 +2671,38 @@ def test_bsf_encoder_scale_fit_has_an_independent_declared_prefix() -> None:
     assert all(torch.isfinite(batch).all() for batch in batches)
 
 
+def test_group_lasso_encoder_scale_fit_remeasures_postactivation_norm() -> None:
+    cell = next(
+        cell
+        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        if cell.recipe_name == "bsf_group_lasso_primary"
+    )
+    values = cell.decision_map
+    train = _synthetic_dataset(cell, "train")
+    preparation = {
+        "data": {
+            "kind": "synthetic",
+            "normalization": _normalization_record(train, values),
+            "source_contract": _synthetic_source_contract(values),
+        }
+    }
+    result = _apply_encoder_scale_calibration(
+        SimpleNamespace(cell=cell, values=values),
+        preparation,
+        BlockCrosscoder(_model_config(cell)),
+    )
+    assert result["statistic"] == "global_fp64_mean_postactivation_block_norm"
+    assert result["solver"] == "positive_bracketed_bisection_remeasure_v1"
+    assert result["remeasured_post_fit"] is True
+    assert abs(result["mean_block_norm_after"] - result["target"]) <= result[
+        "tolerance"
+    ]
+    assert result["mean_block_norm_after"] != pytest.approx(
+        result["mean_block_norm_before"] * result["scale_multiplier"],
+        abs=1e-6,
+    )
+
+
 def test_phase1_confirmation_uses_a_distinct_bound_stream() -> None:
     cell = _cell(seed=19)
     development = _synthetic_dataset(cell, "eval")
@@ -2739,7 +2769,10 @@ def test_store_verification_receipt_skips_rehash_until_file_stat_changes(
         torch.stack((torch.arange(8), torch.arange(8)), dim=1),
     )
     writer.close()
-    monkeypatch.setenv("BSC_VERIFICATION_CACHE_ROOT", str(tmp_path / "receipts"))
+    campaign_root = tmp_path / "campaign"
+    campaign_root.mkdir()
+    monkeypatch.delenv("BSC_VERIFICATION_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign_root))
     calls = 0
     original_verify = StoreReader.verify
 
@@ -2755,12 +2788,91 @@ def test_store_verification_receipt_skips_rehash_until_file_stat_changes(
     _VERIFIED_STORE_BINDINGS.clear()  # simulate a fresh stage subprocess
     _verify_store_reader_once(StoreReader(root, "train"), root, "train")
     assert calls == 1
+    [receipt_path] = (campaign_root / ".store-verification").glob("*.json")
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["content_probes"]
+    assert receipt["content_probes"][0]["length"] > 0
 
     shard = root / "train" / "shard_00000.safetensors"
     os.utime(shard, None)
     _VERIFIED_STORE_BINDINGS.clear()
     _verify_store_reader_once(StoreReader(root, "train"), root, "train")
     assert calls == 2
+
+
+def test_store_verification_cache_override_is_rejected(tmp_path, monkeypatch):
+    root = tmp_path / "store"
+    writer = ShardWriter(
+        root,
+        "train",
+        whitener_hash="raw:test",
+        sites=(0,),
+        d_model=3,
+        meta={"site_dims": [3]},
+        tokens_per_shard=8,
+    )
+    writer.add(
+        torch.randn(8, 1, 3),
+        torch.stack((torch.arange(8), torch.arange(8)), dim=1),
+    )
+    writer.close()
+    campaign_root = tmp_path / "campaign"
+    campaign_root.mkdir()
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign_root))
+    monkeypatch.setenv("BSC_VERIFICATION_CACHE_ROOT", str(tmp_path / "forged"))
+    _VERIFIED_STORE_BINDINGS.clear()
+    with pytest.raises(CellExecutionError, match="unsupported.*BSC_CAMPAIGN_ROOT"):
+        _verify_store_reader_once(StoreReader(root, "train"), root, "train")
+
+
+def test_store_receipt_reuse_rechecks_deterministic_content_probe(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "store"
+    writer = ShardWriter(
+        root,
+        "train",
+        whitener_hash="raw:test",
+        sites=(0,),
+        d_model=3,
+        meta={"site_dims": [3]},
+        tokens_per_shard=8,
+    )
+    writer.add(
+        torch.randn(8, 1, 3),
+        torch.stack((torch.arange(8), torch.arange(8)), dim=1),
+    )
+    writer.close()
+    campaign_root = tmp_path / "campaign"
+    campaign_root.mkdir()
+    monkeypatch.delenv("BSC_VERIFICATION_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign_root))
+    _VERIFIED_STORE_BINDINGS.clear()
+    _verify_store_reader_once(StoreReader(root, "train"), root, "train")
+    [receipt_path] = (campaign_root / ".store-verification").glob("*.json")
+    receipt = json.loads(receipt_path.read_text())
+
+    shard = root / "train" / "shard_00000.safetensors"
+    body = bytearray(shard.read_bytes())
+    body[-1] ^= 1
+    shard.write_bytes(body)
+
+    # Simulate a stat-only receipt refreshed by an unsafe external actor while
+    # leaving the verifier-issued content probe unchanged. The bounded read
+    # must invalidate reuse and force the full checksum verifier.
+    status = shard.stat()
+    receipt["stat_fingerprint"]["shards"][0] = {
+        "path": str(shard.resolve()),
+        "size_bytes": status.st_size,
+        "mtime_ns": status.st_mtime_ns,
+        "ctime_ns": status.st_ctime_ns,
+        "device": status.st_dev,
+        "inode": status.st_ino,
+    }
+    receipt_path.write_text(json.dumps(receipt) + "\n")
+    _VERIFIED_STORE_BINDINGS.clear()
+    with pytest.raises(ValueError, match="checksum"):
+        _verify_store_reader_once(StoreReader(root, "train"), root, "train")
 
 
 def test_ad_hoc_store_verification_uses_process_cache_without_shared_receipt(
@@ -2803,6 +2915,35 @@ def test_ad_hoc_store_verification_uses_process_cache_without_shared_receipt(
     _VERIFIED_STORE_BINDINGS.clear()
     _verify_store_reader_once(StoreReader(root, "train"), root, "train")
     assert calls == 2
+
+
+def test_host_gpu_lock_serializes_cuda_cells_across_campaigns(tmp_path, monkeypatch):
+    base = _cell(seed=19)
+    cuda_cell = replace(
+        base,
+        decisions=tuple(
+            replace(decision, value="cuda")
+            if decision.name == "runtime.device"
+            else decision
+            for decision in base.decisions
+        ),
+    )
+    cell_path = tmp_path / "cell.json"
+    cell_path.write_text(json.dumps(cuda_cell.to_manifest()) + "\n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", f"test-{tmp_path.name}")
+    lock_path = _gpu_lock_path(torch.device("cuda"))
+    lock_path.unlink(missing_ok=True)
+    with _host_gpu_execution_lock(cell_path):
+        payload = json.loads(lock_path.read_text())
+        assert payload["schema"] == "bsc-host-gpu-lock-v1"
+        assert payload["cell_id"] == cuda_cell.cell_id
+        contender = os.open(lock_path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(contender)
+    lock_path.unlink(missing_ok=True)
 
 
 def test_tampered_checkpoint_fails_before_calibration(tmp_path: Path) -> None:
@@ -2902,12 +3043,8 @@ def test_chunked_recovery_association_matches_exact_host_counts(target: str) -> 
         pytest.skip("CUDA unavailable")
     device = torch.device(target)
     tokens, factors, groups = 37, 5, 300
-    truth = (
-        torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
-    )
-    predicted = (
-        torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
-    )
+    truth = torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
+    predicted = torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
     coactive = torch.zeros(factors, groups, dtype=torch.float64, device=device)
     truth_count = torch.zeros(factors, dtype=torch.float64, device=device)
     predicted_count = torch.zeros(groups, dtype=torch.float64, device=device)
@@ -2931,12 +3068,8 @@ def test_mapped_support_confusion_keeps_exact_device_counts(target: str) -> None
         pytest.skip("CUDA unavailable")
     device = torch.device(target)
     tokens, factors, groups = 37, 5, 300
-    truth = (
-        torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
-    )
-    block_mask = (
-        torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
-    )
+    truth = torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
+    block_mask = torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
     group_to_factor = torch.arange(groups).remainder(factors)
     category_masks = (
         torch.arange(factors).remainder(2) == 0,
@@ -2991,15 +3124,22 @@ def test_support_confusion_distinguishes_fdr_from_false_positive_rate() -> None:
 
 
 def test_matching_pathologies_keep_split_and_merge_directions_distinct() -> None:
-    perfect = _matching_pathologies(torch.eye(3))
+    def metrics(association):
+        return _matching_pathologies(
+            association,
+            strong_cutoff=0.5,
+            weak_cutoff=0.25,
+        )
+
+    perfect = metrics(torch.eye(3))
     assert perfect["split_factor_fraction"] == 0
     assert perfect["merge_group_fraction"] == 0
 
-    split = _matching_pathologies(torch.tensor([[0.9, 0.8, 0.0], [0.0, 0.0, 0.9]]))
+    split = metrics(torch.tensor([[0.9, 0.8, 0.0], [0.0, 0.0, 0.9]]))
     assert split["split_factor_fraction"] == 0.5
     assert split["merge_group_fraction"] == 0
 
-    merge = _matching_pathologies(torch.tensor([[0.9, 0.0], [0.8, 0.0], [0.0, 0.9]]))
+    merge = metrics(torch.tensor([[0.9, 0.0], [0.8, 0.0], [0.0, 0.9]]))
     assert merge["split_factor_fraction"] == 0
     assert merge["merge_group_fraction"] == 0.5
 
@@ -3908,7 +4048,7 @@ def test_training_batches_do_not_copy_aligned_chunks(
     assert torch.equal(torch.cat(full)[16:], torch.cat(resumed))
 
 
-def test_released_and_adapted_mechanics_reach_declared_config_branches() -> None:
+def test_released_mechanics_reach_declared_config_and_dead_auxiliary_refuses() -> None:
     base = _cell()
     sasa = RELEASE_DIAGNOSTIC_RECIPES["sasa_released_code_drift"]
     sasa_cell = replace(
@@ -3932,16 +4072,14 @@ def test_released_and_adapted_mechanics_reach_declared_config_branches() -> None
         "objective.auxiliary_reconstruction": ("squared_l2_over_residual_variance"),
         "auxiliary.apply_b_dec_to_input": False,
     }
-    adapted_cell = replace(
-        base,
-        name="phase1.test.decoder_weighted_token_horizon.s0",
-        decisions=tuple(
-            replace(decision, value=adapted_values[decision.name])
-            if decision.name in adapted_values
-            else decision
-            for decision in base.decisions
-        ),
-    )
-    train = _train_config(adapted_cell)
-    assert train.aux_variant == "decoder_weighted_token_horizon"
-    assert train.aux_reconstruction == "squared_l2_over_residual_variance"
+    with pytest.raises(StudyError, match="not declared by any live study recipe"):
+        replace(
+            base,
+            name="phase1.test.decoder_weighted_token_horizon.s0",
+            decisions=tuple(
+                replace(decision, value=adapted_values[decision.name])
+                if decision.name in adapted_values
+                else decision
+                for decision in base.decisions
+            ),
+        )

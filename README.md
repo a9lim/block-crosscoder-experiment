@@ -248,6 +248,7 @@ bsc data capture \
 bsc data derive --raw /data/stores/bsc-gpt2-raw \
   --out /data/stores/bsc-gpt2-views \
   --mode none --mode scalar_rms --mode sqrt_d --mode whiten --mode layer
+# After interruption, repeat the identical derive command with --resume.
 bsc data verify --store /data/stores/bsc-gpt2-raw
 
 export BSC_RAW_STORE_ROOT=/data/stores/bsc-gpt2-raw
@@ -258,6 +259,27 @@ bsc matrix plan --root /data/runs/bsc-phase2 --phase phase2 --seeds 0 1 \
 bsc matrix run --root /data/runs/bsc-phase2 \
   --view-root "$BSC_VIEW_ROOT"
 ```
+
+Capture, derived-view materialization, and transform fitting each hold one
+nonblocking producer lock for their output root; a second writer is refused
+with the recorded host and PID. Derived-view resume reuses only a fully
+hash-verified, source/transform-bound prefix of complete split manifests. A
+partial split or foreign output fails closed and names the exact split that
+must be reviewed before any external cleanup. Store verification also checks
+the raw-source transform binding, canonical sequence/position allocation, and
+structural site dimensions rather than treating payload checksums alone as a
+complete capture. Each derived mode has one exact-key `view.json` verification
+surface: it embeds and reauthenticates the complete capture evidence, binds the
+Whitener and every split/content/row digest, and refuses missing or foreign
+members. Derive and transform fitting refuse a source whose complete
+`capture.json` binding and raw role set do not verify.
+
+Every data producer performs a prewrite check on the filesystem that will
+actually receive the bytes. Capture prices the exact whole-sequence row
+allocation and, on resume, only the verified remaining rows; derive prices each
+missing physical padded split; transform fitting prices its content-addressed
+tensor artifact. These checks preserve the writer's 15% free-space floor and
+report raw free bytes separately from bytes available above that floor.
 
 `--view-root` is a dispatcher, not a scientific override. Before any campaign
 transition it checks each `<mode>/whitener.pt`, every required self-hashed split
@@ -315,6 +337,33 @@ execution; the planning-only insufficient-storage override cannot bypass it.
 If any selected cell fails, the command exits nonzero even though it still
 prints the complete run summary. The full scientific estimate remains
 unchanged.
+
+The incremental check is device-local: campaign artifacts are charged to the
+campaign filesystem, activation inputs are charged only against authenticated
+input credit, same-device roles are summed, and free space on one device never
+authorizes another. An explicit `matrix run --view-root` participates in this
+binding even when no environment variable names it. Because future raw/view
+output placement is not a scientific plan field, any unmaterialized activation
+remainder is conservatively required on every declared input-destination
+filesystem. The planning-only override may acknowledge that conservative
+preparation state; a scientific launch is expected to have complete verified
+inputs, so this remainder is normally zero.
+
+Canonical cell execution persists store-verification receipts only under the
+authenticated campaign root; `BSC_VERIFICATION_CACHE_ROOT` is rejected. Receipt
+reuse still reads a deterministic bounded content probe from every shard in
+addition to matching its exact stat fingerprint. The probe narrows the
+silent-media-corruption gap between full hashes; it is not a replacement for
+the initial complete checksum and is not claimed as whole-store proof after
+that point. CUDA cells also take one
+host-global per-device advisory lock for the persistent worker lifetime, so
+separate campaigns cannot load training/evaluation work concurrently on the
+same GPU. `matrix run --limit` must be positive and cannot be combined with
+explicit `--cell`; `--resume --view-root` includes both failed and interrupted
+cells. Every launch also replays the current phase resource ceilings against
+the loaded plan before its storage check. During dispatch, SIGTERM is converted
+to stack unwinding so the runner closes the worker process group before the CLI
+exits with the conventional signal status.
 
 The 1 TB `/data` volume should not be assumed to hold both campaigns. After the
 Phase-2 panel is frozen and its checkpoints, codecs, evaluations, decisions,

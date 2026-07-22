@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import closing
+from contextlib import closing, contextmanager
+import fcntl
 import functools
 import gc
 import hashlib
@@ -25,6 +26,8 @@ import json
 import math
 import os
 import random
+import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -66,6 +69,7 @@ from block_crosscoder_experiment.codec import (
     estimate_calibration_peak_bytes,
     fit_codec,
 )
+from block_crosscoder_experiment.durability import durable_replace
 from block_crosscoder_experiment.evaluation import (
     EvaluationModeEndpoints,
     evaluate_selector_and_shared_code_modes,
@@ -147,6 +151,7 @@ EXECUTOR_SCHEMA = "bsc-cell-executor-v12"
 EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
+_VERIFICATION_PROBE_BYTES = 64 * 1024
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
     tuple[int, torch.dtype, torch.device],
     tuple[Mapping[str, Any], torch.Tensor, torch.Tensor],
@@ -249,13 +254,9 @@ class _ArtifactDigestCache:
         except OSError as exc:
             raise CellExecutionError(f"cannot stat artifact {resolved}: {exc}") from exc
         if actual_size != size_bytes:
-            raise CellExecutionError(
-                f"prerequisite artifact size mismatch: {resolved}"
-            )
+            raise CellExecutionError(f"prerequisite artifact size mismatch: {resolved}")
         if self.digest(resolved) != sha256:
-            raise CellExecutionError(
-                f"prerequisite artifact hash mismatch: {resolved}"
-            )
+            raise CellExecutionError(f"prerequisite artifact hash mismatch: {resolved}")
         return self._entries[str(resolved)][0]
 
 
@@ -291,6 +292,30 @@ def _verify_store_reader_once(
             "inode": status.st_ino,
         }
 
+    def content_probe(path: Path) -> dict[str, int | str]:
+        size = path.stat().st_size
+        length = min(size, _VERIFICATION_PROBE_BYTES)
+        offset_span = size - length
+        offset_seed = hashlib.sha256(
+            f"{manifest_sha256}:{path.name}".encode("utf-8")
+        ).digest()
+        offset = (
+            int.from_bytes(offset_seed[:8], "big") % (offset_span + 1)
+            if offset_span
+            else 0
+        )
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            body = handle.read(length)
+        if len(body) != length:
+            raise CellExecutionError(f"short verification probe read from {path}")
+        return {
+            "path": str(path.resolve()),
+            "offset": offset,
+            "length": length,
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
     fingerprint = {
         "manifest": stat_record(manifest),
         "shards": [
@@ -298,21 +323,29 @@ def _verify_store_reader_once(
             for record in reader.manifest["shards"]
         ],
     }
-    cache_base = os.environ.get("BSC_VERIFICATION_CACHE_ROOT")
-    if cache_base is None:
-        campaign_root = os.environ.get("BSC_CAMPAIGN_ROOT")
-        if campaign_root is None:
-            # A persistent receipt in a shared temporary directory could be
-            # forged by another local user. Ad-hoc callers therefore receive
-            # only the process-local cache; registered campaigns persist
-            # receipts under their authenticated root.
-            reader.verify(expected_row_identity=expected_row_identity)
-            _VERIFIED_STORE_BINDINGS.add(key)
-            _VERIFIED_STORE_BINDINGS.add(generic_key)
-            return
-        cache_root = Path(campaign_root) / ".store-verification"
-    else:
-        cache_root = Path(cache_base)
+    shard_paths = [
+        root / split / str(record["file"]) for record in reader.manifest["shards"]
+    ]
+    probes = [content_probe(path) for path in shard_paths]
+    if os.environ.get("BSC_VERIFICATION_CACHE_ROOT") is not None:
+        raise CellExecutionError(
+            "BSC_VERIFICATION_CACHE_ROOT is unsupported for canonical execution; "
+            "verification receipts are bound to BSC_CAMPAIGN_ROOT"
+        )
+    campaign_root = os.environ.get("BSC_CAMPAIGN_ROOT")
+    if campaign_root is None:
+        # Ad-hoc callers receive only the process-local cache. Persistent
+        # receipts belong to one authenticated registered campaign.
+        reader.verify(expected_row_identity=expected_row_identity)
+        _VERIFIED_STORE_BINDINGS.add(key)
+        _VERIFIED_STORE_BINDINGS.add(generic_key)
+        return
+    campaign_path = Path(campaign_root).resolve()
+    cache_root = campaign_path / ".store-verification"
+    if cache_root.exists() and cache_root.resolve().parent != campaign_path:
+        raise CellExecutionError(
+            "campaign verification cache must not escape BSC_CAMPAIGN_ROOT"
+        )
     cache_key = hashlib.sha256(
         canonical_json(
             {
@@ -325,7 +358,7 @@ def _verify_store_reader_once(
     ).hexdigest()
     receipt_path = cache_root / f"{cache_key}.json"
     expected_receipt = {
-        "schema": "bsc-store-verification-receipt-v1",
+        "schema": "bsc-store-verification-receipt-v2",
         "root": str(root.resolve()),
         "split": split,
         "manifest_sha256": manifest_sha256,
@@ -335,6 +368,7 @@ def _verify_store_reader_once(
         "n_tokens": reader.n_tokens,
         "expected_row_identity": expected_row_identity,
         "stat_fingerprint": fingerprint,
+        "content_probes": probes,
     }
     if receipt_path.is_file():
         try:
@@ -376,7 +410,7 @@ def _atomic_bytes(path: Path, body: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     try:
-        os.replace(temporary, path)
+        durable_replace(temporary, path, file_already_synced=True)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -503,9 +537,7 @@ class _Context:
             )
         self.root = Path(root_raw).resolve()
         self._artifact_digests = (
-            artifact_digests
-            if artifact_digests is not None
-            else _ArtifactDigestCache()
+            artifact_digests if artifact_digests is not None else _ArtifactDigestCache()
         )
         self._prerequisite_receipts: dict[
             str,
@@ -991,7 +1023,8 @@ class _StageExecutionCache:
             )
         gc.collect()
         live_owners = sorted(
-            name for name, reference in entry.released_owner_refs.items()
+            name
+            for name, reference in entry.released_owner_refs.items()
             if reference() is not None
         )
         if live_owners:
@@ -1798,7 +1831,9 @@ def _expected_capture_allocation(
     try:
         return expected_capture_allocation(values)
     except (KeyError, TypeError, ValueError) as exc:
-        raise CellExecutionError(f"invalid resolved capture split allocation: {exc}") from exc
+        raise CellExecutionError(
+            f"invalid resolved capture split allocation: {exc}"
+        ) from exc
 
 
 def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[str, Any]:
@@ -1811,7 +1846,9 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
     try:
         capture_binding = validate_capture_manifest(capture)
     except ValueError as exc:
-        raise CellExecutionError(f"capture source contract is unauthenticated: {exc}") from exc
+        raise CellExecutionError(
+            f"capture source contract is unauthenticated: {exc}"
+        ) from exc
     source = capture.get("source")
     source_hash = capture.get("source_hash")
     if not isinstance(source, dict) or not isinstance(source_hash, str):
@@ -2918,9 +2955,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     site_rank = (
         None if values["model.site_rank"] is None else int(values["model.site_rank"])
     )
-    code_norm_implementation = str(
-        values["implementation.code_norm_implementation"]
-    )
+    code_norm_implementation = str(values["implementation.code_norm_implementation"])
     if code_norm_implementation not in {
         CODE_NORM_CUDA_IMPLEMENTATION,
         CODE_NORM_NATIVE_IMPLEMENTATION,
@@ -2966,10 +3001,10 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         raise CellExecutionError(
             "factorized-execution implementation violates its carrier predicate"
         )
-    factor_regularizer_eligible = (
-        site_rank in {1, 2}
-        and regularizer in {"map_nuclear", "decoder_nuclear"}
-    )
+    factor_regularizer_eligible = site_rank in {1, 2} and regularizer in {
+        "map_nuclear",
+        "decoder_nuclear",
+    }
     if factorized_execution_implementation in {
         FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
         FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
@@ -3137,7 +3172,6 @@ def _train_config(cell: CellSpec) -> TrainConfig:
         "frequency_dead_residual": "sasa",
         "sasa_release_coordinate": "sasa_release",
         "dead_latent_residual": "long_horizon",
-        "decoder_weighted_token_horizon_residual": ("decoder_weighted_token_horizon"),
     }.get(aux_name)
     if aux_variant is None:
         raise CellExecutionError(f"unknown resolved auxiliary {aux_name!r}")
@@ -3906,9 +3940,7 @@ def _save_immutable_torch(
     serialized_model_state: Mapping[str, torch.Tensor] | None = None
     if model_lineage is not None:
         if not isinstance(model_state_field, str) or not model_state_field:
-            raise CellExecutionError(
-                "snapshot-bound save requires a model-state field"
-            )
+            raise CellExecutionError("snapshot-bound save requires a model-state field")
         candidate = payload.get(model_state_field)
         if not isinstance(candidate, Mapping):
             raise CellExecutionError(
@@ -3957,7 +3989,7 @@ def _save_immutable_torch(
                 model_lineage,
                 label="deployable artifact",
             )
-        os.replace(temporary, path)
+        durable_replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -4145,7 +4177,11 @@ def _apply_encoder_scale_calibration(
             ctx.values["model.encoder_scale_fit_split"],
             ctx.values["model.encoder_scale_fit_count"],
             ctx.values["model.encoder_scale_fit_statistic"],
-        ) != ("not_applicable", 0, "not_applicable"):
+            ctx.values["model.encoder_scale_fit_solver"],
+            ctx.values["model.encoder_scale_fit_target"],
+            ctx.values["model.encoder_scale_fit_tolerance"],
+            ctx.values["model.encoder_scale_fit_max_iterations"],
+        ) != ("not_applicable", 0, "not_applicable", "not_applicable", 0.0, 0.0, 0):
             raise CellExecutionError(
                 "fixed encoder scale cannot declare a data-fit contract"
             )
@@ -4159,42 +4195,121 @@ def _apply_encoder_scale_calibration(
             f"unknown model.encoder_scale_calibration {strategy!r}"
         )
     if ctx.values["model.encoder_scale_fit_statistic"] != (
-        "global_fp64_mean_block_score"
+        "global_fp64_mean_postactivation_block_norm"
+    ) or ctx.values["model.encoder_scale_fit_solver"] != (
+        "positive_bracketed_bisection_remeasure_v1"
     ):
         raise CellExecutionError(
-            "fitted encoder scale requires the declared global fp64 mean block "
-            "score statistic"
+            "fitted encoder scale requires the declared remeasured global fp64 "
+            "postactivation block-norm contract"
         )
-    total = torch.zeros((), dtype=torch.float64, device=model.parameter_device)
-    count = 0
-    decoder = model.decoder_tensor()
-    encoder = (
-        model._tied_encoder_tensor(decoder)
-        if model.cfg.encoder_mode == "tied"
-        else model.encoder_tensor()
-    )
-    score_geometry = model._frozen_score_geometry(decoder)
-    for batch in _encoder_scale_fit_batches(ctx, preparation):
-        x = batch.to(device=model.parameter_device, dtype=torch.float32)
-        z, keep = model._encode_with_tensor(x, encoder)
-        scores = model.scores(
-            z,
-            x=x,
-            _decoder=decoder,
-            _observation_keep=keep,
-            _score_geometry=score_geometry,
-        )
-        total += scores.double().sum()
-        count += scores.numel()
-    if count == 0:
-        raise CellExecutionError("encoder-scale normalization-fit stream is empty")
-    mean_score = float(total / count)
-    if not math.isfinite(mean_score) or mean_score <= 0:
+    target = float(ctx.values["model.encoder_scale_fit_target"])
+    tolerance = float(ctx.values["model.encoder_scale_fit_tolerance"])
+    max_iterations = int(ctx.values["model.encoder_scale_fit_max_iterations"])
+    if target != 1.0 or tolerance != 1.0e-3 or max_iterations != 32:
         raise CellExecutionError(
-            f"encoder-scale fit produced invalid mean block norm {mean_score}"
+            "unsupported encoder-scale fit target/tolerance budget"
         )
-    multiplier = 1.0 / mean_score
-    model.scale_encoder_(multiplier)
+
+    def measure_block_norm() -> tuple[float, int]:
+        total = torch.zeros((), dtype=torch.float64, device=model.parameter_device)
+        count = 0
+        for batch in _encoder_scale_fit_batches(ctx, preparation):
+            x = batch.to(device=model.parameter_device, dtype=torch.float32)
+            # The fit statistic is deliberately independent of the selector's
+            # score geometry.  It measures the postactivation code itself, so
+            # group shrinkage is included and signed loss-decrease scores can
+            # never enter the calibration solver.
+            code = model.encode(x)
+            norms = torch.linalg.vector_norm(code.double(), dim=-1)
+            total += norms.sum()
+            count += norms.numel()
+        if count == 0:
+            raise CellExecutionError("encoder-scale normalization-fit stream is empty")
+        mean_norm = float(total / count)
+        if not math.isfinite(mean_norm) or mean_norm < 0.0:
+            raise CellExecutionError(
+                f"encoder-scale fit produced invalid mean block norm {mean_norm}"
+            )
+        return mean_norm, count
+
+    current_multiplier = 1.0
+
+    def measure_at(multiplier: float) -> tuple[float, int]:
+        nonlocal current_multiplier
+        if not math.isfinite(multiplier) or multiplier <= 0.0:
+            raise CellExecutionError(
+                "encoder-scale solver proposed an invalid multiplier"
+            )
+        model.scale_encoder_(multiplier / current_multiplier)
+        current_multiplier = multiplier
+        return measure_block_norm()
+
+    mean_before, count = measure_at(1.0)
+    mean_after = mean_before
+    iterations = 1
+    lower: tuple[float, float] | None = None
+    upper: tuple[float, float] | None = None
+    if abs(mean_before - target) > tolerance:
+        if mean_before < target:
+            lower = (1.0, mean_before)
+            trial = 1.0
+            while iterations < max_iterations:
+                trial *= 2.0
+                observed, observed_count = measure_at(trial)
+                iterations += 1
+                mean_after = observed
+                if observed_count != count or observed + 1.0e-12 < lower[1]:
+                    raise CellExecutionError(
+                        "encoder-scale fit is not monotone on its declared replay stream"
+                    )
+                if observed >= target:
+                    upper = (trial, observed)
+                    break
+                lower = (trial, observed)
+        else:
+            upper = (1.0, mean_before)
+            trial = 1.0
+            while iterations < max_iterations:
+                trial *= 0.5
+                observed, observed_count = measure_at(trial)
+                iterations += 1
+                mean_after = observed
+                if observed_count != count or observed - 1.0e-12 > upper[1]:
+                    raise CellExecutionError(
+                        "encoder-scale fit is not monotone on its declared replay stream"
+                    )
+                if observed <= target:
+                    lower = (trial, observed)
+                    break
+                upper = (trial, observed)
+        if lower is None or upper is None:
+            raise CellExecutionError(
+                "encoder-scale fit could not bracket its declared target"
+            )
+        while iterations < max_iterations:
+            trial = 0.5 * (lower[0] + upper[0])
+            observed, observed_count = measure_at(trial)
+            iterations += 1
+            if (
+                observed_count != count
+                or not lower[1] - 1.0e-12 <= observed <= upper[1] + 1.0e-12
+            ):
+                raise CellExecutionError(
+                    "encoder-scale fit violated monotonicity during bisection"
+                )
+            mean_after = observed
+            if abs(observed - target) <= tolerance:
+                break
+            if observed < target:
+                lower = (trial, observed)
+            else:
+                upper = (trial, observed)
+    if abs(mean_after - target) > tolerance:
+        raise CellExecutionError(
+            "encoder-scale fit failed its remeasured post-fit tolerance: "
+            f"observed={mean_after}, target={target}, tolerance={tolerance}"
+        )
     if preparation["data"]["kind"] == "synthetic":
         input_binding: dict[str, Any] = {
             "kind": "stateless_generator_prefix",
@@ -4218,9 +4333,16 @@ def _apply_encoder_scale_calibration(
         "fitted": True,
         "input": input_binding,
         "events": count,
-        "mean_block_norm_before": mean_score,
-        "scale_multiplier": multiplier,
-        "mean_block_norm_after": mean_score * multiplier,
+        "statistic": ctx.values["model.encoder_scale_fit_statistic"],
+        "solver": ctx.values["model.encoder_scale_fit_solver"],
+        "target": target,
+        "tolerance": tolerance,
+        "max_iterations": max_iterations,
+        "iterations": iterations,
+        "mean_block_norm_before": mean_before,
+        "scale_multiplier": current_multiplier,
+        "mean_block_norm_after": mean_after,
+        "remeasured_post_fit": True,
     }
 
 
@@ -4511,16 +4633,11 @@ def _validate_final_checkpoint(
         or model_state_digest(model_state) != claimed_model_state_sha256
     ):
         raise CellExecutionError("final checkpoint model-state digest mismatch")
-    if (
-        expected_model_lineage is not None
-        and (
-            expected_model_lineage.snapshot_digest_contract
-            != MODEL_STATE_DIGEST_CONTRACT
-            or not isinstance(expected_model_lineage.snapshot_sha256, str)
-            or claimed_digest_contract
-            != expected_model_lineage.snapshot_digest_contract
-            or claimed_model_state_sha256 != expected_model_lineage.snapshot_sha256
-        )
+    if expected_model_lineage is not None and (
+        expected_model_lineage.snapshot_digest_contract != MODEL_STATE_DIGEST_CONTRACT
+        or not isinstance(expected_model_lineage.snapshot_sha256, str)
+        or claimed_digest_contract != expected_model_lineage.snapshot_digest_contract
+        or claimed_model_state_sha256 != expected_model_lineage.snapshot_sha256
     ):
         raise CellExecutionError(
             "final checkpoint model-state digest differs from synchronous snapshot"
@@ -4652,11 +4769,16 @@ def _training_report_payload(
     if not isinstance(initialization, Mapping):
         raise CellExecutionError("final checkpoint lacks initialization provenance")
     regularizer_calibration = initialization.get("regularizer_calibration")
+    encoder_scale_calibration = initialization.get("encoder_scale_calibration")
     precision_preflight = initialization.get("precision_preflight")
     decoded_energy_preflight = initialization.get("decoded_energy_specialization")
     if not isinstance(regularizer_calibration, Mapping):
         raise CellExecutionError(
             "final checkpoint lacks regularizer-calibration provenance"
+        )
+    if not isinstance(encoder_scale_calibration, Mapping):
+        raise CellExecutionError(
+            "final checkpoint lacks encoder-scale-calibration provenance"
         )
     if not isinstance(precision_preflight, Mapping):
         raise CellExecutionError(
@@ -4679,6 +4801,7 @@ def _training_report_payload(
         "data_cursor": dict(data_cursor),
         "model_cfg": metadata["model_cfg"],
         "train_cfg": metadata["train_cfg"],
+        "encoder_scale_calibration": dict(encoder_scale_calibration),
         "regularizer_calibration": dict(regularizer_calibration),
         "precision_preflight": dict(precision_preflight),
         "decoded_energy_specialization": dict(decoded_energy_preflight),
@@ -4719,9 +4842,7 @@ def _execution_rng_snapshot() -> tuple[Any, ...]:
 
 
 def _model_config_sha256(model: BlockCrosscoder) -> str:
-    return hashlib.sha256(
-        canonical_json(asdict(model.cfg)).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(canonical_json(asdict(model.cfg)).encode("utf-8")).hexdigest()
 
 
 def _assert_callback_free_state_dict(model: BlockCrosscoder) -> None:
@@ -4847,8 +4968,7 @@ def _assert_model_snapshot_lineage_current(
         drift.append("tensor identity/storage/version/schema")
     if drift:
         raise CellExecutionError(
-            f"{label} drifted after its exact durable snapshot: "
-            + ", ".join(drift)
+            f"{label} drifted after its exact durable snapshot: " + ", ".join(drift)
         )
 
 
@@ -4877,7 +4997,9 @@ def _assert_durable_snapshot_schema(
         raise CellExecutionError(f"{label} model state is not a mapping")
     expected = lineage.snapshot_state
     if tuple(state) != tuple(item.name for item in expected):
-        raise CellExecutionError(f"{label} model state field order differs from snapshot")
+        raise CellExecutionError(
+            f"{label} model state field order differs from snapshot"
+        )
     for descriptor in expected:
         tensor = state[descriptor.name]
         if (
@@ -4950,9 +5072,7 @@ def _synchronous_model_snapshot(
         return snapshot, lineage
     finally:
         if _execution_rng_snapshot() != rng_before:
-            raise CellExecutionError(
-                "exact model snapshot perturbed global RNG state"
-            )
+            raise CellExecutionError("exact model snapshot perturbed global RNG state")
 
 
 def _normalize_model_only_consumer_state(model: BlockCrosscoder) -> None:
@@ -5096,8 +5216,7 @@ def _train(
             )
         report = _read_object(ctx.training_report, label="training report")
         if (
-            report.get("checkpoint_sha256")
-            != ctx.artifact_sha256(ctx.checkpoint)
+            report.get("checkpoint_sha256") != ctx.artifact_sha256(ctx.checkpoint)
             or report.get("attempted_tokens") != int(final_cursor)
             or report.get("data_cursor") != metadata["data_cursor"]
             or report.get("accepted_tokens") != metadata["accepted_tokens"]
@@ -5107,6 +5226,10 @@ def _train(
             != canonical_json(metadata["model_cfg"])
             or canonical_json(report.get("train_cfg"))
             != canonical_json(metadata["train_cfg"])
+            or canonical_json(report.get("encoder_scale_calibration"))
+            != canonical_json(
+                metadata["run_binding"]["initialization"]["encoder_scale_calibration"]
+            )
             or canonical_json(report.get("regularizer_calibration"))
             != canonical_json(
                 metadata["run_binding"]["initialization"]["regularizer_calibration"]
@@ -5255,7 +5378,7 @@ def _train(
         checkpoint_lineage,
         label="final checkpoint source model",
     )
-    ctx.progress.replace(ctx.checkpoint)
+    durable_replace(ctx.progress, ctx.checkpoint, file_already_synced=True)
     checkpoint_before_validation = _FileFingerprint.from_path(ctx.checkpoint)
     del checkpoint_model_state
     gc.collect()
@@ -5812,11 +5935,22 @@ def _mapped_support_confusion_counts(
     return totals, category_totals
 
 
-def _matching_pathologies(association: torch.Tensor) -> dict[str, float]:
+def _matching_pathologies(
+    association: torch.Tensor,
+    *,
+    strong_cutoff: float,
+    weak_cutoff: float,
+) -> dict[str, float]:
     """Directional planted-factor/learned-group multiplicity diagnostics."""
 
-    strong = association >= 0.5
-    weak = association >= 0.25
+    if not (
+        math.isfinite(strong_cutoff)
+        and math.isfinite(weak_cutoff)
+        and 0.0 <= weak_cutoff < strong_cutoff <= 1.0
+    ):
+        raise CellExecutionError("pathology association cutoffs are invalid")
+    strong = association >= strong_cutoff
+    weak = association >= weak_cutoff
     associated_groups = strong.any(dim=0)
     merged_groups = strong.sum(dim=0) > 1
     associated_group_count = int(associated_groups.sum())
@@ -5839,7 +5973,7 @@ def _matching_pathologies(association: torch.Tensor) -> dict[str, float]:
         "merged_factor_fraction": float(factors_in_merged_groups.float().mean()),
         "shattering_factor_fraction": float((weak.sum(dim=1) > 1).float().mean()),
         "dilution_factor_fraction": float(
-            (association.max(dim=1).values < 0.25).float().mean()
+            (association.max(dim=1).values < weak_cutoff).float().mean()
         ),
     }
 
@@ -5854,8 +5988,7 @@ def _gather_event_factor_blocks(
     """Gather only each event's truth-matched learned block on its device."""
 
     if selected_code.ndim != 3 or (
-        selected_mask is not None
-        and selected_mask.shape != selected_code.shape[:2]
+        selected_mask is not None and selected_mask.shape != selected_code.shape[:2]
     ):
         raise CellExecutionError("selected code/mask shapes are inconsistent")
     event_factor_device = event_factor.to(
@@ -5872,11 +6005,7 @@ def _gather_event_factor_blocks(
     event_rows = torch.arange(len(selected_code), device=selected_code.device)
     return (
         selected_code[event_rows, event_group],
-        (
-            None
-            if selected_mask is None
-            else selected_mask[event_rows, event_group]
-        ),
+        (None if selected_mask is None else selected_mask[event_rows, event_group]),
     )
 
 
@@ -5891,12 +6020,37 @@ def _synthetic_recovery(
     factor_calibration_range: tuple[int, int],
     evaluation_range: tuple[int, int],
     batch_size: int,
+    rank_mismatch_contract: str,
+    pathology_association_contract: str,
+    pathology_strong_cutoff: float,
+    pathology_weak_cutoff: float,
+    pathology_cutoff_sensitivity: Sequence[Sequence[float]],
 ) -> dict[str, Any]:
     """Truth-aware recovery with matching frozen before scored rows are read."""
 
     device = next(model.parameters()).device
     if selection_mode not in {"topk", "threshold"}:
         raise CellExecutionError("synthetic recovery selection mode is invalid")
+    if rank_mismatch_contract != (
+        "same_block_primary_plus_calibration_frozen_minimum_group_diagnostic_v1"
+    ):
+        raise CellExecutionError("unknown Phase-1 rank-mismatch contract")
+    if pathology_association_contract != (
+        "primary_cutoffs_plus_complete_reporting_only_grid_v1"
+    ):
+        raise CellExecutionError("unknown Phase-1 pathology association contract")
+    sensitivity_pairs = tuple(
+        (float(pair[0]), float(pair[1])) for pair in pathology_cutoff_sensitivity
+    )
+    expected_pairs = tuple(
+        (strong, weak) for strong in (0.4, 0.5, 0.6) for weak in (0.2, 0.25, 0.3)
+    )
+    if (
+        pathology_strong_cutoff != 0.5
+        or pathology_weak_cutoff != 0.25
+        or sensitivity_pairs != expected_pairs
+    ):
+        raise CellExecutionError("Phase-1 pathology cutoff grid is not the frozen grid")
     if not matching_dataset.stream_digest or not evaluation_dataset.stream_digest:
         raise CellExecutionError("synthetic recovery requires finalized protocols")
     if (
@@ -5999,14 +6153,34 @@ def _synthetic_recovery(
         2
         * coactive_device
         / (
-            truth_count_device.unsqueeze(1)
-            + predicted_count_device.unsqueeze(0)
+            truth_count_device.unsqueeze(1) + predicted_count_device.unsqueeze(0)
         ).clamp_min(1)
     ).cpu()
     best_association, factor_to_group = association.max(dim=1)
     group_to_factor = association.argmax(dim=0)
     factor_to_group_device = factor_to_group.to(device)
     group_to_factor_device = group_to_factor.to(device)
+    truth_ranks = tuple(int(metadata.coordinate_dim) for metadata in dataset.factors)
+    grouped_factor_to_groups = tuple(
+        tuple(
+            sorted(
+                range(n_groups),
+                key=lambda group: (-float(association[factor, group]), group),
+            )[: math.ceil(truth_ranks[factor] / model.cfg.block_dim)]
+        )
+        for factor in range(n_factors)
+    )
+    max_grouped_width = max(len(groups) for groups in grouped_factor_to_groups)
+    grouped_index = torch.zeros(
+        n_factors,
+        max_grouped_width,
+        dtype=torch.long,
+        device=device,
+    )
+    grouped_valid = torch.zeros_like(grouped_index, dtype=torch.bool)
+    for factor, groups in enumerate(grouped_factor_to_groups):
+        grouped_index[factor, : len(groups)] = torch.tensor(groups, device=device)
+        grouped_valid[factor, : len(groups)] = True
 
     claim_value = dataset.ground_truth.get("shared_feature_claim_eligible")
     shared_feature_claim_eligible = (
@@ -6039,6 +6213,7 @@ def _synthetic_recovery(
         scales = torch.tensor(normalization["scale"], dtype=torch.float64)
         maps = maps * scales.view(1, -1, 1, 1)
     overlaps = torch.zeros(n_factors, model.cfg.n_blocks)
+    truth_bases: list[torch.Tensor | None] = [None] * n_factors
     if subspace_eligible:
         for factor, metadata in enumerate(dataset.factors):
             rank = metadata.coordinate_dim
@@ -6046,6 +6221,7 @@ def _synthetic_recovery(
             truth = _orthonormal_columns(columns[coordinate_mask.reshape(-1)])
             if truth.shape[1] == 0:
                 continue
+            truth_bases[factor] = truth
             for group, basis in enumerate(learned):
                 if basis.shape[1]:
                     overlaps[factor, group] = (
@@ -6056,14 +6232,31 @@ def _synthetic_recovery(
         if subspace_eligible
         else None
     )
+    grouped_overlap: torch.Tensor | None = None
+    if subspace_eligible:
+        grouped_overlap = torch.zeros(n_factors)
+        for factor, groups in enumerate(grouped_factor_to_groups):
+            truth = truth_bases[factor]
+            if truth is None:
+                continue
+            grouped_basis = _orthonormal_columns(
+                torch.cat(tuple(learned[group] for group in groups), dim=1)
+            )
+            if grouped_basis.shape[1]:
+                grouped_overlap[factor] = (
+                    (truth.T @ grouped_basis).square().sum() / truth.shape[1]
+                ).float()
     # Fit one affine map from the selected learned block to each planted
     # coordinate using factor-calibration rows only.  Lists contain only codes
     # and intrinsic coordinates, never ambient contributions, so peak memory
     # is independent of the large source dimension.
     alignment_coefficients: list[torch.Tensor | None] = [None] * n_factors
     alignment_references: list[torch.Tensor | None] = [None] * n_factors
+    grouped_alignment_coefficients: list[torch.Tensor | None] = [None] * n_factors
+    grouped_alignment_references: list[torch.Tensor | None] = [None] * n_factors
     if subspace_eligible:
         latent_parts: list[list[torch.Tensor]] = [[] for _ in range(n_factors)]
+        grouped_latent_parts: list[list[torch.Tensor]] = [[] for _ in range(n_factors)]
         target_parts: list[list[torch.Tensor]] = [[] for _ in range(n_factors)]
         zero_mean_normalization = {
             **normalization,
@@ -6090,6 +6283,15 @@ def _synthetic_recovery(
                     matching_batch.event_factor == factor, as_tuple=False
                 ).flatten()
                 latent_parts[factor].append(selected_codes[rows])
+                grouped_latent_parts[factor].append(
+                    isolated_out.z_selected[rows.to(device),][
+                        :, grouped_index[factor, grouped_valid[factor]]
+                    ]
+                    .reshape(len(rows), -1)
+                    .detach()
+                    .cpu()
+                    .double()
+                )
                 target_parts[factor].append(
                     matching_batch.coordinates[rows].reshape(len(rows), -1).double()
                 )
@@ -6113,6 +6315,22 @@ def _synthetic_recovery(
                 driver="gelsd",
             ).solution
             alignment_references[factor] = target.mean(dim=0, keepdim=True)
+            grouped_latent = torch.cat(grouped_latent_parts[factor])
+            if len(grouped_latent) < 2 * (grouped_latent.shape[1] + 1):
+                continue
+            grouped_design = torch.cat(
+                (
+                    grouped_latent,
+                    torch.ones(len(grouped_latent), 1, dtype=torch.float64),
+                ),
+                dim=1,
+            )
+            grouped_alignment_coefficients[factor] = torch.linalg.lstsq(
+                grouped_design,
+                target,
+                driver="gelsd",
+            ).solution
+            grouped_alignment_references[factor] = target.mean(dim=0, keepdim=True)
 
     category_masks = tuple(
         torch.tensor(
@@ -6124,6 +6342,7 @@ def _synthetic_recovery(
     )
     alive = torch.zeros(n_groups, dtype=torch.bool, device=device)
     support_totals_device = torch.zeros(4, dtype=torch.int64, device=device)
+    grouped_support_totals_device = torch.zeros(4, dtype=torch.int64, device=device)
     category_totals_device = torch.zeros(
         len(dataset.category_names),
         4,
@@ -6134,6 +6353,9 @@ def _synthetic_recovery(
     isolated_total = torch.zeros(n_factors, dtype=torch.float64)
     code_error = torch.zeros(n_factors, dtype=torch.float64)
     code_total = torch.zeros(n_factors, dtype=torch.float64)
+    grouped_code_error = torch.zeros(n_factors, dtype=torch.float64)
+    grouped_code_total = torch.zeros(n_factors, dtype=torch.float64)
+    grouped_selected_count = torch.zeros(n_factors, dtype=torch.float64)
     selected_count = torch.zeros(n_factors, dtype=torch.float64)
     isolated_count = torch.zeros(n_factors, dtype=torch.float64)
     evaluation_examples = 0
@@ -6166,6 +6388,18 @@ def _synthetic_recovery(
         )
         support_totals_device += support_batch
         category_totals_device += category_batch
+        grouped_predicted = block_mask[:, grouped_index.reshape(-1)].reshape(
+            len(block_mask), n_factors, max_grouped_width
+        )
+        grouped_predicted = (grouped_predicted & grouped_valid.unsqueeze(0)).any(dim=2)
+        grouped_support_totals_device += torch.stack(
+            (
+                (grouped_predicted & truth_active).sum(),
+                (grouped_predicted & ~truth_active).sum(),
+                (~grouped_predicted & truth_active).sum(),
+                (~grouped_predicted & ~truth_active).sum(),
+            )
+        )
 
         if subspace_eligible and batch.n_events:
             isolated = _apply_normalization(
@@ -6206,14 +6440,41 @@ def _synthetic_recovery(
                 code_total[factor] += (target - reference).square().sum()
                 selected_count[factor] += selected_masks[rows].sum()
                 isolated_count[factor] += len(rows)
+                grouped_coefficient = grouped_alignment_coefficients[factor]
+                grouped_reference = grouped_alignment_references[factor]
+                if grouped_coefficient is not None and grouped_reference is not None:
+                    event_rows = rows.to(device)
+                    grouped_latent = isolated_out.z_selected[event_rows][
+                        :, grouped_index[factor, grouped_valid[factor]]
+                    ].reshape(len(rows), -1)
+                    grouped_design = torch.cat(
+                        (
+                            grouped_latent.detach().cpu().double(),
+                            torch.ones(len(rows), 1, dtype=torch.float64),
+                        ),
+                        dim=1,
+                    )
+                    grouped_prediction = grouped_design @ grouped_coefficient
+                    grouped_code_error[factor] += (
+                        (grouped_prediction - target).square().sum()
+                    )
+                    grouped_code_total[factor] += (
+                        (target - grouped_reference).square().sum()
+                    )
+                    grouped_selected_count[factor] += (
+                        isolated_out.mask[event_rows][
+                            :, grouped_index[factor, grouped_valid[factor]]
+                        ]
+                        .any(dim=1)
+                        .sum()
+                        .cpu()
+                    )
         evaluation_examples += len(batch.x)
     if evaluation_examples != evaluation_stop - evaluation_start:
         raise CellExecutionError("synthetic evaluation stream ended early")
 
     support_values = support_totals_device.cpu().tolist()
-    support_totals = dict(
-        zip(("tp", "fp", "fn", "tn"), support_values, strict=True)
-    )
+    support_totals = dict(zip(("tp", "fp", "fn", "tn"), support_values, strict=True))
     category_values = category_totals_device.cpu().tolist()
     category_totals = {
         name: dict(zip(("tp", "fp", "fn", "true"), values, strict=True))
@@ -6236,6 +6497,19 @@ def _synthetic_recovery(
         "false_discovery_rate": fp / max(1, fp + tp),
         "false_positive_rate": fp / max(1, fp + tn),
     }
+    grouped_tp, grouped_fp, grouped_fn, grouped_tn = (
+        int(item) for item in grouped_support_totals_device.cpu().tolist()
+    )
+    grouped_support = {
+        "true_positive_events": grouped_tp,
+        "false_positive_events": grouped_fp,
+        "false_negative_events": grouped_fn,
+        "true_negative_events": grouped_tn,
+        "precision": grouped_tp / max(1, grouped_tp + grouped_fp),
+        "recall": grouped_tp / max(1, grouped_tp + grouped_fn),
+        "false_discovery_rate": grouped_fp / max(1, grouped_fp + grouped_tp),
+        "false_positive_rate": grouped_fp / max(1, grouped_fp + grouped_tn),
+    }
     category = {
         name: {
             "precision": counts["tp"] / max(1, counts["tp"] + counts["fp"]),
@@ -6256,6 +6530,18 @@ def _synthetic_recovery(
         else 1.0 - float(code_error[factor] / code_total[factor])
         for factor in range(n_factors)
     ]
+    grouped_code_r2_by_factor = [
+        None
+        if grouped_code_total[factor] <= 0
+        else 1.0 - float(grouped_code_error[factor] / grouped_code_total[factor])
+        for factor in range(n_factors)
+    ]
+    grouped_selected_coverage_by_factor = [
+        None
+        if isolated_count[factor] <= 0
+        else float(grouped_selected_count[factor] / isolated_count[factor])
+        for factor in range(n_factors)
+    ]
     selected_group_coverage_by_factor = [
         None
         if isolated_count[factor] <= 0
@@ -6272,9 +6558,55 @@ def _synthetic_recovery(
         if code_total.sum() <= 0
         else 1.0 - float(code_error.sum() / code_total.sum())
     )
+    grouped_code_r2_after_alignment = (
+        None
+        if grouped_code_total.sum() <= 0
+        else 1.0 - float(grouped_code_error.sum() / grouped_code_total.sum())
+    )
 
     recovered = best_association >= 0.5
-    pathologies = _matching_pathologies(association)
+    pathologies = _matching_pathologies(
+        association,
+        strong_cutoff=pathology_strong_cutoff,
+        weak_cutoff=pathology_weak_cutoff,
+    )
+    pathology_sensitivity = [
+        {
+            "strong_association_cutoff": strong,
+            "weak_association_cutoff": weak,
+            **_matching_pathologies(
+                association,
+                strong_cutoff=strong,
+                weak_cutoff=weak,
+            ),
+        }
+        for strong, weak in sensitivity_pairs
+    ]
+    rank_mismatch_factors = [
+        {
+            "factor": factor,
+            "truth_rank": truth_ranks[factor],
+            "learner_block_width": model.cfg.block_dim,
+            "same_block_linear_information_ceiling": min(
+                1.0,
+                model.cfg.block_dim / truth_ranks[factor],
+            ),
+            "same_block_support_group": int(factor_to_group[factor]),
+            "grouped_diagnostic_block_count": len(grouped_factor_to_groups[factor]),
+            "grouped_diagnostic_groups": list(grouped_factor_to_groups[factor]),
+            "same_block_subspace_overlap": (
+                None if matched_overlap is None else float(matched_overlap[factor])
+            ),
+            "grouped_subspace_overlap": (
+                None if grouped_overlap is None else float(grouped_overlap[factor])
+            ),
+            "same_block_aligned_code_r2": code_r2_by_factor[factor],
+            "grouped_aligned_code_r2": grouped_code_r2_by_factor[factor],
+            "same_block_selected_coverage": selected_group_coverage_by_factor[factor],
+            "grouped_selected_coverage": grouped_selected_coverage_by_factor[factor],
+        }
+        for factor in range(n_factors)
+    ]
     return {
         "selection_mode": selection_mode,
         "shared_feature_claim_eligible": shared_feature_claim_eligible,
@@ -6306,6 +6638,16 @@ def _synthetic_recovery(
         "global_isolated_input_r2_by_factor": global_isolated_r2_by_factor,
         "category": category,
         **pathologies,
+        "pathology_association": {
+            "contract": pathology_association_contract,
+            "primary": {
+                "strong_association_cutoff": pathology_strong_cutoff,
+                "weak_association_cutoff": pathology_weak_cutoff,
+                **pathologies,
+            },
+            "reporting_only_sensitivity": pathology_sensitivity,
+            "sensitivity_changes_primary_gate": False,
+        },
         "duplicate_block_fraction": pathologies["split_factor_fraction"],
         "cross_factor_mixing_fraction": pathologies["merged_factor_fraction"],
         "alive_block_fraction": float(alive.float().mean()),
@@ -6319,11 +6661,25 @@ def _synthetic_recovery(
         "code_r2_after_alignment": code_r2_after_alignment,
         "code_r2_after_alignment_by_factor": code_r2_by_factor,
         "selected_group_coverage_by_factor": selected_group_coverage_by_factor,
+        "rank_mismatch": {
+            "contract": rank_mismatch_contract,
+            "same_block_metrics_are_primary": True,
+            "same_block_gate_is_ceiling_adjusted": False,
+            "grouped_diagnostic_is_promotable": False,
+            "grouped_support_confusion": grouped_support,
+            "grouped_code_r2_after_alignment": grouped_code_r2_after_alignment,
+            "grouped_subspace_overlap_mean": (
+                None if grouped_overlap is None else float(grouped_overlap.mean())
+            ),
+            "factors": rank_mismatch_factors,
+        },
         "note": (
             "factor-to-group matching and affine code alignment are fit only on "
             "the declared factor-calibration range, then frozen for the complete "
             "development or confirmation range; unselected events retain zero "
-            "codes and therefore penalize R2 rather than being conditioned away"
+            "codes and therefore penalize R2 rather than being conditioned away. "
+            "Rank-mismatch grouped metrics are calibration-frozen diagnostics; "
+            "raw same-block metrics remain the qualification headline and gate"
         ),
     }
 
@@ -6331,8 +6687,15 @@ def _synthetic_recovery(
 def _phase1_identification_evidence(
     recovery: Mapping[str, Any],
     threshold_items: Sequence[Sequence[Any]],
+    *,
+    margin_normalization_contract: str,
 ) -> dict[str, Any]:
     """Evaluate the preregistered factor-level recovery conjunction."""
+
+    if margin_normalization_contract != (
+        "piecewise_available_headroom_signed_margin_v2"
+    ):
+        raise CellExecutionError("unknown Phase-1 margin-normalization contract")
 
     thresholds = {str(item[0]): float(item[1]) for item in threshold_items}
     required = {
@@ -6377,12 +6740,21 @@ def _phase1_identification_evidence(
     overlap = matching.get("matched_subspace_overlap")
     isolated = recovery.get("global_isolated_input_r2_by_factor")
     aligned = recovery.get("code_r2_after_alignment_by_factor")
+    rank_mismatch = recovery.get("rank_mismatch")
+    rank_mismatch_factors = (
+        rank_mismatch.get("factors") if isinstance(rank_mismatch, Mapping) else None
+    )
     n_factors = int(recovery.get("n_truth_factors", -1))
     if not all(
         isinstance(values, list) and len(values) == n_factors
         for values in (association, isolated, aligned)
     ):
         raise CellExecutionError("Phase-1 recovery lacks factor-level evidence")
+    if (
+        not isinstance(rank_mismatch_factors, list)
+        or len(rank_mismatch_factors) != n_factors
+    ):
+        raise CellExecutionError("Phase-1 recovery lacks rank-mismatch evidence")
     subspace_eligible = recovery.get("subspace_metrics_eligible") is True
     if subspace_eligible and not (
         isinstance(overlap, list) and len(overlap) == n_factors
@@ -6398,7 +6770,13 @@ def _phase1_identification_evidence(
             or not math.isfinite(float(value))
         ):
             return -1.0e9
-        return (float(value) - threshold) / max(abs(threshold), 1.0e-12)
+        observed = float(value)
+        denominator = (
+            max(1.0 - threshold, 1.0e-12)
+            if observed >= threshold
+            else max(abs(threshold), 1.0e-12)
+        )
+        return (observed - threshold) / denominator
 
     def max_margin(value: Any, threshold: float) -> float:
         if (
@@ -6407,7 +6785,13 @@ def _phase1_identification_evidence(
             or not math.isfinite(float(value))
         ):
             return -1.0e9
-        return (threshold - float(value)) / max(abs(threshold), 1.0e-12)
+        observed = float(value)
+        denominator = (
+            max(abs(threshold), 1.0e-12)
+            if observed <= threshold
+            else max(1.0 - threshold, 1.0e-12)
+        )
+        return (threshold - observed) / denominator
 
     for factor in range(n_factors):
         metrics = {
@@ -6415,6 +6799,7 @@ def _phase1_identification_evidence(
             "subspace_overlap": None if not subspace_eligible else overlap[factor],
             "global_isolated_input_r2": isolated[factor],
             "aligned_code_r2": aligned[factor],
+            "rank_mismatch": rank_mismatch_factors[factor],
         }
         component_margins = {
             "support_association": min_margin(
@@ -6444,6 +6829,17 @@ def _phase1_identification_evidence(
                 "component_margins": component_margins,
                 "margin": factor_margin,
                 "identified": factor_margin >= 0.0,
+                "same_block_gate_has_positive_headroom": bool(
+                    float(
+                        rank_mismatch_factors[factor][
+                            "same_block_linear_information_ceiling"
+                        ]
+                    )
+                    > max(
+                        thresholds["per_factor.subspace_overlap_min_when_eligible"],
+                        thresholds["per_factor.aligned_code_r2_min"],
+                    )
+                ),
             }
         )
 
@@ -6530,6 +6926,7 @@ def _phase1_identification_evidence(
         "aggregate": aggregate,
         "checks": checks,
         "normalized_margins": normalized_margins,
+        "margin_normalization_contract": margin_normalization_contract,
         "margin": margin,
         "passed": all(checks.values()),
     }
@@ -7417,6 +7814,7 @@ def _evaluate_rate_distortion_and_raw_space(
     row_errors: dict[int, list[float]] = {q: [] for q in codec.spec.qs}
     evaluation_stream: Iterator = paired_stream()
     if device.type == "cuda":
+
         def copy_activation_leaf(tensor: torch.Tensor) -> bool:
             return tensor.is_floating_point()
 
@@ -8631,7 +9029,9 @@ def _evaluate(
         sha256=deployment_hash,
     )
     if deployment_after_load != deployment_before_load:
-        raise CellExecutionError("deployable codec changed while loading for evaluation")
+        raise CellExecutionError(
+            "deployable codec changed while loading for evaluation"
+        )
     if (
         calibration_record.get("deployment_codec_sha256") != deployment_hash
         or calibration_record.get("deployment_codec_size_bytes")
@@ -8671,6 +9071,21 @@ def _evaluate(
                 factor_calibration_range=factor_calibration_range,
                 evaluation_range=evaluation_range,
                 batch_size=recovery_batch_size,
+                rank_mismatch_contract=str(
+                    ctx.values["evaluation.rank_mismatch_contract"]
+                ),
+                pathology_association_contract=str(
+                    ctx.values["evaluation.pathology_association_contract"]
+                ),
+                pathology_strong_cutoff=float(
+                    ctx.values["evaluation.pathology_strong_association_cutoff"]
+                ),
+                pathology_weak_cutoff=float(
+                    ctx.values["evaluation.pathology_weak_association_cutoff"]
+                ),
+                pathology_cutoff_sensitivity=ctx.values[
+                    "evaluation.pathology_association_cutoff_sensitivity"
+                ],
             )
             for mode in ("native", "deployed")
         }
@@ -8678,6 +9093,9 @@ def _evaluate(
             endpoint: _phase1_identification_evidence(
                 recovery[endpoint],
                 ctx.values["qualification.phase1_identification_thresholds"],
+                margin_normalization_contract=str(
+                    ctx.values["evaluation.phase1_margin_normalization"]
+                ),
             )
             for endpoint in ("native", "deployed")
         }
@@ -8944,13 +9362,13 @@ def _qualify(
     calibration_record = _read_object(
         prerequisites["calibration_record"][0], label="calibration record"
     )
-    if ctx.values["qualification.thresholds_version"] != "2026-07-20.v1":
+    if ctx.values["qualification.thresholds_version"] != "2026-07-22.v2":
         raise CellExecutionError(
             "unsupported qualification.thresholds_version "
             + repr(ctx.values["qualification.thresholds_version"])
         )
     threshold_map = {
-        "schema": "bsc-integrity-thresholds-2026-07-20.v1",
+        "schema": "bsc-integrity-thresholds-2026-07-22.v2",
         "support_target_abs_error_max": 0.1,
         "codec_excluded_calibration_event_fraction_max": 0.01,
         "codec_excluded_evaluation_event_fraction_max": 0.01,
@@ -8960,6 +9378,34 @@ def _qualify(
             ctx.values["qualification.phase1_identification_thresholds"]
         ),
         "phase1_identification_enforced": ctx.values["runtime.smoke"] is False,
+        "phase1_margin_normalization_contract": ctx.values[
+            "evaluation.phase1_margin_normalization"
+        ],
+        "phase1_rank_mismatch_contract": ctx.values[
+            "evaluation.rank_mismatch_contract"
+        ],
+        "phase1_pathology_association_contract": ctx.values[
+            "evaluation.pathology_association_contract"
+        ],
+        "phase1_pathology_strong_association_cutoff": ctx.values[
+            "evaluation.pathology_strong_association_cutoff"
+        ],
+        "phase1_pathology_weak_association_cutoff": ctx.values[
+            "evaluation.pathology_weak_association_cutoff"
+        ],
+        "phase1_pathology_association_cutoff_sensitivity": [
+            list(item)
+            for item in ctx.values[
+                "evaluation.pathology_association_cutoff_sensitivity"
+            ]
+        ],
+        "encoder_scale_fit_statistic": ctx.values["model.encoder_scale_fit_statistic"],
+        "encoder_scale_fit_solver": ctx.values["model.encoder_scale_fit_solver"],
+        "encoder_scale_fit_target": ctx.values["model.encoder_scale_fit_target"],
+        "encoder_scale_fit_tolerance": ctx.values["model.encoder_scale_fit_tolerance"],
+        "encoder_scale_fit_max_iterations": ctx.values[
+            "model.encoder_scale_fit_max_iterations"
+        ],
         "fixed_rate_budget_scale_factor": ctx.values[
             "evaluation.fixed_rate_budget_scale_factor"
         ],
@@ -9119,6 +9565,48 @@ def _qualify(
         valid_isolated_loss_diagnostics(native)
         and valid_isolated_loss_diagnostics(deployed)
     )
+
+    encoder_scale_calibration = training_report.get("encoder_scale_calibration")
+    encoder_scale_calibration_integrity = False
+    if isinstance(encoder_scale_calibration, dict):
+        strategy = ctx.values["model.encoder_scale_calibration"]
+        if strategy == "fixed_init_no_data_fit":
+            encoder_scale_calibration_integrity = encoder_scale_calibration == {
+                "strategy": strategy,
+                "fitted": False,
+                "scale_multiplier": 1.0,
+            }
+        else:
+            observed_after = encoder_scale_calibration.get("mean_block_norm_after")
+            target = float(ctx.values["model.encoder_scale_fit_target"])
+            tolerance = float(ctx.values["model.encoder_scale_fit_tolerance"])
+            encoder_scale_calibration_integrity = bool(
+                encoder_scale_calibration.get("strategy") == strategy
+                and encoder_scale_calibration.get("fitted") is True
+                and encoder_scale_calibration.get("statistic")
+                == ctx.values["model.encoder_scale_fit_statistic"]
+                and encoder_scale_calibration.get("solver")
+                == ctx.values["model.encoder_scale_fit_solver"]
+                and encoder_scale_calibration.get("target") == target
+                and encoder_scale_calibration.get("tolerance") == tolerance
+                and encoder_scale_calibration.get("max_iterations")
+                == ctx.values["model.encoder_scale_fit_max_iterations"]
+                and isinstance(encoder_scale_calibration.get("iterations"), int)
+                and 0
+                < encoder_scale_calibration["iterations"]
+                <= ctx.values["model.encoder_scale_fit_max_iterations"]
+                and encoder_scale_calibration.get("remeasured_post_fit") is True
+                and finite_number(observed_after)
+                and abs(float(observed_after) - target) <= tolerance
+                and finite_number(
+                    encoder_scale_calibration.get("mean_block_norm_before")
+                )
+                and finite_number(encoder_scale_calibration.get("scale_multiplier"))
+                and float(encoder_scale_calibration["scale_multiplier"]) > 0.0
+                and isinstance(encoder_scale_calibration.get("events"), int)
+                and encoder_scale_calibration["events"] > 0
+                and isinstance(encoder_scale_calibration.get("input"), dict)
+            )
 
     regularizer_calibration = training_report.get("regularizer_calibration")
     reported_model_cfg = training_report.get("model_cfg")
@@ -9391,6 +9879,41 @@ def _qualify(
                 and 0.0 <= float(recovery[endpoint][name]) <= 1.0
                 for name in ranged_names
             )
+            and recovery[endpoint].get("rank_mismatch", {}).get("contract")
+            == threshold_map["phase1_rank_mismatch_contract"]
+            and recovery[endpoint]
+            .get("rank_mismatch", {})
+            .get("same_block_metrics_are_primary")
+            is True
+            and recovery[endpoint]
+            .get("rank_mismatch", {})
+            .get("same_block_gate_is_ceiling_adjusted")
+            is False
+            and recovery[endpoint].get("pathology_association", {}).get("contract")
+            == threshold_map["phase1_pathology_association_contract"]
+            and recovery[endpoint]
+            .get("pathology_association", {})
+            .get("primary", {})
+            .get("strong_association_cutoff")
+            == threshold_map["phase1_pathology_strong_association_cutoff"]
+            and recovery[endpoint]
+            .get("pathology_association", {})
+            .get("primary", {})
+            .get("weak_association_cutoff")
+            == threshold_map["phase1_pathology_weak_association_cutoff"]
+            and [
+                [
+                    item.get("strong_association_cutoff"),
+                    item.get("weak_association_cutoff"),
+                ]
+                for item in recovery[endpoint]
+                .get("pathology_association", {})
+                .get("reporting_only_sensitivity", ())
+                if isinstance(item, dict)
+            ]
+            == threshold_map["phase1_pathology_association_cutoff_sensitivity"]
+            and identification.get(endpoint, {}).get("margin_normalization_contract")
+            == threshold_map["phase1_margin_normalization_contract"]
             for endpoint in ("native", "deployed")
         )
 
@@ -9618,6 +10141,7 @@ def _qualify(
         )
     checks = {
         "deployment_schedule_integrity": deployment_schedule_integrity,
+        "encoder_scale_calibration_integrity": encoder_scale_calibration_integrity,
         "finite": _finite_json(evaluation),
         "method_endpoints": method_endpoints,
         "provenance": provenance,
@@ -9748,6 +10272,73 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _gpu_lock_path(device: torch.device) -> Path:
+    logical_index = 0 if device.index is None else device.index
+    visible = [
+        item.strip()
+        for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if item.strip()
+    ]
+    physical_identity = (
+        visible[logical_index] if logical_index < len(visible) else str(logical_index)
+    )
+    identity_hash = hashlib.sha256(physical_identity.encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"bsc-gpu-{os.getuid()}-{identity_hash}.lock"
+
+
+@contextmanager
+def _host_gpu_execution_lock(cell_path: Path):
+    """Serialize canonical CUDA workers across campaigns on one host device."""
+
+    try:
+        cell = CellSpec.from_manifest(json.loads(cell_path.read_text()))
+        device = torch.device(str(cell.decision_map["runtime.device"]))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise CellExecutionError(
+            f"cannot resolve host GPU lock from cell manifest: {exc}"
+        ) from exc
+    if device.type != "cuda":
+        yield
+        return
+
+    path = _gpu_lock_path(device)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise CellExecutionError(f"cannot open host GPU lock {path}: {exc}") from exc
+    try:
+        status = os.fstat(fd)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_nlink != 1
+        ):
+            raise CellExecutionError(f"unsafe host GPU lock file: {path}")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        payload = {
+            "schema": "bsc-host-gpu-lock-v1",
+            "cell_id": cell.cell_id,
+            "device": str(device),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+        }
+        body = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, body)
+        os.fsync(fd)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _execute_stage_request(
     cell: Path,
     *,
@@ -9844,17 +10435,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.worker:
         if args.stage is not None or args.artifacts_out is not None or args.resume:
             raise SystemExit("error: --worker cannot be combined with stage arguments")
-        _worker_main(args.cell)
+        with _host_gpu_execution_lock(args.cell):
+            _worker_main(args.cell)
         return
     if args.stage is None or args.artifacts_out is None:
         raise SystemExit("error: --stage and --artifacts-out are required")
     try:
-        _execute_stage_request(
-            args.cell,
-            stage=args.stage,
-            artifacts_out=args.artifacts_out,
-            resume=args.resume,
-        )
+        with _host_gpu_execution_lock(args.cell):
+            _execute_stage_request(
+                args.cell,
+                stage=args.stage,
+                artifacts_out=args.artifacts_out,
+                resume=args.resume,
+            )
     except (CellExecutionError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 

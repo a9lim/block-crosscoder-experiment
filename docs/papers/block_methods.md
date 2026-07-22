@@ -159,6 +159,14 @@ The live matrix therefore has primary and `appendix_aux` cells. Treating the
 appendix term as an invisible default would confound source reproduction with
 dead-feature handling.
 
+For Vanilla and Grassmannian TopK, the unselected encoder carrier remains
+available exactly as the Appendix describes. Group Lasso instead maps every
+inactive block to exact zero after shrinkage, and the source does not specify
+that interaction. Its executable Appendix-Aux cell is therefore an adapted
+bridge: rank and decode the affine pre-shrink `u`, require the complete
+declared runner-up count in every row, and retain the source `1/l` weight. The
+primary Group-Lasso cell remains the unadapted control.
+
 ### 2.8 Inspected-release drift
 
 The official repository was inspected at commit

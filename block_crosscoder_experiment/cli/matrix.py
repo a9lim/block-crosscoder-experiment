@@ -7,19 +7,23 @@ explicit, hash-bound decision artifact through the campaign API after review.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
 from typing import Sequence
 
 from block_crosscoder_experiment.cli.data import (
+    DEFAULT_FREE_SPACE_FLOOR_FRAC,
     expected_capture_allocation,
     expected_capture_source_contract,
     validate_capture_manifest,
+    validate_derived_view_manifest,
 )
 from block_crosscoder_experiment.campaign import (
     Campaign,
@@ -42,11 +46,15 @@ from block_crosscoder_experiment.studies import (
     build_phase2_plan,
     build_phase3_blueprint,
     build_phase3_plan,
+    estimate_activation_store,
     estimate_plan,
+    enforce_plan_resources,
     materialize_child_plan,
     materialize_family_child_plan,
     materialize_family_revisit_plan,
 )
+
+_VERIFICATION_PROBE_BYTES = 64 * 1024
 
 
 def _nonnegative_int(value: str) -> int:
@@ -56,11 +64,35 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return parsed
+
+
+@contextmanager
+def _sigterm_unwinds_runner():
+    """Turn SIGTERM into stack unwinding so worker groups close in ``finally``."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        del frame
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _string_mapping_json(value: str) -> dict[str, str]:
@@ -151,14 +183,39 @@ def _verify_store_with_receipt(
             "inode": status.st_ino,
         }
 
+    def content_probe(path: Path) -> dict[str, int | str]:
+        size = path.stat().st_size
+        length = min(size, _VERIFICATION_PROBE_BYTES)
+        offset_span = size - length
+        offset_seed = hashlib.sha256(
+            f"{manifest_file_sha256}:{path.name}".encode("utf-8")
+        ).digest()
+        offset = (
+            int.from_bytes(offset_seed[:8], "big") % (offset_span + 1)
+            if offset_span
+            else 0
+        )
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            body = handle.read(length)
+        if len(body) != length:
+            raise StudyError(f"short verification probe read from {path}")
+        return {
+            "path": str(path.resolve()),
+            "offset": offset,
+            "length": length,
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
     manifest_file_sha256 = _sha256(manifest_path)
+    shard_paths = [
+        split_dir / str(record["file"]) for record in reader.manifest["shards"]
+    ]
     fingerprint = {
         "manifest": stat_record(manifest_path),
-        "shards": [
-            stat_record(split_dir / str(record["file"]))
-            for record in reader.manifest["shards"]
-        ],
+        "shards": [stat_record(path) for path in shard_paths],
     }
+    probes = [content_probe(path) for path in shard_paths]
     key = _canonical_hash(
         {
             "root": str(split_dir.parent.resolve()),
@@ -168,7 +225,7 @@ def _verify_store_with_receipt(
     )
     receipt_path = cache_root / f"{key}.json"
     expected = {
-        "schema": "bsc-store-verification-receipt-v1",
+        "schema": "bsc-store-verification-receipt-v2",
         "root": str(split_dir.parent.resolve()),
         "split": split_dir.name,
         "manifest_sha256": manifest_file_sha256,
@@ -177,6 +234,7 @@ def _verify_store_with_receipt(
         "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
         "n_tokens": reader.n_tokens,
         "stat_fingerprint": fingerprint,
+        "content_probes": probes,
     }
     if receipt_path.is_file():
         try:
@@ -189,7 +247,9 @@ def _verify_store_with_receipt(
     _write_verification_receipt(receipt_path, expected)
 
 
-def _configured_input_roots() -> tuple[Path, ...]:
+def _configured_input_roots(
+    explicit_roots: Sequence[Path] = (),
+) -> tuple[Path, ...]:
     names = (
         "BSC_VIEW_ROOT",
         "BSC_ACTIVATION_STORE",
@@ -200,8 +260,9 @@ def _configured_input_roots() -> tuple[Path, ...]:
     )
     roots: list[Path] = []
     seen: set[Path] = set()
-    for name in names:
-        value = os.environ.get(name)
+    values = [str(root) for root in explicit_roots]
+    values.extend(os.environ.get(name, "") for name in names)
+    for value in values:
         if not value:
             continue
         root = Path(value).expanduser().resolve()
@@ -215,6 +276,7 @@ def _verified_existing_input_storage(
     *,
     verification_cache_root: Path | None = None,
     plan=None,
+    input_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
     """Hash-verify configured immutable inputs and count their physical bytes.
 
@@ -265,7 +327,7 @@ def _verified_existing_input_storage(
 
     counted_files: set[Path] = set()
     records: list[dict[str, object]] = []
-    for root in _configured_input_roots():
+    for root in _configured_input_roots(input_roots):
         if not root.is_dir():
             raise StudyError(f"configured activation input is not a directory: {root}")
         split_manifests = sorted(root.rglob("split.json"))
@@ -279,14 +341,7 @@ def _verified_existing_input_storage(
                 capture = json.loads(capture_path.read_text())
                 if not isinstance(capture, dict):
                     raise ValueError("manifest must be an object")
-                if plan is None and "capture_binding" not in capture:
-                    source = capture.get("source")
-                    if not isinstance(source, dict) or capture.get(
-                        "source_hash"
-                    ) != _canonical_hash(source):
-                        raise ValueError("capture source hash mismatch")
-                else:
-                    validate_capture_manifest(capture)
+                validate_capture_manifest(capture)
             except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise StudyError(
                     f"invalid capture manifest {capture_path}: {exc}"
@@ -394,15 +449,32 @@ def _verified_existing_input_storage(
     }
 
 
+def _estimated_plan_input_storage_bytes(plan) -> int:
+    """Return the exact activation-store portion of ``estimate_plan(plan)``."""
+
+    if plan is None:
+        return 0
+    stores: dict[tuple[object, ...], int] = {}
+    raw_stores: dict[tuple[object, ...], int] = {}
+    for store_bytes, key in (estimate_activation_store(cell) for cell in plan.cells):
+        stores[key] = max(stores.get(key, 0), store_bytes)
+        if key[12] == "content_addressed_derived_view":
+            raw_key = (*key[:13], "raw_source_view", *key[14:])
+            raw_stores[raw_key] = max(raw_stores.get(raw_key, 0), store_bytes)
+    return sum(stores.values()) + sum(raw_stores.values())
+
+
 def _storage_preflight(
     root: Path,
     estimated_storage_bytes: int,
     *,
     plan=None,
+    input_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
     existing = _verified_existing_input_storage(
         verification_cache_root=root / ".store-verification",
         plan=plan,
+        input_roots=input_roots,
     )
     campaign_artifact_files: set[Path] = set()
     if (root / "plan.json").is_file():
@@ -414,30 +486,109 @@ def _storage_preflight(
     campaign_artifact_bytes = sum(
         path.stat().st_size for path in campaign_artifact_files
     )
-    input_credit = min(
+    estimated_input_bytes = min(
         estimated_storage_bytes,
+        (
+            _estimated_plan_input_storage_bytes(plan)
+            if plan is not None
+            else int(existing["verified_existing_input_bytes"])
+        ),
+    )
+    estimated_campaign_bytes = estimated_storage_bytes - estimated_input_bytes
+    input_credit = min(
+        estimated_input_bytes,
         int(existing["verified_existing_input_bytes"]),
     )
     campaign_artifact_credit = min(
-        max(0, estimated_storage_bytes - input_credit),
+        estimated_campaign_bytes,
         campaign_artifact_bytes,
     )
     credited = input_credit + campaign_artifact_credit
-    additional = max(0, estimated_storage_bytes - credited)
-    parent = _nearest_existing_parent(root)
-    free = shutil.disk_usage(parent).free
+    missing_input = estimated_input_bytes - input_credit
+    missing_campaign = estimated_campaign_bytes - campaign_artifact_credit
+
+    requirements: dict[int, dict[str, object]] = {}
+
+    def add_requirement(path: Path, required: int, role: str) -> None:
+        parent = _nearest_existing_parent(path)
+        device = int(parent.stat().st_dev)
+        usage = shutil.disk_usage(parent)
+        record = requirements.setdefault(
+            device,
+            {
+                "device": device,
+                "filesystem_path": str(parent),
+                "raw_free_bytes": int(usage.free),
+                "free_space_floor_bytes": int(
+                    usage.total * DEFAULT_FREE_SPACE_FLOOR_FRAC
+                ),
+                "required_bytes": 0,
+                "roles": [],
+            },
+        )
+        record["required_bytes"] = int(record["required_bytes"]) + required
+        roles = record["roles"]
+        assert isinstance(roles, list)
+        roles.append(role)
+
+    add_requirement(root, missing_campaign, "campaign_artifacts")
+    configured_roots = _configured_input_roots(input_roots)
+    if missing_input:
+        if configured_roots:
+            # Output placement is not encoded in a scientific plan. Requiring
+            # the complete unmaterialized input remainder on every declared
+            # destination filesystem is conservative and prevents aggregate
+            # free space on another device from authorizing this one.
+            seen_devices: set[int] = set()
+            for configured_root in configured_roots:
+                parent = _nearest_existing_parent(configured_root)
+                device = int(parent.stat().st_dev)
+                if device in seen_devices:
+                    continue
+                seen_devices.add(device)
+                add_requirement(
+                    configured_root,
+                    missing_input,
+                    "unmaterialized_activation_inputs",
+                )
+        else:
+            add_requirement(root, missing_input, "unmaterialized_activation_inputs")
+    filesystem_preflights = sorted(
+        requirements.values(), key=lambda item: item["device"]
+    )
+    for record in filesystem_preflights:
+        record["available_above_floor_bytes"] = max(
+            0,
+            int(record["raw_free_bytes"]) - int(record["free_space_floor_bytes"]),
+        )
+        record["sufficient"] = int(record["required_bytes"]) <= int(
+            record["available_above_floor_bytes"]
+        )
+    additional = missing_input + missing_campaign
+    sufficient = all(bool(record["sufficient"]) for record in filesystem_preflights)
+    campaign_parent = _nearest_existing_parent(root)
+    campaign_usage = shutil.disk_usage(campaign_parent)
+    campaign_free = int(campaign_usage.free)
+    campaign_floor = int(campaign_usage.total * DEFAULT_FREE_SPACE_FLOOR_FRAC)
     return {
         "estimate_scope": "materialized_plan_prefix_or_frozen_panel",
         "estimated_storage_bytes": estimated_storage_bytes,
+        "estimated_input_storage_bytes": estimated_input_bytes,
+        "estimated_campaign_artifact_bytes": estimated_campaign_bytes,
         **existing,
         "verified_existing_campaign_artifact_bytes": campaign_artifact_bytes,
         "credited_existing_input_bytes": input_credit,
         "credited_existing_campaign_artifact_bytes": campaign_artifact_credit,
         "credited_existing_storage_bytes": credited,
         "additional_storage_bytes_required": additional,
-        "free_bytes": free,
-        "filesystem_path": str(parent),
-        "sufficient": additional <= free,
+        "additional_input_storage_bytes_required": missing_input,
+        "additional_campaign_storage_bytes_required": missing_campaign,
+        "free_bytes": campaign_free,
+        "free_space_floor_bytes": campaign_floor,
+        "available_above_floor_bytes": max(0, campaign_free - campaign_floor),
+        "filesystem_path": str(campaign_parent),
+        "filesystem_preflights": filesystem_preflights,
+        "sufficient": sufficient,
     }
 
 
@@ -520,6 +671,33 @@ def _resolve_phase2_view_dispatch(
             mode_root = root / mode
             if not mode_root.is_dir():
                 raise StudyError(f"Phase-2 view {mode!r} does not exist under {root}")
+            view_manifest_path = mode_root / "view.json"
+            try:
+                view_manifest = json.loads(view_manifest_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise StudyError(
+                    f"Phase-2 view {mode!r} lacks a valid root manifest: {exc}"
+                ) from exc
+            if not isinstance(view_manifest, dict):
+                raise StudyError(
+                    f"Phase-2 view {mode!r} root manifest is not an object"
+                )
+            try:
+                view_manifest = validate_derived_view_manifest(view_manifest)
+            except (TypeError, ValueError) as exc:
+                raise StudyError(
+                    f"Phase-2 view {mode!r} has an invalid root manifest: {exc}"
+                ) from exc
+            if view_manifest.get("mode") != mode or view_manifest.get(
+                "split_order"
+            ) != list(declared):
+                raise StudyError(f"Phase-2 view {mode!r} has a divergent root manifest")
+            expected_root_entries = set(declared) | {"whitener.pt", "view.json"}
+            actual_root_entries = {path.name for path in mode_root.iterdir()}
+            if actual_root_entries != expected_root_entries:
+                raise StudyError(
+                    f"Phase-2 view {mode!r} root entries differ from its manifest"
+                )
             transform_path = mode_root / "whitener.pt"
             if not transform_path.is_file():
                 raise StudyError(f"Phase-2 view {mode!r} lacks whitener.pt")
@@ -532,6 +710,12 @@ def _resolve_phase2_view_dispatch(
             if transform.mode != mode:
                 raise StudyError(
                     f"Phase-2 view {mode!r} contains transform mode {transform.mode!r}"
+                )
+            if transform.hash != view_manifest.get("transform_hash") or _sha256(
+                transform_path
+            ) != view_manifest.get("whitener_sha256"):
+                raise StudyError(
+                    f"Phase-2 view {mode!r} transform differs from its root manifest"
                 )
             available = {
                 path.name
@@ -564,6 +748,17 @@ def _resolve_phase2_view_dispatch(
                 ):
                     raise StudyError(
                         f"Phase-2 view {mode!r}/{split} does not bind its cell contract"
+                    )
+                root_record = view_manifest["splits"].get(split)
+                expected_root_record = {
+                    "manifest_sha256": reader.manifest["manifest_sha256"],
+                    "content_stream_sha256": reader.manifest["content_stream_sha256"],
+                    "row_stream_sha256": reader.manifest["row_stream_sha256"],
+                    "n_tokens": reader.n_tokens,
+                }
+                if root_record != expected_root_record:
+                    raise StudyError(
+                        f"Phase-2 view {mode!r}/{split} differs from its root manifest"
                     )
                 signatures[split] = (
                     reader.n_tokens,
@@ -611,7 +806,12 @@ def _run_with_optional_view_dispatch(
     if campaign.plan.phase is not Phase.PHASE2:
         raise StudyError("--view-root is only valid for a Phase-2 campaign")
     if args.cells is None:
-        selected = list(campaign.runnable_cell_ids(include_failed=args.resume))
+        selected = list(
+            campaign.runnable_cell_ids(
+                include_failed=args.resume,
+                include_resume_required=args.resume,
+            )
+        )
     else:
         selected = list(args.cells)
         for cell_id in selected:
@@ -762,15 +962,26 @@ def _checked_storage_extension(
     *,
     allow_insufficient: bool,
     plan=None,
+    input_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
-    preflight = _storage_preflight(root, estimate.storage_bytes, plan=plan)
+    preflight = _storage_preflight(
+        root,
+        estimate.storage_bytes,
+        plan=plan,
+        input_roots=input_roots,
+    )
     if not allow_insufficient and not preflight["sufficient"]:
+        failed_filesystems = [
+            item
+            for item in preflight["filesystem_preflights"]
+            if not item["sufficient"]
+        ]
         raise BudgetExceeded(
             f"storage_bytes: conservative cumulative estimate {estimate.storage_bytes}; "
             "incremental requirement "
-            f"{preflight['additional_storage_bytes_required']} exceeds "
-            f"{preflight['free_bytes']} free bytes at "
-            f"{preflight['filesystem_path']} after crediting "
+            f"{preflight['additional_storage_bytes_required']} is not available on "
+            "every bound destination filesystem: "
+            f"{json.dumps(failed_filesystems, sort_keys=True)}; after crediting "
             f"{preflight['credited_existing_storage_bytes']} bytes of hash-verified "
             "configured inputs and existing campaign artifacts; choose a larger "
             "filesystem or pass "
@@ -865,9 +1076,10 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="run eligible cells through qualification")
     run.add_argument("--root", type=Path, required=True)
-    run.add_argument("--limit", type=_nonnegative_int)
+    selection = run.add_mutually_exclusive_group()
+    selection.add_argument("--limit", type=_positive_int)
     run.add_argument("--resume", action="store_true")
-    run.add_argument("--cell", action="append", dest="cells")
+    selection.add_argument("--cell", action="append", dest="cells")
     run.add_argument(
         "--view-root",
         type=Path,
@@ -1061,14 +1273,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         campaign = Campaign(args.root)
         if args.command == "run":
+            enforce_plan_resources(campaign.plan)
             estimate = estimate_plan(campaign.plan)
             _checked_storage_extension(
                 args.root,
                 estimate,
                 allow_insufficient=False,
                 plan=campaign.plan,
+                input_roots=(args.view_root,) if args.view_root is not None else (),
             )
-            summary = _run_with_optional_view_dispatch(campaign, args)
+            with _sigterm_unwinds_runner():
+                summary = _run_with_optional_view_dispatch(campaign, args)
             _print({"run": summary.to_dict(), "status": campaign.status()})
             if summary.failed_cells:
                 raise SystemExit(1)

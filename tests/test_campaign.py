@@ -1,8 +1,14 @@
 import copy
+import concurrent.futures
 import hashlib
 import json
 import os
+import signal
 import shutil
+import socket
+import subprocess
+import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +29,7 @@ from block_crosscoder_experiment.campaign import (
     CampaignRunner,
     EVALUATION_SCHEMA,
     InvalidTransition,
+    PREPARATION_SCHEMA,
     PROMOTION_SCHEMA,
     QUALIFICATION_SCHEMA,
     RunState,
@@ -56,11 +63,24 @@ from block_crosscoder_experiment.studies import (
 
 
 TEST_IMPLEMENTATION_IDENTITY = {
-    "executor_schema": "test-executor-v1",
-    "source_sha256": "1" * 64,
-    "git_commit": "test-commit",
+    "executor_schema": "bsc-cell-executor-v12",
+    "executor_process_model": "persistent_exact_snapshot_lineage_v5",
+    "python_source_sha256": "1" * 64,
+    "python_source_files": 1,
+    "git_commit": "1" * 40,
     "git_dirty": False,
-    "dependencies": {"python": "test"},
+    "python": "3.12.test",
+    "torch": "2.8.0",
+    "torch_cuda_build": "12.8",
+    "dependencies": {
+        "datasets": "test",
+        "huggingface-hub": "test",
+        "numpy": "test",
+        "sae-lens": "test",
+        "safetensors": "test",
+        "torch": "test",
+        "transformers": "test",
+    },
 }
 TEST_IMPLEMENTATION_IDENTITY_SHA256 = hashlib.sha256(
     canonical_json(TEST_IMPLEMENTATION_IDENTITY).encode("utf-8")
@@ -145,15 +165,25 @@ def phase1_decision_for_phase2(
     smoke: bool,
     forge_nonpromotable_stage: str | None = None,
     capability_failure: tuple[str, str, int] | None = None,
+    implementation_identity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a complete self-contained decision without file I/O."""
 
     if (
         forge_nonpromotable_stage is None
         and capability_failure is None
+        and implementation_identity is None
         and smoke in _PHASE1_DECISION_CACHE
     ):
         return json.loads(json.dumps(_PHASE1_DECISION_CACHE[smoke]))
+    resolved_implementation_identity = (
+        TEST_IMPLEMENTATION_IDENTITY
+        if implementation_identity is None
+        else implementation_identity
+    )
+    resolved_implementation_identity_sha256 = hashlib.sha256(
+        canonical_json(resolved_implementation_identity).encode("utf-8")
+    ).hexdigest()
     seeds = (0,) if smoke else (0, 1, 2)
     blueprint = build_phase1_blueprint(seeds=seeds, smoke=smoke)
     plan = build_phase1_plan(seeds=seeds, smoke=smoke)
@@ -224,6 +254,23 @@ def phase1_decision_for_phase2(
         scientific_identification_passed = bool(
             identification_inapplicable or scientific_passed
         )
+        scientific_checks = {
+            "support_target_calibration": True,
+            "codec_calibration_exclusion": True,
+            "codec_evaluation_exclusion": True,
+            "phase1_identification": scientific_identification_passed,
+            "production_precision_finite": True,
+            "production_precision_reconstruction": True,
+            "production_precision_support": True,
+            "production_fixed_rate_frontier": True,
+        }
+        reasons = []
+        if smoke:
+            reasons.append("runtime_smoke")
+        if not (intent or forged_intent):
+            reasons.append("resolved_nonpromotable_cell")
+        if not scientific_identification_passed:
+            reasons.append("scientific_outcome_failed")
         return {
             "schema": QUALIFICATION_SCHEMA,
             "cell_id": cell.cell_id,
@@ -233,14 +280,17 @@ def phase1_decision_for_phase2(
                 "method_endpoints": True,
                 "provenance": True,
                 "resource_compliance": True,
+                "deployment_schedule_integrity": True,
+                "encoder_scale_calibration_integrity": True,
+                "regularizer_calibration_integrity": True,
+                "precision_preflight_integrity": True,
+                "selection_score_diagnostics_integrity": True,
                 "scientific_endpoint_complete": True,
                 "split_integrity": True,
             },
             "scientific_outcome": {
                 "passed": scientific_identification_passed,
-                "checks": {
-                    "phase1_identification": scientific_identification_passed
-                },
+                "checks": scientific_checks,
                 "inapplicable_checks": (
                     {
                         "phase1_identification": (
@@ -251,6 +301,9 @@ def phase1_decision_for_phase2(
                     else {}
                 ),
                 "margins": {
+                    "support_target_abs_error": 0.1,
+                    "codec_calibration_excluded_fraction": 0.01,
+                    "codec_evaluation_excluded_fraction": 0.01,
                     "phase1_native_identification": (
                         -0.25
                         if capability_conjunction_failed
@@ -261,6 +314,9 @@ def phase1_decision_for_phase2(
                         if capability_conjunction_failed
                         else (1.0 if scientific_passed else -1.0)
                     ),
+                    "production_precision_reconstruction": None,
+                    "production_precision_support_iou": None,
+                    "production_fixed_rate_nonzero_endpoints": None,
                 },
             },
             "inputs": inputs,
@@ -270,21 +326,18 @@ def phase1_decision_for_phase2(
                 canonical_json(selection_metrics).encode()
             ).hexdigest(),
             "selection_metrics_evaluation_sha256": inputs["evaluation"],
-            "implementation_identity": TEST_IMPLEMENTATION_IDENTITY,
+            "implementation_identity": resolved_implementation_identity,
             "implementation_identity_sha256": (
-                TEST_IMPLEMENTATION_IDENTITY_SHA256
+                resolved_implementation_identity_sha256
             ),
+            "qualification_profile": cell.decision_map["qualification.profile"],
+            "thresholds_version": cell.decision_map[
+                "qualification.thresholds_version"
+            ],
+            "thresholds": campaign_module._qualification_thresholds(cell),
             "promotion_eligible": promotion_eligible,
             "promotion_ineligible_reasons": (
-                []
-                if promotion_eligible
-                else [
-                    "scientific_outcome_failed"
-                    if not scientific_passed
-                    else "smoke_protocol_only"
-                    if protocol_eligible
-                    else "recipe_declared_diagnostic"
-                ]
+                [] if promotion_eligible else reasons
             ),
             "selection_eligible_for_protocol_test": protocol_eligible,
             "selection_eligibility_mode": (
@@ -309,7 +362,7 @@ def phase1_decision_for_phase2(
         return "sha256:" + hashlib.sha256(body).hexdigest()
 
     selection_chain: list[dict[str, object]] = []
-    plan_ids = [plan.plan_id]
+    plan_history = [plan]
     while len(plan.stages) < len(blueprint.initial_stages) + len(blueprint.rounds):
         stage = plan.stages[-1]
         policy = stage.selection_policy
@@ -434,11 +487,14 @@ def phase1_decision_for_phase2(
                 "selection_id": selection.selection_id,
                 "selection_universe_sha256": universe_sha256,
                 "selection_artifact_sha256": "sha256:" + "1" * 64,
+                "selection_artifact_sha256_semantics": (
+                    "opaque_historical_commitment_requires_trusted_origin"
+                ),
                 "selection": selection.to_dict(),
             }
         )
         plan = extended
-        plan_ids.append(plan.plan_id)
+        plan_history.append(plan)
 
     cells: list[dict[str, object]] = []
     by_variant: dict[str, list[CellSpec]] = {}
@@ -493,21 +549,32 @@ def phase1_decision_for_phase2(
             }
         )
     manifest = {
-        "schema": "bsc-phase1-campaign-manifest-v1",
+        "schema": campaign_module.PHASE1_CAMPAIGN_MANIFEST_SCHEMA,
         "source_phase1_plan_id": plan.plan_id,
         "source_phase1_blueprint_id": blueprint.blueprint_id,
         "plan_content_sha256": "sha256:"
         + hashlib.sha256(canonical_json(plan.to_manifest()).encode()).hexdigest(),
         "blueprint_content_sha256": "sha256:"
         + hashlib.sha256(canonical_json(blueprint.to_manifest()).encode()).hexdigest(),
-        "plan_sha256": "sha256:" + "2" * 64,
-        "blueprint_sha256": "sha256:" + "3" * 64,
+        "plan_sha256": campaign_module._run_cell_json_sha256(plan.to_manifest()),
+        "blueprint_sha256": campaign_module._run_cell_json_sha256(
+            blueprint.to_manifest()
+        ),
         "journal_sha256": "sha256:" + "4" * 64,
+        "journal_sha256_semantics": (
+            "opaque_historical_commitment_requires_trusted_origin"
+        ),
         "smoke": smoke,
         "plan": plan.to_manifest(),
         "blueprint": blueprint.to_manifest(),
         "plan_history": [
-            {"plan_id": plan_id, "sha256": "sha256:" + "5" * 64} for plan_id in plan_ids
+            {
+                "plan_id": historical.plan_id,
+                "sha256": campaign_module._run_cell_json_sha256(
+                    historical.to_manifest()
+                ),
+            }
+            for historical in plan_history
         ],
         "selection_chain": selection_chain,
         "cells": cells,
@@ -518,7 +585,7 @@ def phase1_decision_for_phase2(
         },
     }
     body = {
-        "schema": "bsc-phase1-go-no-go-decision-v2",
+        "schema": campaign_module.PHASE1_DECISION_SCHEMA,
         "source_phase1_plan_id": plan.plan_id,
         "source_phase1_blueprint_id": blueprint.blueprint_id,
         "authorization_mode": ("smoke_protocol_only" if smoke else "scientific_go"),
@@ -533,7 +600,11 @@ def phase1_decision_for_phase2(
     payload = {**body, "decision_id": content_id(body, prefix="phase1-decision")}
     if forge_nonpromotable_stage is None:
         Campaign.phase1_decision_from_manifest(payload)
-    if forge_nonpromotable_stage is None and capability_failure is None:
+    if (
+        forge_nonpromotable_stage is None
+        and capability_failure is None
+        and implementation_identity is None
+    ):
         _PHASE1_DECISION_CACHE[smoke] = payload
     return json.loads(json.dumps(payload))
 
@@ -657,10 +728,12 @@ def set_phase1_variant_outcome(
         qualification = evidence["qualification"]
         qualification["scientific_outcome"]["passed"] = passed
         qualification["scientific_outcome"]["checks"]["phase1_identification"] = passed
-        qualification["scientific_outcome"]["margins"] = {
-            "phase1_native_identification": 1.0 if passed else -1.0,
-            "phase1_deployed_identification": 1.0 if passed else -1.0,
-        }
+        qualification["scientific_outcome"]["margins"].update(
+            {
+                "phase1_native_identification": 1.0 if passed else -1.0,
+                "phase1_deployed_identification": 1.0 if passed else -1.0,
+            }
+        )
         qualification["selection_metrics"]["validation"] = {
             "phase1_identification_conjunction": passed,
             "phase1_identification_margin": 1.0 if passed else -1.0,
@@ -748,6 +821,11 @@ def evaluation_payload(
         "selection_metrics_sha256": hashlib.sha256(
             canonical_json(selection_metrics).encode("utf-8")
         ).hexdigest(),
+        "raw_space": {"eligible": True},
+        "fixed_rate_raw_selection": {"eligible": True},
+        "synthetic_recovery": {
+            "deployed": {"shared_feature_claim_eligible": True}
+        },
     }
 
 
@@ -756,7 +834,7 @@ def advance_to_evaluated(campaign: Campaign, cell_id: str) -> dict[str, Artifact
         campaign.root,
         "preparation",
         {
-            "schema": "bsc-preparation-v2",
+            "schema": PREPARATION_SCHEMA,
             "cell_id": cell_id,
             "ready": True,
             "implementation": TEST_IMPLEMENTATION_IDENTITY,
@@ -841,7 +919,7 @@ def advance_to_evaluated(campaign: Campaign, cell_id: str) -> dict[str, Artifact
 
 
 def qualification_payload(
-    cell_id: str,
+    cell: CellSpec,
     inputs: dict[str, str],
     *,
     scientific_passed: bool = True,
@@ -850,6 +928,7 @@ def qualification_payload(
     promotion_eligible: bool | None = None,
     protocol_eligible: bool = False,
 ) -> dict[str, object]:
+    cell_id = cell.cell_id
     validation = validation or {"fvu": 0.1, "rate_distortion": 0.8}
     resolved_promotion = (
         scientific_passed
@@ -879,6 +958,29 @@ def qualification_payload(
             "leave_one_out_intersection_energy_coverage_min": 0.92,
         },
     }
+    identification_inapplicable = (
+        cell.phase is Phase.PHASE1
+        and cell.decision_map.get("data.normalization") == "layer"
+    )
+    scientific_checks = {
+        "support_target_calibration": scientific_passed,
+        "codec_calibration_exclusion": scientific_passed,
+        "codec_evaluation_exclusion": scientific_passed,
+        "phase1_identification": (
+            True if identification_inapplicable else scientific_passed
+        ),
+        "production_precision_finite": scientific_passed,
+        "production_precision_reconstruction": scientific_passed,
+        "production_precision_support": scientific_passed,
+        "production_fixed_rate_frontier": scientific_passed,
+    }
+    reasons = []
+    if cell.decision_map["runtime.smoke"] is True:
+        reasons.append("runtime_smoke")
+    if cell.decision_map["qualification.promotable"] is not True:
+        reasons.append("resolved_nonpromotable_cell")
+    if not scientific_passed:
+        reasons.append("scientific_outcome_failed")
     return {
         "schema": QUALIFICATION_SCHEMA,
         "cell_id": cell_id,
@@ -888,13 +990,40 @@ def qualification_payload(
             "method_endpoints": True,
             "provenance": True,
             "resource_compliance": True,
+            "deployment_schedule_integrity": True,
+            "encoder_scale_calibration_integrity": True,
+            "regularizer_calibration_integrity": True,
+            "precision_preflight_integrity": True,
+            "selection_score_diagnostics_integrity": True,
             "scientific_endpoint_complete": True,
             "split_integrity": True,
         },
         "scientific_outcome": {
             "passed": scientific_passed,
-            "checks": {"synthetic_test": scientific_passed},
-            "margins": {"synthetic_test": 0.1 if scientific_passed else -0.1},
+            "checks": scientific_checks,
+            "inapplicable_checks": (
+                {
+                    "phase1_identification": (
+                        "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+                    )
+                }
+                if identification_inapplicable
+                else {}
+            ),
+            "margins": {
+                "support_target_abs_error": 0.1,
+                "codec_calibration_excluded_fraction": 0.01,
+                "codec_evaluation_excluded_fraction": 0.01,
+                "phase1_native_identification": (
+                    0.1 if scientific_passed else -0.1
+                ),
+                "phase1_deployed_identification": (
+                    0.1 if scientific_passed else -0.1
+                ),
+                "production_precision_reconstruction": None,
+                "production_precision_support_iou": None,
+                "production_fixed_rate_nonzero_endpoints": None,
+            },
         },
         "inputs": inputs,
         "validation": validation,
@@ -905,15 +1034,12 @@ def qualification_payload(
         "selection_metrics_evaluation_sha256": inputs["evaluation"],
         "implementation_identity": TEST_IMPLEMENTATION_IDENTITY,
         "implementation_identity_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
+        "qualification_profile": cell.decision_map["qualification.profile"],
+        "thresholds_version": cell.decision_map["qualification.thresholds_version"],
+        "thresholds": campaign_module._qualification_thresholds(cell),
         "promotion_eligible": resolved_promotion,
         "promotion_ineligible_reasons": (
-            []
-            if resolved_promotion
-            else (
-                ["scientific_outcome_failed"]
-                if not scientific_passed
-                else ["recipe_declared_diagnostic"]
-            )
+            [] if resolved_promotion else reasons
         ),
         "selection_eligible_for_protocol_test": protocol_eligible,
         "selection_eligibility_mode": (
@@ -937,7 +1063,7 @@ def good_qualification(
         campaign.root,
         "qualification",
         qualification_payload(
-            cell_id,
+            cell,
             {kind: ref.sha256 for kind, ref in inputs.items()},
             promotion_eligible=not smoke,
             protocol_eligible=(
@@ -975,7 +1101,7 @@ def qualify_cell(
         cell_id,
         "preparation",
         {
-            "schema": "bsc-preparation-v2",
+            "schema": PREPARATION_SCHEMA,
             "cell_id": cell_id,
             "ready": True,
             "implementation": TEST_IMPLEMENTATION_IDENTITY,
@@ -1059,7 +1185,7 @@ def qualify_cell(
         cell_id,
         "qualification",
         qualification_payload(
-            cell_id,
+            campaign._require_cell(cell_id),
             {
                 "preparation": preparation.sha256,
                 "checkpoint": checkpoint.sha256,
@@ -1355,6 +1481,9 @@ def test_phase1_decision_rejects_self_consistent_reduced_blueprint():
         "sha256:"
         + hashlib.sha256(canonical_json(reduced.to_manifest()).encode()).hexdigest()
     )
+    manifest["blueprint_sha256"] = campaign_module._run_cell_json_sha256(
+        reduced.to_manifest()
+    )
     payload["source_phase1_blueprint_id"] = reduced.blueprint_id
     rehash_phase1_decision(payload, rebuild_transfer=False)
     with pytest.raises(CampaignError, match="exact canonical Phase-1 blueprint"):
@@ -1426,6 +1555,18 @@ def test_phase1_decision_rejects_embedded_qualification_tampering():
         lambda qualification: qualification.update(
             selection_eligibility_mode="smoke_protocol_only"
         ),
+        lambda qualification: qualification["checks"].pop(
+            "deployment_schedule_integrity"
+        ),
+        lambda qualification: qualification["scientific_outcome"]["checks"].update(
+            invented_endpoint=True
+        ),
+        lambda qualification: qualification["thresholds"].update(
+            support_target_abs_error_max=999.0
+        ),
+        lambda qualification: qualification["promotion_ineligible_reasons"].append(
+            "invented_reason"
+        ),
     ),
 )
 def test_phase1_decision_rejects_consistently_rehashed_contradictory_qualification(
@@ -1449,7 +1590,7 @@ def test_phase1_decision_rejects_mixed_implementation_identities_after_rehash():
     qualification = evidence["qualification"]
     qualification["implementation_identity"] = {
         **qualification["implementation_identity"],
-        "source_sha256": "f" * 64,
+        "python_source_sha256": "f" * 64,
     }
     qualification["implementation_identity_sha256"] = hashlib.sha256(
         canonical_json(qualification["implementation_identity"]).encode("utf-8")
@@ -1458,6 +1599,35 @@ def test_phase1_decision_rejects_mixed_implementation_identities_after_rehash():
     rehash_phase1_decision(payload)
 
     with pytest.raises(CampaignError, match="mixes qualification implementation"):
+        Campaign.phase1_decision_from_manifest(payload)
+
+
+def test_phase1_scientific_decision_rejects_dirty_identity():
+    identity = {**TEST_IMPLEMENTATION_IDENTITY, "git_dirty": True}
+    with pytest.raises(CampaignError, match="clean committed identity"):
+        phase1_decision_for_phase2(
+            smoke=False,
+            implementation_identity=identity,
+        )
+
+
+def test_phase1_decision_recomputes_plan_history_hashes():
+    payload = phase1_decision_for_phase2(smoke=True)
+    payload["phase1_campaign_manifest"]["plan_history"][0]["sha256"] = (
+        "sha256:" + "f" * 64
+    )
+    rehash_phase1_decision(payload)
+
+    with pytest.raises(CampaignError, match="plan-history evidence"):
+        Campaign.phase1_decision_from_manifest(payload)
+
+
+def test_phase1_decision_labels_opaque_journal_commitment():
+    payload = phase1_decision_for_phase2(smoke=True)
+    payload["phase1_campaign_manifest"]["journal_sha256_semantics"] = "recomputed"
+    rehash_phase1_decision(payload)
+
+    with pytest.raises(CampaignError, match="journal commitment"):
         Campaign.phase1_decision_from_manifest(payload)
 
 
@@ -1707,7 +1877,7 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
             "metrics": {"fvu": 0.1},
         },
     )
-    with pytest.raises(ArtifactError, match="checks"):
+    with pytest.raises(ArtifactError, match="noncanonical field set"):
         campaign.transition(
             cell_id,
             RunState.QUALIFIED,
@@ -1717,7 +1887,10 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
     wrong_binding = write_artifact(
         tmp_path,
         "qualification",
-        qualification_payload(cell_id, {kind: "0" * 64 for kind in inputs}),
+        qualification_payload(
+            campaign._require_cell(cell_id),
+            {kind: "0" * 64 for kind in inputs},
+        ),
     )
     with pytest.raises(ArtifactError, match="binding mismatch"):
         campaign.transition(
@@ -1759,7 +1932,7 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
         first.cell_id,
         "preparation",
         {
-            "schema": "bsc-preparation-v2",
+            "schema": PREPARATION_SCHEMA,
             "cell_id": first.cell_id,
             "implementation": TEST_IMPLEMENTATION_IDENTITY,
             "implementation_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
@@ -1774,13 +1947,16 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
         artifacts=(first_preparation, first_manifest),
     )
 
-    different_identity = {**TEST_IMPLEMENTATION_IDENTITY, "source_sha256": "f" * 64}
+    different_identity = {
+        **TEST_IMPLEMENTATION_IDENTITY,
+        "python_source_sha256": "f" * 64,
+    }
     second_preparation = write_cell_artifact(
         campaign,
         second.cell_id,
         "preparation",
         {
-            "schema": "bsc-preparation-v2",
+            "schema": PREPARATION_SCHEMA,
             "cell_id": second.cell_id,
             "implementation": different_identity,
             "implementation_sha256": hashlib.sha256(
@@ -1798,6 +1974,80 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
             artifacts=(second_preparation, second_manifest),
         )
     assert campaign.record(second.cell_id).state is RunState.PLANNED
+
+
+def test_concurrent_first_preparations_atomically_pin_one_identity(tmp_path):
+    first_plan = one_cell_plan(seed=0, smoke=False)
+    first = first_plan.cells[0]
+    second = one_cell_plan(seed=1, smoke=False).cells[0]
+    plan = StudyPlan(
+        "atomic_implementation_pin",
+        Phase.PHASE1,
+        (
+            StageSpec(
+                "test",
+                (first, second),
+                selection_policy=first_plan.stages[0].selection_policy,
+            ),
+        ),
+    )
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    identities = {
+        first.cell_id: TEST_IMPLEMENTATION_IDENTITY,
+        second.cell_id: {
+            **TEST_IMPLEMENTATION_IDENTITY,
+            "python_source_sha256": "f" * 64,
+        },
+    }
+    transitions = {}
+    for cell in (first, second):
+        identity = identities[cell.cell_id]
+        preparation = write_cell_artifact(
+            campaign,
+            cell.cell_id,
+            "preparation",
+            {
+                "schema": PREPARATION_SCHEMA,
+                "cell_id": cell.cell_id,
+                "implementation": identity,
+                "implementation_sha256": hashlib.sha256(
+                    canonical_json(identity).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        manifest = write_cell_artifact(
+            campaign,
+            cell.cell_id,
+            "prepare_manifest",
+            {"stage": "prepare"},
+        )
+        transitions[cell.cell_id] = (preparation, manifest)
+
+    def prepare(cell_id: str) -> str:
+        try:
+            campaign.transition(
+                cell_id,
+                RunState.PREPARED,
+                artifacts=transitions[cell_id],
+            )
+        except ArtifactError:
+            return "refused"
+        return "prepared"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(prepare, (first.cell_id, second.cell_id)))
+
+    assert sorted(outcomes) == ["prepared", "refused"]
+    prepared = next(
+        cell
+        for cell in (first, second)
+        if campaign.record(cell.cell_id).state is RunState.PREPARED
+    )
+    refused = second if prepared is first else first
+    assert campaign.record(refused.cell_id).state is RunState.PLANNED
+    pin = json.loads(campaign.implementation_identity_path.read_text())
+    assert pin["implementation_identity"] == identities[prepared.cell_id]
 
 
 def test_running_and_failed_cells_are_explicitly_not_default_runnable(tmp_path):
@@ -1837,7 +2087,7 @@ def test_qualification_cannot_forge_selection_metrics_while_naming_real_evaluati
         tmp_path,
         "qualification",
         qualification_payload(
-            cell_id,
+            campaign._require_cell(cell_id),
             {kind: ref.sha256 for kind, ref in inputs.items()},
             validation={"fvu": -1_000.0, "rate_distortion": 1_000.0},
             promotion_eligible=False,
@@ -1902,7 +2152,7 @@ def test_qualification_cannot_override_resolved_nonpromotable_recipe(
         tmp_path,
         "qualification",
         qualification_payload(
-            diagnostic.cell_id,
+            diagnostic,
             {kind: ref.sha256 for kind, ref in inputs.items()},
             promotion_eligible=not smoke,
             protocol_eligible=smoke,
@@ -2055,12 +2305,15 @@ def test_stale_lock_requires_explicit_reconciliation(tmp_path):
     cell_id = plan.cells[0].cell_id
     lock = campaign.lock(cell_id)
     lock.__enter__()
+    lock_payload = json.loads(campaign.lock_path(cell_id).read_text())
     try:
-        lock_payload = json.loads(campaign.lock_path(cell_id).read_text())
-        lock_payload["host"] = "retired-worker.invalid"
-        campaign.lock_path(cell_id).write_text(json.dumps(lock_payload) + "\n")
         with pytest.raises(CampaignLocked):
             campaign.transition(cell_id, RunState.PREPARED)
+    finally:
+        lock.__exit__(None, None, None)
+    lock_payload["host"] = "retired-worker.invalid"
+    campaign.lock_path(cell_id).write_text(json.dumps(lock_payload) + "\n")
+    try:
         now[0] = 109.0
         assert campaign.reconcile_stale_locks(10.0) == ()
         now[0] = 111.0
@@ -2079,8 +2332,81 @@ def test_stale_lock_requires_explicit_reconciliation(tmp_path):
             is RunState.PREPARED
         )
     finally:
-        # Reconciliation may already have removed it.
+        campaign.lock_path(cell_id).unlink(missing_ok=True)
+
+
+def test_cell_lock_release_waits_out_inflight_heartbeat(tmp_path, monkeypatch):
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path, lock_heartbeat_seconds=0.01)
+    register_test_plan(campaign, plan)
+    lock = campaign.lock(plan.cells[0].cell_id)
+    lock.__enter__()
+    original_atomic_json = campaign_module._atomic_json
+    heartbeat_started = threading.Event()
+    release_heartbeat = threading.Event()
+
+    def delayed_atomic_json(path, payload):
+        if path == lock.path and threading.current_thread() is lock._thread:
+            heartbeat_started.set()
+            assert release_heartbeat.wait(timeout=5)
+        original_atomic_json(path, payload)
+
+    monkeypatch.setattr(campaign_module, "_atomic_json", delayed_atomic_json)
+    assert heartbeat_started.wait(timeout=5)
+    released = threading.Event()
+
+    def release_lock():
         lock.__exit__(None, None, None)
+        released.set()
+
+    thread = threading.Thread(target=release_lock)
+    thread.start()
+    assert not released.wait(timeout=0.05)
+    release_heartbeat.set()
+    thread.join(timeout=5)
+    assert released.is_set()
+    assert not lock.path.exists()
+    assert lock.guard_path.exists()
+
+
+def test_stale_reconcile_terminates_owned_orphan_worker_group(tmp_path, monkeypatch):
+    now = 100.0
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path, clock=lambda: now)
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    lease = {
+        "schema": campaign_module.CAMPAIGN_SCHEMA,
+        "cell_id": cell_id,
+        "attempt_id": "orphan-attempt",
+        "pid": 111,
+        "owner_process_identity": "owner-birth",
+        "host": socket.gethostname(),
+        "acquired_at": 0.0,
+        "heartbeat_at": 0.0,
+        "worker_pid": 222,
+        "worker_pgid": 333,
+        "worker_process_identity": "worker-birth",
+    }
+    campaign_module._atomic_json(campaign.lock_path(cell_id), lease)
+    worker_checks = iter((True, False))
+
+    def process_matches(pid, identity):
+        if pid == 111:
+            return False
+        assert (pid, identity) == (222, "worker-birth")
+        return next(worker_checks)
+
+    signals = []
+    monkeypatch.setattr(campaign_module, "_process_matches", process_matches)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 333)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+
+    assert campaign.reconcile_stale_locks(10.0) == (cell_id,)
+    assert signals == [(333, signal.SIGTERM)]
+    assert not campaign.lock_path(cell_id).exists()
+    event = campaign.events()[-1]
+    assert event["metadata"]["worker_process_group_terminated"] is True
 
 
 def test_closed_stage_cannot_be_bypassed_with_an_explicit_cell_id(tmp_path):
@@ -2122,7 +2448,7 @@ def test_closed_stage_cannot_be_bypassed_with_an_explicit_cell_id(tmp_path):
     register_test_plan(campaign, plan)
     assert campaign.runnable_cell_ids() == (first.cell_id,)
     with pytest.raises(CampaignError, match="unopened stage"):
-        CampaignRunner(campaign).run(cell_ids=(second.cell_id,), limit=0)
+        CampaignRunner(campaign).run(cell_ids=(second.cell_id,))
 
     inputs = advance_to_evaluated(campaign, first.cell_id)
     qualification = good_qualification(campaign, first.cell_id, inputs)
@@ -3041,6 +3367,55 @@ def test_family_nomination_deduplicates_before_outcome_ranking():
     assert spread["maximum_per_seed_max_minus_min"] == pytest.approx(0.8)
 
 
+def test_policy_retained_cutoff_ties_are_identical_at_selection_and_replay():
+    base = build_phase1_plan(smoke=False).stages[-1].selection_policy
+    assert isinstance(base, SelectionPolicy)
+    policy = replace(base, tie_policy="retain_all_at_cutoff", retain_count=1)
+    candidates = [
+        {"candidate_id": "candidate:a", "median": 1.0, "worst_seed": 0.5},
+        {"candidate_id": "candidate:b", "median": 1.0, "worst_seed": 0.5},
+        {"candidate_id": "candidate:c", "median": 0.9, "worst_seed": 0.4},
+    ]
+    retained = campaign_module._policy_retained_candidates(
+        candidates,
+        policy,
+        smoke_protocol_only=False,
+    )
+    assert [item["candidate_id"] for item in retained] == [
+        "candidate:a",
+        "candidate:b",
+    ]
+    assert campaign_module._policy_retained_candidates(
+        candidates,
+        policy,
+        smoke_protocol_only=True,
+    ) == [candidates[0]]
+
+
+def test_panel_entry_seed_coverage_is_exact():
+    complete = SimpleNamespace(
+        source_cells=(SimpleNamespace(seed=0), SimpleNamespace(seed=1))
+    )
+    campaign_module._validate_panel_entry_seed_coverage((complete,), (0, 1))
+    missing = SimpleNamespace(source_cells=(SimpleNamespace(seed=0),))
+    with pytest.raises(CampaignError, match="exactly cover"):
+        campaign_module._validate_panel_entry_seed_coverage((missing,), (0, 1))
+
+
+def test_confirmation_guard_reuse_requires_exact_structure():
+    expected = {
+        "cell_id": "cell:current",
+        "parent_cell_id": "cell:parent",
+        "checks": {"sharing": True},
+    }
+    campaign_module._validate_exact_confirmation_guard(copy.deepcopy(expected), expected)
+    with pytest.raises(CampaignError, match="exact authenticated sharing guard"):
+        campaign_module._validate_exact_confirmation_guard(
+            {**expected, "unbound_summary": True},
+            expected,
+        )
+
+
 def test_rank_parsimony_chooses_lowest_seedwise_noninferior_rank(tmp_path):
     base = build_phase2_plan(smoke=False).stages[-1].selection_policy
     assert isinstance(base, SelectionPolicy)
@@ -3131,7 +3506,7 @@ def test_advance_rechecks_cumulative_storage_before_appending(
     campaign.select_stage(stage.name, out=selection_path)
     monkeypatch.setattr(
         "block_crosscoder_experiment.cli.matrix.shutil.disk_usage",
-        lambda _path: SimpleNamespace(free=0),
+        lambda _path: SimpleNamespace(free=0, total=1, used=1),
     )
     with pytest.raises(SystemExit) as exc_info:
         matrix_main(
@@ -3274,7 +3649,7 @@ def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
         )
         family_rows[family_index] = replacement_row
     rehash_panel_decision(runner_up_forgery)
-    with pytest.raises(CampaignError, match="top policy-ranked candidate"):
+    with pytest.raises(CampaignError, match="policy-retained candidate"):
         Campaign.panel_decision_from_manifest(runner_up_forgery)
 
     excluded_winner_forgery = copy.deepcopy(payload)
@@ -3380,6 +3755,43 @@ def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
     with pytest.raises(CampaignError, match="Phase-1 decision-file hash"):
         Campaign.panel_decision_from_manifest(stale_phase1)
 
+    for manifest_name, error in (
+        ("phase2_campaign_manifest", "campaign manifest.*noncanonical field"),
+        ("selection_universe", "selection universe.*noncanonical field"),
+    ):
+        extra_field = copy.deepcopy(payload)
+        extra_field[manifest_name]["future_unbound_field"] = True
+        rehash_panel_decision(extra_field)
+        with pytest.raises(CampaignError, match=error):
+            Campaign.panel_decision_from_manifest(extra_field)
+
+    forged_parent = copy.deepcopy(payload)
+    confirmation = forged_parent["phase2_campaign_manifest"][
+        "confirmation_noninferiority"
+    ]
+    row = confirmation["per_seed"][0]
+    wrong_parent = next(
+        evidence
+        for evidence in forged_parent["phase2_campaign_manifest"]["cells"]
+        if evidence["seed"] == row["seed"]
+        and evidence["cell_id"] not in {row["cell_id"], row["parent_cell_id"]}
+    )
+    wrong_parent_qualification = next(
+        artifact
+        for artifact in wrong_parent["artifacts"]
+        if artifact["kind"] == "qualification"
+    )
+    row["parent_cell_id"] = wrong_parent["cell_id"]
+    row["parent_qualification_sha256"] = (
+        "sha256:" + wrong_parent_qualification["sha256"]
+    )
+    forged_parent["selection_universe"]["confirmation_noninferiority"] = (
+        copy.deepcopy(confirmation)
+    )
+    rehash_panel_decision(forged_parent)
+    with pytest.raises(CampaignError, match="parent binding mismatch"):
+        Campaign.panel_decision_from_manifest(forged_parent)
+
     phase3_blueprint = build_phase3_blueprint(
         seeds=(0,), smoke=True, panel_decision=decision
     )
@@ -3437,15 +3849,24 @@ def test_phase2_freeze_rejects_negative_missing_and_stale_evidence(tmp_path):
     ]
     qualification_path = qualification_ref.resolve(negative.root)
     qualification_payload = json.loads(qualification_path.read_text())
-    qualification_payload["scientific_outcome"] = {
-        "passed": False,
-        "checks": {"injected_confirmation_failure": False},
-        "margins": {"injected_confirmation_failure": -0.1},
-    }
+    qualification_payload["scientific_outcome"]["passed"] = False
+    qualification_payload["scientific_outcome"]["checks"][
+        "support_target_calibration"
+    ] = False
+    qualification_payload["scientific_outcome"]["margins"][
+        "support_target_abs_error"
+    ] = -0.1
     qualification_payload["promotion_eligible"] = False
-    qualification_payload["promotion_ineligible_reasons"] = [
-        "scientific_outcome_failed"
-    ]
+    evaluation_path = negative.record(finalist_cell.cell_id).artifact_map[
+        "evaluation"
+    ].resolve(negative.root)
+    qualification_payload["promotion_ineligible_reasons"] = (
+        campaign_module._promotion_reasons_from_evidence(
+            finalist_cell,
+            outcome_passed=False,
+            evaluation=json.loads(evaluation_path.read_text()),
+        )
+    )
     qualification_path.write_text(
         json.dumps(
             qualification_payload,
@@ -3616,6 +4037,30 @@ p.add_argument("--artifacts-out", type=Path, required=True)
 p.add_argument("--resume", action="store_true")
 a = p.parse_args()
 cell = json.loads(a.cell.read_text())
+values = {item["name"]: item["value"] for item in cell["decisions"]}
+implementation = {
+    "executor_schema": "test-executor-v1",
+    "executor_process_model": "test-process-model-v1",
+    "python_source_sha256": "1" * 64,
+    "python_source_files": 1,
+    "git_commit": "1" * 40,
+    "git_dirty": False,
+    "python": "3.12.test",
+    "torch": "2.8.0",
+    "torch_cuda_build": None,
+    "dependencies": {
+        "datasets": "test",
+        "huggingface-hub": "test",
+        "numpy": "test",
+        "sae-lens": "test",
+        "safetensors": "test",
+        "torch": "test",
+        "transformers": "test",
+    },
+}
+implementation_sha256 = hashlib.sha256(json.dumps(
+    implementation, sort_keys=True, separators=(",", ":")
+).encode("utf-8")).hexdigest()
 root = Path(os.environ["BSC_CAMPAIGN_ROOT"])
 outdir = a.cell.parent / "fake-outputs"
 outdir.mkdir(parents=True, exist_ok=True)
@@ -3641,42 +4086,113 @@ for kind in stage_kinds[a.stage]:
             "validation": {"fvu": 0.1, "rate_distortion": 0.8}
         }
         evaluation_sha256 = refs["evaluation"]["sha256"]
+        scientific_checks = {
+            "support_target_calibration": True,
+            "codec_calibration_exclusion": True,
+            "codec_evaluation_exclusion": True,
+            "phase1_identification": True,
+            "production_precision_finite": True,
+            "production_precision_reconstruction": True,
+            "production_precision_support": True,
+            "production_fixed_rate_frontier": True,
+        }
         payload = {
-            "schema": "bsc-qualification-v2",
+            "schema": "bsc-qualification-v3",
             "cell_id": cell["cell_id"],
             "qualified": True,
             "checks": {
+                "deployment_schedule_integrity": True,
+                "encoder_scale_calibration_integrity": True,
                 "finite": True,
                 "method_endpoints": True,
+                "precision_preflight_integrity": True,
                 "provenance": True,
+                "regularizer_calibration_integrity": True,
                 "resource_compliance": True,
+                "selection_score_diagnostics_integrity": True,
                 "scientific_endpoint_complete": True,
                 "split_integrity": True,
             },
             "scientific_outcome": {
                 "passed": True,
-                "checks": {"fake_endpoint": True},
-                "margins": {"fake_endpoint": 0.1},
+                "checks": scientific_checks,
+                "inapplicable_checks": (
+                    {"phase1_identification": (
+                        "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+                    )}
+                    if values["data.normalization"] == "layer"
+                    else {}
+                ),
+                "margins": {
+                    "support_target_abs_error": 0.1,
+                    "codec_calibration_excluded_fraction": 0.01,
+                    "codec_evaluation_excluded_fraction": 0.01,
+                    "phase1_native_identification": 0.1,
+                    "phase1_deployed_identification": 0.1,
+                    "production_precision_reconstruction": None,
+                    "production_precision_support_iou": None,
+                    "production_fixed_rate_nonzero_endpoints": None,
+                },
             },
             "inputs": {name: refs[name]["sha256"] for name in (
                 "preparation", "checkpoint", "calibration", "deployment_codec",
                 "deployment_schedules", "evaluation"
             )},
-            "implementation_identity": {
-                "executor_schema": "test-executor-v1",
-                "source_sha256": "1" * 64,
-                "git_commit": "test-commit",
-                "git_dirty": False,
-                "dependencies": {"python": "test"},
-            },
-            "implementation_identity_sha256": hashlib.sha256(json.dumps({
-                "dependencies": {"python": "test"},
-                "executor_schema": "test-executor-v1",
-                "git_commit": "test-commit",
-                "git_dirty": False,
-                "source_sha256": "1" * 64,
-            }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "implementation_identity": implementation,
+            "implementation_identity_sha256": implementation_sha256,
             "validation": {"fvu": 0.1, "rate_distortion": 0.8},
+            "qualification_profile": values["qualification.profile"],
+            "thresholds_version": values["qualification.thresholds_version"],
+            "thresholds": {
+                "schema": "bsc-integrity-thresholds-2026-07-22.v2",
+                "support_target_abs_error_max": 0.1,
+                "codec_excluded_calibration_event_fraction_max": 0.01,
+                "codec_excluded_evaluation_event_fraction_max": 0.01,
+                "probability_metric_range": [0.0, 1.0],
+                "required_quantizer_bits": values["codec.quantizer_bits"],
+                "phase1_identification_thresholds": values[
+                    "qualification.phase1_identification_thresholds"
+                ],
+                "phase1_identification_enforced": False,
+                "phase1_margin_normalization_contract": values[
+                    "evaluation.phase1_margin_normalization"
+                ],
+                "phase1_rank_mismatch_contract": values[
+                    "evaluation.rank_mismatch_contract"
+                ],
+                "phase1_pathology_association_contract": values[
+                    "evaluation.pathology_association_contract"
+                ],
+                "phase1_pathology_strong_association_cutoff": values[
+                    "evaluation.pathology_strong_association_cutoff"
+                ],
+                "phase1_pathology_weak_association_cutoff": values[
+                    "evaluation.pathology_weak_association_cutoff"
+                ],
+                "phase1_pathology_association_cutoff_sensitivity": values[
+                    "evaluation.pathology_association_cutoff_sensitivity"
+                ],
+                "encoder_scale_fit_statistic": values[
+                    "model.encoder_scale_fit_statistic"
+                ],
+                "encoder_scale_fit_solver": values["model.encoder_scale_fit_solver"],
+                "encoder_scale_fit_target": values["model.encoder_scale_fit_target"],
+                "encoder_scale_fit_tolerance": values[
+                    "model.encoder_scale_fit_tolerance"
+                ],
+                "encoder_scale_fit_max_iterations": values[
+                    "model.encoder_scale_fit_max_iterations"
+                ],
+                "fixed_rate_budget_scale_factor": values[
+                    "evaluation.fixed_rate_budget_scale_factor"
+                ],
+                "fixed_rate_budget_scale_contract": values[
+                    "evaluation.fixed_rate_budget_scale_contract"
+                ],
+                "production_min_nonzero_rate_endpoints": values[
+                    "precision.preflight_min_nonzero_rate_endpoints"
+                ],
+            },
             "selection_metrics": selection_metrics,
             "selection_metrics_sha256": hashlib.sha256(json.dumps(
                 selection_metrics, sort_keys=True, separators=(",", ":")
@@ -3706,22 +4222,18 @@ for kind in stage_kinds[a.stage]:
             "selection_metrics_sha256": hashlib.sha256(json.dumps(
                 selection_metrics, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")).hexdigest(),
+            "raw_space": {"eligible": True},
+            "fixed_rate_raw_selection": {"eligible": True},
+            "synthetic_recovery": {
+                "deployed": {"shared_feature_claim_eligible": True}
+            },
         }
     elif kind == "preparation":
-        implementation = {
-            "executor_schema": "test-executor-v1",
-            "source_sha256": "1" * 64,
-            "git_commit": "test-commit",
-            "git_dirty": False,
-            "dependencies": {"python": "test"},
-        }
         payload = {
-            "schema": "bsc-preparation-v2",
+            "schema": "bsc-preparation-v3",
             "cell_id": cell["cell_id"],
             "implementation": implementation,
-            "implementation_sha256": hashlib.sha256(json.dumps(
-                implementation, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")).hexdigest(),
+            "implementation_sha256": implementation_sha256,
         }
     else:
         payload = {"cell_id": cell["cell_id"], "stage": a.stage, "resume": a.resume}
@@ -3786,6 +4298,71 @@ def test_generic_runner_stops_at_evaluation_and_never_conflates_it_with_qualific
     assert "qualify stage completed" in commands
 
 
+def test_runner_rejects_ambiguous_or_empty_limits(tmp_path):
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    runner = CampaignRunner(campaign)
+    with pytest.raises(CampaignError, match="limit must be positive"):
+        runner.run(limit=0)
+    with pytest.raises(CampaignError, match="combined with explicit cell IDs"):
+        runner.run(limit=1, cell_ids=(plan.cells[0].cell_id,))
+
+
+def test_persistent_worker_owns_and_terminates_its_process_group(tmp_path):
+    script = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import time; time.sleep(60)']); "
+        "print(child.pid, flush=True); sys.stdin.readline()"
+    )
+    worker = campaign_module._PersistentCellWorker(
+        command=(sys.executable, "-c", script),
+        cwd=tmp_path,
+        environment=os.environ,
+    )
+    assert worker._process.stdout is not None
+    child_pid = int(worker._process.stdout.readline())
+    assert os.getpgid(child_pid) == worker.pgid
+    try:
+        worker.close()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child_pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        assert not state or state.startswith("Z")
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_custom_executor_modules_are_smoke_only(tmp_path):
+    smoke_plan = one_cell_plan(smoke=True)
+    smoke_campaign = Campaign(tmp_path / "smoke")
+    register_test_plan(smoke_campaign, smoke_plan)
+    CampaignRunner(smoke_campaign, module="custom.executor")._validate_executor_module(
+        (smoke_plan.cells[0].cell_id,)
+    )
+
+    scientific_plan = one_cell_plan(smoke=False)
+    scientific_campaign = Campaign(tmp_path / "scientific")
+    register_test_plan(scientific_campaign, scientific_plan)
+    with pytest.raises(CampaignError, match="custom modules are smoke-only"):
+        CampaignRunner(
+            scientific_campaign,
+            module="custom.executor",
+        )._validate_executor_module((scientific_plan.cells[0].cell_id,))
+
+
 def test_artifact_ref_detects_bad_declared_hash_and_size(tmp_path):
     path = tmp_path / "artifact.bin"
     path.write_bytes(b"abc")
@@ -3793,6 +4370,40 @@ def test_artifact_ref_detects_bad_declared_hash_and_size(tmp_path):
     ArtifactRef("x", str(path), digest, 3).verify(tmp_path)
     with pytest.raises(ArtifactError, match="size mismatch"):
         ArtifactRef("x", str(path), digest, 4).verify(tmp_path)
+
+
+def test_campaign_publications_fsync_replacements_and_journal_directory(
+    tmp_path,
+    monkeypatch,
+):
+    replacements = []
+    directory_syncs = []
+    original_replace = campaign_module.durable_replace
+
+    def observed_replace(source, destination, *, file_already_synced=False):
+        replacements.append((Path(destination), file_already_synced))
+        return original_replace(
+            source,
+            destination,
+            file_already_synced=file_already_synced,
+        )
+
+    original_directory_sync = campaign_module.fsync_directory
+
+    def observed_directory_sync(path):
+        directory_syncs.append(Path(path))
+        return original_directory_sync(path)
+
+    monkeypatch.setattr(campaign_module, "durable_replace", observed_replace)
+    monkeypatch.setattr(campaign_module, "fsync_directory", observed_directory_sync)
+    target = tmp_path / "atomic.json"
+    campaign_module._atomic_json(target, {"ready": True})
+    campaign = Campaign(tmp_path / "campaign")
+    campaign._append_event(campaign._event("audit", "__campaign__"))
+    campaign._append_event(campaign._event("audit", "__campaign__"))
+
+    assert replacements == [(target, True)]
+    assert directory_syncs.count(campaign.root) == 1
 
 
 def test_stage_manifest_rejects_extra_kinds_and_malformed_sizes_cleanly(tmp_path):

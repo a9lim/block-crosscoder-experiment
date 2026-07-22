@@ -52,18 +52,16 @@ from .runtime_limits import (
     isolated_loss_mapped_eligible,
 )
 
-SCHEMA_VERSION = "bsc-study-v2"
-LEGACY_STUDY_SCHEMA_VERSION = "bsc-study-v1"
+SCHEMA_VERSION = "bsc-study-v3"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v17"
+    "dense-linear-memory-v18"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
     f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
 )
-CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v2"
-BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v4"
-LEGACY_BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v3"
+CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v3"
+BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v5"
 PHASE3_PROVISIONED_STORAGE_BYTES = 1_000_000_000_000
 PHASE3_STORAGE_CEILING_BYTES = int(PHASE3_PROVISIONED_STORAGE_BYTES * 0.85)
 PHASE3_PRODUCTION_STABILITY_TOKENS = 262_144
@@ -124,7 +122,12 @@ PHASE1_QUALIFICATION_THRESHOLD_SENSITIVITY = (
     ("pathology.cross_factor_mixing_fraction_max", (0.10, 0.20, 0.30)),
     ("pathology.nonfinite_count_max", (0,)),
 )
-PHASE1_TRANSFER_SCHEMA = "bsc-phase1-transfer-v2"
+PHASE1_PATHOLOGY_ASSOCIATION_CUTOFF_SENSITIVITY = tuple(
+    (strong, weak)
+    for strong in (0.4, 0.5, 0.6)
+    for weak in (0.2, 0.25, 0.3)
+)
+PHASE1_TRANSFER_SCHEMA = "bsc-phase1-transfer-v3"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
 PHASE1_UNIVERSAL_DECISION_NAMES = (
@@ -514,6 +517,12 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "data.unique_tokens",
         "evaluation.calibration_split",
         "evaluation.endpoint_profile",
+        "evaluation.phase1_margin_normalization",
+        "evaluation.rank_mismatch_contract",
+        "evaluation.pathology_association_contract",
+        "evaluation.pathology_strong_association_cutoff",
+        "evaluation.pathology_weak_association_cutoff",
+        "evaluation.pathology_association_cutoff_sensitivity",
         "evaluation.fixed_rate_budgets_bits_per_token",
         "evaluation.fixed_rate_budget_scale_contract",
         "evaluation.fixed_rate_budget_scale_factor",
@@ -546,6 +555,10 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "model.encoder_scale_fit_split",
         "model.encoder_scale_fit_count",
         "model.encoder_scale_fit_statistic",
+        "model.encoder_scale_fit_solver",
+        "model.encoder_scale_fit_target",
+        "model.encoder_scale_fit_tolerance",
+        "model.encoder_scale_fit_max_iterations",
         "model.identical_site_init",
         "model.site_rank",
         "model.selector",
@@ -1219,6 +1232,15 @@ class CellSpec:
             raise StudyError(
                 "structured encoder site masking owns its draw and requires probability zero"
             )
+        if values["objective.auxiliary"] not in {
+            "none",
+            "runner_up_blocks",
+            "frequency_dead_residual",
+            "sasa_release_coordinate",
+        }:
+            raise StudyError(
+                "objective.auxiliary is not declared by any live study recipe"
+            )
         if self.phase is Phase.PHASE1:
             n_factors = values["data.n_factors"]
             groups = values["model.groups"]
@@ -1291,6 +1313,37 @@ class CellSpec:
             or values["data.factor_subspace_overlap"] != "not_applicable"
         ):
             raise StudyError("real phases must not declare synthetic factor controls")
+        if self.phase is Phase.PHASE1:
+            expected_phase1_evaluation = {
+                "evaluation.phase1_margin_normalization": (
+                    "piecewise_available_headroom_signed_margin_v2"
+                ),
+                "evaluation.rank_mismatch_contract": (
+                    "same_block_primary_plus_calibration_frozen_minimum_group_diagnostic_v1"
+                ),
+                "evaluation.pathology_association_contract": (
+                    "primary_cutoffs_plus_complete_reporting_only_grid_v1"
+                ),
+                "evaluation.pathology_strong_association_cutoff": 0.5,
+                "evaluation.pathology_weak_association_cutoff": 0.25,
+                "evaluation.pathology_association_cutoff_sensitivity": (
+                    PHASE1_PATHOLOGY_ASSOCIATION_CUTOFF_SENSITIVITY
+                ),
+            }
+        else:
+            expected_phase1_evaluation = {
+                "evaluation.phase1_margin_normalization": "not_applicable",
+                "evaluation.rank_mismatch_contract": "not_applicable",
+                "evaluation.pathology_association_contract": "not_applicable",
+                "evaluation.pathology_strong_association_cutoff": 0.0,
+                "evaluation.pathology_weak_association_cutoff": 0.0,
+                "evaluation.pathology_association_cutoff_sensitivity": (),
+            }
+        for name, expected in expected_phase1_evaluation.items():
+            if values[name] != expected:
+                raise StudyError(
+                    f"{self.phase.value} requires {name}={expected!r}"
+                )
         fit_split = values["data.normalization_fit_split"]
         fit_count = values["data.normalization_fit_count"]
         fit_statistic = values["data.normalization_fit_statistic"]
@@ -1326,11 +1379,26 @@ class CellSpec:
         scale_fit_split = values["model.encoder_scale_fit_split"]
         scale_fit_count = values["model.encoder_scale_fit_count"]
         scale_fit_statistic = values["model.encoder_scale_fit_statistic"]
+        scale_fit_contract = (
+            values["model.encoder_scale_fit_solver"],
+            values["model.encoder_scale_fit_target"],
+            values["model.encoder_scale_fit_tolerance"],
+            values["model.encoder_scale_fit_max_iterations"],
+        )
         if values["model.encoder_scale_calibration"] == "fixed_init_no_data_fit":
-            if (scale_fit_split, scale_fit_count, scale_fit_statistic) != (
+            if (
+                scale_fit_split,
+                scale_fit_count,
+                scale_fit_statistic,
+                *scale_fit_contract,
+            ) != (
                 "not_applicable",
                 0,
                 "not_applicable",
+                "not_applicable",
+                0.0,
+                0.0,
+                0,
             ):
                 raise StudyError("fixed encoder scale cannot declare fit data")
         elif (
@@ -1338,7 +1406,15 @@ class CellSpec:
             or not isinstance(scale_fit_count, int)
             or isinstance(scale_fit_count, bool)
             or scale_fit_count <= 0
-            or scale_fit_statistic != "global_fp64_mean_block_score"
+            or scale_fit_statistic
+            != "global_fp64_mean_postactivation_block_norm"
+            or scale_fit_contract
+            != (
+                "positive_bracketed_bisection_remeasure_v1",
+                1.0,
+                1.0e-3,
+                32,
+            )
         ):
             raise StudyError(
                 "fitted encoder scale requires an explicit positive fit contract"
@@ -1450,15 +1526,11 @@ class CellSpec:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "CellSpec":
-        if payload.get("schema") == LEGACY_STUDY_SCHEMA_VERSION:
-            raise StudyError(
-                "legacy bsc-study-v1 cell manifests predate the complete "
-                "implementation contract and cannot be resumed under bsc-study-v2; "
-                "preserve the old campaign root and create a fresh plan or use an "
-                "explicitly reviewed content-bound migration"
-            )
         if payload.get("schema") != SCHEMA_VERSION:
-            raise StudyError(f"unsupported cell schema {payload.get('schema')!r}")
+            raise StudyError(
+                f"unsupported cell schema {payload.get('schema')!r}; preserve any "
+                "existing artifacts and create a fresh bsc-study-v3 campaign root"
+            )
         cell = cls(
             name=str(payload["name"]),
             phase=Phase(payload["phase"]),
@@ -2306,15 +2378,11 @@ class StudyPlan:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "StudyPlan":
-        if payload.get("schema") == LEGACY_STUDY_SCHEMA_VERSION:
-            raise StudyError(
-                "legacy bsc-study-v1 plans predate the complete implementation "
-                "contract and cannot be resumed under bsc-study-v2; preserve the "
-                "old campaign root and create a fresh plan or use an explicitly "
-                "reviewed content-bound migration"
-            )
         if payload.get("schema") != SCHEMA_VERSION:
-            raise StudyError(f"unsupported plan schema {payload.get('schema')!r}")
+            raise StudyError(
+                f"unsupported plan schema {payload.get('schema')!r}; preserve any "
+                "existing artifacts and create a fresh bsc-study-v3 campaign root"
+            )
         plan = cls(
             name=str(payload["name"]),
             phase=Phase(payload["phase"]),
@@ -3375,13 +3443,11 @@ class Phase2Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase2Blueprint":
-        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError(
-                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
-                "old campaign and build a fresh bsc-blueprint-v4 plan"
-            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError("unsupported Phase-2 blueprint schema")
+            raise StudyError(
+                "unsupported Phase-2 blueprint schema; preserve any existing "
+                "artifacts and build a fresh bsc-blueprint-v5 plan"
+            )
         blueprint = cls(
             name=str(payload["name"]),
             seeds=tuple(int(item) for item in payload["seeds"]),
@@ -3486,13 +3552,11 @@ class Phase1Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase1Blueprint":
-        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError(
-                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
-                "old campaign and build a fresh bsc-blueprint-v4 plan"
-            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError("unsupported Phase-1 blueprint schema")
+            raise StudyError(
+                "unsupported Phase-1 blueprint schema; preserve any existing "
+                "artifacts and build a fresh bsc-blueprint-v5 plan"
+            )
         blueprint = cls(
             name=str(payload["name"]),
             seeds=tuple(int(item) for item in payload["seeds"]),
@@ -3687,13 +3751,11 @@ class Phase3Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase3Blueprint":
-        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError(
-                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
-                "old campaign and build a fresh bsc-blueprint-v4 plan"
-            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
-            raise StudyError("unsupported Phase-3 blueprint schema")
+            raise StudyError(
+                "unsupported Phase-3 blueprint schema; preserve any existing "
+                "artifacts and build a fresh bsc-blueprint-v5 plan"
+            )
         blueprint = cls(
             name=str(payload["name"]),
             seeds=tuple(int(item) for item in payload["seeds"]),
@@ -4391,7 +4453,10 @@ def _estimate_components(
 
     shared_coordinates = groups * block_width
     operational_decoder_elements = shared_coordinates * total_dim
-    operational_encoder_elements = 0 if tied else shared_coordinates * total_dim
+    # Tying removes encoder *parameters*, not encoder execution.  Every tied
+    # forward still forms and applies the scaled decoder-transpose map, and
+    # the materialized map remains live through backward.
+    operational_encoder_elements = shared_coordinates * total_dim
     site_rank_value = values["model.site_rank"]
     if site_rank_value is None:
         decoder_parameters = shared_coordinates * total_dim
@@ -4471,7 +4536,7 @@ def _estimate_components(
         operational_decoder_elements + operational_encoder_elements
     )
     # Factorization reduces learned parameters, checkpoint size, and optimizer
-    # state. Direct-rank kernels also reduce measured execution work, but v17
+    # state. Direct-rank kernels also reduce measured execution work, but v18
     # conservatively retains the unfactorized FLOP price until every direct
     # lifetime has a separately audited accounting model.
     compute_flops = train_tokens * operational_weight_elements * 6
@@ -4547,16 +4612,57 @@ def _estimate_components(
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0
     )
-    retraction_workspace_bytes = (
-        4
-        * (
+    decoder_tensor_bytes = operational_decoder_elements * 4
+    encoder_tensor_bytes = operational_encoder_elements * 4
+    if decoder_retraction_implementation == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION:
+        retraction_workspace_bytes = 4 * (
             len(site_dims) * max(site_dims) * groups * block_width
             + 6 * groups * block_width**2
         )
-        if decoder_retraction_implementation
-        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
-        else 0
-    )
+    elif decoder_retraction_implementation in {
+        DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+        DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    }:
+        # The live implementation is unchunked through 4,096 blocks and then
+        # uses 512-block chunks.  CUDA's small-matrix symmetric eigensolver has
+        # an empirically conservative ~256 KiB reservation per matrix; price
+        # that opaque workspace in addition to explicit Gram/eigen tensors.
+        polar_chunk = groups if groups <= 4_096 else 512
+        retraction_workspace_bytes = (
+            decoder_tensor_bytes
+            + 4 * (6 * polar_chunk * block_width**2 + block_width * max(site_dims))
+            + polar_chunk * 256 * 1024
+        )
+    else:
+        retraction_workspace_bytes = 0
+    regularizer = str(values["objective.regularizer"])
+    forward_precision = str(values["precision.forward"])
+    cast_decoder_bytes = decoder_tensor_bytes if forward_precision == "bf16" else 0
+    cast_encoder_bytes = encoder_tensor_bytes if forward_precision == "bf16" else 0
+    if regularizer == "end_to_end_map_nuclear":
+        # Decoder/encoder fp32 casts, their small Grams and Cholesky/eigen
+        # intermediates, and the unchunked per-block eigensolver reservation.
+        regularizer_workspace_bytes = (
+            cast_decoder_bytes
+            + cast_encoder_bytes
+            + 12 * groups * block_width**2 * 4
+            + groups * 256 * 1024
+        )
+    elif regularizer == "decoder_nuclear":
+        spectrum_batch = (
+            min(len(site_dims) * groups, 16_384)
+            if groups <= 4_096
+            else len(site_dims) * min(groups, 256)
+        )
+        regularizer_workspace_bytes = (
+            cast_decoder_bytes
+            + 6 * len(site_dims) * min(groups, 4_096) * block_width**2 * 4
+            + spectrum_batch * 256 * 1024
+        )
+    elif regularizer == "activation_weighted_site_decoder_l1":
+        regularizer_workspace_bytes = cast_decoder_bytes
+    else:
+        regularizer_workspace_bytes = 0
     auxiliary = str(values["objective.auxiliary"])
     if auxiliary == "frequency_dead_residual":
         active_blocks = _positive_int(
@@ -4576,12 +4682,6 @@ def _estimate_components(
         else:
             tracker_checkpoint_bytes = dead_window_tokens * ((groups + 7) // 8)
         tracker_residency_bytes = tracker_checkpoint_bytes + groups * 8
-    elif auxiliary in {
-        "dead_latent_residual",
-        "decoder_weighted_token_horizon_residual",
-    }:
-        tracker_checkpoint_bytes = groups * 8
-        tracker_residency_bytes = tracker_checkpoint_bytes
     elif auxiliary == "sasa_release_coordinate":
         tracker_checkpoint_bytes = shared_coordinates * 8
         tracker_residency_bytes = tracker_checkpoint_bytes
@@ -4593,6 +4693,15 @@ def _estimate_components(
         + dense_workspace_values * 4
         + factorized_materialization_bytes
         + retraction_workspace_bytes
+        + regularizer_workspace_bytes
+        # A tied encoder is a computed activation even though it owns no
+        # independent parameters.  Retain the exact forward-precision map
+        # through backward rather than granting tying a residency credit.
+        + (
+            operational_encoder_elements * (2 if forward_precision == "bf16" else 4)
+            if tied
+            else 0
+        )
         + tracker_residency_bytes
         # One device batch is copied ahead of the batch being consumed. Phase
         # 1 generators are fp32; captured real activations use store precision.
@@ -4734,6 +4843,19 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
     )
 
 
+def estimate_activation_store(cell: CellSpec) -> tuple[int, tuple[Any, ...]]:
+    """Return one cell's activation-store bytes and exact deduplication key.
+
+    Operational planners need this public projection when assigning disjoint
+    cell subsets to devices.  Keeping the projection here prevents schedulers
+    from depending on the private estimator tuple layout or reimplementing the
+    raw-view identity contract.
+    """
+
+    components = _estimate_components(cell)
+    return components[2], components[8]
+
+
 def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     components = [_estimate_components(cell) for cell in plan.cells]
     # Prefix-nested rungs and seeds reuse one immutable activation store.  For
@@ -4768,14 +4890,42 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     )
 
 
-def _enforce_jobe_memory(plan: StudyPlan) -> StudyPlan:
-    """Fail plan construction before a cell can exceed the declared runner."""
+def declared_phase_budget(phase: Phase | str) -> Budget:
+    """Return every resource ceiling currently declared for one phase.
 
-    Budget(
-        max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES,
-        max_peak_host_ram_bytes=PHASE3_HOST_RAM_CEILING_BYTES,
-    ).enforce(estimate_plan(plan))
+    The Jobe peak-memory limits are universal runner constraints.  Aggregate
+    token, parameter, storage, and dense-compute ceilings are currently
+    preregistered only for the frozen Phase-3 panel; inventing the same totals
+    for the staged Phase-1/2 campaigns would silently change their design.
+    """
+
+    parsed = Phase.parse(phase)
+    return (
+        Budget(
+            max_training_tokens=PHASE3_TRAINING_TOKEN_CEILING,
+            max_parameters=PHASE3_PARAMETER_CEILING,
+            max_storage_bytes=PHASE3_STORAGE_CEILING_BYTES,
+            max_compute_flops=PHASE3_COMPUTE_CEILING_FLOPS,
+            max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES,
+            max_peak_host_ram_bytes=PHASE3_HOST_RAM_CEILING_BYTES,
+        )
+        if parsed is Phase.PHASE3
+        else Budget(
+            max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES,
+            max_peak_host_ram_bytes=PHASE3_HOST_RAM_CEILING_BYTES,
+        )
+    )
+
+
+def enforce_plan_resources(plan: StudyPlan) -> StudyPlan:
+    """Fail a plan against every ceiling declared for its phase."""
+
+    declared_phase_budget(plan.phase).enforce(estimate_plan(plan))
     return plan
+
+
+# Internal compatibility name for the existing staged-construction sites.
+_enforce_jobe_memory = enforce_plan_resources
 
 
 BSF = "Fel et al. 2026, Structuring Sparsity, Eq. 4 and Appendix D"
@@ -5130,9 +5280,28 @@ def _bsf_recipe(kind: str, *, appendix_aux: bool) -> Recipe:
         )
     else:  # pragma: no cover - construction is internal
         raise AssertionError(kind)
+    runner_up_decision = (
+        adapted(
+            "objective.auxiliary",
+            "runner_up_blocks",
+            citation=BSF_AUX,
+            rationale=(
+                "Appendix D specifies runner-ups for an encoder-score TopK "
+                "carrier, while Group Lasso zeros inactive post-shrink codes; "
+                "retain the affine pre-shrink encoder code for its runner-up "
+                "ranking and residual decode"
+            ),
+            ablation=(
+                "compare primary Group Lasso with the complete pre-shrink "
+                "runner-up bundle and report auxiliary gradients/event capacity"
+            ),
+        )
+        if kind == "group_lasso"
+        else exact("objective.auxiliary", "runner_up_blocks", BSF_AUX)
+    )
     aux = (
         (
-            exact("objective.auxiliary", "runner_up_blocks", BSF_AUX),
+            runner_up_decision,
             exact("auxiliary.count", "match_active_blocks", BSF_AUX),
             exact("auxiliary.coefficient", "1/active_blocks", BSF_AUX),
         )
@@ -7370,9 +7539,69 @@ def _resolved_cell_defaults(
                 ),
             ),
         )
+    phase1_evaluation_contracts: tuple[tuple[str, DecisionValue], ...] = (
+        (
+            "evaluation.phase1_margin_normalization",
+            "piecewise_available_headroom_signed_margin_v2",
+        ),
+        (
+            "evaluation.rank_mismatch_contract",
+            "same_block_primary_plus_calibration_frozen_minimum_group_diagnostic_v1",
+        ),
+        (
+            "evaluation.pathology_association_contract",
+            "primary_cutoffs_plus_complete_reporting_only_grid_v1",
+        ),
+        ("evaluation.pathology_strong_association_cutoff", 0.5),
+        ("evaluation.pathology_weak_association_cutoff", 0.25),
+        (
+            "evaluation.pathology_association_cutoff_sensitivity",
+            PHASE1_PATHOLOGY_ASSOCIATION_CUTOFF_SENSITIVITY,
+        ),
+    )
+    real_phase_evaluation_contracts: tuple[tuple[str, DecisionValue], ...] = (
+        ("evaluation.phase1_margin_normalization", "not_applicable"),
+        ("evaluation.rank_mismatch_contract", "not_applicable"),
+        ("evaluation.pathology_association_contract", "not_applicable"),
+        ("evaluation.pathology_strong_association_cutoff", 0.0),
+        ("evaluation.pathology_weak_association_cutoff", 0.0),
+        ("evaluation.pathology_association_cutoff_sensitivity", ()),
+    )
+    for name, value in (
+        phase1_evaluation_contracts
+        if phase is Phase.PHASE1
+        else real_phase_evaluation_contracts
+    ):
+        absent(
+            name,
+            novel(
+                name,
+                value,
+                rationale=(
+                    "bind the truth-known diagnostic, pathology, and selection policies "
+                    "before reading Phase-1 evidence"
+                    if phase is Phase.PHASE1
+                    else "truth-known Phase-1 evaluation policy is inapplicable to real data"
+                ),
+                ablation=(
+                    "publish all declared primary and counterfactual outputs without "
+                    "substituting a diagnostic for the primary gate"
+                    if phase is Phase.PHASE1
+                    else "Phase 1 owns the corresponding policy sensitivity"
+                ),
+            ),
+        )
     encoder_scale_strategy = str(values["model.encoder_scale_calibration"])
     if encoder_scale_strategy == "fixed_init_no_data_fit":
-        encoder_fit = ("not_applicable", 0, "not_applicable")
+        encoder_fit: tuple[DecisionValue, ...] = (
+            "not_applicable",
+            0,
+            "not_applicable",
+            "not_applicable",
+            0.0,
+            0.0,
+            0,
+        )
     elif (
         encoder_scale_strategy
         == "fit_global_mean_block_norm_to_one_on_normalization_fit"
@@ -7380,7 +7609,11 @@ def _resolved_cell_defaults(
         encoder_fit = (
             "train_unique_prefix" if phase is Phase.PHASE1 else "normalization_fit",
             min(int(values["data.unique_tokens"]), 250_000),
-            "global_fp64_mean_block_score",
+            "global_fp64_mean_postactivation_block_norm",
+            "positive_bracketed_bisection_remeasure_v1",
+            1.0,
+            1.0e-3,
+            32,
         )
     else:
         raise StudyError(
@@ -7391,6 +7624,10 @@ def _resolved_cell_defaults(
             "model.encoder_scale_fit_split",
             "model.encoder_scale_fit_count",
             "model.encoder_scale_fit_statistic",
+            "model.encoder_scale_fit_solver",
+            "model.encoder_scale_fit_target",
+            "model.encoder_scale_fit_tolerance",
+            "model.encoder_scale_fit_max_iterations",
         ),
         encoder_fit,
     ):
@@ -7426,7 +7663,7 @@ def _resolved_cell_defaults(
         "qualification.thresholds_version",
         engineering(
             "qualification.thresholds_version",
-            "2026-07-20.v1",
+            "2026-07-22.v2",
             rationale="the numerical guardrail table is immutable and versioned",
         ),
     )
@@ -8281,8 +8518,13 @@ def derive_child_cell(
         ),
         engineering(
             "protocol.hyperparameter_tuning",
-            split != "confirmation",
-            rationale="confirmation children are trained from scratch without retuning",
+            split != "confirmation" and stage_blueprint.role != "capability_panel",
+            rationale=(
+                "truth-known capability panels advance a fixed carrier by protocol, "
+                "not by synthetic hyperparameter ranking"
+                if stage_blueprint.role == "capability_panel"
+                else "confirmation children are trained from scratch without retuning"
+            ),
         ),
         engineering(
             "selection.id",
@@ -9644,34 +9886,36 @@ def _phase1_capability_panel(
     names = {variant.name for variant in variants}
     if carrier not in names:
         raise StudyError(f"capability panel omits fixed carrier {carrier!r}")
-    return tuple(
-        variant
-        if variant.name == carrier
-        else ChildVariant(
-            variant.name,
-            merge_decisions(
-                variant.decisions,
-                (
-                    engineering(
-                        "qualification.promotable",
-                        False,
-                        rationale=(
-                            "this truth-known arm establishes option admissibility "
-                            "but cannot tune the carrier used by the next stage"
-                        ),
-                    ),
-                    engineering(
-                        "protocol.hyperparameter_tuning",
-                        False,
-                        rationale=(
-                            "model- and scale-specific ranking is reserved for Phase 2"
-                        ),
-                    ),
+    result: list[ChildVariant] = []
+    for variant in variants:
+        controls: list[Decision] = [
+            engineering(
+                "protocol.hyperparameter_tuning",
+                False,
+                rationale=(
+                    "the complete truth-known panel tests capability; its declared "
+                    "carrier advances by protocol rather than synthetic ranking"
                 ),
-            ),
+            )
+        ]
+        if variant.name != carrier:
+            controls.append(
+                engineering(
+                    "qualification.promotable",
+                    False,
+                    rationale=(
+                        "this truth-known arm establishes option admissibility "
+                        "but cannot tune the carrier used by the next stage"
+                    ),
+                )
+            )
+        result.append(
+            ChildVariant(
+                variant.name,
+                merge_decisions(variant.decisions, controls),
+            )
         )
-        for variant in variants
-    )
+    return tuple(result)
 
 
 def _phase1_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]:
@@ -11245,26 +11489,29 @@ def _family_aux_variants(family: str) -> tuple[ChildVariant, ...]:
                     _factor(
                         "factor.family_auxiliary",
                         "runner_up_blocks",
-                        "test the BSF Appendix-D residual auxiliary on the calibrated Group-Lasso family",
+                        "test the adapted pre-shrink BSF Appendix-D residual auxiliary on the calibrated Group-Lasso family",
                         "compare the same selected penalty with no auxiliary",
                     ),
-                    _factor(
+                    adapted(
                         "objective.auxiliary",
                         "runner_up_blocks",
-                        "reconstruct residual with runner-up blocks",
-                        "compare no auxiliary",
+                        citation=BSF_AUX,
+                        rationale=(
+                            "rank and decode Group-Lasso runner-ups from the "
+                            "affine pre-shrink encoder carrier because inactive "
+                            "post-shrink codes are zero"
+                        ),
+                        ablation="compare no auxiliary",
                     ),
-                    _factor(
+                    exact(
                         "auxiliary.count",
                         "match_active_blocks",
-                        "match runner-up support to the main support",
-                        "report realized auxiliary event rate",
+                        BSF_AUX,
                     ),
-                    _factor(
+                    exact(
                         "auxiliary.coefficient",
                         "1/active_blocks",
-                        "retain the appendix support scaling",
-                        "compare the zero-auxiliary control",
+                        BSF_AUX,
                     ),
                 ),
             ),
@@ -11954,53 +12201,6 @@ def _phase2_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
             ),
         ),
         ChildVariant(
-            "relu_decoder_weighted_batchtopk",
-            (
-                _factor(
-                    "factor.selector",
-                    "relu_decoder_weighted_batchtopk",
-                    "test Minder-style scalar scoring",
-                    "compare raw-code and decoder-weighted scores",
-                ),
-                _factor(
-                    "model.activation",
-                    "relu",
-                    "use nonnegative codes",
-                    "compare signed codes",
-                ),
-                _factor(
-                    "model.selector",
-                    "decoder_weighted_batchtopk",
-                    "score activations by decoder contribution",
-                    "compare block-norm scoring",
-                ),
-                _factor(
-                    "model.block_width",
-                    1,
-                    "Minder scoring is a scalar selector",
-                    "compare scalar and block allocation",
-                ),
-                _factor(
-                    "model.groups",
-                    8_192,
-                    "retain 8,192 scalar coordinates after leaving a block parent",
-                    "compare parameter- and coded-rate-matched carriers",
-                ),
-                _factor(
-                    "model.active_blocks",
-                    32,
-                    "retain the pilot scalar event budget",
-                    "compare achieved-rate matching",
-                ),
-                _factor(
-                    "model.decoder_norm_geometry",
-                    "sum_l2",
-                    "sum per-site decoder norms in the retained source score",
-                    "use concatenated L2 only as a named negative control",
-                ),
-            ),
-        ),
-        ChildVariant(
             "group_soft_threshold",
             (
                 _factor(
@@ -12386,89 +12586,6 @@ def _phase2_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
             ),
         ),
         ChildVariant(
-            "decoder_weighted_residual_aux",
-            (
-                _factor(
-                    "factor.regularization",
-                    "decoder_weighted_residual_aux",
-                    "test retained decoder-weighted BatchTopK plus release-style residual AuxK as an adapted cross-layer mechanism",
-                    "compare the decoder-weighted carrier without AuxK and other source auxiliaries",
-                ),
-                _factor(
-                    "model.block_width",
-                    1,
-                    "the retained scoring/AuxK mechanics are scalar",
-                    "compare scalar and block mechanisms separately",
-                ),
-                _factor(
-                    "model.groups",
-                    8_192,
-                    "retain the pilot scalar coordinate capacity",
-                    "also report parameter and coded-rate matches",
-                ),
-                _factor(
-                    "model.active_blocks",
-                    32,
-                    "retain the pilot scalar event budget",
-                    "also report achieved rate",
-                ),
-                _factor(
-                    "model.selector",
-                    "decoder_weighted_batchtopk",
-                    "rank scalar activations by decoder contribution",
-                    "compare raw-code BatchTopK",
-                ),
-                _factor(
-                    "model.decoder_norm_geometry",
-                    "sum_l2",
-                    "sum per-site decoder norms in the retained source score",
-                    "use concatenated L2 only as a named negative control",
-                ),
-                adapted(
-                    "objective.auxiliary",
-                    "decoder_weighted_token_horizon_residual",
-                    citation=MINDER_CODE,
-                    rationale="retain the released residual AuxK mechanics without the model-diffing task",
-                    ablation="compare the same scalar carrier with AuxK disabled",
-                ),
-                adapted(
-                    "objective.auxiliary_reconstruction",
-                    "squared_l2_over_residual_variance",
-                    citation=MINDER_CODE,
-                    rationale="retain residual-variance normalization",
-                    ablation="compare squared L2 on the same carrier",
-                ),
-                adapted(
-                    "objective.auxiliary_reduction",
-                    "mean_batch",
-                    citation=MINDER_CODE,
-                    rationale="retain the released batch reduction",
-                    ablation="compare coefficient-rescaled source alternatives only if declared",
-                ),
-                adapted(
-                    "auxiliary.count",
-                    384,
-                    citation=MINDER_CODE,
-                    rationale="apply the release activation_dim/2 rule to the 768-wide pilot",
-                    ablation="compare matched event and coefficient capacity",
-                ),
-                adapted(
-                    "auxiliary.coefficient",
-                    1 / 32,
-                    citation=MINDER_CODE,
-                    rationale="retain the released auxiliary weight",
-                    ablation="compare zero and 1/32",
-                ),
-                adapted(
-                    "auxiliary.dead_after_tokens",
-                    10_000_000,
-                    citation=MINDER_CODE,
-                    rationale="retain the released token-age horizon",
-                    ablation="compare no AuxK on the same 16M-token rung",
-                ),
-            ),
-        ),
-        ChildVariant(
             "decoder_nuclear",
             (
                 _factor(
@@ -12694,50 +12811,6 @@ def _phase2_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
             "compare BatchTopK next",
         ),
     )
-    relu_architecture = (
-        _factor(
-            "model.encoder",
-            "joint_untied_affine",
-            "use affine joint inference",
-            "compare centered inference",
-        ),
-        _factor(
-            "model.encoder_bias",
-            True,
-            "learn the ReLU offset",
-            "compare bias-free inference",
-        ),
-        _factor(
-            "model.decoder",
-            "free_per_site_affine",
-            "use free per-site scalar decoders",
-            "compare normalized geometry",
-        ),
-        _factor(
-            "model.decoder_bias",
-            True,
-            "learn the reconstruction center",
-            "compare fixed-zero reconstruction",
-        ),
-        _factor(
-            "model.decoder_bias_init",
-            "zero",
-            "use a common explicit bias initializer",
-            "compare geometric-median initialization",
-        ),
-        _factor(
-            "model.activation",
-            "relu",
-            "use nonnegative scalar codes",
-            "compare signed codes",
-        ),
-        _factor(
-            "model.selector",
-            "token_topk",
-            "use the pre-selector fixed-support carrier",
-            "compare decoder-weighted BatchTopK next",
-        ),
-    )
     group_architecture = (
         _factor(
             "model.encoder",
@@ -12781,13 +12854,7 @@ def _phase2_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
             item.name,
             merge_decisions(
                 neutral_objective,
-                (
-                    relu_architecture
-                    if item.name == "scalar_relu"
-                    else signed_architecture
-                    if item.name != "parent_architecture"
-                    else ()
-                ),
+                signed_architecture if item.name != "parent_architecture" else (),
                 item.decisions,
             ),
         )
@@ -12805,18 +12872,11 @@ def _phase2_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
             item.name,
             merge_decisions(
                 neutral_objective,
-                (
-                    relu_architecture
-                    if item.name == "relu_decoder_weighted_batchtopk"
-                    else group_architecture
-                    if item.name == "group_soft_threshold"
-                    else ()
-                ),
+                group_architecture if item.name == "group_soft_threshold" else (),
                 item.decisions,
             ),
         )
         for item in selectors
-        if item.name != "relu_decoder_weighted_batchtopk"
     )
     selector_list: list[ChildVariant] = []
     for item in selectors:
@@ -13917,15 +13977,7 @@ def build_phase3_plan(
         Phase.PHASE3,
         (preflight_stage, final_stage),
     )
-    Budget(
-        max_training_tokens=PHASE3_TRAINING_TOKEN_CEILING,
-        max_parameters=PHASE3_PARAMETER_CEILING,
-        max_storage_bytes=PHASE3_STORAGE_CEILING_BYTES,
-        max_compute_flops=PHASE3_COMPUTE_CEILING_FLOPS,
-        max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES,
-        max_peak_host_ram_bytes=PHASE3_HOST_RAM_CEILING_BYTES,
-    ).enforce(estimate_plan(plan))
-    return plan
+    return enforce_plan_resources(plan)
 
 
 def build_plan(
@@ -14041,9 +14093,12 @@ __all__ = [
     "canonical_json",
     "content_id",
     "engineering",
+    "estimate_activation_store",
+    "enforce_plan_resources",
     "derive_child_cell",
     "estimate_cell",
     "estimate_plan",
+    "declared_phase_budget",
     "exact",
     "merge_decisions",
     "materialize_child_plan",

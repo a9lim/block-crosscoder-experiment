@@ -1990,6 +1990,38 @@ def test_group_lasso_bridge_has_positive_learned_threshold(device):
     assert model.log_threshold.grad is not None
 
 
+def test_group_soft_threshold_exposes_exact_affine_preactivation(device):
+    model = make_model(
+        device,
+        selection="dense",
+        code_activation="group_soft_threshold",
+        decoder_constraint="free",
+        encoder_bias=True,
+        encoder_fusion="availability_rescaled_sum",
+        group_threshold_effective_init=100.0,
+    )
+    x = whitened_batch(device, n=8, seed=2191)
+    observed = torch.tensor(
+        [
+            [True, True, False, True],
+            [True, False, True, True],
+        ]
+        * 4,
+        device=device,
+    )
+    preactivation = model.encode_preactivation(x, observed=observed)
+    materialized = model.encode_preactivation(
+        x,
+        observed=observed,
+        _encoder=model.encoder_tensor(),
+    )
+    activated = model.encode(x, observed=observed)
+    assert torch.equal(preactivation, materialized)
+    assert torch.equal(activated, model._activate_code(preactivation))
+    assert bool(preactivation.count_nonzero())
+    assert not bool(activated.count_nonzero())
+
+
 def test_factorized_group_lasso_loss_never_materializes_decoder(device, monkeypatch):
     model = BlockCrosscoder(
         BSCConfig(
@@ -2283,6 +2315,31 @@ def test_init_tied_and_score_comparability(device):
     p = model.scores(model.encode(x)).mean(dim=0)  # [G]
     spread = (p.max() / p.min()).item()
     assert spread < 1.01  # per-block means equalized on the calib batch
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        (
+            {"code_activation": "group_soft_threshold"},
+            "invalid after group soft thresholding",
+        ),
+        (
+            {
+                "selection_score": "isolated_loss_decrease",
+                "decoder_bias": False,
+                "apply_decoder_bias_to_input": False,
+            },
+            "nonnegative homogeneous score",
+        ),
+    ),
+)
+def test_one_shot_encoder_scale_refuses_nonhomogeneous_or_signed_scores(
+    device, overrides, message
+):
+    model = make_model(device, **overrides)
+    with pytest.raises(ValueError, match=message):
+        model.calibrate_encoder_scale_(whitened_batch(device, n=32))
 
 
 def planted_lowrank_batch(device, n=1024, rank=8, seed=3):

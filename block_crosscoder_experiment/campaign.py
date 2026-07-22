@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .durability import durable_replace, fsync_directory
 from .studies import (
     CellSpec,
     FrozenPanelDecision,
@@ -89,27 +91,149 @@ from .studies import (
 
 CAMPAIGN_SCHEMA = "bsc-campaign-v1"
 ARTIFACT_SCHEMA = "bsc-stage-artifacts-v2"
-QUALIFICATION_SCHEMA = "bsc-qualification-v2"
-PREPARATION_SCHEMA = "bsc-preparation-v2"
+QUALIFICATION_SCHEMA = "bsc-qualification-v3"
+PREPARATION_SCHEMA = "bsc-preparation-v3"
 EVALUATION_SCHEMA = "bsc-evaluation-v2"
 EVALUATION_EXECUTION_IMPLEMENTATION = "fused_deployable_full_view_packet_v2"
+CANONICAL_CELL_MODULE = "block_crosscoder_experiment.cli.run_cell"
+CANONICAL_EXECUTOR_SCHEMA = "bsc-cell-executor-v12"
+CANONICAL_EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
+CAMPAIGN_IMPLEMENTATION_SCHEMA = "bsc-campaign-implementation-v1"
 PROMOTION_SCHEMA = "bsc-promotion-v1"
 SELECTION_SCHEMA = "bsc-stage-selection-v2"
 FAMILY_NOMINATION_SCHEMA = "bsc-family-revisit-nomination-v3"
-PHASE1_DECISION_SCHEMA = "bsc-phase1-go-no-go-decision-v2"
-PHASE1_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase1-campaign-manifest-v1"
-PANEL_DECISION_PRODUCER_SCHEMA = "bsc-phase3-panel-decision-v1"
-PHASE2_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase2-campaign-manifest-v1"
-SELECTION_UNIVERSE_SCHEMA = "bsc-phase2-selection-universe-v2"
+PHASE1_DECISION_SCHEMA = "bsc-phase1-go-no-go-decision-v3"
+PHASE1_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase1-campaign-manifest-v3"
+PANEL_DECISION_PRODUCER_SCHEMA = "bsc-phase3-panel-decision-v2"
+PHASE2_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase2-campaign-manifest-v3"
+SELECTION_UNIVERSE_SCHEMA = "bsc-phase2-selection-universe-v3"
+PHASE2_CAMPAIGN_MANIFEST_KEYS = frozenset(
+    {
+        "schema",
+        "source_phase2_plan_id",
+        "source_phase2_blueprint_id",
+        "plan_sha256",
+        "blueprint_sha256",
+        "journal_sha256",
+        "journal_sha256_semantics",
+        "smoke",
+        "phase1_decision_sha256",
+        "phase1_decision",
+        "phase1_transfer_id",
+        "plan_history",
+        "selection_chain",
+        "main_selection_chain",
+        "family_selection_chains",
+        "family_nominations",
+        "confirmation_noninferiority",
+        "duplicate_substitutions",
+        "cells",
+        "panel_entries",
+    }
+)
+PHASE2_SELECTION_UNIVERSE_KEYS = frozenset(
+    {
+        "schema",
+        "source_phase2_plan_id",
+        "source_phase2_blueprint_id",
+        "selection_chain",
+        "main_selection_chain",
+        "family_selection_chains",
+        "family_nominations",
+        "ranked_stage_universes",
+        "panel_source_candidate_ids",
+        "phase1_decision_id",
+        "phase1_transfer_id",
+        "confirmation_noninferiority",
+        "duplicate_substitutions",
+    }
+)
 
 REQUIRED_QUALIFICATION_CHECKS = frozenset(
     {
+        "deployment_schedule_integrity",
+        "encoder_scale_calibration_integrity",
         "finite",
         "method_endpoints",
+        "precision_preflight_integrity",
         "provenance",
+        "regularizer_calibration_integrity",
         "resource_compliance",
+        "selection_score_diagnostics_integrity",
         "scientific_endpoint_complete",
         "split_integrity",
+    }
+)
+REQUIRED_SCIENTIFIC_OUTCOME_CHECKS = frozenset(
+    {
+        "support_target_calibration",
+        "codec_calibration_exclusion",
+        "codec_evaluation_exclusion",
+        "phase1_identification",
+        "production_precision_finite",
+        "production_precision_reconstruction",
+        "production_precision_support",
+        "production_fixed_rate_frontier",
+    }
+)
+REQUIRED_SCIENTIFIC_MARGIN_KEYS = frozenset(
+    {
+        "support_target_abs_error",
+        "codec_calibration_excluded_fraction",
+        "codec_evaluation_excluded_fraction",
+        "phase1_native_identification",
+        "phase1_deployed_identification",
+        "production_precision_reconstruction",
+        "production_precision_support_iou",
+        "production_fixed_rate_nonzero_endpoints",
+    }
+)
+IMPLEMENTATION_IDENTITY_KEYS = frozenset(
+    {
+        "executor_schema",
+        "executor_process_model",
+        "python_source_sha256",
+        "python_source_files",
+        "git_commit",
+        "git_dirty",
+        "python",
+        "torch",
+        "torch_cuda_build",
+        "dependencies",
+    }
+)
+IMPLEMENTATION_DEPENDENCY_KEYS = frozenset(
+    {
+        "datasets",
+        "huggingface-hub",
+        "numpy",
+        "sae-lens",
+        "safetensors",
+        "torch",
+        "transformers",
+    }
+)
+QUALIFICATION_KEYS = frozenset(
+    {
+        "schema",
+        "cell_id",
+        "qualified",
+        "checks",
+        "scientific_outcome",
+        "inputs",
+        "implementation_identity",
+        "implementation_identity_sha256",
+        "validation",
+        "qualification_profile",
+        "thresholds_version",
+        "thresholds",
+        "selection_metrics",
+        "selection_metrics_sha256",
+        "selection_metrics_evaluation_sha256",
+        "promotion_eligible",
+        "promotion_ineligible_reasons",
+        "selection_eligible_for_protocol_test",
+        "selection_eligibility_mode",
     }
 )
 QUALIFICATION_INPUT_KINDS = (
@@ -332,6 +456,241 @@ def _is_sha256_hex(value: Any) -> bool:
     )
 
 
+def _process_identity(pid: int) -> str | None:
+    """Return a PID-reuse-resistant process birth identity when available."""
+
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text(encoding="utf-8").split()
+        if len(fields) > 21:
+            return "proc-start:" + fields[21]
+    except (OSError, UnicodeError):
+        pass
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    started = completed.stdout.strip()
+    return None if completed.returncode != 0 or not started else "ps-start:" + started
+
+
+def _process_matches(pid: int, identity: Any) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if identity is None:
+        return True
+    return isinstance(identity, str) and _process_identity(pid) == identity
+
+
+def _qualification_thresholds(cell: CellSpec) -> dict[str, Any]:
+    values = cell.decision_map
+    return {
+        "schema": "bsc-integrity-thresholds-2026-07-22.v2",
+        "support_target_abs_error_max": 0.1,
+        "codec_excluded_calibration_event_fraction_max": 0.01,
+        "codec_excluded_evaluation_event_fraction_max": 0.01,
+        "probability_metric_range": [0.0, 1.0],
+        "required_quantizer_bits": list(values["codec.quantizer_bits"]),
+        "phase1_identification_thresholds": [
+            list(item)
+            for item in values["qualification.phase1_identification_thresholds"]
+        ],
+        "phase1_identification_enforced": values["runtime.smoke"] is False,
+        "phase1_margin_normalization_contract": values[
+            "evaluation.phase1_margin_normalization"
+        ],
+        "phase1_rank_mismatch_contract": values[
+            "evaluation.rank_mismatch_contract"
+        ],
+        "phase1_pathology_association_contract": values[
+            "evaluation.pathology_association_contract"
+        ],
+        "phase1_pathology_strong_association_cutoff": values[
+            "evaluation.pathology_strong_association_cutoff"
+        ],
+        "phase1_pathology_weak_association_cutoff": values[
+            "evaluation.pathology_weak_association_cutoff"
+        ],
+        "phase1_pathology_association_cutoff_sensitivity": [
+            list(item)
+            for item in values[
+                "evaluation.pathology_association_cutoff_sensitivity"
+            ]
+        ],
+        "encoder_scale_fit_statistic": values[
+            "model.encoder_scale_fit_statistic"
+        ],
+        "encoder_scale_fit_solver": values["model.encoder_scale_fit_solver"],
+        "encoder_scale_fit_target": values["model.encoder_scale_fit_target"],
+        "encoder_scale_fit_tolerance": values[
+            "model.encoder_scale_fit_tolerance"
+        ],
+        "encoder_scale_fit_max_iterations": values[
+            "model.encoder_scale_fit_max_iterations"
+        ],
+        "fixed_rate_budget_scale_factor": values[
+            "evaluation.fixed_rate_budget_scale_factor"
+        ],
+        "fixed_rate_budget_scale_contract": values[
+            "evaluation.fixed_rate_budget_scale_contract"
+        ],
+        "production_min_nonzero_rate_endpoints": values[
+            "precision.preflight_min_nonzero_rate_endpoints"
+        ],
+    }
+
+
+def _validate_implementation_identity(
+    identity: Mapping[str, Any],
+    *,
+    scientific: bool,
+) -> str:
+    if set(identity) != set(IMPLEMENTATION_IDENTITY_KEYS):
+        raise ArtifactError(
+            "implementation identity does not have the exact versioned field set"
+        )
+    executor_schema = identity.get("executor_schema")
+    process_model = identity.get("executor_process_model")
+    dependencies = identity.get("dependencies")
+    if (
+        not isinstance(executor_schema, str)
+        or not executor_schema
+        or not isinstance(process_model, str)
+        or not process_model
+        or not _is_sha256_hex(identity.get("python_source_sha256"))
+        or not isinstance(identity.get("python_source_files"), int)
+        or isinstance(identity.get("python_source_files"), bool)
+        or int(identity["python_source_files"]) <= 0
+        or not isinstance(identity.get("python"), str)
+        or not identity["python"]
+        or not isinstance(identity.get("torch"), str)
+        or not identity["torch"]
+        or identity.get("torch_cuda_build") is not None
+        and not isinstance(identity.get("torch_cuda_build"), str)
+        or not isinstance(dependencies, Mapping)
+        or set(dependencies) != set(IMPLEMENTATION_DEPENDENCY_KEYS)
+        or any(
+            value is not None and not isinstance(value, str)
+            for value in dependencies.values()
+        )
+    ):
+        raise ArtifactError("implementation identity has malformed versioned fields")
+    git_commit = identity.get("git_commit")
+    git_dirty = identity.get("git_dirty")
+    if git_commit is not None and not (
+        isinstance(git_commit, str)
+        and len(git_commit) == 40
+        and all(character in "0123456789abcdef" for character in git_commit)
+    ):
+        raise ArtifactError("implementation git commit must be a canonical 40-hex ID")
+    if git_dirty is not None and not isinstance(git_dirty, bool):
+        raise ArtifactError("implementation git-dirty state must be boolean or null")
+    if scientific and (
+        executor_schema != CANONICAL_EXECUTOR_SCHEMA
+        or process_model != CANONICAL_EXECUTOR_PROCESS_MODEL
+        or git_commit is None
+        or git_dirty is not False
+    ):
+        raise ArtifactError(
+            "scientific cells require the canonical executor and a clean committed identity"
+        )
+    return _sha256_canonical_payload(identity)
+
+
+def _promotion_reasons_from_evidence(
+    cell: CellSpec,
+    *,
+    outcome_passed: bool,
+    evaluation: Mapping[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    if cell.decision_map["runtime.smoke"] is not False:
+        reasons.append("runtime_smoke")
+    if evaluation.get("raw_space", {}).get("eligible") is not True:
+        reasons.append("raw_codec_requires_unpriced_side_information")
+    if (
+        cell.phase is not Phase.PHASE1
+        and evaluation.get("fixed_rate_raw_selection", {}).get("eligible") is not True
+    ):
+        reasons.append("fixed_rate_budget_ineligible")
+    if cell.phase is Phase.PHASE1 and evaluation.get("synthetic_recovery", {}).get(
+        "deployed", {}
+    ).get("shared_feature_claim_eligible") is not True:
+        reasons.append("synthetic_shared_feature_claim_ineligible")
+    if cell.decision_map["qualification.promotable"] is not True:
+        reasons.append("resolved_nonpromotable_cell")
+    if outcome_passed is not True:
+        reasons.append("scientific_outcome_failed")
+    if cell.phase is Phase.PHASE3 or "confirmation" in cell.stage:
+        if not cell.decision_map["selection.parent_cell_ids"]:
+            reasons.append("missing_frozen_phase2_selection_decision")
+    return reasons
+
+
+def _policy_retained_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    policy: SelectionPolicy,
+    *,
+    smoke_protocol_only: bool,
+) -> list[Mapping[str, Any]]:
+    """Apply the frozen cutoff and tie policy identically at select and replay."""
+
+    if policy.retain_count is not None:
+        keep = min(len(candidates), policy.retain_count)
+    else:
+        assert policy.retain_fraction is not None
+        keep = max(1, math.ceil(len(candidates) * policy.retain_fraction))
+    retained = list(candidates[:keep])
+    if (
+        retained
+        and not smoke_protocol_only
+        and policy.tie_policy == "retain_all_at_cutoff"
+        and keep < len(candidates)
+    ):
+        cutoff = (
+            float(candidates[keep - 1]["median"]),
+            float(candidates[keep - 1]["worst_seed"]),
+        )
+        retained.extend(
+            candidate
+            for candidate in candidates[keep:]
+            if (
+                float(candidate["median"]),
+                float(candidate["worst_seed"]),
+            )
+            == cutoff
+        )
+    return retained
+
+
+def _validate_panel_entry_seed_coverage(
+    entries: Sequence[FrozenPanelEntry],
+    expected_seeds: tuple[int, ...],
+) -> None:
+    for entry in entries:
+        if tuple(cell.seed for cell in entry.source_cells) != expected_seeds:
+            raise CampaignError("panel entry does not exactly cover the blueprint seeds")
+
+
+def _validate_exact_confirmation_guard(
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    if observed != expected:
+        raise CampaignError(
+            "confirmation does not reuse the exact authenticated sharing guard"
+        )
+
+
 def _validate_qualification_payload(
     payload: Mapping[str, Any],
     *,
@@ -352,25 +711,42 @@ def _validate_qualification_payload(
     cell_id = cell.cell_id
     if payload.get("schema") != QUALIFICATION_SCHEMA:
         raise ArtifactError("qualification artifact has the wrong schema")
+    if set(payload) != set(QUALIFICATION_KEYS):
+        raise ArtifactError("qualification artifact has a noncanonical field set")
     if payload.get("cell_id") != cell_id or payload.get("qualified") is not True:
         raise ArtifactError("qualification artifact does not approve this cell")
     checks = payload.get("checks")
-    if not isinstance(checks, Mapping):
-        raise ArtifactError("qualification checks must be an object")
-    missing_checks = REQUIRED_QUALIFICATION_CHECKS.difference(checks)
-    if missing_checks:
-        raise ArtifactError(
-            f"qualification lacks required checks {sorted(missing_checks)}"
-        )
+    if not isinstance(checks, Mapping) or set(checks) != set(
+        REQUIRED_QUALIFICATION_CHECKS
+    ):
+        raise ArtifactError("qualification checks must use the exact v3 check set")
     if not all(value is True for value in checks.values()):
         raise ArtifactError("qualification checks must all be true")
 
+    if (
+        payload.get("qualification_profile")
+        != cell.decision_map["qualification.profile"]
+        or payload.get("thresholds_version")
+        != cell.decision_map["qualification.thresholds_version"]
+        or payload.get("thresholds") != _qualification_thresholds(cell)
+    ):
+        raise ArtifactError(
+            "qualification profile/version/thresholds disagree with the resolved cell"
+        )
+
     scientific_outcome = payload.get("scientific_outcome")
-    if not isinstance(scientific_outcome, Mapping):
+    if not isinstance(scientific_outcome, Mapping) or set(scientific_outcome) != {
+        "passed",
+        "checks",
+        "inapplicable_checks",
+        "margins",
+    }:
         raise ArtifactError("qualification must report scientific_outcome")
     outcome_checks = scientific_outcome.get("checks")
-    if not isinstance(outcome_checks, Mapping) or not outcome_checks:
-        raise ArtifactError("scientific_outcome checks must be a nonempty object")
+    if not isinstance(outcome_checks, Mapping) or set(outcome_checks) != set(
+        REQUIRED_SCIENTIFIC_OUTCOME_CHECKS
+    ):
+        raise ArtifactError("scientific_outcome checks must use the exact v3 check set")
     if not all(isinstance(value, bool) for value in outcome_checks.values()):
         raise ArtifactError("scientific_outcome checks must be boolean")
     outcome_passed = scientific_outcome.get("passed")
@@ -405,14 +781,18 @@ def _validate_qualification_payload(
             "scientific_outcome inapplicability disagrees with the resolved cell"
         )
     margins = scientific_outcome.get("margins")
-    if not isinstance(margins, Mapping) or any(
-        value is not None
-        and (
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math_isfinite(value)
+    if (
+        not isinstance(margins, Mapping)
+        or set(margins) != set(REQUIRED_SCIENTIFIC_MARGIN_KEYS)
+        or any(
+            value is not None
+            and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math_isfinite(value)
+            )
+            for value in margins.values()
         )
-        for value in margins.values()
     ):
         raise ArtifactError(
             "scientific_outcome margins must be finite numbers or null"
@@ -472,6 +852,11 @@ def _validate_qualification_payload(
         raise ArtifactError(
             "smoke protocol eligibility is inconsistent with the resolved cell"
         )
+    expected_protocol_eligible = bool(is_smoke and resolved_promotable)
+    if protocol_eligible is not expected_protocol_eligible:
+        raise ArtifactError(
+            "qualification protocol eligibility disagrees with the resolved cell"
+        )
 
     inputs = payload.get("inputs")
     if not isinstance(inputs, Mapping) or set(inputs) != set(QUALIFICATION_INPUT_KINDS):
@@ -500,8 +885,9 @@ def _validate_qualification_payload(
         raise ArtifactError(
             "qualification must bind its complete implementation identity"
         )
-    observed_implementation_sha256 = _sha256_canonical_payload(
-        implementation_identity
+    observed_implementation_sha256 = _validate_implementation_identity(
+        implementation_identity,
+        scientific=not is_smoke,
     )
     if implementation_identity_sha256 != observed_implementation_sha256:
         raise ArtifactError("qualification implementation-identity hash mismatch")
@@ -569,6 +955,44 @@ def _validate_qualification_payload(
             raise ArtifactError(
                 "evaluation validation differs from bound selection metrics"
             )
+        expected_reasons = _promotion_reasons_from_evidence(
+            cell,
+            outcome_passed=outcome_passed,
+            evaluation=evaluation,
+        )
+        if reasons != expected_reasons or promotion_eligible is not bool(
+            not expected_reasons
+        ):
+            raise ArtifactError(
+                "qualification promotion eligibility/reasons differ from bound evidence"
+            )
+    else:
+        allowed_reasons = {
+            "runtime_smoke",
+            "raw_codec_requires_unpriced_side_information",
+            "fixed_rate_budget_ineligible",
+            "synthetic_shared_feature_claim_ineligible",
+            "resolved_nonpromotable_cell",
+            "scientific_outcome_failed",
+            "missing_frozen_phase2_selection_decision",
+        }
+        if any(reason not in allowed_reasons for reason in reasons):
+            raise ArtifactError("qualification names an unknown promotion reason")
+        mandatory_reasons = {
+            *(("runtime_smoke",) if is_smoke else ()),
+            *(("resolved_nonpromotable_cell",) if not resolved_promotable else ()),
+            *(("scientific_outcome_failed",) if not outcome_passed else ()),
+            *(
+                ("missing_frozen_phase2_selection_decision",)
+                if (cell.phase is Phase.PHASE3 or "confirmation" in cell.stage)
+                and not cell.decision_map["selection.parent_cell_ids"]
+                else ()
+            ),
+        }
+        if not mandatory_reasons.issubset(reasons):
+            raise ArtifactError(
+                "qualification omits a cell-derived promotion-ineligibility reason"
+            )
     return observed_implementation_sha256
 
 
@@ -588,7 +1012,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     try:
-        os.replace(tmp, path)
+        durable_replace(tmp, path, file_already_synced=True)
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -746,10 +1170,16 @@ class CellLock(AbstractContextManager["CellLock"]):
         self.campaign = campaign
         self.cell_id = cell_id
         self.path = campaign.lock_path(cell_id)
+        self.guard_path = campaign.lock_guard_path(cell_id)
         self.held = False
         self.attempt_id = uuid.uuid4().hex
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._guard_handle: Any | None = None
+        self._metadata_lock = threading.Lock()
+        self._worker_pid: int | None = None
+        self._worker_pgid: int | None = None
+        self._worker_process_identity: str | None = None
 
     def _payload(self, acquired_at: float) -> dict[str, Any]:
         return {
@@ -757,37 +1187,62 @@ class CellLock(AbstractContextManager["CellLock"]):
             "cell_id": self.cell_id,
             "attempt_id": self.attempt_id,
             "pid": os.getpid(),
+            "owner_process_identity": _process_identity(os.getpid()),
             "host": socket.gethostname(),
             "acquired_at": acquired_at,
             "heartbeat_at": float(self.campaign.clock()),
+            "worker_pid": self._worker_pid,
+            "worker_pgid": self._worker_pgid,
+            "worker_process_identity": self._worker_process_identity,
         }
+
+    def _publish(self, acquired_at: float) -> None:
+        with self._metadata_lock:
+            _atomic_json(self.path, self._payload(acquired_at))
 
     def _heartbeat(self, acquired_at: float) -> None:
         interval = self.campaign.lock_heartbeat_seconds
         while not self._stop.wait(interval):
             try:
-                current = _read_json(self.path)
-                if current.get("attempt_id") != self.attempt_id:
-                    return
-                _atomic_json(self.path, self._payload(acquired_at))
+                self._publish(acquired_at)
             except (CampaignError, FileNotFoundError, OSError):
                 return
+
+    def bind_worker(self, *, pid: int, pgid: int) -> None:
+        if not self.held:
+            raise CampaignError("cannot bind a worker to an unheld cell lock")
+        self._worker_pid = int(pid)
+        self._worker_pgid = int(pgid)
+        self._worker_process_identity = _process_identity(pid)
+        self._publish(self._acquired_at)
 
     def __enter__(self) -> "CellLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         acquired_at = float(self.campaign.clock())
-        payload = self._payload(acquired_at)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        self._acquired_at = acquired_at
+        guard_handle = self.guard_path.open("a+", encoding="utf-8")
         try:
-            fd = os.open(self.path, flags, 0o600)
-        except FileExistsError as exc:
+            fcntl.flock(
+                guard_handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            guard_handle.close()
             raise CampaignLocked(f"cell is locked: {self.cell_id}") from exc
+        if self.path.exists():
+            fcntl.flock(guard_handle.fileno(), fcntl.LOCK_UN)
+            guard_handle.close()
+            raise CampaignLocked(
+                f"cell has an unreconciled lock lease: {self.cell_id}"
+            )
+        self._guard_handle = guard_handle
         try:
-            body = (canonical_json(payload) + "\n").encode("utf-8")
-            os.write(fd, body)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            self._publish(acquired_at)
+        except Exception:
+            fcntl.flock(guard_handle.fileno(), fcntl.LOCK_UN)
+            guard_handle.close()
+            self._guard_handle = None
+            raise
         self.held = True
         self._thread = threading.Thread(
             target=self._heartbeat,
@@ -802,13 +1257,18 @@ class CellLock(AbstractContextManager["CellLock"]):
         if self.held:
             self._stop.set()
             if self._thread is not None:
-                self._thread.join(timeout=2.0)
-            try:
-                current = _read_json(self.path)
-                if current.get("attempt_id") == self.attempt_id:
-                    self.path.unlink()
-            except (CampaignError, FileNotFoundError):
-                pass
+                self._thread.join()
+            with self._metadata_lock:
+                try:
+                    current = _read_json(self.path)
+                    if current.get("attempt_id") == self.attempt_id:
+                        self.path.unlink()
+                except (CampaignError, FileNotFoundError):
+                    pass
+            if self._guard_handle is not None:
+                fcntl.flock(self._guard_handle.fileno(), fcntl.LOCK_UN)
+                self._guard_handle.close()
+                self._guard_handle = None
             self.held = False
 
 
@@ -833,6 +1293,8 @@ class Campaign:
         self.blueprint_path = self.root / "blueprint.json"
         self.phase1_decision_path = self.root / "phase1-decision.json"
         self.panel_decision_path = self.root / "panel-decision.json"
+        self.implementation_identity_path = self.root / "implementation-identity.json"
+        self.implementation_identity_lock_path = self.root / ".implementation.lock"
         self._events_cache: tuple[dict[str, Any], ...] | None = None
         self._events_by_cell_cache: dict[str, tuple[dict[str, Any], ...]] = {}
         self._events_cache_signature: tuple[int, int, int, int] | None = None
@@ -984,6 +1446,9 @@ class Campaign:
 
     def lock_path(self, cell_id: str) -> Path:
         return self.root / ".locks" / f"{_slug(cell_id)}.lock"
+
+    def lock_guard_path(self, cell_id: str) -> Path:
+        return self.root / ".locks" / f"{_slug(cell_id)}.guard"
 
     def lock(self, cell_id: str) -> CellLock:
         self._require_cell(cell_id)
@@ -1278,6 +1743,7 @@ class Campaign:
             "plan_sha256",
             "blueprint_sha256",
             "journal_sha256",
+            "journal_sha256_semantics",
             "smoke",
             "plan",
             "blueprint",
@@ -1306,6 +1772,23 @@ class Campaign:
             blueprint.to_manifest()
         ):
             raise CampaignError("Phase-1 decision embeds noncanonical plan evidence")
+        if (
+            manifest.get("plan_sha256")
+            != _run_cell_json_sha256(plan.to_manifest())
+            or manifest.get("blueprint_sha256")
+            != _run_cell_json_sha256(blueprint.to_manifest())
+        ):
+            raise CampaignError("Phase-1 plan/blueprint file hash is stale")
+        if (
+            not isinstance(manifest.get("journal_sha256"), str)
+            or not str(manifest["journal_sha256"]).startswith("sha256:")
+            or not _is_sha256_hex(
+                str(manifest["journal_sha256"]).removeprefix("sha256:")
+            )
+            or manifest.get("journal_sha256_semantics")
+            != "opaque_historical_commitment_requires_trusted_origin"
+        ):
+            raise CampaignError("Phase-1 journal commitment is noncanonical")
         if (
             manifest.get("source_phase1_plan_id") != plan.plan_id
             or payload.get("source_phase1_plan_id") != plan.plan_id
@@ -1410,13 +1893,41 @@ class Campaign:
             )
 
         expected = canonical_prefix
-        replayed_plan_ids = [expected.plan_id]
+        replayed_plans = [expected]
         chain = manifest.get("selection_chain")
         if not isinstance(chain, list) or len(chain) != len(blueprint.rounds):
             raise CampaignError("Phase-1 decision has an incomplete selection chain")
         for index, chain_item in enumerate(chain):
             if not isinstance(chain_item, Mapping):
                 raise CampaignError("Phase-1 selection-chain item must be an object")
+            if set(chain_item) != {
+                "source_plan_id",
+                "source_stage",
+                "target_plan_id",
+                "target_stage",
+                "policy_id",
+                "selection_id",
+                "selection_universe_sha256",
+                "selection_artifact_sha256",
+                "selection_artifact_sha256_semantics",
+                "selection",
+            }:
+                raise CampaignError("Phase-1 selection-chain item is noncanonical")
+            selection_artifact_sha256 = chain_item.get(
+                "selection_artifact_sha256"
+            )
+            if (
+                not isinstance(selection_artifact_sha256, str)
+                or not selection_artifact_sha256.startswith("sha256:")
+                or not _is_sha256_hex(
+                    selection_artifact_sha256.removeprefix("sha256:")
+                )
+                or chain_item.get("selection_artifact_sha256_semantics")
+                != "opaque_historical_commitment_requires_trusted_origin"
+            ):
+                raise CampaignError(
+                    "Phase-1 selection-artifact commitment is noncanonical"
+                )
             source_stage = expected.stages[-1]
             if source_stage.selection_policy is None:
                 raise CampaignError(
@@ -1467,33 +1978,11 @@ class Campaign:
                 "excluded_candidates": replayed_excluded,
             }
             replayed_universe_sha256 = _canonical_sha256(universe_payload)
-            if policy.retain_count is not None:
-                keep = min(len(replayed_candidates), policy.retain_count)
-            else:
-                assert policy.retain_fraction is not None
-                keep = max(
-                    1,
-                    math.ceil(len(replayed_candidates) * policy.retain_fraction),
-                )
-            replayed_selected = list(replayed_candidates[:keep])
-            if (
-                not replayed_smoke
-                and policy.tie_policy == "retain_all_at_cutoff"
-                and keep < len(replayed_candidates)
-            ):
-                cutoff = (
-                    float(replayed_candidates[keep - 1]["median"]),
-                    float(replayed_candidates[keep - 1]["worst_seed"]),
-                )
-                replayed_selected.extend(
-                    candidate
-                    for candidate in replayed_candidates[keep:]
-                    if (
-                        float(candidate["median"]),
-                        float(candidate["worst_seed"]),
-                    )
-                    == cutoff
-                )
+            replayed_selected = _policy_retained_candidates(
+                replayed_candidates,
+                policy,
+                smoke_protocol_only=replayed_smoke,
+            )
             source_cells_by_id = {cell.cell_id: cell for cell in source_stage.cells}
             try:
                 selected_cells = tuple(
@@ -1534,9 +2023,9 @@ class Campaign:
                 raise CampaignError(
                     f"cannot reconstruct Phase-1 selected universe: {exc}"
                 ) from exc
-            if replayed_selections != (selection,):
+            if selection not in replayed_selections:
                 raise CampaignError(
-                    "Phase-1 selection is not the exact policy-ranked winner"
+                    "Phase-1 selection is not among the exact policy-retained winners"
                 )
             if (
                 chain_item.get("source_plan_id") != expected.plan_id
@@ -1615,24 +2104,22 @@ class Campaign:
                     "Phase-1 selection chain does not replay its blueprint"
                 )
             expected = extended
-            replayed_plan_ids.append(expected.plan_id)
+            replayed_plans.append(expected)
         if expected != plan:
             raise CampaignError("Phase-1 decision does not replay to its final plan")
         plan_history = manifest.get("plan_history")
         if (
             not isinstance(plan_history, list)
-            or [
-                item.get("plan_id")
-                for item in plan_history
-                if isinstance(item, Mapping)
-            ]
-            != replayed_plan_ids
-            or len(plan_history) != len(replayed_plan_ids)
+            or len(plan_history) != len(replayed_plans)
             or any(
                 not isinstance(item, Mapping)
-                or not isinstance(item.get("sha256"), str)
-                or not item["sha256"].startswith("sha256:")
-                for item in plan_history
+                or set(item) != {"plan_id", "sha256"}
+                or item.get("plan_id") != replayed.plan_id
+                or item.get("sha256")
+                != _run_cell_json_sha256(replayed.to_manifest())
+                for item, replayed in zip(
+                    plan_history, replayed_plans, strict=True
+                )
             )
         ):
             raise CampaignError("Phase-1 plan-history evidence is incomplete")
@@ -1817,8 +2304,21 @@ class Campaign:
             raise CampaignError(
                 "panel decision has the wrong selection-universe schema"
             )
+        if set(campaign_manifest) != set(PHASE2_CAMPAIGN_MANIFEST_KEYS):
+            raise CampaignError("panel campaign manifest has a noncanonical field set")
+        if set(universe) != set(PHASE2_SELECTION_UNIVERSE_KEYS):
+            raise CampaignError("panel selection universe has a noncanonical field set")
         if not isinstance(campaign_manifest.get("smoke"), bool):
             raise CampaignError("campaign manifest must declare its smoke status")
+        journal_sha256 = campaign_manifest.get("journal_sha256")
+        if (
+            not isinstance(journal_sha256, str)
+            or not journal_sha256.startswith("sha256:")
+            or not _is_sha256_hex(journal_sha256.removeprefix("sha256:"))
+            or campaign_manifest.get("journal_sha256_semantics")
+            != "opaque_historical_commitment_requires_trusted_origin"
+        ):
+            raise CampaignError("panel journal commitment is noncanonical")
         phase1_decision = campaign_manifest.get("phase1_decision")
         if not isinstance(phase1_decision, Mapping):
             raise CampaignError("panel decision lacks its Phase-1 authorization")
@@ -2011,6 +2511,7 @@ class Campaign:
             raise CampaignError(
                 "panel source blueprint does not replay its Phase-1 transfer"
             )
+        _validate_panel_entry_seed_coverage(decision.entries, replay_blueprint.seeds)
         for entry in decision.entries:
             for index, cell in enumerate(entry.source_cells):
                 evidence = cells_by_id.get(cell.cell_id)
@@ -2251,6 +2752,20 @@ class Campaign:
             parent_evidence = cells_by_id.get(str(parent_cell_id))
             if parent_evidence is None:
                 raise CampaignError("confirmation parent lacks campaign evidence")
+            declared_parent_ids = cell.decision_map.get(
+                "selection.parent_cell_ids", ()
+            )
+            if not isinstance(declared_parent_ids, (tuple, list)):
+                raise CampaignError("confirmation cell has malformed parent binding")
+            same_seed_declared_parents = [
+                embedded_cells_by_id.get(str(parent_id))
+                for parent_id in declared_parent_ids
+            ]
+            same_seed_declared_parents = [
+                parent
+                for parent in same_seed_declared_parents
+                if parent is not None and parent.seed == cell.seed
+            ]
             if (
                 row.get("cell_id") != cell.cell_id
                 or row.get("qualification_sha256") != expected_hash
@@ -2258,6 +2773,8 @@ class Campaign:
                 or row.get("parent_qualification_sha256")
                 != qualification_hash(parent_evidence)
                 or parent_evidence.get("seed") != cell.seed
+                or len(same_seed_declared_parents) != 1
+                or same_seed_declared_parents[0].cell_id != parent_cell_id
             ):
                 raise CampaignError("confirmation seed/hash/parent binding mismatch")
             current_qualification = current_evidence["qualification"]
@@ -2313,6 +2830,12 @@ class Campaign:
             guard = row.get("sharing_guard")
             if not isinstance(guard, Mapping):
                 raise CampaignError("confirmation lacks its sharing guard")
+            expected_guard = embedded_sharing_guard(
+                cell,
+                current_metrics,
+                confirmation_policy,
+            )
+            _validate_exact_confirmation_guard(guard, expected_guard)
             trace = guard.get("authenticated_lineage")
             checks = guard.get("checks")
             measurements = guard.get("measurements")
@@ -3146,6 +3669,7 @@ class Campaign:
                 "family_name",
                 "selection_id",
                 "selection_artifact_sha256",
+                "selection_artifact_sha256_semantics",
                 "selection_universe_sha256",
                 "policy_id",
                 "candidate_id",
@@ -3154,6 +3678,23 @@ class Campaign:
             }
             if set(chain_item) != expected_chain_keys:
                 raise CampaignError("panel selection-chain item is noncanonical")
+            selection_artifact_sha256 = chain_item.get(
+                "selection_artifact_sha256"
+            )
+            if selection_artifact_sha256 is not None and (
+                not isinstance(selection_artifact_sha256, str)
+                or not selection_artifact_sha256.startswith("sha256:")
+                or not _is_sha256_hex(
+                    selection_artifact_sha256.removeprefix("sha256:")
+                )
+            ):
+                raise CampaignError("panel selection commitment is malformed")
+            if chain_item.get("selection_artifact_sha256_semantics") != (
+                "not_applicable"
+                if selection_artifact_sha256 is None
+                else "opaque_historical_commitment_requires_trusted_origin"
+            ):
+                raise CampaignError("panel selection commitment is mislabeled")
             candidates = ranked.get("ranked_candidates")
             excluded_candidates = ranked.get("excluded_candidates")
             if (
@@ -3360,12 +3901,21 @@ class Campaign:
             is_validated_duplicate_substitution = (
                 canonical_json(chain_item) in validated_duplicate_substitution_chains
             )
+            retained_candidate_ids = {
+                str(candidate.get("candidate_id", ""))
+                for candidate in _policy_retained_candidates(
+                    candidates,
+                    policy,
+                    smoke_protocol_only=smoke,
+                )
+            }
             if (
-                chain_item.get("candidate_id") != candidates[0].get("candidate_id")
+                str(chain_item.get("candidate_id", ""))
+                not in retained_candidate_ids
                 and not is_validated_duplicate_substitution
             ):
                 raise CampaignError(
-                    "selection chain does not name the top policy-ranked candidate"
+                    "selection chain does not name a policy-retained candidate"
                 )
             if (
                 chain_item.get("branch") == "comparator_family_duplicate_substitute"
@@ -4301,6 +4851,7 @@ class Campaign:
 
     def _append_event(self, event: Mapping[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        journal_existed = self.journal_path.exists()
         body = (canonical_json(event) + "\n").encode("utf-8")
         fd = os.open(
             self.journal_path,
@@ -4332,6 +4883,11 @@ class Campaign:
             )
         finally:
             os.close(fd)
+        if not journal_existed:
+            # The journal fd is fsynced for every append.  Its parent needs an
+            # additional fsync only when this call may have created the entry;
+            # racing first writers may both flush the directory harmlessly.
+            fsync_directory(self.root)
         cached_event = dict(event)
         with self._events_cache_lock:
             if (
@@ -4577,6 +5133,36 @@ class Campaign:
         message: str,
         metadata: Mapping[str, Any] | None,
     ) -> CampaignRecord:
+        if target is RunState.PREPARED:
+            self.root.mkdir(parents=True, exist_ok=True)
+            with self.implementation_identity_lock_path.open(
+                "a+", encoding="utf-8"
+            ) as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                return self._transition_locked_commit(
+                    cell_id,
+                    target,
+                    artifacts=artifacts,
+                    message=message,
+                    metadata=metadata,
+                )
+        return self._transition_locked_commit(
+            cell_id,
+            target,
+            artifacts=artifacts,
+            message=message,
+            metadata=metadata,
+        )
+
+    def _transition_locked_commit(
+        self,
+        cell_id: str,
+        target: RunState,
+        *,
+        artifacts: tuple[ArtifactRef, ...],
+        message: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> CampaignRecord:
         record = self.record(cell_id)
         if target not in LEGAL_TRANSITIONS[record.state]:
             raise InvalidTransition(
@@ -4672,7 +5258,7 @@ class Campaign:
         cell_id: str,
         artifacts: Mapping[str, ArtifactRef],
     ) -> None:
-        """Reject implementation drift as soon as a production cell prepares."""
+        """Atomically pin and audit the exact campaign implementation identity."""
 
         payload = _read_json(artifacts["preparation"].resolve(self.root))
         implementation = payload.get("implementation")
@@ -4681,6 +5267,7 @@ class Campaign:
         # qualification gate; when an identity is present, bind it immediately.
         if implementation is None:
             return
+        cell = self._require_cell(cell_id)
         if (
             payload.get("schema") != PREPARATION_SCHEMA
             or payload.get("cell_id") != cell_id
@@ -4691,7 +5278,11 @@ class Campaign:
             raise ArtifactError(
                 "preparation artifact lacks its schema/cell/implementation binding"
             )
-        observed_digest = _sha256_canonical_payload(implementation)
+        observed_digest = _validate_implementation_identity(
+            implementation,
+            scientific=cell.decision_map["runtime.smoke"] is False,
+        )
+        prior_digests: set[str] = set()
         for planned_cell in self.plan.cells:
             record = self.record(planned_cell.cell_id)
             if record.cell_id == cell_id:
@@ -4708,16 +5299,55 @@ class Campaign:
                 raise ArtifactError(
                     "prepared campaign cell has malformed implementation identity"
                 )
-            other_digest = _sha256_canonical_payload(other_implementation)
-            if other_digest != observed_digest:
+            other_digest = _validate_implementation_identity(
+                other_implementation,
+                scientific=planned_cell.decision_map["runtime.smoke"] is False,
+            )
+            if other_payload.get("implementation_sha256") != other_digest:
                 raise ArtifactError(
-                    "preparation implementation identity differs from an already "
-                    f"prepared campaign cell {record.cell_id}"
+                    f"prepared campaign cell {record.cell_id} has a stale identity hash"
                 )
-            # Every production preparation traverses this gate, so one prior
-            # bound identity is the campaign identity.  Avoid an O(cells^2)
-            # rescan of hundreds of immutable preparation files.
-            break
+            prior_digests.add(other_digest)
+        if prior_digests.difference({observed_digest}):
+            raise ArtifactError(
+                "preparation implementation identity differs from an already "
+                "prepared campaign cell"
+            )
+
+        if self.implementation_identity_path.exists():
+            pinned = _read_json(self.implementation_identity_path)
+            if set(pinned) != {
+                "schema",
+                "implementation_identity",
+                "implementation_identity_sha256",
+            } or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA:
+                raise ArtifactError("campaign implementation pin is noncanonical")
+            pinned_identity = pinned.get("implementation_identity")
+            if not isinstance(pinned_identity, Mapping):
+                raise ArtifactError("campaign implementation pin lacks its identity")
+            pinned_digest = _validate_implementation_identity(
+                pinned_identity,
+                scientific=any(
+                    item.decision_map["runtime.smoke"] is False
+                    for item in self.plan.cells
+                ),
+            )
+            if (
+                pinned.get("implementation_identity_sha256") != pinned_digest
+                or pinned_digest != observed_digest
+            ):
+                raise ArtifactError(
+                    "preparation implementation identity differs from the campaign pin"
+                )
+        else:
+            _write_immutable_json(
+                self.implementation_identity_path,
+                {
+                    "schema": CAMPAIGN_IMPLEMENTATION_SCHEMA,
+                    "implementation_identity": dict(implementation),
+                    "implementation_identity_sha256": observed_digest,
+                },
+            )
 
     def _validate_qualification(
         self,
@@ -4726,7 +5356,7 @@ class Campaign:
     ) -> None:
         """Validate a qualification decision, not merely a metrics report.
 
-        The qualification JSON must have schema ``bsc-qualification-v2``, the
+        The qualification JSON must have schema ``bsc-qualification-v3``, the
         matching cell ID, ``qualified: true``, the complete all-true evidence
         integrity check set, a separately reported scientific outcome, an
         explicit boolean promotion-eligibility decision, and an ``inputs``
@@ -6230,30 +6860,11 @@ class Campaign:
             normalized_evidence,
             sharing_guard_for_cell=self._sharing_guard_result,
         )
-        if policy.retain_count is not None:
-            keep = min(len(candidates), policy.retain_count)
-        else:
-            assert policy.retain_fraction is not None
-            keep = max(1, math.ceil(len(candidates) * policy.retain_fraction))
-        selected_candidates = list(candidates[:keep])
-        if (
-            not smoke_protocol_only
-            and policy.tie_policy == "retain_all_at_cutoff"
-            and keep < len(candidates)
-        ):
-            cutoff = (
-                float(candidates[keep - 1]["median"]),
-                float(candidates[keep - 1]["worst_seed"]),
-            )
-            selected_candidates.extend(
-                candidate
-                for candidate in candidates[keep:]
-                if (
-                    float(candidate["median"]),
-                    float(candidate["worst_seed"]),
-                )
-                == cutoff
-            )
+        selected_candidates = _policy_retained_candidates(
+            candidates,
+            policy,
+            smoke_protocol_only=smoke_protocol_only,
+        )
 
         universe_payload = {
             "plan_id": self.plan.plan_id if source_plan_id is None else source_plan_id,
@@ -6839,6 +7450,9 @@ class Campaign:
                             selection.selection_universe_sha256
                         ),
                         "selection_artifact_sha256": ("sha256:" + selection_ref.sha256),
+                        "selection_artifact_sha256_semantics": (
+                            "opaque_historical_commitment_requires_trusted_origin"
+                        ),
                         "selection": selection.to_dict(),
                     }
                 )
@@ -6967,6 +7581,9 @@ class Campaign:
                 "plan_sha256": "sha256:" + plan_sha256,
                 "blueprint_sha256": "sha256:" + blueprint_sha256,
                 "journal_sha256": "sha256:" + journal_sha256,
+                "journal_sha256_semantics": (
+                    "opaque_historical_commitment_requires_trusted_origin"
+                ),
                 "smoke": smoke,
                 "plan": plan.to_manifest(),
                 "blueprint": blueprint.to_manifest(),
@@ -7573,6 +8190,11 @@ class Campaign:
                         None
                         if selection_ref is None
                         else "sha256:" + selection_ref.sha256
+                    ),
+                    "selection_artifact_sha256_semantics": (
+                        "not_applicable"
+                        if selection_ref is None
+                        else "opaque_historical_commitment_requires_trusted_origin"
                     ),
                     "selection_universe_sha256": (selection.selection_universe_sha256),
                     "policy_id": selection.policy_id,
@@ -8217,6 +8839,9 @@ class Campaign:
                     if journal_path_sha256 is None
                     else "sha256:" + journal_path_sha256
                 ),
+                "journal_sha256_semantics": (
+                    "opaque_historical_commitment_requires_trusted_origin"
+                ),
                 "smoke": smoke,
                 "phase1_decision_sha256": ("sha256:" + phase1_decision_path_sha256),
                 "phase1_decision": phase1_decision,
@@ -8437,39 +9062,103 @@ class Campaign:
             return ()
         now = float(self.clock())
         for path in sorted(lock_root.glob("*.lock")):
+            guard_path = path.with_suffix(".guard")
+            guard_handle = guard_path.open("a+", encoding="utf-8")
             try:
-                payload = _read_json(path)
-                heartbeat = float(payload.get("heartbeat_at", payload["acquired_at"]))
-                cell_id = str(payload["cell_id"])
-            except (CampaignError, KeyError, TypeError, ValueError):
-                heartbeat = path.stat().st_mtime
-                cell_id = path.stem
-                payload = {}
-            if now - heartbeat <= max_age_seconds:
-                continue
-            if payload.get("host") == socket.gethostname():
                 try:
-                    pid = int(payload["pid"])
-                    os.kill(pid, 0)
-                except (KeyError, TypeError, ValueError, ProcessLookupError):
-                    pass
-                except PermissionError:
+                    fcntl.flock(
+                        guard_handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
                     continue
-                else:
+                try:
+                    payload = _read_json(path)
+                    heartbeat = float(
+                        payload.get("heartbeat_at", payload["acquired_at"])
+                    )
+                    cell_id = str(payload["cell_id"])
+                except (CampaignError, KeyError, TypeError, ValueError):
+                    try:
+                        heartbeat = path.stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    cell_id = path.stem
+                    payload = {}
+                if now - heartbeat <= max_age_seconds:
                     continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            event = self._event(
-                "lock_reconciled",
-                cell_id,
-                message="removed stale cell lock",
-                metadata={"age_seconds": now - heartbeat, "lock": str(path)},
-                artifacts=(),
-            )
-            self._append_event(event)
-            reconciled.append(cell_id)
+                worker_terminated = False
+                if payload.get("host") == socket.gethostname():
+                    try:
+                        owner_pid = int(payload["pid"])
+                    except (KeyError, TypeError, ValueError):
+                        owner_pid = -1
+                    if owner_pid > 0 and _process_matches(
+                        owner_pid,
+                        payload.get("owner_process_identity"),
+                    ):
+                        continue
+                    try:
+                        worker_pid = int(payload["worker_pid"])
+                        worker_pgid = int(payload["worker_pgid"])
+                    except (KeyError, TypeError, ValueError):
+                        worker_pid = worker_pgid = -1
+                    worker_identity = payload.get("worker_process_identity")
+                    if (
+                        worker_pid > 0
+                        and worker_pgid > 0
+                        and isinstance(worker_identity, str)
+                        and worker_pgid != os.getpgrp()
+                        and _process_matches(worker_pid, worker_identity)
+                    ):
+                        try:
+                            observed_pgid = os.getpgid(worker_pid)
+                        except ProcessLookupError:
+                            observed_pgid = -1
+                        if observed_pgid == worker_pgid:
+                            try:
+                                os.killpg(worker_pgid, signal.SIGTERM)
+                                worker_terminated = True
+                            except ProcessLookupError:
+                                pass
+                            for _ in range(20):
+                                if not _process_matches(worker_pid, worker_identity):
+                                    break
+                                time.sleep(0.05)
+                            else:
+                                try:
+                                    os.killpg(worker_pgid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                try:
+                    current = _read_json(path)
+                except (CampaignError, FileNotFoundError):
+                    continue
+                if payload and current.get("attempt_id") != payload.get("attempt_id"):
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                event = self._event(
+                    "lock_reconciled",
+                    cell_id,
+                    message="removed stale cell lock lease",
+                    metadata={
+                        "age_seconds": now - heartbeat,
+                        "lock": str(path),
+                        "guard": str(guard_path),
+                        "worker_process_group_terminated": worker_terminated,
+                    },
+                    artifacts=(),
+                )
+                self._append_event(event)
+                reconciled.append(cell_id)
+            finally:
+                try:
+                    fcntl.flock(guard_handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    guard_handle.close()
         return tuple(reconciled)
 
     def _reconcile_plan_projection(self) -> str | None:
@@ -8634,13 +9323,23 @@ class _PersistentCellWorker:
                 stdout=subprocess.PIPE,
                 stderr=self._stderr,
                 bufsize=1,
+                start_new_session=True,
             )
         except Exception:
             self._stderr.close()
             raise
+        self._pgid = self._process.pid
         if self._process.stdin is None or self._process.stdout is None:
             self.close()
             raise CampaignError("persistent run_cell worker lacks control pipes")
+
+    @property
+    def pid(self) -> int:
+        return int(self._process.pid)
+
+    @property
+    def pgid(self) -> int:
+        return int(self._pgid)
 
     def _stderr_tail(self) -> str:
         self._stderr.flush()
@@ -8718,12 +9417,41 @@ class _PersistentCellWorker:
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.terminate()
+                    try:
+                        os.killpg(self._pgid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        process.kill()
+                        try:
+                            os.killpg(self._pgid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         process.wait()
+            # The worker is the session leader.  If it exited without reaping a
+            # descendant, terminate the remainder of its owned process group.
+            try:
+                os.killpg(self._pgid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    os.killpg(self._pgid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                else:
+                    for _ in range(20):
+                        try:
+                            os.killpg(self._pgid, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        try:
+                            os.killpg(self._pgid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
         finally:
             if process.stdout is not None:
                 process.stdout.close()
@@ -8752,6 +9480,21 @@ class CampaignRunner:
         self.module = module
         self.env = dict(env or {})
 
+    def _validate_executor_module(self, cell_ids: Sequence[str]) -> None:
+        if self.module == CANONICAL_CELL_MODULE:
+            return
+        scientific = [
+            cell_id
+            for cell_id in cell_ids
+            if self.campaign._require_cell(cell_id).decision_map["runtime.smoke"]
+            is False
+        ]
+        if scientific:
+            raise CampaignError(
+                "non-smoke scientific cells require the canonical cell executor "
+                f"module {CANONICAL_CELL_MODULE!r}; custom modules are smoke-only"
+            )
+
     def run(
         self,
         *,
@@ -8760,8 +9503,10 @@ class CampaignRunner:
         cell_ids: Sequence[str] | None = None,
         stop_after: str | None = None,
     ) -> RunSummary:
-        if limit is not None and limit < 0:
-            raise CampaignError("limit must be non-negative")
+        if limit is not None and limit <= 0:
+            raise CampaignError("limit must be positive")
+        if limit is not None and cell_ids is not None:
+            raise CampaignError("limit cannot be combined with explicit cell IDs")
         if stop_after is not None and stop_after not in STAGE_TARGETS:
             raise CampaignError(f"unknown stop stage {stop_after!r}")
         if cell_ids is None:
@@ -8781,6 +9526,7 @@ class CampaignRunner:
                     )
         if limit is not None:
             selected = selected[:limit]
+        self._validate_executor_module(selected)
         completed = failed = skipped = 0
         for cell_id in selected:
             try:
@@ -8806,7 +9552,7 @@ class CampaignRunner:
         resume: bool,
         stop_after: str | None,
     ) -> RunState:
-        with self.campaign.lock(cell_id):
+        with self.campaign.lock(cell_id) as cell_lock:
             record = self.campaign.record(cell_id)
             if record.state is RunState.FAILED:
                 if not resume:
@@ -8838,6 +9584,7 @@ class CampaignRunner:
                     try:
                         if worker is None and self._supports_persistent_worker:
                             worker = self._start_worker(cell_id)
+                            cell_lock.bind_worker(pid=worker.pid, pgid=worker.pgid)
                         artifacts = self._invoke(
                             cell_id,
                             stage,

@@ -1189,6 +1189,80 @@ def test_block_auxk_cutoff_ties_choose_lowest_block_indices(
     assert torch.equal(support, expected)
 
 
+def test_group_lasso_fel_aux_uses_preactivation_and_updates_encoder_decoder(device):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=4,
+            block_dim=2,
+            n_sites=1,
+            d_model=4,
+            k=1,
+            selection="dense",
+            code_activation="group_soft_threshold",
+            decoder_constraint="free",
+            decoder_bias=False,
+            group_threshold_effective_init=100.0,
+        )
+    ).to(device)
+    x = torch.randn(
+        8,
+        1,
+        4,
+        generator=torch.Generator().manual_seed(2193),
+    ).to(device)
+    out = model(x)
+    preactivation = model.encode_preactivation(x)
+    assert bool(preactivation.count_nonzero())
+    assert not bool(out.z.count_nonzero())
+    assert not bool(out.mask.any())
+    loss = aux_loss(
+        model,
+        x,
+        out,
+        "fel",
+        dead=None,
+        s_aux=2,
+        encoder_preactivation=preactivation,
+    )
+    assert loss is not None and torch.isfinite(loss)
+    loss.backward()
+    assert model.E is not None and model.E.grad is not None
+    assert model.D is not None and model.D.grad is not None
+    assert bool(model.E.grad.count_nonzero())
+    assert bool(model.D.grad.count_nonzero())
+
+
+def test_fel_aux_fails_closed_when_any_row_cannot_supply_full_width(device):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=4,
+            block_dim=1,
+            n_sites=1,
+            d_model=4,
+            k=1,
+            decoder_constraint="free",
+        )
+    ).to(device)
+    x = torch.zeros(2, 1, 4, device=device)
+    z = torch.ones(2, 4, 1, device=device)
+    selected = torch.tensor(
+        [
+            [True, True, True, False],
+            [True, False, False, False],
+        ],
+        device=device,
+    )
+    out = BSCOutput(
+        torch.zeros_like(x),
+        z,
+        z * selected.unsqueeze(-1),
+        torch.ones(2, 4, device=device),
+        selected,
+    )
+    with pytest.raises(ValueError, match=r"s_aux=2.*minimum=1"):
+        aux_loss(model, x, out, "fel", dead=None, s_aux=2)
+
+
 def test_sasa_release_auxk_cutoff_ties_use_row_major_scalar_coordinate_order(
     device,
     monkeypatch,
@@ -1494,7 +1568,21 @@ def test_auxk_revives_dead_encoders(device):
 
 
 def test_fel_runner_up_aux(device):
-    model = BlockCrosscoder(CFG).to(device)
+    # Exact per-token TopK keeps the tiny fixture's auxiliary capacity
+    # deterministic.  BatchTopK may legitimately concentrate almost every
+    # selected block in one row; the production Fel path now refuses such an
+    # underfilled row instead of silently changing its auxiliary width.
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=G,
+            block_dim=B_DIM,
+            n_sites=S,
+            d_model=D_MODEL,
+            k=3,
+            seed=0,
+            selection="token_topk",
+        )
+    ).to(device)
     trainer = Trainer(model, train_cfg(total_steps=20, aux_variant="fel", s_aux=4))
     history = trainer.fit(planted_batches(device))
     logged = [r for r in history if "aux" in r]

@@ -502,7 +502,9 @@ class Whitener:
         path = Path(path)
         tmp = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, tmp)
-        tmp.rename(path)
+        _fsync_file(tmp)
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
 
     @classmethod
     def load(cls, path: str | Path) -> "Whitener":

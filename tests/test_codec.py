@@ -536,8 +536,74 @@ def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
         assert fitted.meta["canonical_null_dimensions"] == [1]
         assert fitted.lo[0, -1].item() == 0.0
         assert fitted.hi[0, -1].item() == 0.0
+        # A null coordinate has a singleton alphabet.  Both the dense helper
+        # and an adversarially nonzero packet symbol must reconstruct the
+        # exact calibrated constant rather than an epsilon-width interval.
+        probe = torch.zeros(1, 1, 2)
+        probe[..., -1] = 1.0
+        for q in spec.qs:
+            symbols = fitted.quantize_indices(probe, q)
+            assert symbols[..., -1].item() == 0
+            assert fitted.quantize(probe, q)[..., -1].item() == 0.0
+            symbols[..., -1] = (1 << q) - 1
+            assert fitted.dequantize_indices(symbols, q)[..., -1].item() == 0.0
         # Serialized validation binds the exact drop contract.
         Codec.from_payload(fitted.to_payload())
+
+    # Exercise every deployed sparse decoder with an adversarial maximum
+    # symbol in the calibrated null coordinate.  The packet support remains
+    # the encoder-authenticated event stream; only the amplitude is forged.
+    _, events, packets = _encode_batch_all_q_events(original, first, evaluation)
+    zero_public = {
+        q: decode_batch(original, first, packet).clone()
+        for q, packet in packets.items()
+    }
+    zero_multi = {
+        q: value.clone()
+        for q, value in decode_batch_all_q(original, first, packets).items()
+    }
+    zero_trusted = {
+        q: value.clone()
+        for chunk in _decode_trusted_packet_events_q_chunks(
+            original,
+            first,
+            events,
+            packets,
+        )
+        for q, value in chunk.items()
+    }
+    zero_trusted_implicit = {
+        q: value
+        for chunk in _decode_trusted_packet_events_q_chunks(
+            original,
+            first,
+            events,
+            qs=spec.qs,
+        )
+        for q, value in chunk.items()
+    }
+    for q in zero_trusted_implicit:
+        assert torch.equal(zero_trusted_implicit[q], zero_public[q])
+    for q, packet in packets.items():
+        assert not packet.amplitude_symbols[:, -1].any()
+        packet.amplitude_symbols[:, -1] = (1 << q) - 1
+    for q, packet in packets.items():
+        assert torch.equal(decode_batch(original, first, packet), zero_public[q])
+    for q, value in decode_batch_all_q(original, first, packets).items():
+        assert torch.equal(value, zero_multi[q])
+    forged_trusted = {
+        q: value
+        for chunk in _decode_trusted_packet_events_q_chunks(
+            original,
+            first,
+            events,
+            packets,
+        )
+        for q, value in chunk.items()
+    }
+    assert forged_trusted.keys() == zero_trusted.keys()
+    for q in forged_trusted:
+        assert torch.equal(forged_trusted[q], zero_trusted[q])
 
     forged = copy.deepcopy(first.to_payload())
     forged["lo"][0, -1] = 1.0
@@ -556,6 +622,33 @@ def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
             result_second["points"][str(q)]["fvu_pooled"],
             abs=1e-7,
         )
+
+
+def test_quantizer_preserves_tiny_positive_and_exact_zero_spans():
+    torch.manual_seed(2187)
+    model = calibrated(make_model(g=2, b=2, k=1), torch.randn(128, S, D))
+    codec = fit_codec(
+        model,
+        batches_of(torch.randn(128, S, D)),
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=8),
+    )
+    block = int(codec.rank_to_block[0])
+    with torch.no_grad():
+        codec.lo[block, 0] = 0.0
+        codec.hi[block, 0] = 1e-15
+        codec.lo[block, 1] = 0.0
+        codec.hi[block, 1] = 0.0
+    probe = torch.zeros(1, model.cfg.n_blocks, model.cfg.block_dim)
+    probe[0, block] = torch.tensor([1e-9, 1.0])
+    symbols = codec.quantize_indices(probe, 4)
+    reconstructed = codec.quantize(probe, 4)
+    assert symbols[0, block].tolist() == [15, 0]
+    assert reconstructed[0, block, 0].item() == codec.hi[block, 0].item()
+    assert reconstructed[0, block, 1].item() == 0.0
+    assert torch.equal(
+        codec.dequantize_indices(symbols, 4)[0, block],
+        reconstructed[0, block],
+    )
 
 
 def test_floor_exclusion_reported_and_enforced():

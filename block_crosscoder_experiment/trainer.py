@@ -20,8 +20,10 @@ and adapted variants:
     "long_horizon"  an adapted block rule — dead = zero activations over a
                     long accepted-token horizon; same selection mechanics.
     "fel"           Fel-style runner-up AuxK — no dead set; the next
-                    s_aux runner-up blocks (by main-code norm, unselected)
-                    explain the residual with the *main* code;
+                    s_aux runner-up blocks (by encoder-code norm, unselected)
+                    explain the residual with the pre-selection code. The
+                    Group-Lasso bridge uses its explicit pre-shrink affine
+                    carrier because inactive post-shrink codes are zero;
                     alpha = 1/s_aux. This is a hybrid: Fel App. D uses the
                     next-l runner-ups with alpha = 1/l where l is the MAIN
                     block sparsity — faithful only when s_aux = k.
@@ -48,6 +50,7 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
+from .durability import durable_replace
 from .gram import _retract_count_tensor_, gram_residual, site_frobenius_shares
 from .model import (
     BlockCrosscoder,
@@ -965,6 +968,7 @@ def aux_loss(
     observation_mask: torch.Tensor | None = None,
     encoder_observed: torch.Tensor | None = None,
     reconstruction_loss: str = "squared_l2",
+    encoder_preactivation: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """L_aux under the same declared fp32 reduction as L_rec.
 
@@ -1034,14 +1038,39 @@ def aux_loss(
         return masked.pow(2).sum() / B
 
     if variant == "fel":
-        # Runner-up blocks by main-code norm among the unselected; the main
-        # code (not a re-encoding) explains what the selected blocks missed.
-        n_unselected = int(G - out.mask.sum(dim=1).max().item())
-        keep = min(s_aux, n_unselected)
-        if keep <= 0:
-            return None
-        p = out.scores.masked_fill(out.mask, float("-inf"))
-        z_aux = out.z
+        # Appendix-D runner-ups are selected from the encoder carrier. Signed
+        # hard-TopK recipes retain that carrier in ``out.z``. Group shrinkage
+        # does not: every inactive post-shrink code is exact zero, so its
+        # explicitly adapted bridge uses the affine pre-shrink ``u`` instead.
+        # Every token must supply the complete declared auxiliary width; a
+        # variable or silently underfilled AuxK is a different method.
+        unselected_per_row = (~out.mask).sum(dim=1)
+        if bool((unselected_per_row < s_aux).any()):
+            minimum = int(unselected_per_row.min().item())
+            raise ValueError(
+                "fel runner-up auxiliary requires at least "
+                f"s_aux={s_aux} unselected blocks in every row; minimum={minimum}"
+            )
+        keep = s_aux
+        if model.cfg.code_activation == "group_soft_threshold":
+            if encoder_preactivation is None:
+                encoder_preactivation = model.encode_preactivation(
+                    x,
+                    observed=encoder_observed,
+                )
+            if encoder_preactivation.shape != out.z.shape:
+                raise ValueError(
+                    "fel encoder preactivation shape does not match the main code"
+                )
+            z_aux = encoder_preactivation
+            p = z_aux.norm(dim=-1).masked_fill(out.mask, float("-inf"))
+        else:
+            if encoder_preactivation is not None:
+                raise ValueError(
+                    "fel encoder preactivation belongs only to group shrinkage"
+                )
+            p = out.scores.masked_fill(out.mask, float("-inf"))
+            z_aux = out.z
     elif variant == "sasa_release":
         # The inspected SASA release applies a scalar-coordinate AuxK to the
         # original signed preactivations.  A selected signed group activates
@@ -1782,6 +1811,7 @@ class Trainer:
         if cfg.aux_variant != "none" and self._auxiliary_can_have_dead_features(len(x)):
             assert out is not None
             dead = None
+            encoder_preactivation = None
             if cfg.aux_variant in (
                 "sasa",
                 "sasa_release",
@@ -1801,6 +1831,16 @@ class Trainer:
                         window_tokens=cfg.dead_window_tokens,
                         horizon_tokens=cfg.dead_horizon_tokens,
                     )
+            elif (
+                cfg.aux_variant == "fel"
+                and self.fwd.cfg.code_activation == "group_soft_threshold"
+            ):
+                encoder_preactivation = self.fwd.encode_preactivation(
+                    x,
+                    observed=encoder_observed,
+                    validate_observed=False,
+                    _encoder=encoder,
+                )
             l_aux = aux_loss(
                 self.fwd,
                 x,
@@ -1811,6 +1851,7 @@ class Trainer:
                 observation_mask=observed,
                 encoder_observed=encoder_observed,
                 reconstruction_loss=cfg.aux_reconstruction,
+                encoder_preactivation=encoder_preactivation,
             )
             if l_aux is not None:
                 alpha = 1.0 / cfg.s_aux if cfg.aux_variant == "fel" else cfg.alpha_aux
@@ -2290,8 +2331,8 @@ class Trainer:
         if require_native_blocking_save and torch.save is not _NATIVE_TORCH_SAVE:
             raise RuntimeError("checkpoint lineage requires native blocking torch.save")
         save = _NATIVE_TORCH_SAVE if require_native_blocking_save else torch.save
-        save(payload, tmp)  # native blocking write, followed by atomic rename
-        tmp.rename(path)
+        save(payload, tmp)  # native blocking write, followed by durable publication
+        durable_replace(tmp, path)
 
     @classmethod
     def load_checkpoint(

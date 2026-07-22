@@ -28,7 +28,7 @@ model-comparison project.
 Later conditional stages do not exist until a complete, hash-bound selection
 artifact from the preceding stage is verified.
 Phase 2 additionally requires the complete authenticated Phase-1 go/no-go and
-`bsc-phase1-transfer-v2` envelope. Its blueprint binds both the Phase-1
+`bsc-phase1-transfer-v3` envelope. Its blueprint binds both the Phase-1
 decision ID and transfer ID; prose, a cell ID, a copied metric, or an unbound
 preview cannot authorize registration.
 

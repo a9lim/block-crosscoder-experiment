@@ -122,7 +122,7 @@ exit is not evidence by itself.
   normalization modes, zero support, q order/tails, padding/bias, packet
   corruption, and CUDA drift use the gates and benchmark in `design.md`.
   Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
-  Estimator v17 prices the complete fused lifetime and dedicated-stream device
+  Estimator v18 prices the complete fused lifetime and dedicated-stream device
   lookahead without a traversal credit. Training and ordinary metric iterators
   use the same ordered event-bound transfer pipeline. All three calibration
   traversals use separately closed instances of that host/CUDA prefetch
@@ -142,7 +142,7 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v17 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v18 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
@@ -211,7 +211,7 @@ exit is not evidence by itself.
   the fresh parameter shape before PyTorch may accept positional optimizer
   state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
-  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v17
+  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v18
   remains conservative and grants no runtime credit for this optimization.
   Unfactorized map-nuclear cells additionally bind
   `batched_site_gram_reference_guard_d1e-3_e1e-4_v1`; the old site-reducing
@@ -370,6 +370,18 @@ exit is not evidence by itself.
   cursor, and reports.
 - Campaign transitions are append-only and legal; retries cannot overwrite
   earlier attempts.
+- Atomic JSON publication fsyncs both file data and the replaced directory
+  entry. Every journal append fsyncs the journal fd; a possible first creator
+  additionally fsyncs the campaign root, so the authoritative commit cannot
+  survive without its directory entry while ordinary appends avoid redundant
+  directory flushes.
+- A cell lock holds a never-unlinked advisory-lock guard for its whole lifetime
+  and publishes heartbeat/worker ownership through a separate atomic lease.
+  Reconciliation first acquires the guard nonblocking, then re-reads the stale
+  lease; release waits for any in-flight heartbeat. Canonical workers run in a
+  dedicated process group whose PID, PGID, and process-birth identity are bound
+  into that lease and whose descendants receive TERM/KILL on shutdown or stale
+  orphan reconciliation.
 - Append-only is an API/filesystem discipline, not pre-freeze origin
   authentication. A writer who can replace the journal and all matching
   artifacts lies outside the in-process tamper model; freeze proves internal
@@ -380,13 +392,35 @@ exit is not evidence by itself.
   artifact fails verification.
 - Qualification rehashes every prerequisite rather than trusting an artifact
   manifest's claim about itself.
-- Study-v2/blueprint-v4 explicitly refuse legacy study-v1/blueprint-v3 campaign
-  roots with a preservation/migration error. Preparation-v2 and
-  qualification-v2 bind the complete implementation identity and all six
-  qualification inputs. Detached Phase-1/Phase-2 replay reruns the live
-  qualification semantics, and a selection refuses mixed implementation
-  identities across seeds. Every non-smoke phase requires clean committed
-  source before preparation.
+- Study-v3/blueprint-v5 accept only the current prelaunch schema; any older or
+  noncurrent local root remains physically preserved but is not migrated or
+  supported and must be replaced with a fresh root. Preparation-v3 and
+  qualification-v3 bind an exact versioned implementation-identity shape, the
+  exact eleven integrity checks, exact eight scientific checks and margins,
+  cell-derived profile/thresholds, all six qualification inputs, and promotion
+  reasons replayed from the bound evaluation. Detached Phase-1/Phase-2 replay
+  reruns the same qualification semantics and refuses opaque, dirty, uncommitted,
+  or noncanonical scientific identities. A selection refuses mixed
+  implementation identities across seeds.
+- The first preparation atomically creates one immutable campaign-wide
+  implementation pin under a cross-cell lock. Concurrent first preparations
+  with different identities cannot both commit. Every non-smoke phase requires
+  the canonical executor and clean committed source; custom executor modules
+  are smoke-only.
+- Embedded plan, blueprint, and plan-history hashes are recomputed from their
+  canonical JSON evidence. Historical journal and selection-artifact digests
+  that cannot be recomputed from the detached envelope are explicitly labeled
+  opaque commitments requiring a separately trusted origin; they are never
+  described as detached authentication.
+- Detached Phase-2 evidence uses exact campaign-manifest and
+  selection-universe field sets. Every panel entry exactly covers the frozen
+  blueprint seeds, and confirmation rows bind the unique same-seed parent from
+  the cell's immutable `selection.parent_cell_ids` while reusing the exact
+  shared sharing-guard reconstruction.
+- Selection and detached replay call one cutoff/tie-policy implementation, so
+  any cutoff-tied candidate admitted for advancement is also replayable at
+  freeze. Runner limits are strictly positive and cannot be combined with an
+  explicit cell list.
 - Integrity qualification, scientific outcome, and promotion eligibility are
   separate and internally consistent.
 - Structurally inapplicable Phase-1 identification endpoints carry
@@ -415,7 +449,7 @@ exit is not evidence by itself.
   only the named carrier may enter the next stage. Decoded energy is the fixed
   provisional Stiefel score carrier, the three parallel free-decoder score arms
   are nonpromotable, and robustness confirmation is nonselectable.
-- `freeze-phase1` rederives `bsc-phase1-transfer-v2` from the complete campaign
+- `freeze-phase1` rederives `bsc-phase1-transfer-v3` from the complete campaign
   manifest. The transfer binds source plan/blueprint and evidence hashes,
   baseline cells, selection IDs, the hashed universal method contract, the
   hashed provisional carrier, every diagnostic capability qualification
@@ -553,6 +587,17 @@ exit is not evidence by itself.
 - Phase 1 checks native and deployed support association, same-block subspace,
   isolated-input guard, same-block aligned code, precision/recall, deadness,
   split, merge, and nonfinite thresholds.
+- Width-below-truth-rank cells report their exact same-block information
+  ceiling and retain the raw gate. Their calibration-frozen minimum-group
+  support/subspace/code companion is reporting-only and cannot authorize
+  promotion.
+- Pathology association uses content-bound primary `.50/.25` strong/weak
+  cutoffs and the complete declared 3-by-3 reporting-only sensitivity grid;
+  qualification verifies both the cell contract and emitted evidence.
+- Encoder-scale fitting measures postactivation block norm independently of
+  selector geometry, replays a positive bracketed solver, and qualifies only
+  a remeasured `1.0 +/- .001` result. One-shot calibration refuses Group-Lasso
+  shrinkage and signed isolated-loss scores.
 - Phase 2 checks the exact mean score over 256, 384, and 512 total bits/token
   and records the complete zero/2/4/6/8/12/16-bit rate-distortion surface even
   though only the frozen scalar aggregate enters selection.
@@ -566,7 +611,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v17-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v18-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks. Cholesky-QR1 reserves
@@ -580,16 +625,41 @@ exit is not evidence by itself.
 - Local filesystem planning checks live free space unless explicitly overridden
   for planning only.
 - Launch repeats the live storage check without accepting the planning override.
+  It first replays the current phase resource ceilings against the complete
+  loaded plan, so an older registration cannot bypass a tightened estimator or
+  ceiling.
   Input credit is bound to the materialized plan's capture/allocation/view
   contract; stateless Phase 1 receives zero input-store credit, unrelated stores
   receive none, and only verified recorded campaign artifacts receive resume
-  credit.
+  credit. Requirements are grouped by destination device, same-device roles are
+  summed, and cross-device free space is never aggregated. An explicit
+  `--view-root` is part of this binding. If inputs are not yet complete, their
+  remainder is conservatively required on every declared input destination;
+  scientific launch normally has zero such remainder, while planning alone may
+  record the existing override.
+- Capture, derive, and transform fitting run destination-device prewrite gates
+  before their corresponding payload writes and retain the writer's 15% free
+  space floor. Reports distinguish raw free bytes, the reserved floor, and
+  usable bytes above the floor.
 - Phase 3 remains within the frozen 4,002,097,152 optimizer-token
   (4B final plus eight short preflights), 400M-parameter,
   22GB peak-VRAM, 55GB peak-host-RAM, 850GB-storage, and one-week conservative
   compute ceilings.
 - GPU execution is sequential; evaluation does not load another checkpoint
-  alongside a training job on the 24GB device.
+  alongside a training job on the 24GB device. A host-global per-device advisory
+  lock serializes canonical CUDA workers even across distinct campaigns.
+  SIGTERM during matrix dispatch unwinds the runner, closes its isolated worker
+  process group, and restores the caller's prior signal handler.
+- Every materialized derived mode has one exact-key root manifest embedding an
+  authenticated capture contract and binding its transform plus complete split,
+  content, and row streams. Standalone verification rejects a subset, foreign
+  entry, rewritten capture binding, or divergent split.
+- Persistent store-verification receipts live only below the authenticated
+  campaign root. Arbitrary cache-root overrides are refused; reuse requires both
+  an exact file-identity/timestamp fingerprint and bounded deterministic shard
+  content probes before the full checksum may be skipped. These probes narrow
+  silent media-corruption exposure; they do not replace the initial full hash
+  or constitute a later whole-store integrity proof.
 
 ## 7. Required review loop
 

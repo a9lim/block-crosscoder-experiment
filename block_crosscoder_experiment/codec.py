@@ -63,6 +63,7 @@ from typing import NamedTuple, Protocol
 
 import torch
 
+from .durability import durable_replace
 from .model import BSCOutput, BSCSelection
 from .runtime_limits import TRUSTED_DECODE_Q_CHUNK
 
@@ -393,6 +394,27 @@ def _artifact_digest(payload: dict) -> str:
 
     add(payload)
     return h.hexdigest()
+
+
+def _normalized_quantizer_position(
+    values: torch.Tensor,
+    lo: torch.Tensor,
+    hi: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return clipped quantizer positions and the exact serialized span.
+
+    A zero clip span is a constant coordinate, not a numerical interval that
+    may be widened for division.  In particular, canonical-null coordinates
+    are serialized as ``[0, 0]`` and must emit symbol zero and reconstruct
+    exact zero even when evaluation presents out-of-calibration content.  A
+    positive but tiny span likewise retains its actual endpoints.
+    """
+
+    span = hi - lo
+    safe_denominator = torch.where(span > 0, span, torch.ones_like(span))
+    normalized = ((values - lo) / safe_denominator).clamp(0.0, 1.0)
+    normalized = torch.where(span > 0, normalized, torch.zeros_like(normalized))
+    return normalized, span
 
 
 @dataclass
@@ -871,8 +893,7 @@ class Codec:
         levels = (1 << q) - 1
         lo = self._tensor_on("lo", z_can.device)
         hi = self._tensor_on("hi", z_can.device)
-        span = (hi - lo).clamp_min(1e-12)
-        t = ((z_can - lo) / span).clamp(0.0, 1.0)
+        t, span = _normalized_quantizer_position(z_can, lo, hi)
         return lo + torch.round(t * levels) / levels * span
 
     def quantize_indices(self, z_can: torch.Tensor, q: int) -> torch.Tensor:
@@ -880,14 +901,14 @@ class Codec:
         levels = (1 << q) - 1
         lo = self._tensor_on("lo", z_can.device)
         hi = self._tensor_on("hi", z_can.device)
-        span = (hi - lo).clamp_min(1e-12)
-        return torch.round(((z_can - lo) / span).clamp(0, 1) * levels).to(torch.int32)
+        normalized, _ = _normalized_quantizer_position(z_can, lo, hi)
+        return torch.round(normalized * levels).to(torch.int32)
 
     def dequantize_indices(self, symbols: torch.Tensor, q: int) -> torch.Tensor:
         levels = (1 << q) - 1
         lo = self._tensor_on("lo", symbols.device)
         hi = self._tensor_on("hi", symbols.device)
-        return lo + symbols.float() / levels * (hi - lo).clamp_min(1e-12)
+        return lo + symbols.float() / levels * (hi - lo)
 
     def save(self, path: str | Path) -> None:
         """Atomically serialize every calibration-fit codec parameter."""
@@ -896,7 +917,7 @@ class Codec:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         torch.save(payload, tmp)
-        tmp.replace(path)
+        durable_replace(tmp, path)
 
     def to_payload(self) -> dict:
         """Return the complete, internally authenticated consumer payload."""
@@ -1095,10 +1116,12 @@ def _packet_from_events(codec: Codec, events: _PacketEvents, q: int) -> EncodedB
     levels = (1 << q) - 1
     lo = codec._tensor_on("lo", events.canonical_codes.device)[events.original_ids]
     hi = codec._tensor_on("hi", events.canonical_codes.device)[events.original_ids]
-    span = (hi - lo).clamp_min(1e-12)
-    symbols = torch.round(
-        ((events.canonical_codes - lo) / span).clamp(0, 1) * levels
-    ).to(torch.int32)
+    normalized, _ = _normalized_quantizer_position(
+        events.canonical_codes,
+        lo,
+        hi,
+    )
+    symbols = torch.round(normalized * levels).to(torch.int32)
     return EncodedBatch(
         q=q,
         n_tokens=events.n_tokens,
@@ -1335,7 +1358,7 @@ def decode_batch(
     symbols = amplitude_symbols.to(device=device, non_blocking=True)
     lo = codec._tensor_on("lo", device)[ids]
     hi = codec._tensor_on("hi", device)[ids]
-    z_can = lo + symbols.float() / levels * (hi - lo).clamp_min(1e-12)
+    z_can = lo + symbols.float() / levels * (hi - lo)
     z_events = torch.einsum(
         "eji,ej->ei",
         codec._tensor_on("rotation", device)[ids],
@@ -1524,7 +1547,7 @@ def decode_batch_all_q(
     ranks = block_ids.to(device=device, non_blocking=True)
     ids = codec._tensor_on("rank_to_block", device, dtype=torch.long)[ranks]
     lo = codec._tensor_on("lo", device)[ids]
-    span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
+    span = codec._tensor_on("hi", device)[ids] - lo
     symbol_stack = torch.stack(
         [symbols_by_q[q].to(device=device, non_blocking=True) for q in requested]
     )
@@ -1635,13 +1658,15 @@ def _decode_trusted_packet_events_q_chunks(
     ids = events.original_ids
     counts = events.counts
     lo = codec._tensor_on("lo", device)[ids]
-    span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
-    event_rotation = codec._tensor_on("rotation", device)[ids]
-    normalized_codes = (
-        None
-        if packets is not None
-        else ((events.canonical_codes - lo) / span).clamp(0, 1)
+    hi = codec._tensor_on("hi", device)[ids]
+    normalized_codes, span = _normalized_quantizer_position(
+        events.canonical_codes,
+        lo,
+        hi,
     )
+    event_rotation = codec._tensor_on("rotation", device)[ids]
+    if packets is not None:
+        normalized_codes = None
     expanded_counts = counts.to(dtype=torch.long) * b
     event_columns = (
         ids.unsqueeze(1) * b

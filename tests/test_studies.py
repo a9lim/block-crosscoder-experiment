@@ -44,6 +44,8 @@ from block_crosscoder_experiment.studies import (
     PHASE3_RUNTIME_CEILING_SECONDS,
     PHASE3_STORAGE_CEILING_BYTES,
     PHASE3_TRAINING_TOKEN_CEILING,
+    PHASE3_VRAM_CEILING_BYTES,
+    PHASE3_HOST_RAM_CEILING_BYTES,
     RECIPES,
     RELEASE_DIAGNOSTIC_RECIPES,
     REQUIRED_CELL_DECISIONS,
@@ -72,8 +74,10 @@ from block_crosscoder_experiment.studies import (
     build_phase3_blueprint,
     build_phase3_plan,
     build_plan,
+    declared_phase_budget,
     engineering,
     estimate_cell,
+    estimate_activation_store,
     estimate_plan,
     exact,
     materialize_child_plan,
@@ -302,6 +306,34 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
     )
     assert values["model.decoder_norm_geometry"] == "sum_l2"
     assert values["objective.auxiliary"] == "none"
+    group_lasso_aux = {
+        decision.name: decision
+        for decision in PAPER_RECIPES["bsf_group_lasso_appendix_aux"].decisions
+    }["objective.auxiliary"]
+    assert group_lasso_aux.value == "runner_up_blocks"
+    assert group_lasso_aux.lineage is Lineage.ADAPTED
+    assert "pre-shrink" in group_lasso_aux.rationale
+    assert group_lasso_aux.ablation is not None
+    for recipe_name in (
+        "bsf_vanilla_appendix_aux",
+        "bsf_grassmannian_appendix_aux",
+    ):
+        auxiliary = {
+            decision.name: decision for decision in PAPER_RECIPES[recipe_name].decisions
+        }["objective.auxiliary"]
+        assert auxiliary.lineage is Lineage.EXACT
+    family_runner = next(
+        variant
+        for variant in studies_module._family_aux_variants("bsf_group_lasso")
+        if variant.name == "aux_runner_up"
+    )
+    family_runner_decisions = {
+        decision.name: decision for decision in family_runner.decisions
+    }
+    assert family_runner_decisions["factor.family_auxiliary"].lineage is Lineage.NOVEL
+    assert family_runner_decisions["objective.auxiliary"].lineage is Lineage.ADAPTED
+    assert family_runner_decisions["auxiliary.count"].lineage is Lineage.EXACT
+    assert family_runner_decisions["auxiliary.coefficient"].lineage is Lineage.EXACT
     sasa_release = {
         decision.name: decision.value
         for decision in RELEASE_DIAGNOSTIC_RECIPES["sasa_released_code_drift"].decisions
@@ -477,6 +509,10 @@ def test_phase1_selection_uses_qualified_truth_margin_and_untouched_confirmation
             value is False
             for variant, value in promotable.items()
             if variant != round_spec.fixed_carrier_variant
+        )
+        assert all(
+            cell.decision_map["protocol.hyperparameter_tuning"] is False
+            for cell in stage.cells
         )
     final = plan.stages[-1]
     assert {cell.decision_map["evaluation.split"] for cell in final.cells} == {
@@ -1524,29 +1560,11 @@ def test_manifests_are_deterministic_round_trip_and_tamper_evident():
         CellSpec.from_manifest(bad)
 
 
-def test_legacy_v1_manifests_fail_with_explicit_migration_guidance():
-    plan = build_phase1_plan(seeds=(0,), smoke=True)
-    legacy_plan = plan.to_manifest()
-    legacy_plan["schema"] = "bsc-study-v1"
-    with pytest.raises(StudyError, match="legacy bsc-study-v1.*fresh plan"):
-        StudyPlan.from_manifest(legacy_plan)
-
-    legacy_cell = plan.cells[0].to_manifest()
-    legacy_cell["schema"] = "bsc-study-v1"
-    with pytest.raises(StudyError, match="legacy bsc-study-v1.*fresh plan"):
-        CellSpec.from_manifest(legacy_cell)
-
-    legacy_blueprint = build_phase1_blueprint((0,), smoke=True).to_manifest()
-    legacy_blueprint["schema"] = "bsc-blueprint-v3"
-    with pytest.raises(StudyError, match="legacy bsc-blueprint-v3.*fresh"):
-        Phase1Blueprint.from_manifest(legacy_blueprint)
-
-
 def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v17"
+        "dense-linear-memory-v18"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1694,6 +1712,113 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     assert dense_aux_storage - token_aux_storage == (
         dense_tracker_bytes - sasa_tracker_bytes
     )
+
+
+def test_phase_budgets_apply_every_ceiling_only_where_declared() -> None:
+    for phase in (Phase.PHASE1, Phase.PHASE2):
+        budget = declared_phase_budget(phase)
+        assert budget.max_training_tokens is None
+        assert budget.max_parameters is None
+        assert budget.max_storage_bytes is None
+        assert budget.max_compute_flops is None
+        assert budget.max_peak_vram_bytes == PHASE3_VRAM_CEILING_BYTES
+        assert budget.max_peak_host_ram_bytes == PHASE3_HOST_RAM_CEILING_BYTES
+    assert declared_phase_budget(Phase.PHASE3) == Budget(
+        max_training_tokens=PHASE3_TRAINING_TOKEN_CEILING,
+        max_parameters=PHASE3_PARAMETER_CEILING,
+        max_storage_bytes=PHASE3_STORAGE_CEILING_BYTES,
+        max_compute_flops=PHASE3_COMPUTE_CEILING_FLOPS,
+        max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES,
+        max_peak_host_ram_bytes=PHASE3_HOST_RAM_CEILING_BYTES,
+    )
+
+
+def test_v18_prices_tied_encoder_execution_and_exposes_store_projection() -> None:
+    cell = next(
+        cell
+        for cell in build_phase1_plan().cells
+        if cell.decision_map["model.encoder"].startswith("tied")
+    )
+    values = cell.decision_map
+    operational_side = (
+        int(values["model.groups"])
+        * int(values["model.block_width"])
+        * sum(int(item) for item in values["data.site_dims"])
+    )
+    assert estimate_cell(cell).compute_flops == (
+        int(values["data.train_tokens"]) * 2 * operational_side * 6
+    )
+    store_bytes, store_key = estimate_activation_store(cell)
+    assert store_bytes == 0
+    assert store_key[0] == Phase.PHASE1.value
+
+
+def test_v18_prices_polar_and_map_regularizer_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(studies_module, "_evaluation_workspace_bytes", lambda **_: 0)
+    base = next(
+        cell
+        for cell in build_phase1_plan().cells
+        if cell.recipe_name == "bsf_grassmannian_primary"
+    )
+    polar = _replace_decision(base, "model.decoder", "concatenated_stiefel_polar")
+    polar = _replace_decision(
+        polar,
+        "implementation.decoder_retraction_implementation",
+        DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    )
+    free = _replace_decision(base, "model.decoder", "free_scale_controlled")
+    free = _replace_decision(
+        free,
+        "implementation.decoder_retraction_implementation",
+        DECODER_RETRACTION_NOT_APPLICABLE,
+    )
+    values = polar.decision_map
+    groups = int(values["model.groups"])
+    width = int(values["model.block_width"])
+    total_dim = sum(int(item) for item in values["data.site_dims"])
+    expected_polar = (
+        groups * width * total_dim * 4
+        + 4 * (6 * groups * width**2 + width * max(values["data.site_dims"]))
+        + groups * 256 * 1024
+    )
+    assert estimate_cell(polar).peak_vram_bytes - estimate_cell(
+        free
+    ).peak_vram_bytes == expected_polar
+
+    nuclear = next(
+        cell
+        for cell in build_phase1_plan().cells
+        if cell.decision_map["objective.regularizer"] == "end_to_end_map_nuclear"
+    )
+    neutral_values = {
+        "objective.regularizer": "none",
+        "objective.regularizer_coefficient": 0.0,
+        "objective.regularizer_coefficient_mode": "absolute",
+        "objective.regularizer_target_initial_ratio": None,
+        "objective.regularizer_calibration_contract": "not_applicable",
+    }
+    neutral = replace(
+        nuclear,
+        decisions=tuple(
+            replace(decision, value=neutral_values[decision.name])
+            if decision.name in neutral_values
+            else decision
+            for decision in nuclear.decisions
+        ),
+    )
+    values = nuclear.decision_map
+    expected_regularizer = (
+        12
+        * int(values["model.groups"])
+        * int(values["model.block_width"]) ** 2
+        * 4
+        + int(values["model.groups"]) * 256 * 1024
+    )
+    assert estimate_cell(nuclear).peak_vram_bytes - estimate_cell(
+        neutral
+    ).peak_vram_bytes == expected_regularizer
 
 
 def _expected_retraction_implementation(decoder: str) -> str:

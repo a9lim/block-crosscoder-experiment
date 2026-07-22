@@ -1362,11 +1362,13 @@ class BlockCrosscoder(nn.Module):
             x = x - self.c.to(x.dtype).unsqueeze(0)
         return x
 
-    def _finish_encoded_sum(
+    def _finish_encoded_preactivation(
         self,
         z: torch.Tensor,
         keep: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Apply evidence fusion and encoder bias, but no code activation."""
+
         cfg = self.cfg
         if cfg.encoder_fusion == "mean":
             assert keep is not None
@@ -1377,6 +1379,12 @@ class BlockCrosscoder(nn.Module):
         z = z.view(-1, cfg.n_blocks, cfg.block_dim)
         if self.a is not None:
             z = z + self.a
+        return z
+
+    def _activate_code(self, z: torch.Tensor) -> torch.Tensor:
+        """Apply the configured code nonlinearity to one exact preactivation."""
+
+        cfg = self.cfg
         if cfg.code_activation == "relu":
             z = torch.relu(z)
         elif cfg.code_activation == "group_soft_threshold":
@@ -1394,6 +1402,13 @@ class BlockCrosscoder(nn.Module):
             z = z * torch.relu(1.0 - threshold / norm.clamp_min(1e-12))
         return z
 
+    def _finish_encoded_sum(
+        self,
+        z: torch.Tensor,
+        keep: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self._activate_code(self._finish_encoded_preactivation(z, keep))
+
     def _encode_with_tensor(
         self,
         x: torch.Tensor,
@@ -1401,6 +1416,7 @@ class BlockCrosscoder(nn.Module):
         *,
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
+        return_preactivation: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode with an already materialized structured encoder.
 
@@ -1437,7 +1453,12 @@ class BlockCrosscoder(nn.Module):
             cfg.n_latents,
         )
         z = x.reshape(x.shape[0], cfg.n_sites * cfg.d_model) @ W
-        return self._finish_encoded_sum(z, keep), keep
+        finish = (
+            self._finish_encoded_preactivation
+            if return_preactivation
+            else self._finish_encoded_sum
+        )
+        return finish(z, keep), keep
 
     def _encode_factorized_direct(
         self,
@@ -1445,6 +1466,7 @@ class BlockCrosscoder(nn.Module):
         *,
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
+        return_preactivation: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode through ``[S,R]`` and physical ``[R*d,G*b]`` directly."""
 
@@ -1469,7 +1491,12 @@ class BlockCrosscoder(nn.Module):
         # GEMM.  Peak structured weight storage is R*G*b*d rather than S*G*b*d.
         rank_input = torch.matmul(x.transpose(1, 2), self.E_site).transpose(1, 2)
         z = rank_input.reshape(x.shape[0], -1) @ self._encoder_factor_core_map()
-        return self._finish_encoded_sum(z, keep), keep
+        finish = (
+            self._finish_encoded_preactivation
+            if return_preactivation
+            else self._finish_encoded_sum
+        )
+        return finish(z, keep), keep
 
     def _frozen_encoder_sites(
         self,
@@ -1554,6 +1581,42 @@ class BlockCrosscoder(nn.Module):
                 self.encoder_tensor(),
                 observed=observed,
             )
+        return z
+
+    def encode_preactivation(
+        self,
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+        _encoder: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the exact fused affine code before its nonlinearity.
+
+        Hard TopK signed and ReLU recipes normally consume the activated code
+        directly.  The adapted Group-Lasso Appendix-Aux bridge instead needs
+        the affine carrier ``u``: post-shrinkage inactive groups are exact
+        zero and cannot reconstruct a runner-up residual.  An already
+        materialized encoder may be supplied by the trainer so the API does
+        not rebuild structured weights.
+        """
+
+        if self.uses_direct_factorized_execution and _encoder is None:
+            z, _ = self._encode_factorized_direct(
+                x,
+                observed=observed,
+                validate_observed=validate_observed,
+                return_preactivation=True,
+            )
+            return z
+        encoder = self.encoder_tensor() if _encoder is None else _encoder
+        z, _ = self._encode_with_tensor(
+            x,
+            encoder,
+            observed=observed,
+            validate_observed=validate_observed,
+            return_preactivation=True,
+        )
         return z
 
     @staticmethod
@@ -2396,17 +2459,32 @@ class BlockCrosscoder(nn.Module):
     def calibrate_encoder_scale_(
         self, x: torch.Tensor, *, per_block: bool = True, eps: float = 1e-12
     ) -> None:
-        """Scale the encoder so initial selection scores are comparable
-        across blocks. Fel App. D prescribes
-        transpose-tied init with encoder scale calibration in broad terms;
-        the per-block median equalization here is BSC-specific. Preserves
-        the global scale the tied Gram-constrained init already gives.
+        """One-shot equalize positive homogeneous selection scores by block.
+
+        This convenience method is intentionally narrower than the campaign's
+        replayed global calibration.  A signed score or nonlinear group shrink
+        destroys the multiplicative identity used here and must use a measured
+        solver instead of an analytically inferred post-fit value.
         """
-        p = self.scores(self.encode(x), x=x)  # [B, G]
         if self.cfg.encoder_mode == "tied":
             # Fel Grassmannian has one learned gamma, not per-block scales.
             return
-        mean_p = p.mean(dim=0).clamp_min(eps)  # [G]
+        if self.cfg.code_activation == "group_soft_threshold":
+            raise ValueError(
+                "one-shot encoder calibration is invalid after group soft "
+                "thresholding; use a remeasured global solver"
+            )
+        if self.cfg.selection_score == "isolated_loss_decrease":
+            raise ValueError(
+                "one-shot encoder calibration requires a nonnegative homogeneous score"
+            )
+        p = self.scores(self.encode(x), x=x)  # [B, G]
+        mean_p = p.mean(dim=0)  # [G]
+        if not bool(torch.isfinite(mean_p).all()) or bool((mean_p <= eps).any()):
+            raise ValueError(
+                "one-shot encoder calibration requires every mean score to be "
+                "finite and strictly positive"
+            )
         if self.cfg.site_rank is not None and per_block:
             raise ValueError(
                 "per-block encoder calibration is not representable by a "
