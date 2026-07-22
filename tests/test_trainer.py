@@ -194,6 +194,60 @@ def test_step_releases_dead_forward_branches_before_backward(monkeypatch):
     assert checked
 
 
+def test_trainer_detaches_unconsumed_score_graph_without_changing_trajectory(
+    monkeypatch,
+):
+    base = BlockCrosscoder(CFG)
+    training = train_cfg(total_steps=3, log_every=1)
+    optimized = Trainer(copy.deepcopy(base), training)
+    reference = Trainer(copy.deepcopy(base), training)
+    original_forward = reference.fwd.forward_with_materialized
+
+    def force_score_grad(*args, **kwargs):
+        kwargs["_score_grad"] = True
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(
+        reference.fwd,
+        "forward_with_materialized",
+        force_score_grad,
+    )
+    batches = planted_batches("cpu", n_batches=3, batch=32)
+    optimized_records = [optimized.step(batch) for batch in batches]
+    reference_records = [reference.step(batch) for batch in batches]
+    _assert_nested_exact(optimized_records, reference_records)
+    _assert_nested_exact(optimized.master.state_dict(), reference.master.state_dict())
+    _assert_nested_exact(optimized.opt.state_dict(), reference.opt.state_dict())
+
+
+def test_trainer_retains_score_graph_for_positive_crosscoder_l1(monkeypatch):
+    cfg = BSCConfig(
+        n_blocks=8,
+        block_dim=1,
+        n_sites=2,
+        d_model=6,
+        k=2,
+        selection="batch_topk",
+        code_activation="relu",
+        selection_score="decoder_weighted",
+        decoder_constraint="free",
+        regularizer="crosscoder_l1",
+        lambda_regularizer=1e-3,
+    )
+    trainer = Trainer(BlockCrosscoder(cfg), train_cfg(total_steps=2))
+    original_scores = trainer.fwd.scores
+    observed_requires_grad: list[bool] = []
+
+    def observed_scores(*args, **kwargs):
+        result = original_scores(*args, **kwargs)
+        observed_requires_grad.append(result.requires_grad)
+        return result
+
+    monkeypatch.setattr(trainer.fwd, "scores", observed_scores)
+    trainer.step(torch.randn(24, 2, 6), materialize_record=False)
+    assert observed_requires_grad == [True]
+
+
 def test_optimizer_numerics_are_explicitly_frozen():
     model = BlockCrosscoder(CFG)
     cfg = train_cfg(total_steps=1, eps=3e-8, foreach=False, fused=False)

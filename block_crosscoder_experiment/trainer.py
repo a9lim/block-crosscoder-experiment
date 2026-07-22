@@ -1649,6 +1649,10 @@ class Trainer:
             x,
             observed=encoder_observed,
             validate_observed=False,
+            _score_grad=(
+                self.fwd.cfg.lambda_regularizer > 0
+                and self.fwd.cfg.regularizer == "crosscoder_l1"
+            ),
         )
         # The target mask is the true data-availability mask, not the stochastic
         # augmentation mask: hidden clean sites remain reconstruction targets.

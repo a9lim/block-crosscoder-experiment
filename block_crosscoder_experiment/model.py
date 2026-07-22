@@ -1920,6 +1920,7 @@ class BlockCrosscoder(nn.Module):
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
         _encoder_sites: _FrozenEncoderSites | None = None,
+        _score_grad: bool = True,
     ) -> tuple[BSCOutput, torch.Tensor | None, torch.Tensor | None]:
         """Forward plus any materialized structured weights used by that pass.
 
@@ -1937,6 +1938,7 @@ class BlockCrosscoder(nn.Module):
             _encoder=_encoder,
             _score_geometry=_score_geometry,
             _encoder_sites=_encoder_sites,
+            _score_grad=_score_grad,
         )
         xhat = self.decode(selection.z_selected, _decoder=decoder)
         return BSCOutput(xhat, *selection), decoder, encoder
@@ -1952,6 +1954,7 @@ class BlockCrosscoder(nn.Module):
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
         _encoder_sites: _FrozenEncoderSites | None = None,
+        _score_grad: bool = True,
     ) -> tuple[BSCSelection, torch.Tensor | None, torch.Tensor | None]:
         """Encode and select without paying for an unused dense decode.
 
@@ -1973,12 +1976,13 @@ class BlockCrosscoder(nn.Module):
                 observed=observed,
                 validate_observed=validate_observed,
             )
-            scores = self.scores(
-                z,
-                x=x,
-                observed=observed,
-                _observation_keep=keep,
-            )
+            with torch.set_grad_enabled(torch.is_grad_enabled() and _score_grad):
+                scores = self.scores(
+                    z,
+                    x=x,
+                    observed=observed,
+                    _observation_keep=keep,
+                )
             mask = self._select_scores(scores, mode=mode, z=z)
             z_selected = z * mask.unsqueeze(-1)
             return BSCSelection(z, z_selected, scores, mask), None, None
@@ -2007,14 +2011,15 @@ class BlockCrosscoder(nn.Module):
                 observed=observed,
                 validate_observed=validate_observed,
             )
-        scores = self.scores(
-            z,
-            x=x,
-            observed=observed,
-            _decoder=decoder,
-            _observation_keep=keep,
-            _score_geometry=_score_geometry,
-        )
+        with torch.set_grad_enabled(torch.is_grad_enabled() and _score_grad):
+            scores = self.scores(
+                z,
+                x=x,
+                observed=observed,
+                _decoder=decoder,
+                _observation_keep=keep,
+                _score_geometry=_score_geometry,
+            )
         mask = self._select_scores(scores, mode=mode, z=z)
         z_selected = z * mask.unsqueeze(-1)
         return BSCSelection(z, z_selected, scores, mask), decoder, encoder
