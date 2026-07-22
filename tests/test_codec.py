@@ -18,6 +18,7 @@ from block_crosscoder_experiment.codec import (
     _decode_trusted_packet_events_q_chunks,
     _encode_batch_all_q_events,
     _evaluate_rd_stream,
+    _grouped_coordinate_quantiles,
     _packet_from_output,
     _rotate_multi_q_events,
     decode_batch,
@@ -98,6 +99,45 @@ def test_codec_fits_and_evaluates():
     assert res["zero_rate"]["fvu_pooled"] == 1.0
     assert p4["rate_bits_per_token"] >= p4["amplitude_bits_per_token"]
     assert len(p4["rate_bits_ci95"]) == 2
+
+
+def test_grouped_coordinate_quantiles_are_bitwise_exact_and_bounded():
+    generator = torch.Generator().manual_seed(1900)
+    counts = torch.tensor((3, 11, 2, 19, 5, 7), dtype=torch.long)
+    ids = torch.repeat_interleave(torch.arange(len(counts)), counts)
+    codes = torch.randn(int(counts.sum()), 4, generator=generator)
+    order = torch.randperm(len(codes), generator=generator)
+    ids = ids[order]
+    codes = codes[order]
+    sort_order = torch.argsort(ids)
+    sorted_ids = ids[sort_order]
+    sorted_codes = codes[sort_order]
+    boundaries = torch.searchsorted(
+        sorted_ids,
+        torch.arange(len(counts) + 1),
+    )
+    groups = torch.tensor((0, 1, 3, 5))
+    quantiles = torch.tensor((0.001, 0.999))
+    actual = _grouped_coordinate_quantiles(
+        sorted_codes,
+        boundaries,
+        groups,
+        quantiles,
+        # Force several differently shaped padded chunks.
+        max_pad_elements=80,
+    )
+    expected = torch.stack(
+        [
+            torch.quantile(
+                sorted_codes[boundaries[group] : boundaries[group + 1]],
+                quantiles,
+                dim=0,
+            )
+            for group in groups
+        ],
+        dim=1,
+    )
+    assert torch.equal(actual, expected)
 
 
 def test_factorized_codec_pipeline_never_materializes_site_weights(monkeypatch):

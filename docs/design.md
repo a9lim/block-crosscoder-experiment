@@ -941,10 +941,11 @@ space: sparse packet rows multiply `D_core` and then project through `D_site`.
 At rank one, the 2,048-token threshold-select kernel falls from `2.147` to
 `.878 ms` (`2.445x`); four-batch R-D evaluation falls from `22.866` to
 `15.959 ms` (`30.21%`, `1.433x`), and codec-fit/evaluation peaks each fall by
-`192.0 MiB`. The one-time codec fit is presently CPU-quantile-bound and rises
-from `73.311` to `81.810 ms`; this measured regression is retained here rather
-than hidden because using a superseded materialized selector would disagree
-with the canonical rank-space threshold contract.
+`192.0 MiB`. Codec fitting batches ragged per-group coordinate quantiles in a
+bounded NaN-padded workspace; it is bitwise identical to the scalar group loop
+and preserves the complete artifact hash. This reduces rank-space fit time
+from `67.340` to `28.712 ms` (`57.36%`, `2.345x`) and improves on the original
+materialized fit's `73.311 ms` by `60.84%` (`2.553x`).
 
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M

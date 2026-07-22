@@ -100,6 +100,10 @@ _CODEC_PAYLOAD_KEYS = {
 # selected calibration events.  At the publication block width (b=4), this is
 # a 32 MiB outer-product slab plus a small code-conversion buffer.
 _CALIBRATION_MOMENT_CHUNK = 262_144
+# Batched ragged quantiles replace thousands of tiny torch.quantile calls while
+# bounding the NaN-padded workspace to 32 MiB of fp32 values. A single unusually
+# frequent group may exceed this cap only by its own unavoidable event payload.
+_CALIBRATION_QUANTILE_PAD_MAX_ELEMENTS = 8 << 20
 
 
 def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int:
@@ -112,6 +116,65 @@ def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int
     return selected_events * (32 + 24 * block_dim) + moment_events * (
         8 * block_dim * block_dim + 8 * block_dim
     )
+
+
+def _grouped_coordinate_quantiles(
+    sorted_codes: torch.Tensor,
+    boundaries: torch.Tensor,
+    groups: torch.Tensor,
+    quantiles: torch.Tensor,
+    *,
+    max_pad_elements: int = _CALIBRATION_QUANTILE_PAD_MAX_ELEMENTS,
+) -> torch.Tensor:
+    """Exact per-group quantiles through bounded ragged batches."""
+
+    if sorted_codes.ndim != 2 or boundaries.ndim != 1 or groups.ndim != 1:
+        raise ValueError("grouped quantile tensors have invalid rank")
+    if max_pad_elements <= 0:
+        raise ValueError("grouped quantile workspace bound must be positive")
+    block_dim = sorted_codes.shape[1]
+    group_ids = [int(group) for group in groups]
+    result = torch.empty(
+        len(quantiles),
+        len(group_ids),
+        block_dim,
+        dtype=sorted_codes.dtype,
+        device=sorted_codes.device,
+    )
+    cursor = 0
+    while cursor < len(group_ids):
+        stop = cursor
+        max_count = 0
+        while stop < len(group_ids):
+            group = group_ids[stop]
+            count = int(boundaries[group + 1] - boundaries[group])
+            if count <= 0:
+                raise ValueError("quantile group has no calibration events")
+            candidate_max = max(max_count, count)
+            candidate_elements = (stop - cursor + 1) * candidate_max * block_dim
+            if stop > cursor and candidate_elements > max_pad_elements:
+                break
+            max_count = candidate_max
+            stop += 1
+
+        chunk_groups = group_ids[cursor:stop]
+        padded = torch.full(
+            (len(chunk_groups), max_count, block_dim),
+            float("nan"),
+            dtype=sorted_codes.dtype,
+            device=sorted_codes.device,
+        )
+        for local_index, group in enumerate(chunk_groups):
+            start = int(boundaries[group])
+            end = int(boundaries[group + 1])
+            padded[local_index, : end - start] = sorted_codes[start:end]
+        result[:, cursor:stop] = torch.nanquantile(
+            padded,
+            quantiles.to(device=sorted_codes.device, dtype=sorted_codes.dtype),
+            dim=1,
+        )
+        cursor = stop
+    return result
 
 
 def _artifact_digest(payload: dict) -> str:
@@ -1414,12 +1477,16 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     sorted_ids = ids[order]
     sorted_codes = codes_can[order]
     boundaries = torch.searchsorted(sorted_ids, torch.arange(G + 1, dtype=torch.long))
-    boundary_values = boundaries.tolist()
     qs = torch.tensor([spec.clip_lo, spec.clip_hi])
-    for g in included.nonzero().flatten().tolist():
-        seg = sorted_codes[boundary_values[g] : boundary_values[g + 1]]
-        ql = torch.quantile(seg, qs, dim=0)
-        lo[g], hi[g] = ql[0], ql[1]
+    quantile_groups = (included & (block_events > 0)).nonzero().flatten()
+    grouped_quantiles = _grouped_coordinate_quantiles(
+        sorted_codes,
+        boundaries,
+        quantile_groups,
+        qs,
+    )
+    lo[quantile_groups] = grouped_quantiles[0]
+    hi[quantile_groups] = grouped_quantiles[1]
     # Count model: add-one smoothing over the *entire legal alphabet*
     # [0, G_included].  Tail clamping is not a code: an unseen but legal
     # count must still have a distinct decodable symbol.
