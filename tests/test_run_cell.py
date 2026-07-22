@@ -24,7 +24,10 @@ from block_crosscoder_experiment.campaign import (
 from block_crosscoder_experiment.cli.run_cell import (
     CellExecutionError,
     _Context,
+    _FileFingerprint,
     _RawEndpointErrorCache,
+    _RetainedArtifactKey,
+    _StageExecutionCache,
     _VERIFIED_STORE_BINDINGS,
     _accumulate_chunked_recovery_association,
     _apply_encoder_scale_calibration,
@@ -116,6 +119,101 @@ import block_crosscoder_experiment.cli.run_cell as run_cell_module
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+class _WeakrefableCacheOwner:
+    pass
+
+
+def _retained_cache_key() -> _RetainedArtifactKey:
+    return _RetainedArtifactKey(
+        cell_id="cell-a",
+        producer_stage="train",
+        consumer_stage="calibrate",
+        artifact_kind="checkpoint",
+        canonical_path="/immutable/cell-a/checkpoint.pt",
+        sha256="a" * 64,
+        size_bytes=101,
+        fingerprint=_FileFingerprint(
+            device=11,
+            inode=22,
+            size_bytes=101,
+            mtime_ns=33,
+            ctime_ns=44,
+        ),
+        model_config_sha256="b" * 64,
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    (
+        "cell_id",
+        "producer_stage",
+        "consumer_stage",
+        "artifact_kind",
+        "canonical_path",
+        "sha256",
+        "size_bytes",
+        "fingerprint.device",
+        "fingerprint.inode",
+        "fingerprint.size_bytes",
+        "fingerprint.mtime_ns",
+        "fingerprint.ctime_ns",
+        "model_config_sha256",
+    ),
+)
+def test_retained_checkpoint_refuses_every_cache_key_mismatch(
+    changed_field: str,
+) -> None:
+    expected = _retained_cache_key()
+    if changed_field.startswith("fingerprint."):
+        field = changed_field.removeprefix("fingerprint.")
+        actual = replace(
+            expected,
+            fingerprint=replace(
+                expected.fingerprint,
+                **{field: getattr(expected.fingerprint, field) + 1},
+            ),
+        )
+    else:
+        value = getattr(expected, changed_field)
+        actual = replace(
+            expected,
+            **{
+                changed_field: (
+                    value + 1 if isinstance(value, int) else value + "-changed"
+                )
+            },
+        )
+    cache = _StageExecutionCache()
+    cache.remember_checkpoint(actual, _WeakrefableCacheOwner(), {})
+    with pytest.raises(
+        CellExecutionError,
+        match="binding differs from journaled artifact",
+    ):
+        cache.take_checkpoint(expected)
+    assert cache.checkpoint is None
+
+
+def test_retained_deployment_refuses_a_live_calibration_model() -> None:
+    cache = _StageExecutionCache()
+    key = _retained_cache_key()
+    producer = _WeakrefableCacheOwner()
+    cache.remember_deployment(
+        key,
+        {},
+        _WeakrefableCacheOwner(),
+        object(),
+        {},
+        producer_model=producer,
+    )
+    with pytest.raises(
+        CellExecutionError,
+        match="calibration model remains live before retained evaluation",
+    ):
+        cache.take_deployment(key)
+    assert cache.deployment is None
 
 
 def test_immutable_torch_save_is_byte_exact_across_fresh_processes(
@@ -711,10 +809,10 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
         persistent_refs["preparation"].resolve(persistent.root).read_text()
     )
     assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v7"
+        "bsc-cell-executor-v8"
     )
     assert preparation["implementation"]["executor_process_model"] == (
-        "persistent_cell_stage_handshake_v1"
+        "persistent_durable_consumer_handoff_v2"
     )
 
 

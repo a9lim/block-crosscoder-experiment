@@ -17,6 +17,7 @@ import argparse
 import copy
 from contextlib import closing
 import functools
+import gc
 import hashlib
 import importlib.metadata
 import itertools
@@ -28,6 +29,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import weakref
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -126,8 +128,8 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v7"
-EXECUTOR_PROCESS_MODEL = "persistent_cell_stage_handshake_v1"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v8"
+EXECUTOR_PROCESS_MODEL = "persistent_durable_consumer_handoff_v2"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -879,6 +881,146 @@ class _Context:
             kind: (self.verify_ref(raw_refs[kind]), str(raw_refs[kind]["sha256"]))
             for kind in required
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedArtifactKey:
+    cell_id: str
+    producer_stage: str
+    consumer_stage: str
+    artifact_kind: str
+    canonical_path: str
+    sha256: str
+    size_bytes: int
+    fingerprint: _FileFingerprint
+    model_config_sha256: str
+
+
+@dataclass(slots=True)
+class _RetainedCheckpointModel:
+    key: _RetainedArtifactKey
+    model: BlockCrosscoder
+    metadata: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _RetainedDeploymentConsumer:
+    key: _RetainedArtifactKey
+    deployment: dict[str, Any]
+    model: BlockCrosscoder
+    codec: Codec
+    training_summary: dict[str, int]
+    producer_model_ref: weakref.ReferenceType[BlockCrosscoder]
+
+
+class _StageExecutionCache:
+    """Retain only consumers reconstructed from immutable durable bytes."""
+
+    def __init__(self) -> None:
+        self.checkpoint: _RetainedCheckpointModel | None = None
+        self.deployment: _RetainedDeploymentConsumer | None = None
+
+    @staticmethod
+    def _release_unused_model_memory() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def remember_checkpoint(
+        self,
+        key: _RetainedArtifactKey,
+        model: BlockCrosscoder,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        if self.checkpoint is not None or self.deployment is not None:
+            raise CellExecutionError("retained-consumer cache is not empty after train")
+        self.checkpoint = _RetainedCheckpointModel(key, model, dict(metadata))
+
+    def take_checkpoint(
+        self,
+        expected: _RetainedArtifactKey,
+    ) -> tuple[BlockCrosscoder, dict[str, Any]] | None:
+        entry = self.checkpoint
+        self.checkpoint = None
+        if entry is None:
+            return None
+        if entry.key != expected:
+            del entry
+            self._release_unused_model_memory()
+            raise CellExecutionError(
+                "retained checkpoint model binding differs from journaled artifact"
+            )
+        return entry.model, entry.metadata
+
+    def remember_deployment(
+        self,
+        key: _RetainedArtifactKey,
+        deployment: Mapping[str, Any],
+        model: BlockCrosscoder,
+        codec: Codec,
+        training_summary: Mapping[str, int],
+        *,
+        producer_model: BlockCrosscoder,
+    ) -> None:
+        if self.checkpoint is not None or self.deployment is not None:
+            raise CellExecutionError(
+                "retained-consumer cache is not empty after calibration"
+            )
+        self.deployment = _RetainedDeploymentConsumer(
+            key,
+            dict(deployment),
+            model,
+            codec,
+            dict(training_summary),
+            weakref.ref(producer_model),
+        )
+
+    def take_deployment(
+        self,
+        expected: _RetainedArtifactKey,
+    ) -> tuple[dict[str, Any], BlockCrosscoder, Codec, dict[str, int]] | None:
+        entry = self.deployment
+        self.deployment = None
+        if entry is None:
+            return None
+        gc.collect()
+        if entry.producer_model_ref() is not None:
+            raise CellExecutionError(
+                "calibration model remains live before retained evaluation"
+            )
+        if entry.key != expected:
+            del entry
+            self._release_unused_model_memory()
+            raise CellExecutionError(
+                "retained deployment binding differs from journaled artifact"
+            )
+        return entry.deployment, entry.model, entry.codec, entry.training_summary
+
+
+def _retained_artifact_key(
+    ctx: _Context,
+    *,
+    producer_stage: str,
+    consumer_stage: str,
+    artifact_kind: str,
+    path: Path,
+    sha256: str,
+    fingerprint: _FileFingerprint,
+    model_cfg: Mapping[str, Any],
+) -> _RetainedArtifactKey:
+    return _RetainedArtifactKey(
+        cell_id=ctx.cell.cell_id,
+        producer_stage=producer_stage,
+        consumer_stage=consumer_stage,
+        artifact_kind=artifact_kind,
+        canonical_path=str(path.resolve()),
+        sha256=sha256,
+        size_bytes=fingerprint.size_bytes,
+        fingerprint=fingerprint,
+        model_config_sha256=hashlib.sha256(
+            canonical_json(dict(model_cfg)).encode("utf-8")
+        ).hexdigest(),
+    )
 
 
 def _device(ctx: _Context) -> torch.device:
@@ -4227,7 +4369,10 @@ def _binding(
 
 
 def _validate_final_checkpoint(
-    path: Path, binding: Mapping[str, Any]
+    path: Path,
+    binding: Mapping[str, Any],
+    *,
+    retain_model_state: bool = False,
 ) -> dict[str, Any]:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -4315,7 +4460,7 @@ def _validate_final_checkpoint(
         or not bool(torch.isfinite(previous_shares).all())
     ):
         raise CellExecutionError("final checkpoint lacks exact diagnostic state")
-    return {
+    metadata = {
         "model_cfg": payload.get("model_cfg"),
         "train_cfg": payload.get("train_cfg"),
         "run_binding": payload.get("run_binding"),
@@ -4325,6 +4470,12 @@ def _validate_final_checkpoint(
         "optimizer_kind": optimizer_kind,
         "terminal_log": dict(history[-1]) if history else None,
     }
+    if retain_model_state:
+        model_state = payload.get("model")
+        if not isinstance(model_state, dict) or not model_state:
+            raise CellExecutionError("final checkpoint lacks retained model state")
+        metadata["_retained_model_state"] = dict(model_state)
+    return metadata
 
 
 def _training_report_payload(
@@ -4376,6 +4527,28 @@ def _training_report_payload(
     }
 
 
+def _model_from_validated_checkpoint_state(
+    model_cfg: Mapping[str, Any],
+    model_state: Mapping[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> BlockCrosscoder:
+    cfg_payload = dict(model_cfg)
+    if cfg_payload.get("site_dims") is not None:
+        cfg_payload["site_dims"] = tuple(cfg_payload["site_dims"])
+    try:
+        model = BlockCrosscoder(BSCConfig(**cfg_payload), device=device)
+        if set(model_state) != set(model.state_dict()):
+            raise ValueError("model state field set differs from resolved model")
+        model.load_state_dict(model_state, strict=True)
+        model.validate_decoded_energy_implementation()
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise CellExecutionError(
+            f"cannot retain model from validated checkpoint bytes: {exc}"
+        ) from exc
+    return model.eval()
+
+
 def _seed_fresh_training_rng(seed: int) -> None:
     """Seed every RNG captured by Trainer before a fresh optimization run."""
 
@@ -4393,6 +4566,7 @@ def _train(
     prerequisites: Mapping[str, tuple[Path, str]],
     *,
     resume: bool,
+    execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
     preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
     device = _device(ctx)
@@ -4541,6 +4715,7 @@ def _train(
     else:
         _seed_fresh_training_rng(int(ctx.values["random.model_seed"]))
         trainer = Trainer(model, train_cfg, run_binding=binding)
+        model = None
 
     start_token = int(trainer.data_cursor.get("next_token", trainer.accepted_tokens))
     if start_token != trainer.accepted_tokens:
@@ -4623,7 +4798,17 @@ def _train(
     # no point do we retain two complete optimizer checkpoints for one cell.
     trainer.save_checkpoint(ctx.progress)
     ctx.progress.replace(ctx.checkpoint)
-    metadata = _validate_final_checkpoint(ctx.checkpoint, binding)
+    checkpoint_before_validation = _FileFingerprint.from_path(ctx.checkpoint)
+    metadata = _validate_final_checkpoint(
+        ctx.checkpoint,
+        binding,
+        retain_model_state=execution_cache is not None,
+    )
+    retained_model_state = metadata.pop("_retained_model_state", None)
+    checkpoint_hash = ctx.artifact_sha256(ctx.checkpoint)
+    checkpoint_after_validation = _FileFingerprint.from_path(ctx.checkpoint)
+    if checkpoint_after_validation != checkpoint_before_validation:
+        raise CellExecutionError("final checkpoint changed while validating")
     if metadata["data_cursor"].get("next_token") != start_token:
         raise CellExecutionError("final checkpoint cursor differs from training stream")
     if metadata["accepted_tokens"] != start_token:
@@ -4634,11 +4819,56 @@ def _train(
     report = _training_report_payload(
         ctx,
         metadata=metadata,
-        checkpoint_hash=ctx.artifact_sha256(ctx.checkpoint),
+        checkpoint_hash=checkpoint_hash,
         preparation_hash=prerequisites["preparation"][1],
         terminal_log=history[-1] if history else None,
     )
     _write_immutable_json(ctx.training_report, report)
+    if execution_cache is not None:
+        if not isinstance(retained_model_state, dict):
+            raise CellExecutionError("validated checkpoint state was not retained")
+        training_owner_refs = {
+            "master": weakref.ref(trainer.master),
+            "forward": (
+                None if trainer.fwd is trainer.master else weakref.ref(trainer.fwd)
+            ),
+            "optimizer": weakref.ref(trainer.opt),
+        }
+        del trainer
+        gc.collect()
+        live_training_owners = sorted(
+            name
+            for name, reference in training_owner_refs.items()
+            if reference is not None and reference() is not None
+        )
+        if live_training_owners:
+            raise CellExecutionError(
+                "training owners remain live before retained calibration: "
+                + ", ".join(live_training_owners)
+            )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        retained_model = _model_from_validated_checkpoint_state(
+            metadata["model_cfg"],
+            retained_model_state,
+            device=device,
+        )
+        retained_metadata = dict(metadata)
+        retained_metadata["checkpoint_sha256"] = checkpoint_hash
+        execution_cache.remember_checkpoint(
+            _retained_artifact_key(
+                ctx,
+                producer_stage="train",
+                consumer_stage="calibrate",
+                artifact_kind="checkpoint",
+                path=ctx.checkpoint,
+                sha256=checkpoint_hash,
+                fingerprint=checkpoint_after_validation,
+                model_cfg=metadata["model_cfg"],
+            ),
+            retained_model,
+            retained_metadata,
+        )
     return (
         ("checkpoint", ctx.checkpoint),
         ("training_report", ctx.training_report),
@@ -4648,6 +4878,8 @@ def _train(
 def _calibrate(
     ctx: _Context,
     prerequisites: Mapping[str, tuple[Path, str]],
+    *,
+    execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
     preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
     checkpoint_path, checkpoint_hash = prerequisites["checkpoint"]
@@ -4664,16 +4896,37 @@ def _calibrate(
         checkpoint_path,
         sha256=checkpoint_hash,
     )
-    try:
-        model, metadata = load_trained_model(
-            checkpoint_path,
-            device=_device(ctx),
-            verified_checkpoint_sha256=checkpoint_hash,
+    retained_checkpoint = (
+        None
+        if execution_cache is None
+        else execution_cache.take_checkpoint(
+            _retained_artifact_key(
+                ctx,
+                producer_stage="train",
+                consumer_stage="calibrate",
+                artifact_kind="checkpoint",
+                path=checkpoint_path,
+                sha256=checkpoint_hash,
+                fingerprint=checkpoint_before_load,
+                model_cfg=training_report["model_cfg"],
+            )
         )
-    except Exception as exc:  # noqa: BLE001
-        raise CellExecutionError(
-            f"cannot load checkpoint for calibration: {exc}"
-        ) from exc
+    )
+    if retained_checkpoint is None:
+        try:
+            model, metadata = load_trained_model(
+                checkpoint_path,
+                device=_device(ctx),
+                verified_checkpoint_sha256=checkpoint_hash,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise CellExecutionError(
+                f"cannot load checkpoint for calibration: {exc}"
+            ) from exc
+    else:
+        model, metadata = retained_checkpoint
+        if next(model.parameters()).device != _device(ctx):
+            raise CellExecutionError("retained checkpoint model is on the wrong device")
     checkpoint_after_load = ctx.prerequisite_fingerprint(
         checkpoint_path,
         sha256=checkpoint_hash,
@@ -4829,32 +5082,42 @@ def _calibrate(
         codec.save(ctx.calibration)
     # Always reload the exact durable bytes before reporting calibration.
     frozen = Codec.load(ctx.calibration)
+    calibration_hash = ctx.artifact_sha256(ctx.calibration)
     deployment_payload = _deployment_codec_payload(
         ctx,
         preparation,
         model,
         checkpoint_hash=checkpoint_hash,
         checkpoint_metadata=metadata,
-        calibration_hash=ctx.artifact_sha256(ctx.calibration),
+        calibration_hash=calibration_hash,
         preparation_hash=prerequisites["preparation"][1],
     )
     _save_immutable_torch(ctx.deployment_codec, deployment_payload)
     # Reconstruct the exact consumer before pricing; truncated, incomplete, or
     # internally inconsistent bytes never reach evaluation.
-    frozen_deployment, _, frozen_consumer_codec, _ = _load_deployable_codec(
+    deployment_before_load = _FileFingerprint.from_path(ctx.deployment_codec)
+    (
+        frozen_deployment,
+        frozen_consumer_model,
+        frozen_consumer_codec,
+        frozen_training_summary,
+    ) = _load_deployable_codec(
         ctx.deployment_codec,
         cell_id=ctx.cell.cell_id,
         checkpoint_hash=checkpoint_hash,
-        calibration_hash=ctx.artifact_sha256(ctx.calibration),
+        calibration_hash=calibration_hash,
         preparation_hash=prerequisites["preparation"][1],
         device=torch.device("cpu"),
     )
+    deployment_hash = ctx.artifact_sha256(ctx.deployment_codec)
+    deployment_after_load = _FileFingerprint.from_path(ctx.deployment_codec)
+    if deployment_after_load != deployment_before_load:
+        raise CellExecutionError("deployable codec changed while reconstructing")
     if (
         frozen_deployment.get("schema") != "bsc-deployable-codec-v2"
         or frozen_deployment.get("cell_id") != ctx.cell.cell_id
         or frozen_deployment.get("checkpoint_sha256") != checkpoint_hash
-        or frozen_deployment.get("calibration_sha256")
-        != ctx.artifact_sha256(ctx.calibration)
+        or frozen_deployment.get("calibration_sha256") != calibration_hash
     ):
         raise CellExecutionError("deployable codec artifact binding mismatch")
     if frozen_consumer_codec.meta != frozen.meta:
@@ -4867,8 +5130,8 @@ def _calibrate(
         "schema": "bsc-calibration-record-v1",
         "cell_id": ctx.cell.cell_id,
         "checkpoint_sha256": checkpoint_hash,
-        "codec_sha256": ctx.artifact_sha256(ctx.calibration),
-        "deployment_codec_sha256": ctx.artifact_sha256(ctx.deployment_codec),
+        "codec_sha256": calibration_hash,
+        "deployment_codec_sha256": deployment_hash,
         "deployment_codec_size_bytes": ctx.deployment_codec.stat().st_size,
         "theta": float(frozen.meta["theta"]),
         "target_avg_blocks": target,
@@ -4892,6 +5155,24 @@ def _calibrate(
         ),
     }
     _write_immutable_json(ctx.calibration_record, record)
+    if execution_cache is not None:
+        execution_cache.remember_deployment(
+            _retained_artifact_key(
+                ctx,
+                producer_stage="calibrate",
+                consumer_stage="evaluate",
+                artifact_kind="deployment_codec",
+                path=ctx.deployment_codec,
+                sha256=deployment_hash,
+                fingerprint=deployment_after_load,
+                model_cfg=asdict(frozen_consumer_model.cfg),
+            ),
+            frozen_deployment,
+            frozen_consumer_model,
+            frozen_consumer_codec,
+            frozen_training_summary,
+            producer_model=model,
+        )
     return (
         ("calibration", ctx.calibration),
         ("deployment_codec", ctx.deployment_codec),
@@ -7630,6 +7911,8 @@ def _selection_validation_metrics(
 def _evaluate(
     ctx: _Context,
     prerequisites: Mapping[str, tuple[Path, str]],
+    *,
+    execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
     preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
     checkpoint_path, checkpoint_hash = prerequisites["checkpoint"]
@@ -7644,14 +7927,46 @@ def _evaluate(
         or calibration_record.get("codec_sha256") != calibration_hash
     ):
         raise CellExecutionError("calibration record/input binding mismatch")
-    deployment, model, codec, training_summary = _load_deployable_codec(
+    deployment_before_load = ctx.prerequisite_fingerprint(
         deployment_path,
-        cell_id=ctx.cell.cell_id,
-        checkpoint_hash=checkpoint_hash,
-        calibration_hash=calibration_hash,
-        preparation_hash=prerequisites["preparation"][1],
-        device=_device(ctx),
+        sha256=deployment_hash,
     )
+    expected_model_cfg, _ = validate_cell_config(ctx.cell)
+    retained_deployment = (
+        None
+        if execution_cache is None
+        else execution_cache.take_deployment(
+            _retained_artifact_key(
+                ctx,
+                producer_stage="calibrate",
+                consumer_stage="evaluate",
+                artifact_kind="deployment_codec",
+                path=deployment_path,
+                sha256=deployment_hash,
+                fingerprint=deployment_before_load,
+                model_cfg=asdict(expected_model_cfg),
+            )
+        )
+    )
+    device = _device(ctx)
+    if retained_deployment is None:
+        deployment, model, codec, training_summary = _load_deployable_codec(
+            deployment_path,
+            cell_id=ctx.cell.cell_id,
+            checkpoint_hash=checkpoint_hash,
+            calibration_hash=calibration_hash,
+            preparation_hash=prerequisites["preparation"][1],
+            device=device,
+        )
+    else:
+        deployment, model, codec, training_summary = retained_deployment
+        model = model.to(device).eval()
+    deployment_after_load = ctx.prerequisite_fingerprint(
+        deployment_path,
+        sha256=deployment_hash,
+    )
+    if deployment_after_load != deployment_before_load:
+        raise CellExecutionError("deployable codec changed while loading for evaluation")
     if (
         calibration_record.get("deployment_codec_sha256") != deployment_hash
         or calibration_record.get("deployment_codec_size_bytes")
@@ -7659,7 +7974,6 @@ def _evaluate(
     ):
         raise CellExecutionError("deployable codec/input binding mismatch")
 
-    device = _device(ctx)
     mode_endpoints = evaluate_selector_and_shared_code_modes(
         model,
         _prefetched_evaluation_batches(ctx, preparation),
@@ -8727,17 +9041,23 @@ def execute(
     *,
     resume: bool,
     prerequisites: Mapping[str, tuple[Path, str]] | None = None,
+    execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
     if prerequisites is None:
         prerequisites = ctx.prerequisites()
     if ctx.stage == "prepare":
         return _prepare(ctx)
     if ctx.stage == "train":
-        return _train(ctx, prerequisites, resume=resume)
+        return _train(
+            ctx,
+            prerequisites,
+            resume=resume,
+            execution_cache=execution_cache,
+        )
     if ctx.stage == "calibrate":
-        return _calibrate(ctx, prerequisites)
+        return _calibrate(ctx, prerequisites, execution_cache=execution_cache)
     if ctx.stage == "evaluate":
-        return _evaluate(ctx, prerequisites)
+        return _evaluate(ctx, prerequisites, execution_cache=execution_cache)
     if ctx.stage == "qualify":
         return _qualify(ctx, prerequisites)
     raise AssertionError(ctx.stage)
@@ -8763,10 +9083,11 @@ def _execute_stage_request(
     stage: str,
     artifacts_out: Path,
     resume: bool,
+    execution_cache: _StageExecutionCache | None = None,
 ) -> None:
-    # The historical one-process-per-stage contract forced this cache to die at
-    # every boundary.  Preserve that integrity boundary while retaining the
-    # expensive Python/Torch process and compiled kernels around it.
+    # Store verification remains stage-local.  The separate retained-consumer
+    # cache can cross a parent handshake only after rebinding the exact durable
+    # file identity supplied by the newly reconstructed context below.
     _VERIFIED_STORE_BINDINGS.clear()
     ctx = _Context(cell, artifacts_out, stage)
     prerequisites = ctx.prerequisites()
@@ -8774,6 +9095,7 @@ def _execute_stage_request(
         ctx,
         resume=resume,
         prerequisites=prerequisites,
+        execution_cache=execution_cache,
     )
     _emit_stage_manifest(
         ctx.artifacts_out,
@@ -8786,6 +9108,7 @@ def _execute_stage_request(
 
 
 def _worker_main(cell: Path) -> None:
+    execution_cache = _StageExecutionCache()
     for raw in sys.stdin:
         try:
             request = json.loads(raw)
@@ -8814,6 +9137,7 @@ def _worker_main(cell: Path) -> None:
                 stage=stage,
                 artifacts_out=Path(artifacts_out),
                 resume=resume,
+                execution_cache=execution_cache,
             )
             response = {"ok": True, "stage": stage}
         except (
