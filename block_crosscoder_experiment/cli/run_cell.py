@@ -6223,15 +6223,19 @@ def _evaluate_rate_distortion_and_raw_space(
     row_errors: dict[int, list[float]] = {q: [] for q in codec.spec.qs}
     evaluation_stream: Iterator = paired_stream()
     if device.type == "cuda":
+        def copy_activation_leaf(tensor: torch.Tensor) -> bool:
+            return tensor.is_floating_point()
+
         evaluation_stream = prefetch_batches(
             evaluation_stream,
             depth=2,
-            pin_memory=True,
+            pin_memory=copy_activation_leaf,
         )
         evaluation_stream = cuda_prefetch_batches(
             evaluation_stream,
             device=device,
             depth=1,
+            copy_policy=copy_activation_leaf,
         )
 
     class _RawObserver:

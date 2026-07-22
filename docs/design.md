@@ -955,6 +955,13 @@ bootstrap order without one Python/CUDA scalar synchronization per token. The
 complete result JSON hash is unchanged; canonical 128-token-row evaluation
 falls from `15.984` to `14.932 ms` (`6.58%`), while the Phase-1-style
 one-token-row case falls from `349.824` to `37.567 ms` (`89.26%`, `9.312x`).
+The paired prefetch pipeline selects floating activation leaves explicitly:
+row identities remain in their original unpinned CPU storage instead of being
+copied to CUDA and immediately returned for sequence grouping. At 4,096 rows
+this removes `96 KiB` H2D and `32 KiB` D2H per batch. An interleaved jobe
+benchmark improves a transfer-bound width-64 pair from `.3299` to `.3194 ms`
+(`3.18%`) and is neutral at the Phase-2 width-768 pair (`3.7748` to
+`3.7687 ms`).
 
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M

@@ -1076,7 +1076,7 @@ def prefetch_batches(
     it: Iterator,
     depth: int = 4,
     *,
-    pin_memory: bool = False,
+    pin_memory: bool | Callable[[torch.Tensor], bool] = False,
 ) -> Iterator:
     """Drive an I/O-bound batch iterator
     from a daemon thread, holding up to ``depth`` batches ahead of the
@@ -1084,6 +1084,8 @@ def prefetch_batches(
     exceptions are re-raised at the consumption point. This overlaps shard
     reads with GPU steps.
 
+    ``pin_memory=True`` pins every tensor leaf. A callable can instead select
+    leaves to pin; unselected metadata remains in its original CPU storage.
     Total lookahead is the queue depth plus the producer's current item (and
     any shard held by the source iterator), not exactly ``depth`` resident
     batches. Closing or abandoning the returned generator sets a cancellation
@@ -1095,18 +1097,33 @@ def prefetch_batches(
 
     if depth <= 0:
         raise ValueError("prefetch depth must be positive")
+    if not isinstance(pin_memory, bool) and not callable(pin_memory):
+        raise TypeError("pin_memory must be a bool or callable")
     q: queue.Queue = queue.Queue(maxsize=depth)
     end = object()
     stop = threading.Event()
 
     def prepare(item):
-        if not pin_memory:
-            return item
         if torch.is_tensor(item):
+            should_pin = pin_memory(item) if callable(pin_memory) else pin_memory
+            if not isinstance(should_pin, bool):
+                raise TypeError("pin_memory callable must return bool")
+            if not should_pin:
+                return item
             return item if item.is_pinned() else item.pin_memory()
         if isinstance(item, tuple):
-            return tuple(prepare(value) for value in item)
-        raise TypeError("prefetched batches must be tensors or tensor tuples")
+            children = tuple(prepare(value) for value in item)
+            if hasattr(item, "_fields"):
+                return type(item)(*children)
+            return children
+        if isinstance(item, list):
+            return [prepare(value) for value in item]
+        if isinstance(item, Mapping):
+            return {key: prepare(value) for key, value in item.items()}
+        raise TypeError(
+            "prefetched batches must contain only tensors or nested "
+            "tuples/lists/mappings of tensors"
+        )
 
     def deliver(item: object) -> bool:
         while not stop.is_set():
@@ -1172,6 +1189,7 @@ def cuda_prefetch_batches(
     dtype_policy: (
         torch.dtype | Callable[[torch.Tensor], torch.dtype | None] | None
     ) = None,
+    copy_policy: Callable[[torch.Tensor], bool] | None = None,
 ) -> Iterator:
     """Copy nested CPU tensor batches ahead on one dedicated CUDA stream.
 
@@ -1183,9 +1201,11 @@ def cuda_prefetch_batches(
     and H2D transfer with CUDA work.
 
     A static ``torch.dtype`` policy casts floating tensor leaves only. A
-    callable receives every tensor leaf and returns its target dtype, or
-    ``None`` to preserve that leaf's dtype. Nested tuples, lists, and mappings
-    are reconstructed with the same order; all leaves must be CPU tensors.
+    callable receives every copied tensor leaf and returns its target dtype, or
+    ``None`` to preserve that leaf's dtype. ``copy_policy`` can select which
+    leaves are pinned and copied; unselected leaves remain the same CPU tensor.
+    Nested tuples, lists, and mappings are reconstructed with the same order;
+    all leaves must initially be CPU tensors.
 
     Each copy records a CUDA event. Before yielding, the consumer's current
     stream waits for that event and every device tensor records the consumer
@@ -1210,6 +1230,8 @@ def cuda_prefetch_batches(
         and not callable(dtype_policy)
     ):
         raise TypeError("dtype_policy must be a torch.dtype, callable, or None")
+    if copy_policy is not None and not callable(copy_policy):
+        raise TypeError("copy_policy must be callable or None")
 
     source = iter(it)
     copy_stream = torch.cuda.Stream(device=resolved_device)
@@ -1224,6 +1246,14 @@ def cuda_prefetch_batches(
             return tensor.dtype
         if not isinstance(resolved, torch.dtype):
             raise TypeError("dtype_policy callable must return a torch.dtype or None")
+        return resolved
+
+    def should_copy(tensor: torch.Tensor) -> bool:
+        if copy_policy is None:
+            return True
+        resolved = copy_policy(tensor)
+        if not isinstance(resolved, bool):
+            raise TypeError("copy_policy callable must return bool")
         return resolved
 
     def map_batch(value: Any, leaf: Callable[[torch.Tensor], torch.Tensor]) -> Any:
@@ -1246,9 +1276,13 @@ def cuda_prefetch_batches(
     def pin_leaf(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device.type != "cpu":
             raise ValueError("CUDA-prefetched tensor leaves must be on CPU")
+        if not should_copy(tensor):
+            return tensor
         return tensor if tensor.is_pinned() else tensor.pin_memory()
 
     def copy_leaf(tensor: torch.Tensor) -> torch.Tensor:
+        if not should_copy(tensor):
+            return tensor
         return tensor.to(
             device=resolved_device,
             dtype=target_dtype(tensor),
@@ -1256,7 +1290,8 @@ def cuda_prefetch_batches(
         )
 
     def record_leaf(tensor: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
-        tensor.record_stream(stream)
+        if tensor.device.type == "cuda":
+            tensor.record_stream(stream)
         return tensor
 
     def generate() -> Iterator:

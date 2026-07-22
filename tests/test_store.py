@@ -13,6 +13,7 @@ from block_crosscoder_experiment.store import (
     Whitener,
     WhitenerAccumulator,
     cuda_prefetch_batches,
+    prefetch_batches,
 )
 
 S, D = 3, 16
@@ -595,6 +596,37 @@ def test_prefetch_close_cancels_early_exit():
     assert source_closed.wait(timeout=2.0)
 
 
+def test_prefetch_pin_policy_preserves_unselected_nested_metadata(monkeypatch):
+    activation = torch.randn(4)
+    row_ids = torch.arange(4, dtype=torch.int64)
+    pinned: list[torch.Tensor] = []
+
+    def fake_pin(tensor: torch.Tensor) -> torch.Tensor:
+        pinned.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin)
+    batch = next(
+        prefetch_batches(
+            iter(({"payload": [activation], "row_ids": (row_ids,)},)),
+            depth=1,
+            pin_memory=lambda tensor: tensor.is_floating_point(),
+        )
+    )
+    assert pinned == [activation]
+    assert batch["payload"][0] is activation
+    assert batch["row_ids"][0] is row_ids
+
+
+def test_prefetch_rejects_invalid_pin_policy_result():
+    batches = prefetch_batches(
+        iter((torch.zeros(1),)),
+        pin_memory=lambda tensor: None,  # type: ignore[return-value]
+    )
+    with pytest.raises(TypeError, match="must return bool"):
+        next(batches)
+
+
 def test_cuda_prefetch_rejects_non_cuda_device_and_bad_depth():
     source = iter((torch.zeros(1),))
     with pytest.raises(ValueError, match="requires a CUDA device"):
@@ -607,6 +639,12 @@ def test_cuda_prefetch_rejects_non_cuda_device_and_bad_depth():
                 iter((torch.zeros(1),)),
                 device="cuda",
                 dtype_policy="float32",  # type: ignore[arg-type]
+            )
+        with pytest.raises(TypeError, match="copy_policy"):
+            cuda_prefetch_batches(
+                iter((torch.zeros(1),)),
+                device="cuda",
+                copy_policy="floating",  # type: ignore[arg-type]
             )
     else:
         with pytest.raises(RuntimeError, match="CUDA is unavailable"):
@@ -676,6 +714,42 @@ def test_cuda_prefetch_static_dtype_casts_only_floating_leaves():
     assert integer.dtype == torch.int64
     assert torch.equal(floating.cpu(), batch[0].float())
     assert torch.equal(integer.cpu(), batch[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_copy_policy_leaves_metadata_on_original_cpu_storage():
+    activation = torch.arange(8, dtype=torch.bfloat16)
+    row_ids = torch.arange(16, dtype=torch.int64).view(8, 2)
+    observed = torch.ones(8, dtype=torch.bool)
+    source = {
+        "activation": activation,
+        "metadata": (row_ids, [observed]),
+    }
+    batch = next(
+        cuda_prefetch_batches(
+            iter((source,)),
+            device="cuda",
+            copy_policy=lambda tensor: tensor.is_floating_point(),
+        )
+    )
+    assert batch["activation"].is_cuda
+    assert batch["metadata"][0] is row_ids
+    assert batch["metadata"][1][0] is observed
+    assert batch["metadata"][0].device.type == "cpu"
+    assert batch["metadata"][1][0].device.type == "cpu"
+    assert not row_ids.is_pinned()
+    assert not observed.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_rejects_invalid_copy_policy_result():
+    batches = cuda_prefetch_batches(
+        iter((torch.zeros(1),)),
+        device="cuda",
+        copy_policy=lambda tensor: None,  # type: ignore[return-value]
+    )
+    with pytest.raises(TypeError, match="must return bool"):
+        next(batches)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
