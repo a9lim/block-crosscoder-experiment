@@ -156,6 +156,10 @@ exit is not evidence by itself.
   fallback, and all serialized artifact identities must agree. Primitive,
   complete-Trainer, 20-step trajectory, exact-resume, both-hard-selector, and
   code-norm/decoded-energy gates use the fixed bounds reported in `design.md`.
+  The Trainer may pass its immediately preceding global finite result into QR;
+  QR's factor and post-Gram guards must still refuse injected nonfinite input
+  or candidates transactionally, and no other decoder projection may reuse
+  that specialization.
 - Site-axis factorization includes an exact selected-parent carrier. Phase 1
   records full and rank `1/2/4` as nonpromotable capability evidence and
   advances the exact carrier. In Phase 2 the common free carrier must pass the

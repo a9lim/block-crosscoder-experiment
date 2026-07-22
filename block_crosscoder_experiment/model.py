@@ -2362,6 +2362,8 @@ class BlockCrosscoder(nn.Module):
     @torch.no_grad()
     def _project_decoder_with_state_(
         self,
+        *,
+        qr_input_finite: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Project and return a device count plus the exact mutated tensors."""
         mutated: list[torch.Tensor] = []
@@ -2393,13 +2395,19 @@ class BlockCrosscoder(nn.Module):
                     self.cfg.decoder_retraction_implementation
                     == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
                 ):
-                    bad = _cholesky_qr_retract_count_tensor_(self.D.data)
+                    bad = _cholesky_qr_retract_count_tensor_(
+                        self.D.data,
+                        input_finite=qr_input_finite,
+                    )
                 else:
                     assert (
                         self.cfg.decoder_retraction_implementation
                         == DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
                     )
-                    bad = _qr_retract_count_tensor_(self.D.data)
+                    bad = _qr_retract_count_tensor_(
+                        self.D.data,
+                        input_finite=qr_input_finite,
+                    )
                 mark(self.D)
             elif self.cfg.decoder_constraint == "frobenius":
                 bad = _project_block_frobenius_count_tensor_(self.D.data)

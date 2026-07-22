@@ -1419,10 +1419,35 @@ def _finite_gradients_with_l2_guard(
 
 def _project_decoder_(
     model: BlockCrosscoder,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    *,
+    qr_input_finite: bool = False,
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, ...],
+    tuple[torch.Tensor, ...],
+]:
     project_with_state = getattr(model, "_project_decoder_with_state_", None)
     if project_with_state is not None:
-        return project_with_state()
+        canonical = (
+            getattr(project_with_state, "__func__", None)
+            is BlockCrosscoder._project_decoder_with_state_
+        )
+        if canonical:
+            count, mutated = project_with_state(
+                qr_input_finite=qr_input_finite,
+            )
+            certified = (
+                tuple(
+                    parameter
+                    for parameter in mutated
+                    if parameter is model.D or parameter is model.c
+                )
+                if model.cfg.decoder_constraint == "qr"
+                else ()
+            )
+            return count, mutated, certified
+        count, mutated = project_with_state()
+        return count, mutated, ()
     project = getattr(model, "project_decoder_", None)
     if project is not None:
         result = project()
@@ -1431,9 +1456,9 @@ def _project_decoder_(
             dtype=torch.int64,
             device=next(model.parameters()).device,
         )
-        return count, tuple(model.parameters())
+        return count, tuple(model.parameters()), ()
     count = _retract_count_tensor_(model.D.data, eig_floor=model.cfg.eig_floor)
-    return count, (model.D,)
+    return count, (model.D,), ()
 
 
 def _constraint_residual(model: BlockCrosscoder) -> float | None:
@@ -1869,12 +1894,31 @@ class Trainer:
         self.sched.step()
         floor_hits_t: torch.Tensor | None = None
         projected_parameters: tuple[torch.Tensor, ...] = ()
+        finite_certified_parameters: tuple[torch.Tensor, ...] = ()
         # ``step_idx`` is zero-based while ``retract_every`` is a cadence
         # in completed optimizer updates. Initialization applies the declared
         # constraint separately, so cadence 20 means updates 20, 40, ....
         if projected_decoder:
-            floor_hits_t, projected_parameters = _project_decoder_(self.master)
-        if projected_parameters and not _all_finite(projected_parameters):
+            (
+                floor_hits_t,
+                projected_parameters,
+                finite_certified_parameters,
+            ) = _project_decoder_(
+                self.master,
+                # The immediately preceding global parameter/state scan has
+                # already established this exact fact. QR still validates its
+                # factors, candidate, and post-Gram before mutating the master.
+                qr_input_finite=True,
+            )
+        post_projection_parameters = tuple(
+            parameter
+            for parameter in projected_parameters
+            if not any(
+                parameter is certified
+                for certified in finite_certified_parameters
+            )
+        )
+        if post_projection_parameters and not _all_finite(post_projection_parameters):
             raise RuntimeError(
                 "decoder projection produced non-finite parameters; refusing "
                 "to continue (reload the last atomic checkpoint)"

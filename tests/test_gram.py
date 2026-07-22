@@ -114,8 +114,53 @@ def test_cholesky_qr_is_idempotent_and_positive_scale_invariant(device):
 
 
 @pytest.mark.parametrize(
+    "retraction",
+    (
+        gram_module._cholesky_qr_retract_count_tensor_,
+        gram_module._qr_retract_count_tensor_,
+    ),
+)
+def test_qr_prevalidated_input_flag_preserves_exact_candidate(device, retraction):
+    checked = random_stack(device, seed=1211)
+    prevalidated = checked.clone()
+    expected_count = retraction(checked)
+    actual_count = retraction(prevalidated, input_finite=True)
+    assert torch.equal(actual_count, expected_count)
+    assert torch.equal(prevalidated, checked)
+
+
+@pytest.mark.parametrize(
+    "retraction",
+    (
+        gram_module._cholesky_qr_retract_count_tensor_,
+        gram_module._qr_retract_count_tensor_,
+    ),
+)
+def test_qr_prevalidated_input_still_refuses_nonfinite_candidate(
+    device,
+    retraction,
+):
+    source = random_stack(device, seed=1212)
+    source[0, 0, 0, 0] = float("nan")
+    before = source.clone()
+    with pytest.raises(
+        (ValueError, gram_module.CholeskyQRRetractionError),
+        match="QR|candidate|Gram",
+    ):
+        retraction(source, input_finite=True)
+    torch.testing.assert_close(source, before, equal_nan=True)
+
+
+@pytest.mark.parametrize(
     "failure",
-    ("nonfinite", "rank_deficient", "condition", "reconstruction", "post_gram"),
+    (
+        "nonfinite",
+        "rank_deficient",
+        "condition",
+        "reconstruction",
+        "candidate_nonfinite",
+        "post_gram",
+    ),
 )
 def test_cholesky_qr_failures_are_transactional_and_have_no_fallback(
     device,
@@ -146,6 +191,18 @@ def test_cholesky_qr_failures_are_transactional_and_have_no_fallback(
                 -1.0,
             )
             expected = "conditioning/reconstruction"
+        elif failure == "candidate_nonfinite":
+            original_bmm = torch.bmm
+
+            def poisoned_bmm(input, mat2, *, out=None):
+                result = original_bmm(input, mat2, out=out)
+                assert out is not None
+                if out.shape[-1] != out.shape[-2]:
+                    out.fill_(float("inf"))
+                return result
+
+            monkeypatch.setattr(torch, "bmm", poisoned_bmm)
+            expected = "post-Gram"
         else:
             assert failure == "post_gram"
             monkeypatch.setattr(

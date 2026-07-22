@@ -193,7 +193,11 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
 
 
 @torch.no_grad()
-def _qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
+def _qr_retract_count_tensor_(
+    D: torch.Tensor,
+    *,
+    input_finite: bool = False,
+) -> torch.Tensor:
     """Canonical positive-diagonal Householder-QR reference retraction.
 
     Each block's site-concatenated decoder is a ``b x sum(d_s)`` matrix.  QR
@@ -206,7 +210,7 @@ def _qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
     """
 
     _validate_qr_retraction_input(D)
-    if not bool(_all_finite(D)):
+    if not input_finite and not bool(_all_finite(D)):
         raise ValueError("Householder QR retraction requires finite input")
     sites, groups, block_dim, width = D.shape
     concatenated = D.permute(1, 0, 3, 2).reshape(groups, sites * width, block_dim)
@@ -221,8 +225,7 @@ def _qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
     candidate = q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2)
     residual = gram_residual(candidate)
     if not bool(
-        _all_finite(candidate)
-        & torch.isfinite(residual).all()
+        torch.isfinite(residual).all()
         & (residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
     ):
         raise ValueError("Householder QR candidate violates the Gram bound")
@@ -239,7 +242,11 @@ def qr_retract_(D: torch.Tensor) -> int:
 
 
 @torch.no_grad()
-def _cholesky_qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
+def _cholesky_qr_retract_count_tensor_(
+    D: torch.Tensor,
+    *,
+    input_finite: bool = False,
+) -> torch.Tensor:
     """Transactional guarded Cholesky-QR1 Stiefel retraction.
 
     For ordered decoder rows ``B_g`` this computes ``M_g = B_g B_g.T``, the
@@ -251,7 +258,7 @@ def _cholesky_qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
     """
 
     _validate_qr_retraction_input(D)
-    if not bool(_all_finite(D)):
+    if not input_finite and not bool(_all_finite(D)):
         raise CholeskyQRRetractionError(
             "Cholesky-QR requires finite fp32 master weights"
         )
@@ -332,8 +339,7 @@ def _cholesky_qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
     diagonal.sub_(1.0)
     post_residual = post_gram.norm(dim=(-2, -1))
     post_ok = (
-        _all_finite(candidate)
-        & torch.isfinite(post_residual).all()
+        torch.isfinite(post_residual).all()
         & (post_residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
     )
     if not bool(post_ok):

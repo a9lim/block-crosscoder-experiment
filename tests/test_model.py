@@ -329,10 +329,10 @@ def test_model_qr_retraction_dispatch_is_identity_bound(
     calls = 0
     original = getattr(model_module, function_name)
 
-    def tracked(value):
+    def tracked(value, **kwargs):
         nonlocal calls
         calls += 1
-        return original(value)
+        return original(value, **kwargs)
 
     monkeypatch.setattr(model_module, function_name, tracked)
     model = BlockCrosscoder(

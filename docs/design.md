@@ -1140,6 +1140,19 @@ Gram residuals remain below `7e-7`. These bounds authorize the engineering
 replacement before the first experiment run; changing a guard or gauge
 convention requires a new implementation identity.
 
+The Trainer's global post-optimizer parameter/state scan now supplies QR's
+input-finite fact directly. Both QR implementations still validate every
+factor and the complete post-Gram before their transactional copy; any
+nonfinite candidate necessarily makes a diagonal Gram sum-of-squares and its
+post-residual nonfinite. The duplicate input, candidate, and post-projection
+full-decoder scans are therefore elided without changing the refusal set.
+Exact checked/prevalidated candidate tests cover Cholesky and Householder QR,
+and an injected infinite candidate must still fail transactionally. On jobe
+at `B=2048`, tied token-TopK/code-norm selection and the Phase-2 QR weight
+geometry, 21 post-warmup complete-Trainer samples fall from `8.836` to
+`8.563 ms` median (`3.09%`, `1.032x`) and from `9.768` to `9.354 ms` p95;
+peak allocation is unchanged.
+
 The shared kernels also retain guarded configuration values used only by unit
 fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted

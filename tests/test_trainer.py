@@ -8,6 +8,7 @@ from dataclasses import asdict
 import pytest
 import torch
 
+import block_crosscoder_experiment.gram as gram_module
 import block_crosscoder_experiment.model as model_module
 import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
@@ -352,9 +353,9 @@ def test_projection_cadence_counts_completed_updates(device, monkeypatch):
     calls: list[int] = []
     project = trainer_module._project_decoder_
 
-    def counted(model):
+    def counted(model, **kwargs):
         calls.append(1)
-        return project(model)
+        return project(model, **kwargs)
 
     monkeypatch.setattr(trainer_module, "_project_decoder_", counted)
     trainer = Trainer(
@@ -1891,6 +1892,168 @@ def test_post_step_nonfinite_refuses_run(device, monkeypatch):
     monkeypatch.setattr(trainer.opt, "step", poison_step)
     with pytest.raises(RuntimeError, match="optimizer produced non-finite"):
         trainer.step(planted_batches(device, n_batches=1, seed=43)[0])
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    (
+        DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+        DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    ),
+)
+def test_qr_step_reuses_global_input_and_transactional_output_finite_checks(
+    device,
+    monkeypatch,
+    implementation,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "qr",
+            "decoder_retraction_implementation": implementation,
+            "encoder_mode": "tied",
+            "decoder_bias": False,
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+    trainer_finite = trainer_module._all_finite
+    gram_finite = gram_module._all_finite
+    trainer_calls = 0
+    gram_calls = 0
+
+    def counted_trainer(obj):
+        nonlocal trainer_calls
+        trainer_calls += 1
+        return trainer_finite(obj)
+
+    def counted_gram(value):
+        nonlocal gram_calls
+        gram_calls += 1
+        return gram_finite(value)
+
+    monkeypatch.setattr(trainer_module, "_all_finite", counted_trainer)
+    monkeypatch.setattr(gram_module, "_all_finite", counted_gram)
+    trainer.step(planted_batches(device, n_batches=1, seed=430)[0])
+
+    # One global parameter/state scan establishes QR input finiteness. QR's
+    # post-Gram validates its candidate before the transactional copy, so no
+    # candidate or post-projection decoder rescan remains.
+    assert trainer_calls == 1
+    assert gram_calls == 0
+
+
+def test_qr_step_refuses_optimizer_poison_before_trusting_input(
+    device,
+    monkeypatch,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "qr",
+            "decoder_retraction_implementation": (
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+            ),
+            "encoder_mode": "tied",
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+    original_step = trainer.opt.step
+    projection_calls = 0
+
+    def poison_step(*args, **kwargs):
+        result = original_step(*args, **kwargs)
+        with torch.no_grad():
+            assert trainer.master.D is not None
+            trainer.master.D.view(-1)[0] = float("nan")
+        return result
+
+    original_projection = trainer_module._project_decoder_
+
+    def counted_projection(*args, **kwargs):
+        nonlocal projection_calls
+        projection_calls += 1
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.opt, "step", poison_step)
+    monkeypatch.setattr(trainer_module, "_project_decoder_", counted_projection)
+    with pytest.raises(RuntimeError, match="optimizer produced non-finite"):
+        trainer.step(planted_batches(device, n_batches=1, seed=431)[0])
+    assert projection_calls == 0
+
+
+def test_qr_step_retains_separate_encoder_projection_finite_scan(
+    device,
+    monkeypatch,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "qr",
+            "decoder_retraction_implementation": (
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+            ),
+            "encoder_mode": "untied",
+            "encoder_constraint": "unit_latent",
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+    project_rows = model_module._project_latent_rows_count_tensor_
+
+    def poison_encoder(tensor):
+        result = project_rows(tensor)
+        tensor[(0,) * tensor.ndim] = float("nan")
+        return result
+
+    monkeypatch.setattr(
+        model_module,
+        "_project_latent_rows_count_tensor_",
+        poison_encoder,
+    )
+    with pytest.raises(RuntimeError, match="decoder projection produced non-finite"):
+        trainer.step(planted_batches(device, n_batches=1, seed=432)[0])
+
+
+def test_qr_step_does_not_trust_custom_projection_backend(device, monkeypatch):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "qr",
+            "decoder_retraction_implementation": (
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+            ),
+            "encoder_mode": "tied",
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+
+    def poison_projection():
+        assert trainer.master.D is not None
+        with torch.no_grad():
+            trainer.master.D[(0,) * trainer.master.D.ndim] = float("nan")
+        return (
+            torch.zeros((), dtype=torch.int64, device=device),
+            (trainer.master.D,),
+        )
+
+    monkeypatch.setattr(
+        trainer.master,
+        "_project_decoder_with_state_",
+        poison_projection,
+    )
+    with pytest.raises(RuntimeError, match="decoder projection produced non-finite"):
+        trainer.step(planted_batches(device, n_batches=1, seed=433)[0])
 
 
 def test_nonlogging_unclipped_fast_step_keeps_only_finite_scans(device, monkeypatch):
