@@ -135,6 +135,13 @@ def test_calibrate_prefetches_and_closes_all_three_cuda_traversals() -> None:
     assert "achieved_events += int(selected.sum())" not in source
 
 
+def test_raw_observer_packs_grouped_metric_readback() -> None:
+    source = inspect.getsource(run_cell_module._evaluate_rate_distortion_and_raw_space)
+    assert "grouped_metrics = torch.stack(" in source
+    assert "grouped_metrics[:, index + 1].tolist()" in source
+    assert "grouped_errors[q].sum(dim=1).cpu().tolist()" not in source
+
+
 @pytest.mark.parametrize("target", ("cpu", "cuda"))
 def test_event_factor_blocks_are_gathered_before_host_transfer(target) -> None:
     if target == "cuda" and not torch.cuda.is_available():

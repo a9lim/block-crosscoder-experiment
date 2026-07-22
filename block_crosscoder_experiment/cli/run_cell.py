@@ -6498,9 +6498,17 @@ def _evaluate_rate_distortion_and_raw_space(
                 grouped.index_add_(0, inverse, self._token_errors[q])
                 grouped_errors[q] = grouped
             sequence_values = unique_sequences.tolist()
-            denominator_values = grouped_denominator.sum(dim=1).cpu().tolist()
+            grouped_metrics = torch.stack(
+                (
+                    grouped_denominator.sum(dim=1),
+                    *(grouped_errors[q].sum(dim=1) for q in codec.spec.qs),
+                ),
+                dim=1,
+            ).cpu()
+            denominator_values = grouped_metrics[:, 0].tolist()
             error_values = {
-                q: grouped_errors[q].sum(dim=1).cpu().tolist() for q in codec.spec.qs
+                q: grouped_metrics[:, index + 1].tolist()
+                for index, q in enumerate(codec.spec.qs)
             }
             for group, sequence in enumerate(sequence_values):
                 den_value = denominator_values[group]
