@@ -11,6 +11,7 @@ from block_crosscoder_experiment.gram import gram_residual, retract_
 from block_crosscoder_experiment.model import (
     BlockCrosscoder,
     BSCConfig,
+    BSCOutput,
     SignedStreamingScoreQuantile,
     batch_topk_mask,
     bsc_loss,
@@ -30,6 +31,50 @@ def whitened_batch(device, n=512, seed=1):
     return torch.randn(n, CFG.n_sites, CFG.d_model, generator=gen).to(device)
 
 
+def _legacy_per_site_forward(
+    model: BlockCrosscoder,
+    x: torch.Tensor,
+    observed: torch.Tensor | None,
+) -> tuple[BSCOutput, torch.Tensor, torch.Tensor]:
+    """Test oracle for the superseded per-site BMM training kernel."""
+    cfg = model.cfg
+    decoder = model.decoder_tensor()
+    if cfg.encoder_mode == "tied":
+        assert model.log_gamma is not None
+        encoder = decoder * model.log_gamma.exp()
+    else:
+        encoder = model.encoder_tensor()
+    prepared = model._prepare_encoder_input(x)
+    if observed is None and cfg.encoder_fusion == "sum":
+        keep = None
+    else:
+        keep = model._site_observation_mask(prepared, observed)
+        prepared = prepared * keep
+    weights = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
+    per_site = torch.bmm(
+        prepared.transpose(0, 1),
+        weights.transpose(1, 2),
+    )
+    z = model._finish_encoded_sum(per_site.sum(dim=0), keep)
+    scores = model.scores(
+        z,
+        x=x,
+        observed=observed,
+        _decoder=decoder,
+        _observation_keep=keep,
+    )
+    mask = model._select_scores(scores, mode="topk", z=z)
+    z_selected = z * mask.unsqueeze(-1)
+    xhat = model.decode(z_selected, _decoder=decoder)
+    return BSCOutput(xhat, z, z_selected, scores, mask), decoder, encoder
+
+
+def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    numerator = (actual.float() - expected.float()).norm()
+    denominator = expected.float().norm().clamp_min(1e-12)
+    return float((numerator / denominator).detach())
+
+
 def test_selection_score_identity(device):
     """Under the constraint, ||z_g||^2 is exactly the block's contribution
     energy sum_s ||D_g^s^T z_g||^2 — the score is not a proxy."""
@@ -46,6 +91,258 @@ def test_encode_matches_naive(device):
     z = model.encode(x)
     naive = torch.einsum("bsd,sgkd->bgk", x, model.E)
     assert torch.allclose(z, naive, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize(
+    "case",
+    (
+        "untied_sum_all",
+        "untied_sum_missing",
+        "untied_mean_missing",
+        "untied_rescaled_missing",
+        "untied_source_missing",
+        "untied_padded_missing",
+        "tied_rescaled_missing",
+        "factorized_mean_missing",
+    ),
+)
+def test_flattened_training_encoder_tracks_legacy_kernel_end_to_end(
+    device, dtype, case
+):
+    """Bound numerical drift from the authorized bf16 reduction-order change.
+
+    The reference deliberately retains the previous ``[S,B,G*b]`` BMM
+    materialization.  Besides encoder output, this checks every public forward
+    tensor, reconstruction loss, hard support, and all parameter gradients.
+    """
+    common = dict(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=4,
+        d_model=16,
+        k=3,
+        seed=731,
+        selection="token_topk",
+        decoder_constraint="free",
+        encoder_bias=True,
+        decoder_bias=True,
+    )
+    batch_tokens = 128
+    overrides: dict[str, object] = {}
+    observed: torch.Tensor | None
+    if case == "untied_sum_all":
+        observed = None
+    else:
+        observed = torch.ones(batch_tokens, 4, dtype=torch.bool, device=device)
+        observed[::2, 0] = False
+        observed[1::3, 2] = False
+    if case == "untied_mean_missing":
+        overrides["encoder_fusion"] = "mean"
+    elif case == "untied_rescaled_missing":
+        overrides["encoder_fusion"] = "availability_rescaled_sum"
+    elif case == "untied_source_missing":
+        overrides.update(encoder_fusion="source", source_site=1)
+    elif case == "untied_padded_missing":
+        overrides.update(
+            site_dims=(16, 13, 10, 7),
+            apply_decoder_bias_to_input=True,
+        )
+    elif case == "tied_rescaled_missing":
+        overrides.update(
+            encoder_mode="tied",
+            encoder_fusion="availability_rescaled_sum",
+        )
+    elif case == "factorized_mean_missing":
+        overrides.update(site_rank=2, encoder_fusion="mean")
+
+    actual_model = BlockCrosscoder(BSCConfig(**{**common, **overrides})).to(
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        actual_model.c.copy_(
+            torch.linspace(
+                -0.15,
+                0.25,
+                actual_model.c.numel(),
+                device=device,
+                dtype=dtype,
+            ).reshape_as(actual_model.c)
+        )
+        assert actual_model.a is not None
+        actual_model.a.copy_(
+            torch.linspace(
+                -0.05,
+                0.10,
+                actual_model.a.numel(),
+                device=device,
+                dtype=dtype,
+            ).reshape_as(actual_model.a)
+        )
+    legacy_model = copy.deepcopy(actual_model)
+    generator = torch.Generator(device="cpu").manual_seed(919)
+    x = torch.randn(batch_tokens, 4, 16, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    )
+
+    actual, actual_decoder, actual_encoder = actual_model.forward_with_materialized(
+        x,
+        observed=observed,
+    )
+    expected, expected_decoder, expected_encoder = _legacy_per_site_forward(
+        legacy_model,
+        x,
+        observed,
+    )
+    actual_loss = bsc_loss(
+        actual,
+        x,
+        actual_model,
+        observation_mask=observed,
+        decoder=actual_decoder,
+        encoder=actual_encoder,
+    )["total"]
+    expected_loss = bsc_loss(
+        expected,
+        x,
+        legacy_model,
+        observation_mask=observed,
+        decoder=expected_decoder,
+        encoder=expected_encoder,
+    )["total"]
+    actual_loss.backward()
+    expected_loss.backward()
+
+    output_drifts = {
+        "code": _relative_l2(actual.z, expected.z),
+        "score": _relative_l2(actual.scores, expected.scores),
+        "selected_code": _relative_l2(actual.z_selected, expected.z_selected),
+        "reconstruction": _relative_l2(actual.xhat, expected.xhat),
+        "loss": abs(float((actual_loss - expected_loss).detach()))
+        / max(abs(float(expected_loss.detach())), 1e-12),
+    }
+    support_disagreement = float((actual.mask != expected.mask).sum()) / max(
+        int(actual.mask.sum() + expected.mask.sum()),
+        1,
+    )
+    actual_parameters = dict(actual_model.named_parameters())
+    expected_parameters = dict(legacy_model.named_parameters())
+    assert actual_parameters.keys() == expected_parameters.keys()
+    gradient_drifts = {}
+    for name in actual_parameters:
+        actual_gradient = actual_parameters[name].grad
+        expected_gradient = expected_parameters[name].grad
+        assert actual_gradient is not None, name
+        assert expected_gradient is not None, name
+        gradient_drifts[name] = _relative_l2(actual_gradient, expected_gradient)
+
+    if dtype == torch.float32:
+        assert max(output_drifts.values()) < 2e-6, output_drifts
+        assert support_disagreement == 0.0
+        assert max(gradient_drifts.values()) < 5e-6, gradient_drifts
+    else:
+        # The old kernel rounded each site's GEMM before summing; the flattened
+        # kernel rounds once after contracting sites and coordinates together.
+        # These bounds make that authorized difference explicit without
+        # pretending bf16 support is bitwise invariant.
+        assert output_drifts["code"] < 6e-3, output_drifts
+        assert output_drifts["score"] < 6e-3, output_drifts
+        assert output_drifts["selected_code"] < 0.2, output_drifts
+        assert output_drifts["reconstruction"] < 0.2, output_drifts
+        assert output_drifts["loss"] < 3e-3, output_drifts
+        assert support_disagreement < 0.02, support_disagreement
+        assert max(gradient_drifts.values()) < 0.25, gradient_drifts
+
+
+@pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
+@pytest.mark.parametrize(
+    "selection_score",
+    ("code_norm", "decoder_weighted", "decoded_energy", "isolated_loss_decrease"),
+)
+def test_flattened_bf16_encoder_bounds_selector_and_gradient_drift(
+    device, selection, selection_score
+):
+    """Quantify drift through every score geometry and hard TopK selector."""
+    config = dict(
+        n_blocks=128,
+        block_dim=4,
+        n_sites=4,
+        d_model=64,
+        k=8,
+        seed=811,
+        selection=selection,
+        decoder_constraint="free",
+        encoder_bias=True,
+        decoder_bias=True,
+        selection_score=selection_score,
+    )
+    if selection_score == "decoder_weighted":
+        config["code_activation"] = "relu"
+    elif selection_score == "isolated_loss_decrease":
+        config["decoder_bias"] = False
+    cfg = BSCConfig(**config)
+    actual_model = BlockCrosscoder(cfg).to(device=device, dtype=torch.bfloat16)
+    legacy_model = copy.deepcopy(actual_model)
+    x = torch.randn(
+        256,
+        cfg.n_sites,
+        cfg.d_model,
+        generator=torch.Generator(device="cpu").manual_seed(812),
+    ).to(device=device, dtype=torch.bfloat16)
+    actual, actual_decoder, actual_encoder = actual_model.forward_with_materialized(x)
+    expected, expected_decoder, expected_encoder = _legacy_per_site_forward(
+        legacy_model,
+        x,
+        None,
+    )
+    actual_loss = bsc_loss(
+        actual,
+        x,
+        actual_model,
+        decoder=actual_decoder,
+        encoder=actual_encoder,
+    )["total"]
+    expected_loss = bsc_loss(
+        expected,
+        x,
+        legacy_model,
+        decoder=expected_decoder,
+        encoder=expected_encoder,
+    )["total"]
+    actual_loss.backward()
+    expected_loss.backward()
+
+    changed_event_fraction = float((actual.mask != expected.mask).sum()) / float(
+        actual.mask.sum() + expected.mask.sum()
+    )
+    expected_parameters = dict(legacy_model.named_parameters())
+    gradient_drifts = {}
+    for name, parameter in actual_model.named_parameters():
+        actual_gradient = parameter.grad
+        expected_gradient = expected_parameters[name].grad
+        if actual_gradient is None or expected_gradient is None:
+            assert actual_gradient is None and expected_gradient is None, name
+            continue
+        gradient_drifts[name] = _relative_l2(actual_gradient, expected_gradient)
+    drift = {
+        "code": _relative_l2(actual.z, expected.z),
+        "score": _relative_l2(actual.scores, expected.scores),
+        "changed_event_fraction": changed_event_fraction,
+        "selected_code": _relative_l2(actual.z_selected, expected.z_selected),
+        "reconstruction": _relative_l2(actual.xhat, expected.xhat),
+        "loss": abs(float((actual_loss - expected_loss).detach()))
+        / abs(float(expected_loss.detach())),
+        "gradient_max": max(gradient_drifts.values()),
+    }
+    assert drift["code"] < 6e-3, drift
+    assert drift["score"] < 6e-3, drift
+    assert drift["changed_event_fraction"] < 0.02, drift
+    assert drift["selected_code"] < 0.2, drift
+    assert drift["reconstruction"] < 0.2, drift
+    assert drift["loss"] < 3e-3, drift
+    assert drift["gradient_max"] < 0.25, {**drift, "gradients": gradient_drifts}
 
 
 def test_decode_matches_naive_and_bias(device):
@@ -111,7 +408,7 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
     "activation",
     ("signed", "relu", "group_soft_threshold"),
 )
-def test_frozen_encoder_sites_preserve_every_view_exactly(
+def test_frozen_encoder_sites_track_flattened_training_views(
     device, topology, fusion, activation
 ):
     overrides = {
@@ -163,7 +460,19 @@ def test_frozen_encoder_sites_preserve_every_view_exactly(
                 _encoder_sites=frozen_sites,
             )[0]
             for actual, expected in zip(cached, reference, strict=True):
-                assert torch.equal(actual, expected)
+                if observed is None or actual.dtype == torch.bool:
+                    assert torch.equal(actual, expected)
+                else:
+                    # Frozen multi-view evaluation intentionally retains the
+                    # per-site contractions it must cache, while training now
+                    # fuses sites into one GEMM.  Their fp32 reduction orders
+                    # differ without changing the bound view semantics.
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
 
 
 def test_frozen_encoder_sites_fail_closed_on_stale_state(device):
@@ -663,7 +972,15 @@ def test_frozen_score_geometry_is_exact_and_decoder_bound(device, selection_scor
             _encoder_sites=encoder_sites,
         )[0]
         for actual, expected in zip(encoder_cached, cached, strict=True):
-            assert torch.equal(actual, expected)
+            if actual.dtype == torch.bool:
+                assert torch.equal(actual, expected)
+            else:
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=2e-5,
+                    atol=2e-6,
+                )
         with pytest.raises(ValueError, match="not bound"):
             model.forward_with_materialized(
                 x,

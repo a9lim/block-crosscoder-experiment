@@ -48,6 +48,13 @@ exit is not evidence by itself.
 
 - Forward equations, masks, reductions, constraints, initialization order,
   selector scores, thresholds, and complete Aux bundles have unit tests.
+- The `flattened_encoder_reduction_sensitivity` release gate compares the
+  direct flattened GEMM against the superseded per-site BMM oracle across
+  fp32/bf16, all fusion and weight topologies, both hard selectors, and every
+  score geometry at the fixed bounds in `design.md`. The all-view evaluator
+  uses the direct kernel exactly; only declared partial views use the cached
+  per-site reduction. Any kernel or bound change requires a new clean
+  implementation identity before launch.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.

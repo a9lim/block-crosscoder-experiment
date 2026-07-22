@@ -904,9 +904,19 @@ class BlockCrosscoder(nn.Module):
                 validate=validate_observed,
             )
             x = x * keep
+        # Fuse the site sum into one GEMM.  The former strided BMM produced
+        # ``[S,B,G*b]`` and then reduced the site axis, a 640 MiB transient at
+        # the Phase-2 B=8192/S=4/G*b=8192 geometry.  Flattening in the common
+        # ``(site, coordinate)`` order contracts the same mathematical map
+        # directly into ``[B,G*b]``.  This deliberately changes bf16 rounding
+        # from one rounded result per site plus a sum to one GEMM reduction;
+        # Phase 2 binds bf16 precision, not the superseded kernel order.
         W = encoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
-        per_site = torch.bmm(x.transpose(0, 1), W.transpose(1, 2))
-        z = per_site.sum(dim=0)
+        W = W.transpose(1, 2).reshape(
+            cfg.n_sites * cfg.d_model,
+            cfg.n_latents,
+        )
+        z = x.reshape(x.shape[0], cfg.n_sites * cfg.d_model) @ W
         return self._finish_encoded_sum(z, keep), keep
 
     def _frozen_encoder_sites(
@@ -956,16 +966,24 @@ class BlockCrosscoder(nn.Module):
                 "frozen encoder sites have invalid shape: "
                 f"expected {expected_shape}, got {tuple(frozen_sites.values.shape)}"
             )
-        if observed is None and cfg.encoder_fusion == "sum":
-            keep = None
-            per_site = frozen_sites.values
-        else:
-            keep = self._site_observation_mask(
+        # The all-view endpoint must use the same direct flattened contraction
+        # as training, calibration, and codec selection.  Frozen per-site
+        # contractions exist specifically to amortize the distinct partial
+        # views below; their floating reduction order is deliberately not
+        # substituted for the operational all-view kernel.
+        if observed is None:
+            return self._encode_with_tensor(
                 x,
-                observed,
-                validate=validate_observed,
+                encoder,
+                observed=None,
+                validate_observed=validate_observed,
             )
-            per_site = frozen_sites.values * keep.transpose(0, 1)
+        keep = self._site_observation_mask(
+            x,
+            observed,
+            validate=validate_observed,
+        )
+        per_site = frozen_sites.values * keep.transpose(0, 1)
         z = per_site.sum(dim=0)
         return self._finish_encoded_sum(z, keep), keep
 

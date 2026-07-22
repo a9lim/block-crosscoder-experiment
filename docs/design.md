@@ -848,6 +848,23 @@ fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted
 by `studies.py` is live, and nonmaterializable recipes fail before execution.
 
+The direct training, calibration, codec, and all-view evaluation encoder uses
+one flattened `(site, coordinate)` GEMM. Partial-view sharing evaluation keeps
+one per-site contraction and fuses each declared observation mask from that
+cache; this is the same linear map but has a different floating reduction
+order. Both paths are bound by the clean implementation commit before prepare.
+The named `flattened_encoder_reduction_sensitivity` engineering ablation uses
+the superseded per-site BMM as a test oracle across fp32/bf16, every fusion and
+weight topology, both hard selectors, and all four score geometries. Its fp32
+gate requires exact support, relative output/loss drift below `2e-6`, and
+relative gradient drift below `5e-6`. Its bf16 gate requires code and score
+drift below `.006`, changed support below `.02`, loss drift below `.003`, and
+maximum parameter-gradient drift below `.25` in both the complete topology
+matrix and the larger selector-by-score matrix. These are pre-run release
+gates, not a tunable scientific matrix row; changing either kernel or bound
+requires a new clean implementation identity and a fresh audit before any
+campaign starts.
+
 Atomic checkpoints include model, optimizer, scheduler, retraction/dead-state,
 attempted and accepted tokens, data cursor, Python/NumPy/Torch/accelerator RNG
 states, and all content bindings. Resume validates the bindings and continues
@@ -923,7 +940,7 @@ materially affect a claim:
 | calibrated deployment threshold | adapted engineering: replace batch/global training selection with source-free per-token inference | calibration target error, native/deployed endpoints, saved-codec round trip | live |
 | quantizer frontier and 256/384/512-bit budgets | engineering/scientific: compare methods at actual total deployment cost rather than nominal L0 | complete zero/2/4/6/8/12/16-bit frontier, exact codec bytes, no extrapolation | live |
 | deterministic row replay and checkpointing | engineering: make unique data and optimizer presentations auditable and resumable | uninterrupted-versus-resume equality and row-stream hashes | live |
-| CUDA execution and sparse data movement | engineering: fuse invariant checks, reuse frozen/materialized tensors, stage pinned batches, stop capture at the last requested hook, and decode only transmitted events without changing the mathematical cell | bit-identical trained model-state parity for the optimized trainer; dense/sparse packet round trips, CPU lifecycle, CUDA/CPU endpoint parity, and deterministic stream-order tests | universal, not swept |
+| CUDA execution and sparse data movement | engineering: fuse invariant checks, use the flattened direct encoder plus cached partial-view contractions, reuse frozen/materialized tensors, stage pinned batches, stop capture at the last requested hook, and decode only transmitted events without changing the mathematical cell | named `flattened_encoder_reduction_sensitivity` ablation and bounds; exact resume under the bound clean implementation; dense/sparse packet round trips, CPU lifecycle, CUDA/CPU endpoint parity, deterministic stream order | universal pre-run implementation choice, not swept |
 | deterministic selector cutoff ties | engineering: exact zero/ReLU ties are common and backend TopK tie order is not a scientific choice | score descending, then lowest block index per token or lowest row-major event index batch-wide; invalid policy refused | universal, not swept |
 | smoke protocol selection | engineering: exercise the complete conditional state machine without laundering tiny runs into evidence | preserve full-cell promotable intent; `runtime.smoke` blocks promotion; mode is `smoke_protocol_only`; panel escalation refused | test-only |
 | site-axis factorization | adapted from FMX at the mechanism level: a low-rank layer axis may reduce parameters and impose useful cross-layer regularity without changing the sparse block coordinate | exact selected parent, unfactorized free-weight control, ranks `1/2/4`, fixed-rate and identification endpoints; repeat after nonzero/structured masking | Phase-1 capability; Phase-2 parsimony tuning and post-mask interaction revisit |

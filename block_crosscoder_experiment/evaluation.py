@@ -330,7 +330,11 @@ def evaluate_shared_code_modes(
             x = x[: max_tokens - n_tokens]
         if not x.numel():
             break
-        encoder_sites = model._frozen_encoder_sites(x, materialized_encoder)
+        encoder_sites = (
+            None
+            if cfg.encoder_fusion == "source" or S == 1
+            else model._frozen_encoder_sites(x, materialized_encoder)
+        )
         full_outputs = outputs_for_view(x, encoder_sites=encoder_sites)
         accumulate_target_statistics(x)
         full_mask_counts: dict[str, torch.Tensor] = {}
