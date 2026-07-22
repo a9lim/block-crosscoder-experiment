@@ -412,13 +412,15 @@ the exact decoder-Gram implementation. The implementation identity and its
 residual thresholds are project engineering decisions and are content-bound in
 the cell, checkpoint, run binding, and deployable codec.
 
-Factorized arms separately derive `direct_rank_space_bmm_bounded_v1`; the
+Factorized arms separately derive `direct_rank_space_prepacked_core_bmm_v2`; the
 materialized site tensor is retained only under the explicit
-`materialized_site_tensor_reference_v1` oracle identity. Direct rank-space
+`materialized_prepacked_core_reference_v2` oracle identity. Direct rank-space
 contraction is a project execution optimization, not an FMX procedure claim or
 a new experimental arm. The cell, checkpoint, run binding, and deployable
-codec bind this identity, while estimator v14 conservatively retains the prior
-operational compute and workspace price.
+codec bind this identity. The physical encoder and decoder cores are contiguous
+in their respective GEMM orders; stale v1 layouts refuse rather than migrate.
+Estimator v14 conservatively retains the prior operational compute and
+workspace price.
 
 Deployment evaluation binds the engineering identity
 `joint_transformed_raw_packet_v1`: transformed-space packet diagnostics and

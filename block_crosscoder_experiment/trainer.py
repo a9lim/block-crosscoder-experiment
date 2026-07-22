@@ -447,9 +447,7 @@ class DeadTracker:
             if self.max_tokens is None:
                 while len(self.chunks) > self.capacity:
                     removed = self.chunks.pop(0)
-                    retained = int(removed["n_tokens"]) - int(
-                        removed["start_token"]
-                    )
+                    retained = int(removed["n_tokens"]) - int(removed["start_token"])
                     self._history_tokens -= retained
                     self._history_count -= self._chunk_counts(
                         removed,
@@ -515,11 +513,15 @@ class DeadTracker:
                 max(int(round(len(accepted) * self.active_blocks)), 0),
                 accepted.numel(),
             )
-            indices = byte_mask.reshape(-1).topk(
-                n_keep,
-                largest=True,
-                sorted=False,
-            ).indices
+            indices = (
+                byte_mask.reshape(-1)
+                .topk(
+                    n_keep,
+                    largest=True,
+                    sorted=False,
+                )
+                .indices
+            )
             indices = indices.sort().values.to(torch.int32)
         else:
             indices = byte_mask[:, 0::8].clone()
@@ -548,9 +550,13 @@ class DeadTracker:
         stop = n_tokens if row_stop is None else row_stop
         counts = torch.zeros(self.n_blocks, dtype=dtype, device=self.device)
         if self.representation == "fixed_token_indices":
-            blocks = indices[start:stop].reshape(-1).to(
-                device=self.device,
-                dtype=torch.int64,
+            blocks = (
+                indices[start:stop]
+                .reshape(-1)
+                .to(
+                    device=self.device,
+                    dtype=torch.int64,
+                )
             )
             weights = torch.ones(blocks.shape, dtype=dtype, device=self.device)
         elif self.representation == "fixed_batch_indices":
@@ -717,9 +723,7 @@ class DeadTracker:
         elif self.policy == "decoder_weighted_token_horizon":
             state["tokens_since_fired"] = self.tokens_since_fired
         elif self.policy == "sasa_release":
-            state["coordinate_passes_since_fired"] = (
-                self.coordinate_passes_since_fired
-            )
+            state["coordinate_passes_since_fired"] = self.coordinate_passes_since_fired
             state["forward_passes"] = self.forward_passes
         return state
 
@@ -799,10 +803,7 @@ class DeadTracker:
                     or not 0 <= start_token < n_tokens
                 ):
                     raise ValueError("dead-tracker chunk token bounds are malformed")
-                if (
-                    self.representation != "fixed_batch_indices"
-                    and start_token != 0
-                ):
+                if self.representation != "fixed_batch_indices" and start_token != 0:
                     raise ValueError(
                         "compact dead-tracker chunks cannot retain a stale prefix"
                     )
@@ -826,9 +827,7 @@ class DeadTracker:
                         (indices[:, 1:] <= indices[:, :-1]).any()
                     )
                     if out_of_range or unordered:
-                        raise ValueError(
-                            "token-topk tracker indices are not canonical"
-                        )
+                        raise ValueError("token-topk tracker indices are not canonical")
                 elif self.representation == "fixed_batch_indices":
                     if indices.dtype != torch.int32:
                         raise ValueError("dead-tracker chunk indices must be int32")
@@ -841,23 +840,18 @@ class DeadTracker:
                             "batch-topk tracker indices have the wrong shape"
                         )
                     out_of_range = bool(
-                        (
-                            (indices < 0)
-                            | (indices >= n_tokens * self.n_blocks)
-                        ).any()
+                        ((indices < 0) | (indices >= n_tokens * self.n_blocks)).any()
                     )
                     unordered = len(indices) > 1 and bool(
                         (indices[1:] <= indices[:-1]).any()
                     )
                     if out_of_range or unordered:
-                        raise ValueError(
-                            "batch-topk tracker indices are not canonical"
-                        )
+                        raise ValueError("batch-topk tracker indices are not canonical")
                 else:
                     packed_width = (self.n_blocks + 7) // 8
-                    if (
-                        indices.dtype != torch.uint8
-                        or indices.shape != (n_tokens, packed_width)
+                    if indices.dtype != torch.uint8 or indices.shape != (
+                        n_tokens,
+                        packed_width,
                     ):
                         raise ValueError(
                             "bitpacked tracker masks have the wrong shape or dtype"
@@ -875,13 +869,9 @@ class DeadTracker:
                     ):
                         raise ValueError("bitpacked tracker padding is nonzero")
             history_tokens = sum(
-                int(chunk["n_tokens"]) - int(chunk["start_token"])
-                for chunk in chunks
+                int(chunk["n_tokens"]) - int(chunk["start_token"]) for chunk in chunks
             )
-            if (
-                self.max_tokens is not None
-                and history_tokens > self.max_tokens
-            ) or (
+            if (self.max_tokens is not None and history_tokens > self.max_tokens) or (
                 self.max_tokens is None and len(chunks) > self.capacity
             ):
                 raise ValueError("dead-tracker chunks exceed their retention bound")
@@ -918,9 +908,7 @@ class DeadTracker:
                 raise ValueError("dead-tracker last_fire is outside the token history")
             self.tokens_seen = tokens_seen
             assert self.last_fire is not None
-            self.last_fire.copy_(
-                last_fire.to(device=self.device)
-            )
+            self.last_fire.copy_(last_fire.to(device=self.device))
         elif self.policy == "decoder_weighted_token_horizon":
             assert self.tokens_since_fired is not None
             tokens_since_fired = require_tensor(
@@ -930,9 +918,7 @@ class DeadTracker:
             )
             if bool((tokens_since_fired < 0).any()):
                 raise ValueError("dead-tracker token ages must be non-negative")
-            self.tokens_since_fired.copy_(
-                tokens_since_fired.to(device=self.device)
-            )
+            self.tokens_since_fired.copy_(tokens_since_fired.to(device=self.device))
         elif self.policy == "sasa_release":
             assert self.coordinate_passes_since_fired is not None
             coordinate_ages = require_tensor(
@@ -1215,9 +1201,7 @@ def _optimizer_group_contract(
             (
                 len(params),
                 *(
-                    tuple(group[field])
-                    if field == "betas"
-                    else group[field]
+                    tuple(group[field]) if field == "betas" else group[field]
                     for field in _OPTIMIZER_IMMUTABLE_GROUP_FIELDS
                 ),
             )
@@ -1260,6 +1244,67 @@ def validate_optimizer_state_config(
     if cfg.optimizer == "adam" and any(weight_decays):
         raise ValueError("Adam optimizer state contains decoupled weight decay")
     return contract
+
+
+def _validate_optimizer_state_shapes(
+    optimizer_state: object,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    """Refuse positional optimizer state whose tensors do not fit parameters.
+
+    PyTorch accepts mismatched Adam moment shapes during ``load_state_dict``
+    and fails only at the next step. Check the serialized positional mapping
+    against the freshly constructed optimizer before mutation so a stale
+    factor-core layout cannot become an apparently resumed campaign.
+    """
+
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("checkpoint lacks optimizer state")
+    stored_groups = optimizer_state.get("param_groups")
+    stored_states = optimizer_state.get("state")
+    if not isinstance(stored_groups, list) or not isinstance(stored_states, dict):
+        raise ValueError("checkpoint optimizer state is malformed")
+    if len(stored_groups) != len(optimizer.param_groups):
+        raise ValueError("checkpoint optimizer group count mismatch")
+    for group_index, (stored_group, live_group) in enumerate(
+        zip(stored_groups, optimizer.param_groups, strict=True)
+    ):
+        stored_parameters = stored_group.get("params")
+        live_parameters = live_group.get("params")
+        if not isinstance(stored_parameters, list) or not isinstance(
+            live_parameters, list
+        ):
+            raise ValueError(f"checkpoint optimizer group {group_index} is malformed")
+        if len(stored_parameters) != len(live_parameters):
+            raise ValueError(
+                f"checkpoint optimizer group {group_index} parameter count mismatch"
+            )
+        for parameter_index, (state_id, parameter) in enumerate(
+            zip(stored_parameters, live_parameters, strict=True)
+        ):
+            state = stored_states.get(state_id, {})
+            if not isinstance(state, dict):
+                raise ValueError(
+                    "checkpoint optimizer parameter state is malformed at "
+                    f"group {group_index}, position {parameter_index}"
+                )
+            for state_name, tensor in state.items():
+                if not torch.is_tensor(tensor):
+                    continue
+                if state_name == "step" and tensor.ndim == 0:
+                    continue
+                if tensor.shape != parameter.shape:
+                    raise ValueError(
+                        f"checkpoint optimizer {state_name} shape {tuple(tensor.shape)} "
+                        f"does not match parameter shape {tuple(parameter.shape)} at "
+                        f"group {group_index}, position {parameter_index}"
+                    )
+                if tensor.dtype != parameter.dtype:
+                    raise ValueError(
+                        f"checkpoint optimizer {state_name} dtype {tensor.dtype} "
+                        f"does not match parameter dtype {parameter.dtype} at "
+                        f"group {group_index}, position {parameter_index}"
+                    )
 
 
 def _lr_factor(cfg: TrainConfig):
@@ -1448,6 +1493,17 @@ class Trainer:
         if self.fwd is not self.master:
             self.fwd.validate_decoded_energy_implementation()
         self.opt, self.optimizer_kind = build_optimizer(self.master, cfg)
+        if self.fwd is not self.master:
+            master_manifest = tuple(
+                (name, tuple(parameter.shape))
+                for name, parameter in self.master.named_parameters()
+            )
+            forward_manifest = tuple(
+                (name, tuple(parameter.shape))
+                for name, parameter in self.fwd.named_parameters()
+            )
+            if forward_manifest != master_manifest:
+                raise RuntimeError("master and forward parameter manifests diverged")
         self._optimizer_contract = validate_optimizer_state_config(
             self.opt.state_dict(),
             cfg,
@@ -1494,10 +1550,7 @@ class Trainer:
         if variant == "sasa_release":
             return self.tracker.forward_passes > self.cfg.dead_window_passes
         if variant == "decoder_weighted_token_horizon":
-            return (
-                self.accepted_tokens + batch_tokens
-                >= self.cfg.dead_horizon_tokens
-            )
+            return self.accepted_tokens + batch_tokens >= self.cfg.dead_horizon_tokens
         return True
 
     def _encoder_observation_mask(self, observed: torch.Tensor) -> torch.Tensor:
@@ -1585,7 +1638,9 @@ class Trainer:
                     f"[{x.shape[0]}, {self.master.cfg.n_sites}]"
                 )
             if not bool(observed.any(dim=1).all()):
-                raise ValueError("every token must have at least one true-observed site")
+                raise ValueError(
+                    "every token must have at least one true-observed site"
+                )
             encoder_observed = self._encoder_observation_mask(observed)
         log_step = self.step_idx % cfg.log_every == 0
         want_record = materialize_record or log_step
@@ -1608,9 +1663,7 @@ class Trainer:
         )
 
         l_aux = None
-        if cfg.aux_variant != "none" and self._auxiliary_can_have_dead_features(
-            len(x)
-        ):
+        if cfg.aux_variant != "none" and self._auxiliary_can_have_dead_features(len(x)):
             dead = None
             if cfg.aux_variant in (
                 "sasa",
@@ -1692,9 +1745,7 @@ class Trainer:
         scalar_values: dict[str, float] | None = None
         if want_record:
             if observed is None:
-                keep_fraction_t = torch.ones(
-                    (), device=x.device, dtype=torch.float32
-                )
+                keep_fraction_t = torch.ones((), device=x.device, dtype=torch.float32)
             else:
                 assert encoder_observed is not None
                 keep_fraction_t = encoder_observed.sum() / observed.sum()
@@ -1735,9 +1786,7 @@ class Trainer:
                     "unclipped_grad_norm",
                 )
             ):
-                raise RuntimeError(
-                    "non-finite loss/gradient/parameter/optimizer state"
-                )
+                raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
         else:
             finite = (
                 _all_finite((parts["rec"], parts["total"], unclipped_grad_norm_t))
@@ -1747,9 +1796,7 @@ class Trainer:
                 )
             )
             if not finite:
-                raise RuntimeError(
-                    "non-finite loss/gradient/parameter/optimizer state"
-                )
+                raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
 
         # The load-bearing ordering: step on master -> retract master ->
         # regenerate the forward copy -> measure the post-cast residual.
@@ -1785,9 +1832,7 @@ class Trainer:
             self.tracker.update(
                 out.mask,
                 coordinate_activity=(
-                    (out.z_selected != 0)
-                    if cfg.aux_variant == "sasa_release"
-                    else None
+                    (out.z_selected != 0) if cfg.aux_variant == "sasa_release" else None
                 ),
             )
         self.accepted_tokens += int(x.shape[0])
@@ -1801,15 +1846,11 @@ class Trainer:
                 "total": scalar_values["total"],
                 "lr": self.sched.get_last_lr()[0],
                 "grad_norm": scalar_values["grad_norm"],
-                "floor_hits": (
-                    int(floor_hits_t) if floor_hits_t is not None else 0
-                ),
+                "floor_hits": (int(floor_hits_t) if floor_hits_t is not None else 0),
                 "encoder_site_keep_fraction": scalar_values["keep"],
             }
             if cfg.gradient_clip_norm is not None:
-                record["grad_norm_unclipped"] = scalar_values[
-                    "unclipped_grad_norm"
-                ]
+                record["grad_norm_unclipped"] = scalar_values["unclipped_grad_norm"]
             if "regularizer" in parts:
                 record["regularizer"] = scalar_values["regularizer"]
             if l_aux is not None:
@@ -1873,9 +1914,7 @@ class Trainer:
         # reuse its one Gram scan for both the general constraint metric and
         # the specialization metric.
         if self.master.uses_stiefel_code_norm_decoded_energy:
-            master_score_geometry = (
-                self.master.validate_decoded_energy_implementation()
-            )
+            master_score_geometry = self.master.validate_decoded_energy_implementation()
             master_residual = float(master_score_geometry["gram_residual_max"])
             d["decoder_constraint_residual_master"] = master_residual
             d["decoded_energy_master_gram_residual"] = master_residual
@@ -1888,9 +1927,7 @@ class Trainer:
                 forward_score_geometry = (
                     self.fwd.validate_decoded_energy_implementation()
                 )
-                postcast_residual = float(
-                    forward_score_geometry["gram_residual_max"]
-                )
+                postcast_residual = float(forward_score_geometry["gram_residual_max"])
                 d["decoder_constraint_residual_postcast"] = postcast_residual
                 d["decoded_energy_postcast_gram_residual"] = postcast_residual
             else:
@@ -1936,6 +1973,7 @@ class Trainer:
             != self._optimizer_contract
         ):
             raise RuntimeError("live optimizer implementation contract changed")
+        _validate_optimizer_state_shapes(optimizer_state, self.opt)
         np_state = np.random.get_state()
         payload = {
             "model": self.master.state_dict(),
@@ -2027,15 +2065,9 @@ class Trainer:
             or isinstance(accepted_tokens, bool)
             or accepted_tokens < 0
         ):
-            raise ValueError(
-                "checkpoint lacks a valid exact accepted-token counter"
-            )
+            raise ValueError("checkpoint lacks a valid exact accepted-token counter")
         step_idx = payload.get("step_idx")
-        if (
-            not isinstance(step_idx, int)
-            or isinstance(step_idx, bool)
-            or step_idx < 0
-        ):
+        if not isinstance(step_idx, int) or isinstance(step_idx, bool) or step_idx < 0:
             raise ValueError("checkpoint lacks a valid exact step counter")
         stored_binding = payload.get("run_binding")
         if stored_binding is not None:
@@ -2064,6 +2096,7 @@ class Trainer:
             != trainer._optimizer_contract
         ):
             raise ValueError("checkpoint optimizer group contract mismatch")
+        _validate_optimizer_state_shapes(payload["optimizer"], trainer.opt)
         trainer.opt.load_state_dict(payload["optimizer"])
         if (
             validate_optimizer_state_config(

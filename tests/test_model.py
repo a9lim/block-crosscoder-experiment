@@ -189,12 +189,17 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
         == FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
     )
 
-    with pytest.raises(ValueError, match="unknown factorized"):
-        BSCConfig(
-            **common,
-            site_rank=2,
-            factorized_execution_implementation="ambient_cuda_default",
-        )
+    for stale_identity in (
+        "ambient_cuda_default",
+        "direct_rank_space_bmm_bounded_v1",
+        "materialized_site_tensor_reference_v1",
+    ):
+        with pytest.raises(ValueError, match="unknown factorized"):
+            BSCConfig(
+                **common,
+                site_rank=2,
+                factorized_execution_implementation=stale_identity,
+            )
     with pytest.raises(ValueError, match="not-applicable"):
         BSCConfig(
             **common,

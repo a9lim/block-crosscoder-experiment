@@ -867,8 +867,8 @@ direct-rank lifetime.
 
 Every cell serializes `factorized_execution_implementation`. Unfactorized
 carriers derive `not_applicable_v1`; site-rank carriers derive
-`direct_rank_space_bmm_bounded_v1`. The explicit
-`materialized_site_tensor_reference_v1` identity is an oracle only. Unknown or
+`direct_rank_space_prepacked_core_bmm_v2`. The explicit
+`materialized_prepacked_core_reference_v2` identity is an oracle only. Unknown or
 carrier-incompatible identities refuse, and root, smoke, and child
 materialization rederive the canonical identity after each effective delta.
 The direct path contracts `[batch,d_model,sites]` with the site basis, applies
@@ -894,6 +894,18 @@ Across 24 paired steps, maximum loss drift is `6.91e-6`, terminal loss drift is
 `5.14e-6`, support disagreement is `4.19e-4`, and support IoU is `.97353`.
 This bounded kernel-order change is engineering evidence, not a new scientific
 factorization arm.
+
+Version 2 stores the logical encoder core physically as contiguous
+`[rank*d_model,groups*block_width]` and the decoder core as contiguous
+`[groups*block_width,rank*d_model]`. The hot encode/decode GEMMs therefore
+consume parameters directly instead of permuting and packing them every step;
+explicit logical-core adapters remain for materialization, score geometry, and
+regularizers. Old v1 identities refuse rather than migrate. At the same jobe
+shape, nine 31-step samples show rank one neutral (`4.1712` to `4.1708 ms`),
+rank two `7.842` to `7.460 ms` (`4.87%`) with `24.0 MiB` lower peak, and rank
+four `14.022` to `13.279 ms` (`5.29%`) with `96.0 MiB` lower peak. Across 24
+steps, the v1 and v2 materialized master weights, bf16 forward weights,
+supports, and losses are bitwise identical at ranks `1/2/4`.
 
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M

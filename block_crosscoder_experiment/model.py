@@ -6,8 +6,10 @@ token-LayerNorm, or whitened. Inputs are batches x: [B, S, d].
 
 Unfactorized parameter stacks are [S, G, b, d].  A declared novel arm may
 instead use a low-rank site-axis factorization
-``W[s,g,b,d] = sum_r A[s,r] B[r,g,b,d]`` for both encoder and decoder.  Its
-canonical forward contracts that factorization directly in rank space;
+``W[s,g,b,d] = sum_r A[s,r] B[r,g,b,d]`` for both encoder and decoder. The
+logical core is stored in contraction-ready physical layouts: encoder
+``[R*d,G*b]`` and decoder ``[G*b,R*d]``. Its canonical forward contracts
+those parameters directly in rank space;
 ``encoder_tensor`` and ``decoder_tensor`` remain explicit materialized-oracle
 surfaces.  Parameters are fp32 masters, and the bf16 forward copy is the
 trainer's job.
@@ -683,6 +685,28 @@ def _site_axis_factorize(
     return site, core
 
 
+def _pack_encoder_factor_core(core: torch.Tensor) -> torch.Tensor:
+    """Store logical ``[R,G,b,d]`` in encode-GEMM order ``[R*d,G*b]``."""
+
+    rank, groups, block_dim, d_model = core.shape
+    return (
+        core.permute(0, 3, 1, 2)
+        .reshape(rank * d_model, groups * block_dim)
+        .contiguous()
+    )
+
+
+def _pack_decoder_factor_core(core: torch.Tensor) -> torch.Tensor:
+    """Store logical ``[R,G,b,d]`` in decode-GEMM order ``[G*b,R*d]``."""
+
+    rank, groups, block_dim, d_model = core.shape
+    return (
+        core.permute(1, 2, 0, 3)
+        .reshape(groups * block_dim, rank * d_model)
+        .contiguous()
+    )
+
+
 # The smallest Phase-2 selector pool is 2048 optimizer tokens by 2048 blocks,
 # four times this fixed gate. Keep smaller CUDA calls eager so calibration
 # tails, Phase-1 cells, and tests do not pay Inductor compilation churn. The
@@ -794,9 +818,9 @@ class BlockCrosscoder(nn.Module):
     E: nn.Parameter | None  # [S,G,b,d], absent when tied or factorized
     D: nn.Parameter | None  # [S,G,b,d], absent when factorized
     E_site: nn.Parameter | None  # [S,R]
-    E_core: nn.Parameter | None  # [R,G,b,d]
+    E_core: nn.Parameter | None  # physical [R*d,G*b]
     D_site: nn.Parameter | None  # [S,R]
-    D_core: nn.Parameter | None  # [R,G,b,d]
+    D_core: nn.Parameter | None  # physical [G*b,R*d]
     c: nn.Parameter  # [S, d]
     theta: torch.Tensor  # scalar buffer, inference selection threshold
 
@@ -867,7 +891,7 @@ class BlockCrosscoder(nn.Module):
             decoder_site, decoder_core = _site_axis_factorize(D, cfg.site_rank)
             self.register_parameter("D", None)
             self.D_site = nn.Parameter(decoder_site)
-            self.D_core = nn.Parameter(decoder_core)
+            self.D_core = nn.Parameter(_pack_decoder_factor_core(decoder_core))
         # Transpose-tied at init only (Fel App. D convention); encoder scale
         # is norm-calibrated on a data batch via calibrate_encoder_scale_.
         if cfg.encoder_mode == "untied":
@@ -897,7 +921,7 @@ class BlockCrosscoder(nn.Module):
                 )
                 self.register_parameter("E", None)
                 self.E_site = nn.Parameter(encoder_site)
-                self.E_core = nn.Parameter(encoder_core)
+                self.E_core = nn.Parameter(_pack_encoder_factor_core(encoder_core))
             self.register_parameter("log_gamma", None)
         else:
             self.register_parameter("E", None)
@@ -955,7 +979,11 @@ class BlockCrosscoder(nn.Module):
             decoder = self.D
         else:
             assert self.D_site is not None and self.D_core is not None
-            decoder = torch.einsum("sr,rgbd->sgbd", self.D_site, self.D_core)
+            decoder = torch.einsum(
+                "sr,rgbd->sgbd",
+                self.D_site,
+                self._decoder_factor_core_tensor(),
+            )
         if self._has_padded_coordinates:
             return decoder * self.coordinate_mask
         return decoder
@@ -1029,7 +1057,11 @@ class BlockCrosscoder(nn.Module):
     def encoder_tensor(self) -> torch.Tensor:
         if self.cfg.site_rank is not None:
             assert self.E_site is not None and self.E_core is not None
-            encoder = torch.einsum("sr,rgbd->sgbd", self.E_site, self.E_core)
+            encoder = torch.einsum(
+                "sr,rgbd->sgbd",
+                self.E_site,
+                self._encoder_factor_core_tensor(),
+            )
         elif self.E is None:
             assert self.D is not None and self.log_gamma is not None
             encoder = self.D * self.log_gamma.exp()
@@ -1039,17 +1071,57 @@ class BlockCrosscoder(nn.Module):
             return encoder * self.coordinate_mask
         return encoder
 
-    def _factorized_core_with_coordinate_mask(
-        self,
-        core: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply the common factorized-site padding mask without building S."""
+    def _factorized_flat_coordinate_mask(self, dtype: torch.dtype) -> torch.Tensor:
+        """Return the common rank-major ``[R*d]`` padding mask."""
 
+        assert self.cfg.site_rank is not None
+        coordinate = self.coordinate_mask[0, 0, 0].to(dtype)
+        return coordinate.expand(self.cfg.site_rank, -1).reshape(-1)
+
+    def _encoder_factor_core_map(self) -> torch.Tensor:
+        """Return physical encoder core ``[R*d,G*b]``, structurally masked."""
+
+        assert self.E_core is not None
         if not self._has_padded_coordinates:
-            return core
-        # BSCConfig requires equal site widths for this parameterization, so
-        # every site has the same coordinate mask and it belongs on the core.
-        return core * self.coordinate_mask[0].to(core.dtype)
+            return self.E_core
+        return self.E_core * self._factorized_flat_coordinate_mask(
+            self.E_core.dtype
+        ).unsqueeze(1)
+
+    def _decoder_factor_core_map(self) -> torch.Tensor:
+        """Return physical decoder core ``[G*b,R*d]``, structurally masked."""
+
+        assert self.D_core is not None
+        if not self._has_padded_coordinates:
+            return self.D_core
+        return self.D_core * self._factorized_flat_coordinate_mask(
+            self.D_core.dtype
+        ).unsqueeze(0)
+
+    def _encoder_factor_core_tensor(self) -> torch.Tensor:
+        """Logical ``[R,G,b,d]`` adapter for explicit materialization."""
+
+        cfg = self.cfg
+        assert cfg.site_rank is not None and self.E_core is not None
+        return self.E_core.view(
+            cfg.site_rank,
+            cfg.d_model,
+            cfg.n_blocks,
+            cfg.block_dim,
+        ).permute(0, 2, 3, 1)
+
+    def _decoder_factor_core_tensor(self, *, masked: bool = False) -> torch.Tensor:
+        """Logical ``[R,G,b,d]`` adapter for scores and materialization."""
+
+        cfg = self.cfg
+        assert cfg.site_rank is not None and self.D_core is not None
+        core = self._decoder_factor_core_map() if masked else self.D_core
+        return core.view(
+            cfg.n_blocks,
+            cfg.block_dim,
+            cfg.site_rank,
+            cfg.d_model,
+        ).permute(2, 0, 1, 3)
 
     def _site_observation_mask(
         self,
@@ -1228,7 +1300,7 @@ class BlockCrosscoder(nn.Module):
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Encode through ``[S,R]`` and ``[R,G,b,d]`` without building SGBD."""
+        """Encode through ``[S,R]`` and physical ``[R*d,G*b]`` directly."""
 
         cfg = self.cfg
         assert self.E_site is not None and self.E_core is not None
@@ -1250,12 +1322,7 @@ class BlockCrosscoder(nn.Module):
         # [N,d,S] @ [S,R] -> [N,d,R], followed by one flattened rank-core
         # GEMM.  Peak structured weight storage is R*G*b*d rather than S*G*b*d.
         rank_input = torch.matmul(x.transpose(1, 2), self.E_site).transpose(1, 2)
-        core = self._factorized_core_with_coordinate_mask(self.E_core)
-        core_map = core.permute(0, 3, 1, 2).reshape(
-            cfg.site_rank * cfg.d_model,
-            cfg.n_latents,
-        )
-        z = rank_input.reshape(x.shape[0], -1) @ core_map
+        z = rank_input.reshape(x.shape[0], -1) @ self._encoder_factor_core_map()
         return self._finish_encoded_sum(z, keep), keep
 
     def _frozen_encoder_sites(
@@ -1508,7 +1575,7 @@ class BlockCrosscoder(nn.Module):
 
         assert self.D_site is not None and self.D_core is not None
         site = self.D_site.float()
-        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+        core = self._decoder_factor_core_tensor(masked=True).float()
         core_gram = torch.einsum("rgbd,tgbd->grt", core, core)
         norm_sq = torch.einsum("sr,grt,st->sg", site, core_gram, site)
         per_site = norm_sq.clamp_min(0).sqrt()
@@ -1521,7 +1588,7 @@ class BlockCrosscoder(nn.Module):
 
         assert self.D_site is not None and self.D_core is not None
         site_metric = self.D_site.float().transpose(0, 1) @ self.D_site.float()
-        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+        core = self._decoder_factor_core_tensor(masked=True).float()
         return torch.einsum("rt,rgbd,tgcd->gbc", site_metric, core, core)
 
     def _factorized_isolated_loss_decrease_scores(
@@ -1538,19 +1605,16 @@ class BlockCrosscoder(nn.Module):
         assert cfg.site_rank is not None
         assert self.D_site is not None and self.D_core is not None
         site = self.D_site.float()
-        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+        core = self._decoder_factor_core_tensor(masked=True).float()
 
         # Linear term: observed residual sites -> rank coordinates -> blocks.
         rank_residual = torch.matmul(
             residual.transpose(1, 2),
             site,
         ).transpose(1, 2)
-        core_map = core.permute(0, 3, 1, 2).reshape(
-            cfg.site_rank * cfg.d_model,
-            cfg.n_latents,
-        )
         projected = (
-            rank_residual.reshape(residual.shape[0], -1) @ core_map
+            rank_residual.reshape(residual.shape[0], -1)
+            @ self._decoder_factor_core_map().float().transpose(0, 1)
         ).reshape_as(code)
 
         if all_sites_observed:
@@ -1807,12 +1871,7 @@ class BlockCrosscoder(nn.Module):
         if _decoder is None and self.uses_direct_factorized_execution:
             assert cfg.site_rank is not None
             assert self.D_site is not None and self.D_core is not None
-            core = self._factorized_core_with_coordinate_mask(self.D_core)
-            core_map = core.permute(1, 2, 0, 3).reshape(
-                cfg.n_latents,
-                cfg.site_rank * cfg.d_model,
-            )
-            rank_output = (flat @ core_map).reshape(
+            rank_output = (flat @ self._decoder_factor_core_map()).reshape(
                 z_selected.shape[0],
                 cfg.site_rank,
                 cfg.d_model,

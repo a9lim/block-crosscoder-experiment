@@ -1597,6 +1597,71 @@ def test_site_mask_rng_and_factorized_parameters_resume_exactly(device, tmp_path
         assert torch.equal(forward, master.to(torch.bfloat16))
 
 
+def test_factorized_checkpoint_refuses_stale_logical_optimizer_core_shape(
+    device, tmp_path
+):
+    cfg = BSCConfig(
+        n_blocks=6,
+        block_dim=2,
+        n_sites=4,
+        d_model=5,
+        k=2,
+        decoder_constraint="free",
+        site_rank=2,
+        seed=124,
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=3, forward_dtype="bf16"),
+    )
+    batch = torch.randn(
+        32,
+        cfg.n_sites,
+        cfg.d_model,
+        generator=torch.Generator().manual_seed(125),
+    ).to(device)
+    trainer.step(batch)
+    checkpoint = tmp_path / "factorized-packed.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
+
+    named = {
+        id(parameter): name for name, parameter in trainer.master.named_parameters()
+    }
+    found = False
+    for stored_group, live_group in zip(
+        payload["optimizer"]["param_groups"],
+        trainer.opt.param_groups,
+        strict=True,
+    ):
+        for state_id, parameter in zip(
+            stored_group["params"], live_group["params"], strict=True
+        ):
+            state = payload["optimizer"]["state"].get(state_id, {})
+            for state_name, tensor in state.items():
+                if state_name != "step":
+                    assert tensor.shape == parameter.shape
+                    assert tensor.dtype == parameter.dtype
+            if named[id(parameter)] == "D_core":
+                packed = state["exp_avg"]
+                state["exp_avg"] = (
+                    packed.view(
+                        cfg.n_blocks,
+                        cfg.block_dim,
+                        cfg.site_rank,
+                        cfg.d_model,
+                    )
+                    .permute(2, 0, 1, 3)
+                    .contiguous()
+                )
+                found = True
+    assert found
+    stale = tmp_path / "factorized-stale-optimizer.pt"
+    torch.save(payload, stale)
+    with pytest.raises(ValueError, match="optimizer exp_avg shape"):
+        Trainer.load_checkpoint(stale, device=device)
+
+
 def test_lr_schedule_linear_fifth():
     """SASA B.3 schedule: warmup, constant, linear decay over the final
     fifth. Cosine remains the default and is untouched."""

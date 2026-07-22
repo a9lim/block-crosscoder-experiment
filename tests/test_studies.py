@@ -1701,7 +1701,7 @@ def test_decoder_retraction_estimator_admits_only_bound_carriers(
             estimate_cell(changed)
 
 
-def test_v13_estimator_prices_cholesky_qr1_training_workspace(
+def test_v14_estimator_prices_cholesky_qr1_training_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cholesky = next(
@@ -1834,7 +1834,7 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_v13_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v14_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -1943,7 +1943,7 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
     )
 
 
-def test_v13_estimator_prices_mapped_isolated_loss_training_and_geometry(
+def test_v14_estimator_prices_mapped_isolated_loss_training_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped = _isolated_loss_estimator_cell(

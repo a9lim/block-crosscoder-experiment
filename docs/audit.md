@@ -138,12 +138,16 @@ exit is not evidence by itself.
   constrained untied encoders. Its optimizer roles and codec round trip remain
   operational.
 - Factorized cells derive and serialize
-  `direct_rank_space_bmm_bounded_v1`; unfactorized cells derive
-  `not_applicable_v1`, and `materialized_site_tensor_reference_v1` is an
+  `direct_rank_space_prepacked_core_bmm_v2`; unfactorized cells derive
+  `not_applicable_v1`, and `materialized_prepacked_core_reference_v2` is an
   explicit release oracle only. Canonical rank-space encode, every score
-  geometry, and decode must not materialize a full site tensor. Unknown or
+  geometry, and decode must not materialize a full site tensor. Encoder and
+  decoder cores use their declared contiguous contraction-ready physical
+  layouts; stale v1 identities refuse. Unknown or
   carrier-incompatible identities refuse in cells, checkpoints, run bindings,
-  and codecs. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
+  and codecs. Checkpoint loading validates every non-scalar Adam moment against
+  the fresh parameter shape before PyTorch may accept positional optimizer
+  state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
   use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
   grants no runtime credit for this optimization.

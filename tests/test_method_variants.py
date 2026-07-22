@@ -682,9 +682,11 @@ def test_low_rank_site_axis_parameters_have_the_declared_shapes_and_rank():
     )
     model = BlockCrosscoder(cfg)
     assert model.D_site is not None and model.D_site.shape == (4, 2)
-    assert model.D_core is not None and model.D_core.shape == (2, 5, 2, 3)
+    assert model.D_core is not None and model.D_core.shape == (10, 6)
+    assert model.D_core.is_contiguous()
     assert model.E_site is not None and model.E_site.shape == (4, 2)
-    assert model.E_core is not None and model.E_core.shape == (2, 5, 2, 3)
+    assert model.E_core is not None and model.E_core.shape == (6, 10)
+    assert model.E_core.is_contiguous()
     expected_factor_parameters = 2 * (4 * 2 + 2 * 5 * 2 * 3)
     actual_factor_parameters = sum(
         parameter.numel()
