@@ -232,13 +232,12 @@ def validate_run_binding(
 
 
 class DeadTracker:
-    """Exact token-window frequency plus O(G) last-activation horizons.
+    """Exact, policy-specific dead-feature state.
 
-    SASA's short frequency window stores boolean token masks and trims the
-    oldest chunk at the exact token boundary. Long-horizon deadness does not
-    retain a ``horizon x G`` matrix: one last-fire token index per block is
-    sufficient and exact. ``max_tokens=0`` disables frequency storage for
-    long-horizon-only auxiliary rules.
+    Each scientific auxiliary owns a disjoint criterion, so a tracker retains
+    and updates only that criterion's sufficient state. SASA keeps its exact
+    boolean token window; long-horizon rules keep one last-fire index per
+    block; release adapters keep only their declared age counters.
     """
 
     def __init__(
@@ -249,6 +248,7 @@ class DeadTracker:
         *,
         max_tokens: int | None = None,
         block_dim: int = 1,
+        policy: str,
     ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
@@ -258,28 +258,55 @@ class DeadTracker:
         self.block_dim = int(block_dim)
         if self.block_dim <= 0:
             raise ValueError("block_dim must be positive")
+        if policy not in {
+            "disabled",
+            "sasa",
+            "long_horizon",
+            "decoder_weighted_token_horizon",
+            "sasa_release",
+        }:
+            raise ValueError(f"unknown dead-tracker policy {policy!r}")
+        if policy == "sasa":
+            if max_tokens == 0:
+                raise ValueError("SASA dead tracking requires a nonzero token window")
+        elif max_tokens != 0:
+            raise ValueError("non-SASA dead tracking requires max_tokens=0")
         self.capacity = int(capacity)
         self.max_tokens = max_tokens
         self.device = torch.device(device)
+        self.policy = policy
         self.chunks: list[torch.Tensor] = []
         self._history_tokens = 0
-        self._history_count = torch.zeros(
-            n_blocks, dtype=torch.int64, device=self.device
+        self._history_count = (
+            torch.zeros(n_blocks, dtype=torch.int64, device=self.device)
+            if policy == "sasa"
+            else None
         )
         self.tokens_seen = 0
-        self.last_fire = torch.full(
-            (n_blocks,), -1, dtype=torch.int64, device=self.device
+        self.last_fire = (
+            torch.full((n_blocks,), -1, dtype=torch.int64, device=self.device)
+            if policy == "long_horizon"
+            else None
         )
         # Minder's release increments a feature-age counter by the whole
         # batch size, then resets every feature selected anywhere in that
         # batch.  This is deliberately separate from ``last_fire``: the
         # latter preserves exact within-batch token positions for the adapted
         # block horizon, while the release counter is batch-boundary exact.
-        self.tokens_since_fired = torch.zeros(
-            n_blocks, dtype=torch.int64, device=self.device
+        self.tokens_since_fired = (
+            torch.zeros(n_blocks, dtype=torch.int64, device=self.device)
+            if policy == "decoder_weighted_token_horizon"
+            else None
         )
-        self.coordinate_passes_since_fired = torch.zeros(
-            n_blocks, self.block_dim, dtype=torch.int64, device=self.device
+        self.coordinate_passes_since_fired = (
+            torch.zeros(
+                n_blocks,
+                self.block_dim,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if policy == "sasa_release"
+            else None
         )
         self.forward_passes = 0
 
@@ -295,35 +322,55 @@ class DeadTracker:
             )
         if mask.shape[0] <= 0:
             raise ValueError("dead-tracker observations must contain tokens")
+        if self.policy == "disabled":
+            raise RuntimeError("disabled dead tracker cannot accept observations")
         accepted = mask.detach().to(device=self.device, dtype=torch.bool)
-        any_fire = accepted.any(dim=0)
-        self.tokens_since_fired += len(accepted)
-        self.tokens_since_fired.masked_fill_(any_fire, 0)
-        reverse_offset = accepted.flip(0).to(torch.int8).argmax(dim=0)
-        positions = self.tokens_seen + len(accepted) - 1 - reverse_offset
-        self.last_fire.copy_(torch.where(any_fire, positions, self.last_fire))
-        self.tokens_seen += len(accepted)
+        if self.policy == "long_horizon":
+            assert self.last_fire is not None
+            any_fire = accepted.any(dim=0)
+            reverse_offset = accepted.flip(0).to(torch.int8).argmax(dim=0)
+            positions = self.tokens_seen + len(accepted) - 1 - reverse_offset
+            self.last_fire.copy_(torch.where(any_fire, positions, self.last_fire))
+            self.tokens_seen += len(accepted)
+            return
+        if self.policy == "decoder_weighted_token_horizon":
+            assert self.tokens_since_fired is not None
+            any_fire = accepted.any(dim=0)
+            self.tokens_since_fired += len(accepted)
+            self.tokens_since_fired.masked_fill_(any_fire, 0)
+            return
 
         # Exact SAELens rule: after each forward, increment every scalar
         # coordinate and reset those whose post-selection activation was
         # nonzero anywhere in the batch.  Signed negative values count as
         # firing because bool() is nonzero, matching the release trainer.
-        self.coordinate_passes_since_fired += 1
-        if coordinate_activity is None:
-            coordinate_activity = accepted.unsqueeze(-1).expand(-1, -1, self.block_dim)
-        if coordinate_activity.shape != (mask.shape[0], self.n_blocks, self.block_dim):
-            raise ValueError(
-                "coordinate_activity must have shape "
-                f"[B, {self.n_blocks}, {self.block_dim}]"
+        if self.policy == "sasa_release":
+            assert self.coordinate_passes_since_fired is not None
+            self.coordinate_passes_since_fired += 1
+            if coordinate_activity is None:
+                coordinate_activity = accepted.unsqueeze(-1).expand(
+                    -1, -1, self.block_dim
+                )
+            if coordinate_activity.shape != (
+                mask.shape[0],
+                self.n_blocks,
+                self.block_dim,
+            ):
+                raise ValueError(
+                    "coordinate_activity must have shape "
+                    f"[B, {self.n_blocks}, {self.block_dim}]"
+                )
+            did_fire = (
+                coordinate_activity.detach()
+                .to(device=self.device, dtype=torch.bool)
+                .any(dim=0)
             )
-        did_fire = (
-            coordinate_activity.detach()
-            .to(device=self.device, dtype=torch.bool)
-            .any(dim=0)
-        )
-        self.coordinate_passes_since_fired.masked_fill_(did_fire, 0)
-        self.forward_passes += 1
+            self.coordinate_passes_since_fired.masked_fill_(did_fire, 0)
+            self.forward_passes += 1
+            return
 
+        assert self.policy == "sasa"
+        assert self._history_count is not None
         if self.max_tokens != 0:
             if self.max_tokens is not None and len(accepted) >= self.max_tokens:
                 suffix = accepted[-self.max_tokens :].clone()
@@ -369,12 +416,15 @@ class DeadTracker:
         Stored boolean chunks are sliced at the exact token boundary, so batch
         size and partial final batches do not change the criterion.
         """
+        if self.policy != "sasa":
+            raise RuntimeError("frequency is available only for the SASA policy")
         if window_tokens <= 0:
             raise ValueError("window_tokens must be positive")
         if not self.chunks:
             return torch.zeros(self.n_blocks, device=self.device)
         history_tokens = self.history_tokens
         if window_tokens >= history_tokens:
+            assert self._history_count is not None
             return self._history_count.float() / max(1, history_tokens)
         remaining = window_tokens
         total = torch.zeros(self.n_blocks, device=self.device)
@@ -395,6 +445,10 @@ class DeadTracker:
         horizon_tokens: int,
     ) -> torch.Tensor:
         """Bool [G]. All-False until the token-denominated history is full."""
+        if variant != self.policy or variant not in {"sasa", "long_horizon"}:
+            raise ValueError(
+                f"dead criterion {variant!r} is unavailable for {self.policy!r}"
+            )
         G = self.n_blocks
         device = self.device
         if variant == "sasa":
@@ -402,6 +456,7 @@ class DeadTracker:
                 return torch.zeros(G, dtype=torch.bool, device=device)
             return self.frequency(window_tokens) <= threshold
         if variant == "long_horizon":
+            assert self.last_fire is not None
             if self.tokens_seen < horizon_tokens:
                 return torch.zeros(G, dtype=torch.bool, device=device)
             return self.last_fire < self.tokens_seen - horizon_tokens
@@ -409,8 +464,13 @@ class DeadTracker:
 
     def dead_coordinates(self, window_passes: int) -> torch.Tensor:
         """SAELens scalar dead mask, shape [G,b], evaluated before a forward."""
+        if self.policy != "sasa_release":
+            raise RuntimeError(
+                "coordinate deadness is available only for the SASA-release policy"
+            )
         if window_passes <= 0:
             raise ValueError("window_passes must be positive")
+        assert self.coordinate_passes_since_fired is not None
         return self.coordinate_passes_since_fired > window_passes
 
     def token_horizon_dead_after_current(
@@ -425,10 +485,15 @@ class DeadTracker:
         AuxK.  The real tracker is mutated only after an accepted optimizer
         step, so guarded/skipped batches cannot contaminate resume state.
         """
+        if self.policy != "decoder_weighted_token_horizon":
+            raise RuntimeError(
+                "token-age deadness is available only for the Minder policy"
+            )
         if horizon_tokens <= 0:
             raise ValueError("horizon_tokens must be positive")
         if current_mask.ndim != 2 or current_mask.shape[1] != self.n_blocks:
             raise ValueError(f"current_mask must have shape [B, {self.n_blocks}]")
+        assert self.tokens_since_fired is not None
         projected = self.tokens_since_fired + int(current_mask.shape[0])
         projected = projected.clone()
         projected.masked_fill_(
@@ -438,44 +503,139 @@ class DeadTracker:
         return projected >= horizon_tokens
 
     def state_dict(self) -> dict:
-        return {
-            "chunks": self.chunks,
-            "tokens_seen": self.tokens_seen,
-            "last_fire": self.last_fire,
-            "tokens_since_fired": self.tokens_since_fired,
+        state = {
             "capacity": self.capacity,
             "max_tokens": self.max_tokens,
             "block_dim": self.block_dim,
-            "coordinate_passes_since_fired": self.coordinate_passes_since_fired,
-            "forward_passes": self.forward_passes,
+            "policy": self.policy,
         }
+        if self.policy == "sasa":
+            state["chunks"] = self.chunks
+        elif self.policy == "long_horizon":
+            state["tokens_seen"] = self.tokens_seen
+            state["last_fire"] = self.last_fire
+        elif self.policy == "decoder_weighted_token_horizon":
+            state["tokens_since_fired"] = self.tokens_since_fired
+        elif self.policy == "sasa_release":
+            state["coordinate_passes_since_fired"] = (
+                self.coordinate_passes_since_fired
+            )
+            state["forward_passes"] = self.forward_passes
+        return state
 
     def load_state_dict(self, state: dict) -> None:
-        self.chunks = [
-            chunk.to(device=self.device, dtype=torch.bool).clone()
-            for chunk in state.get("chunks", [])
-        ]
-        self._history_tokens = sum(len(chunk) for chunk in self.chunks)
-        self._history_count.zero_()
-        for chunk in self.chunks:
-            self._history_count += chunk.sum(dim=0, dtype=torch.int64)
-        self.tokens_seen = int(state.get("tokens_seen", self.history_tokens))
-        self.last_fire = state.get("last_fire", self.last_fire).to(
-            device=self.device, dtype=torch.int64
-        )
-        self.tokens_since_fired = state.get(
-            "tokens_since_fired", self.tokens_since_fired
-        ).to(device=self.device, dtype=torch.int64)
-        self.capacity = int(state.get("capacity", self.capacity))
-        self.max_tokens = state.get("max_tokens", self.max_tokens)
-        stored_dim = int(state.get("block_dim", self.block_dim))
-        if stored_dim != self.block_dim:
-            raise ValueError("dead-tracker block_dim changed across resume")
-        self.coordinate_passes_since_fired = state.get(
-            "coordinate_passes_since_fired",
-            self.coordinate_passes_since_fired,
-        ).to(device=self.device, dtype=torch.int64)
-        self.forward_passes = int(state.get("forward_passes", self.forward_passes))
+        if state.get("policy") != self.policy:
+            raise ValueError("dead-tracker policy changed across resume")
+        expected_keys = set(self.state_dict())
+        if set(state) != expected_keys:
+            raise ValueError("dead-tracker state keys do not match its policy")
+        if (
+            int(state["capacity"]) != self.capacity
+            or state["max_tokens"] != self.max_tokens
+            or int(state["block_dim"]) != self.block_dim
+        ):
+            raise ValueError("dead-tracker configuration changed across resume")
+
+        def require_tensor(
+            name: str,
+            shape: tuple[int, ...],
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            value = state[name]
+            if (
+                not torch.is_tensor(value)
+                or value.shape != shape
+                or value.dtype != dtype
+            ):
+                raise ValueError(
+                    f"dead-tracker {name} must have shape {shape} and dtype {dtype}"
+                )
+            return value
+
+        if self.policy == "sasa":
+            chunks = state["chunks"]
+            if not isinstance(chunks, list):
+                raise ValueError("dead-tracker chunks must be a list")
+            for chunk in chunks:
+                if (
+                    not torch.is_tensor(chunk)
+                    or chunk.ndim != 2
+                    or chunk.shape[0] <= 0
+                    or chunk.shape[1] != self.n_blocks
+                    or chunk.dtype != torch.bool
+                ):
+                    raise ValueError(
+                        "dead-tracker chunks must be nonempty bool [tokens, blocks]"
+                    )
+            history_tokens = sum(len(chunk) for chunk in chunks)
+            if (
+                self.max_tokens is not None
+                and history_tokens > self.max_tokens
+            ) or (
+                self.max_tokens is None and len(chunks) > self.capacity
+            ):
+                raise ValueError("dead-tracker chunks exceed their retention bound")
+            self.chunks = [
+                chunk.to(device=self.device, dtype=torch.bool).clone()
+                for chunk in chunks
+            ]
+            self._history_tokens = history_tokens
+            assert self._history_count is not None
+            self._history_count.zero_()
+            for chunk in self.chunks:
+                self._history_count += chunk.sum(dim=0, dtype=torch.int64)
+        elif self.policy == "long_horizon":
+            tokens_seen = state["tokens_seen"]
+            if (
+                not isinstance(tokens_seen, int)
+                or isinstance(tokens_seen, bool)
+                or tokens_seen < 0
+            ):
+                raise ValueError("dead-tracker tokens_seen must be non-negative")
+            last_fire = require_tensor(
+                "last_fire",
+                (self.n_blocks,),
+                torch.int64,
+            )
+            if bool(((last_fire < -1) | (last_fire >= tokens_seen)).any()):
+                raise ValueError("dead-tracker last_fire is outside the token history")
+            self.tokens_seen = tokens_seen
+            assert self.last_fire is not None
+            self.last_fire.copy_(
+                last_fire.to(device=self.device)
+            )
+        elif self.policy == "decoder_weighted_token_horizon":
+            assert self.tokens_since_fired is not None
+            tokens_since_fired = require_tensor(
+                "tokens_since_fired",
+                (self.n_blocks,),
+                torch.int64,
+            )
+            if bool((tokens_since_fired < 0).any()):
+                raise ValueError("dead-tracker token ages must be non-negative")
+            self.tokens_since_fired.copy_(
+                tokens_since_fired.to(device=self.device)
+            )
+        elif self.policy == "sasa_release":
+            assert self.coordinate_passes_since_fired is not None
+            coordinate_ages = require_tensor(
+                "coordinate_passes_since_fired",
+                (self.n_blocks, self.block_dim),
+                torch.int64,
+            )
+            forward_passes = state["forward_passes"]
+            if (
+                bool((coordinate_ages < 0).any())
+                or not isinstance(forward_passes, int)
+                or isinstance(forward_passes, bool)
+                or forward_passes < 0
+                or bool((coordinate_ages > forward_passes).any())
+            ):
+                raise ValueError("dead-tracker pass ages must be non-negative")
+            self.coordinate_passes_since_fired.copy_(
+                coordinate_ages.to(device=self.device)
+            )
+            self.forward_passes = forward_passes
 
 
 def aux_loss(
@@ -841,6 +1001,11 @@ class Trainer:
             device=next(model.parameters()).device,
             max_tokens=(cfg.dead_window_tokens if cfg.aux_variant == "sasa" else 0),
             block_dim=model.cfg.block_dim,
+            policy=(
+                cfg.aux_variant
+                if cfg.aux_variant not in {"none", "fel"}
+                else "disabled"
+            ),
         )
         self.step_idx = 0
         self.accepted_tokens = 0
@@ -1186,6 +1351,7 @@ class Trainer:
                 )
             }
         elif self.cfg.aux_variant == "decoder_weighted_token_horizon":
+            assert self.tracker.tokens_since_fired is not None
             d = {
                 "dead_frac_token_horizon": float(
                     (self.tracker.tokens_since_fired >= self.cfg.dead_horizon_tokens)
@@ -1193,7 +1359,7 @@ class Trainer:
                     .mean()
                 )
             }
-        else:
+        elif self.cfg.aux_variant == "sasa":
             d = {
                 "dead_frac_window": float(
                     (
@@ -1204,6 +1370,21 @@ class Trainer:
                     .mean()
                 ),
             }
+        elif self.cfg.aux_variant == "long_horizon":
+            d = {
+                "dead_frac_token_horizon": float(
+                    self.tracker.dead(
+                        "long_horizon",
+                        threshold=self.cfg.dead_threshold,
+                        window_tokens=self.cfg.dead_window_tokens,
+                        horizon_tokens=self.cfg.dead_horizon_tokens,
+                    )
+                    .float()
+                    .mean()
+                )
+            }
+        else:
+            d = {}
         master_residual = _constraint_residual(self.master)
         if master_residual is not None:
             d["decoder_constraint_residual_master"] = master_residual
