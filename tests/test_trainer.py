@@ -16,6 +16,8 @@ from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
@@ -1224,6 +1226,189 @@ def test_cholesky_qr_checkpoint_resume_is_exact_at_retraction_boundary(
     _assert_nested_exact(actual, expected)
     _assert_nested_exact(resumed.master.state_dict(), uninterrupted.master.state_dict())
     _assert_nested_exact(resumed.opt.state_dict(), uninterrupted.opt.state_dict())
+
+
+def test_site_bmm_polar_checkpoint_resume_is_exact_at_retraction_boundary(
+    device,
+    tmp_path,
+):
+    cfg = BSCConfig(
+        n_blocks=24,
+        block_dim=4,
+        n_sites=4,
+        d_model=24,
+        k=4,
+        seed=1672,
+        decoder_constraint="gram",
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+        ),
+    )
+    training = train_cfg(total_steps=4, lr=3e-4, retract_every=1, log_every=1)
+    generator = torch.Generator().manual_seed(1673)
+    batches = [torch.randn(64, 4, 24, generator=generator).to(device) for _ in range(4)]
+    uninterrupted = Trainer(BlockCrosscoder(cfg).to(device), training)
+    split = Trainer(BlockCrosscoder(cfg).to(device), training)
+    expected = [uninterrupted.step(batch) for batch in batches]
+    actual = [split.step(batch) for batch in batches[:2]]
+    path = tmp_path / "site-bmm-polar.pt"
+    split.save_checkpoint(path)
+    resumed = Trainer.load_checkpoint(path, device=device)
+    actual.extend(resumed.step(batch) for batch in batches[2:])
+    _assert_nested_exact(actual, expected)
+    _assert_nested_exact(resumed.master.state_dict(), uninterrupted.master.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), uninterrupted.opt.state_dict())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_site_bmm_polar_small_shape_routes_reference_trajectory_exactly():
+    common = dict(
+        n_blocks=256,
+        block_dim=4,
+        n_sites=4,
+        d_model=128,
+        k=8,
+        seed=1674,
+        selection="token_topk",
+        decoder_constraint="gram",
+    )
+    actual_cfg = BSCConfig(
+        **common,
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+        ),
+    )
+    reference_cfg = BSCConfig(
+        **common,
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION
+        ),
+    )
+    training = train_cfg(
+        total_steps=20,
+        lr=3e-4,
+        warmup_steps=1,
+        forward_dtype="bf16",
+        fused=True,
+        retract_every=1,
+        log_every=1,
+    )
+    generator = torch.Generator().manual_seed(1675)
+    batches = [
+        torch.randn(512, 4, 128, generator=generator).to("cuda") for _ in range(20)
+    ]
+    actual = Trainer(BlockCrosscoder(actual_cfg).to("cuda"), training)
+    reference = Trainer(BlockCrosscoder(reference_cfg).to("cuda"), training)
+    actual_records = []
+    reference_records = []
+    intersections = 0
+    unions = 0
+    for batch in batches:
+        actual_records.append(actual.step(batch))
+        reference_records.append(reference.step(batch))
+        with torch.no_grad():
+            actual_support = actual.fwd(batch.to(torch.bfloat16)).mask
+            reference_support = reference.fwd(batch.to(torch.bfloat16)).mask
+        intersections += int((actual_support & reference_support).sum())
+        unions += int((actual_support | reference_support).sum())
+
+    _assert_nested_exact(actual_records, reference_records)
+    assert intersections == unions
+    assert all(record["floor_hits"] == 0 for record in actual_records)
+    assert all(record["floor_hits"] == 0 for record in reference_records)
+    _assert_nested_exact(actual.master.state_dict(), reference.master.state_dict())
+    _assert_nested_exact(actual.opt.state_dict(), reference.opt.state_dict())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_site_bmm_polar_fast_shape_bounds_reference_training_trajectory(
+    monkeypatch,
+):
+    common = dict(
+        n_blocks=1024,
+        block_dim=4,
+        n_sites=4,
+        d_model=512,
+        k=8,
+        seed=1676,
+        selection="token_topk",
+        encoder_mode="tied",
+        decoder_constraint="gram",
+    )
+    actual_cfg = BSCConfig(
+        **common,
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+        ),
+    )
+    reference_cfg = BSCConfig(
+        **common,
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION
+        ),
+    )
+    training = train_cfg(
+        total_steps=20,
+        lr=3e-4,
+        warmup_steps=1,
+        forward_dtype="bf16",
+        fused=True,
+        retract_every=1,
+        log_every=1,
+    )
+    generator = torch.Generator().manual_seed(1677)
+    batches = [
+        torch.randn(256, 4, 512, generator=generator).to("cuda") for _ in range(20)
+    ]
+    actual = Trainer(BlockCrosscoder(actual_cfg).to("cuda"), training)
+    reference = Trainer(BlockCrosscoder(reference_cfg).to("cuda"), training)
+    fast_gram = gram_module._block_gram_no_grad
+    fast_calls = 0
+
+    def counted_fast_gram(value):
+        nonlocal fast_calls
+        fast_calls += 1
+        return fast_gram(value)
+
+    monkeypatch.setattr(gram_module, "_block_gram_no_grad", counted_fast_gram)
+    actual_records = []
+    reference_records = []
+    intersections = 0
+    unions = 0
+    for batch in batches:
+        actual_records.append(actual.step(batch))
+        reference_records.append(reference.step(batch))
+        with torch.no_grad():
+            actual_support = actual.fwd(batch.to(torch.bfloat16)).mask
+            reference_support = reference.fwd(batch.to(torch.bfloat16)).mask
+        intersections += int((actual_support & reference_support).sum())
+        unions += int((actual_support | reference_support).sum())
+
+    maximum_loss_drift = max(
+        abs(actual_record["total"] - reference_record["total"])
+        / max(abs(reference_record["total"]), 1e-30)
+        for actual_record, reference_record in zip(
+            actual_records,
+            reference_records,
+            strict=True,
+        )
+    )
+    assert fast_calls == training.total_steps
+    assert maximum_loss_drift <= 2e-5
+    assert intersections / max(unions, 1) >= 0.995
+    assert all(record["floor_hits"] == 0 for record in actual_records)
+    assert all(record["floor_hits"] == 0 for record in reference_records)
+    assert actual.master.D is not None and reference.master.D is not None
+    assert float(gram_residual(actual.master.D).max()) <= 1e-4
+    assert float(gram_residual(reference.master.D).max()) <= 1e-4
+    assert _nested_relative_l2(
+        actual.master.state_dict(),
+        reference.master.state_dict(),
+    ) <= 3e-3
+    assert _nested_relative_l2(
+        actual.opt.state_dict()["state"],
+        reference.opt.state_dict()["state"],
+    ) <= 1e-5
 
 
 @pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
@@ -2583,6 +2768,15 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     torch.save(forged_map_nuclear, forged_map_nuclear_path)
     with pytest.raises(ValueError, match="run binding mismatch"):
         Trainer.load_checkpoint(forged_map_nuclear_path, device=device)
+
+    forged_polar = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    forged_polar["model_cfg"]["decoder_retraction_implementation"] = (
+        DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION
+    )
+    forged_polar_path = tmp_path / "forged-polar-id.pt"
+    torch.save(forged_polar, forged_polar_path)
+    with pytest.raises(ValueError, match="run binding mismatch"):
+        Trainer.load_checkpoint(forged_polar_path, device=device)
 
 
 def test_factor_regularizer_checkpoint_refuses_stale_v3_identity(device, tmp_path):

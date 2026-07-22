@@ -1152,7 +1152,7 @@ planner retains its larger pre-optimization gradient allowance.
 
 Decoder retraction has a separate serialized implementation identity. Canonical
 QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar cells derive
-`symmetric_polar_eigh_floor_v1`, and other decoder carriers derive
+`symmetric_polar_site_bmm_guard_g1024_w8192_c512_f2_r1e-4_v2`, and other decoder carriers derive
 `not_applicable_v1`; root, smoke, and child cells recompute that identity.
 Positive-diagonal Cholesky-QR1 fails closed above condition 64 or on nonfinite,
 factorization, reconstruction-residual, or post-Gram-residual failure, with no
@@ -1167,6 +1167,23 @@ across one, four, and six sites; CPU retains the existing einsum. At `S=4`,
 `G=2048`, `b=4`, `d=768` on jobe, the polar primitive falls from `1.558` to
 `1.175 ms` (`24.6%`); the complete Phase-2 polar step is projected to improve
 by about `3.0%` with no peak increase.
+
+Version 2 also forms the fp32 multi-site Gram through sequential site BMMs;
+`symmetric_polar_eigh_floor_v1` remains the explicit site-reducing-einsum
+oracle. The fast branch is CUDA-only, requires at least 1,024 groups and
+`S*b*d >= 8192`, and retains the fixed 512-group chunk ceiling. Before any
+chunk is mutated, every eigenvalue must be finite and its minimum must exceed
+both twice the eig-floor and `1e-4` of the maximum; otherwise that whole chunk
+recomputes through v1. Thus small cells and floor-active or rank-deficient
+chunks are bitwise reference-exact. The admitted fast primitive is bounded to
+`5e-6` relative output drift, `1e-5` post-Gram-residual difference, `1e-4`
+absolute post-Gram residual, and exactly zero floor hits. Its canonical
+20-step bf16 gate requires loss drift at most `2e-5`, support IoU at least
+`.995`, model relative L2 drift at most `3e-3`, and optimizer relative L2 drift
+at most `1e-5`; same-identity resume is bitwise exact. Combined with sitewise
+application, the canonical polar primitive falls from `1.567` to `.651 ms`
+(`58.4%`); `G=4096` falls `54.1%`, and chunked `G=8192` falls `16–21%` without
+the roughly 2.25 GiB unchunked workspace.
 
 The fixed jobe benchmark uses five warmups and 31 separately synchronized
 CUDA-event samples, with nearest-rank p95, peak reset after warmup, and all

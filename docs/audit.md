@@ -149,9 +149,10 @@ exit is not evidence by itself.
 - Stiefel QR and symmetric-polar retractions satisfy their declared Gram
   invariant and produce finite gradients. Canonical QR, polar, and other
   carriers respectively bind `cholesky_qr1_positive_diagonal_cond64_v1`,
-  `symmetric_polar_eigh_floor_v1`, and `not_applicable_v1`; root, smoke, and
-  child cells rederive the identity. Positive-diagonal Householder QR remains a
-  reference/test oracle. Unknown or mismatched identities, condition above 64,
+  `symmetric_polar_site_bmm_guard_g1024_w8192_c512_f2_r1e-4_v2`, and `not_applicable_v1`;
+  root, smoke, and child cells rederive the identity. Polar v1 and
+  positive-diagonal Householder QR remain reference/test oracles. Unknown or
+  mismatched identities, condition above 64,
   nonfinite state, factorization failure, or residual failure refuse without
   fallback, and all serialized artifact identities must agree. Primitive,
   complete-Trainer, 20-step trajectory, exact-resume, both-hard-selector, and
@@ -163,6 +164,9 @@ exit is not evidence by itself.
   candidate and combine its precondition, factor, rank, and post-Gram
   predicates into one admitted-path host fence; every failure-only diagnostic
   and the no-mutation refusal remain release gates.
+  Polar v2 may enter its site-BMM Gram only above the bound workload gate and
+  only while every unmutated chunk clears the bound eig-floor and spectrum
+  guard; small or unsafe chunks must reproduce polar v1 exactly.
 - Site-axis factorization includes an exact selected-parent carrier. Phase 1
   records full and rank `1/2/4` as nonpromotable capability evidence and
   advances the exact carrier. In Phase 2 the common free carrier must pass the

@@ -23,6 +23,8 @@ from block_crosscoder_experiment.gram import (
 )
 from block_crosscoder_experiment.runtime_limits import (
     CHOLESKY_QR_GRAM_CONDITION_MAX,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
 )
@@ -859,7 +861,114 @@ def test_sitewise_polar_application_is_bitwise_einsum_exact(
     expected.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, expected))
     monkeypatch.setattr(gram_module, "_GRAM_BLOCK_CHUNK", 7)
     monkeypatch.setattr(gram_module, "_RETRACT_UNCHUNKED_MAX", 0)
-    actual_hits = retract_(actual)
+    actual_hits = retract_(
+        actual,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    )
+    assert actual_hits == expected_hits
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("sites", (1, 4, 6))
+def test_polar_site_bmm_gram_has_bounded_reference_drift(device, sites):
+    generator = torch.Generator(device="cpu").manual_seed(5290 + sites)
+    source = torch.randn(sites, 127, 4, 33, generator=generator).to(device)
+    actual = source.clone()
+    expected = source.clone()
+    actual_hits = retract_(
+        actual,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    )
+    expected_hits = retract_(
+        expected,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    )
+    assert actual_hits == expected_hits
+    assert torch.equal(actual, expected)
+
+
+def test_polar_site_bmm_gram_retains_rank_deficient_floor_counts(device):
+    source = random_stack(device, seed=5297)
+    source[:, 0] = 0.0
+    source[0, 0, 0, 0] = 1.0
+    actual = source.clone()
+    expected = source.clone()
+    actual_hits = retract_(
+        actual,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    )
+    expected_hits = retract_(
+        expected,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    )
+    assert actual_hits == expected_hits
+    assert actual_hits >= B_DIM - 1
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_polar_site_bmm_fast_shape_has_bounded_reference_drift(monkeypatch):
+    generator = torch.Generator(device="cuda").manual_seed(5298)
+    source = torch.randn(
+        4,
+        1024,
+        4,
+        512,
+        generator=generator,
+        device="cuda",
+    )
+    actual = source.clone()
+    expected = source.clone()
+    expected_hits = retract_(
+        expected,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    )
+
+    def refuse_reference(*args, **kwargs):
+        raise AssertionError("healthy polar fast shape used the v1 einsum")
+
+    with monkeypatch.context() as reference_guard:
+        reference_guard.setattr(gram_module.torch, "einsum", refuse_reference)
+        actual_hits = retract_(
+            actual,
+            implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+        )
+    difference = (actual - expected).norm()
+    scale = expected.norm().clamp_min(1e-30)
+    assert actual_hits == expected_hits == 0
+    assert float(difference / scale) <= 5e-6
+    actual_residual = gram_residual(actual)
+    expected_residual = gram_residual(expected)
+    assert float(actual_residual.max()) <= 1e-4
+    assert float(expected_residual.max()) <= 1e-4
+    assert float((actual_residual - expected_residual).abs().max()) <= 1e-5
+
+
+def test_polar_site_bmm_spectral_guard_falls_back_before_mutation(
+    monkeypatch,
+    device,
+):
+    source = random_stack(device, seed=5299)
+    source[:, 0] = 0.0
+    source[0, 0, 0, 0] = 1.0
+    actual = source.clone()
+    expected = source.clone()
+    monkeypatch.setattr(gram_module, "SYMMETRIC_POLAR_FAST_MIN_GROUPS", 1)
+    monkeypatch.setattr(
+        gram_module,
+        "SYMMETRIC_POLAR_FAST_MIN_SITE_BLOCK_WIDTH",
+        1,
+    )
+    actual_hits = retract_(
+        actual,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    )
+    expected_hits = retract_(
+        expected,
+        implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    )
     assert actual_hits == expected_hits
     assert torch.equal(actual, expected)
 

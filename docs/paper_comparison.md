@@ -446,10 +446,11 @@ this does not alter the data stream or scientific method.
 
 QR versus symmetric-polar retraction remains a scientific architecture choice.
 Canonical QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar
-cells derive `symmetric_polar_eigh_floor_v1`, and other carriers derive
-`not_applicable_v1`. Positive-diagonal Householder QR is an admitted
-reference/test oracle, not a matrix row or tuning choice. Root, smoke, and child
-cells rederive the identity, serialized artifacts bind it, and unknown or
+cells derive `symmetric_polar_site_bmm_guard_g1024_w8192_c512_f2_r1e-4_v2`, and other carriers
+derive `not_applicable_v1`. The former polar einsum and positive-diagonal
+Householder QR are admitted reference/test oracles, not matrix rows or tuning
+choices. Root, smoke, and child cells rederive the identity, serialized
+artifacts bind it, and unknown or
 carrier-incompatible values fail closed. These identities and the Cholesky
 condition/residual gates are project engineering decisions, not paper recipes.
 

@@ -28,10 +28,16 @@ from .runtime_limits import (
     CHOLESKY_QR_GRAM_CONDITION_MAX,
     CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX,
     CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_DECODER_CHOLESKY_DIAGONAL_RATIO_MIN,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     MAP_NUCLEAR_SPECTRUM_RATIO_MIN,
+    SYMMETRIC_POLAR_FAST_FLOOR_MULTIPLIER,
+    SYMMETRIC_POLAR_FAST_MIN_GROUPS,
+    SYMMETRIC_POLAR_FAST_MIN_SITE_BLOCK_WIDTH,
+    SYMMETRIC_POLAR_FAST_SPECTRUM_RATIO_MIN,
 )
 
 # Safe batch count for cusolver's batched symmetric eigensolvers
@@ -162,6 +168,7 @@ def _retract_count_tensor_(
     D: torch.Tensor,
     *,
     eig_floor: float = 1e-6,
+    implementation: str = DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
 ) -> torch.Tensor:
     """In-place retraction onto the Gram manifold: D_g^s <- M_g^{-1/2} D_g^s.
 
@@ -179,10 +186,40 @@ def _retract_count_tensor_(
     chunk_size = (
         D.shape[1] if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
     )
+    fast_shape = (
+        D.device.type == "cuda"
+        and D.shape[1] >= SYMMETRIC_POLAR_FAST_MIN_GROUPS
+        and D.shape[0] * D.shape[2] * D.shape[3]
+        >= SYMMETRIC_POLAR_FAST_MIN_SITE_BLOCK_WIDTH
+    )
     for start in range(0, D.shape[1], chunk_size):
         chunk = D[:, start : start + chunk_size]
-        M = torch.einsum("sgbd,sgcd->gbc", chunk, chunk)
-        evals, evecs = torch.linalg.eigh(M)
+        if (
+            implementation == DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+            and fast_shape
+        ):
+            M = _block_gram_no_grad(chunk)
+            evals, evecs = torch.linalg.eigh(M)
+            spectral_floor = torch.maximum(
+                torch.full_like(evals[..., 0], eig_floor)
+                * SYMMETRIC_POLAR_FAST_FLOOR_MULTIPLIER,
+                evals[..., -1] * SYMMETRIC_POLAR_FAST_SPECTRUM_RATIO_MIN,
+            )
+            fast_safe = torch.isfinite(evals).all(dim=-1) & (
+                evals[..., 0] > spectral_floor
+            )
+            if bool((~fast_safe).any()):
+                M = torch.einsum("sgbd,sgcd->gbc", chunk, chunk)
+                evals, evecs = torch.linalg.eigh(M)
+        elif (
+            implementation == DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+            or implementation
+            == DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION
+        ):
+            M = torch.einsum("sgbd,sgcd->gbc", chunk, chunk)
+            evals, evecs = torch.linalg.eigh(M)
+        else:
+            raise ValueError("unknown symmetric-polar retraction implementation")
         floor_hits += (evals < eig_floor).sum()
         evals = evals.clamp_min(eig_floor)
         inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
@@ -197,9 +234,20 @@ def _retract_count_tensor_(
 
 
 @torch.no_grad()
-def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
+def retract_(
+    D: torch.Tensor,
+    *,
+    eig_floor: float = 1e-6,
+    implementation: str = DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+) -> int:
     """Public integer-count wrapper for the Gram-manifold retraction."""
-    return int(_retract_count_tensor_(D, eig_floor=eig_floor).item())
+    return int(
+        _retract_count_tensor_(
+            D,
+            eig_floor=eig_floor,
+            implementation=implementation,
+        ).item()
+    )
 
 
 @torch.no_grad()

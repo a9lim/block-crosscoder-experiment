@@ -45,6 +45,7 @@ from .runtime_limits import (
     DECODER_RETRACTION_IMPLEMENTATIONS,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
     CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR,
     CUDA_SPARSE_DECODE_MIN_BATCH,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -385,10 +386,10 @@ class BSCConfig:
                     "QR decoder constraint requires a QR retraction implementation"
                 )
         elif self.decoder_constraint == "gram":
-            if (
-                self.decoder_retraction_implementation
-                != DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
-            ):
+            if self.decoder_retraction_implementation not in {
+                DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+                DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+            }:
                 raise ValueError(
                     "Gram decoder constraint requires symmetric-polar retraction"
                 )
@@ -952,7 +953,11 @@ class BlockCrosscoder(nn.Module):
         # the declared constraint only after those operations, so the very
         # first forward has the same geometry as every post-step forward.
         if cfg.decoder_constraint == "gram":
-            _retract_count_tensor_(D, eig_floor=cfg.eig_floor)
+            _retract_count_tensor_(
+                D,
+                eig_floor=cfg.eig_floor,
+                implementation=cfg.decoder_retraction_implementation,
+            )
         elif cfg.decoder_constraint == "qr":
             if (
                 cfg.decoder_retraction_implementation
@@ -2453,6 +2458,7 @@ class BlockCrosscoder(nn.Module):
                 bad = _retract_count_tensor_(
                     self.D.data,
                     eig_floor=self.cfg.eig_floor,
+                    implementation=self.cfg.decoder_retraction_implementation,
                 )
                 mark(self.D)
             elif self.cfg.decoder_constraint == "qr":
