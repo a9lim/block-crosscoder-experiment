@@ -6960,7 +6960,12 @@ def _evaluate_cached_time_sharing(
     errors = {
         key: torch.zeros((), dtype=torch.float64, device=device) for key in resolved
     }
-    upper_counts = {key: 0 for key in resolved}
+    # The balanced predicate is the difference of consecutive floor values,
+    # so its prefix sum is exact without synchronizing a CUDA count per chunk.
+    upper_counts = {
+        key: cache.tokens * int(plan["upper_tokens"]) // horizon
+        for key, plan in resolved.items()
+    }
     token_offset = 0
     for cpu_chunk in cache.chunks:
         if (
@@ -6990,7 +6995,6 @@ def _evaluate_cached_time_sharing(
             lower = chunk[name_to_index[str(plan["lower_name"])]]
             upper = chunk[name_to_index[str(plan["upper_name"])]]
             errors[key] += torch.where(mask, upper, lower).sum()
-            upper_counts[key] += int(mask.sum())
         token_offset += chunk_tokens
     if token_offset != cache.tokens:
         raise CellExecutionError("raw endpoint cache token count is inconsistent")
