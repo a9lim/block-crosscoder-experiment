@@ -131,6 +131,7 @@ _SYNTHETIC_NORMALIZATION_CACHE: dict[
     tuple[int, torch.dtype, torch.device],
     tuple[Mapping[str, Any], torch.Tensor, torch.Tensor],
 ] = {}
+_RECOVERY_ASSOCIATION_GROUP_CHUNK = 256
 _DEPLOYABLE_CODEC_KEYS = {
     "format_version",
     "schema",
@@ -4924,6 +4925,27 @@ def _support_confusion(
     }
 
 
+def _accumulate_chunked_recovery_association(
+    truth_active: torch.Tensor,
+    block_mask: torch.Tensor,
+    coactive: torch.Tensor,
+    truth_count: torch.Tensor,
+    predicted_count: torch.Tensor,
+) -> None:
+    """Accumulate exact binary association counts without a full-width cast."""
+
+    truth = truth_active.to(device=coactive.device, dtype=torch.float64)
+    truth_count.add_(truth.sum(dim=0))
+    for start in range(0, block_mask.shape[1], _RECOVERY_ASSOCIATION_GROUP_CHUNK):
+        stop = min(
+            start + _RECOVERY_ASSOCIATION_GROUP_CHUNK,
+            block_mask.shape[1],
+        )
+        predicted = block_mask[:, start:stop].to(dtype=torch.float64)
+        coactive[:, start:stop].addmm_(truth.T, predicted)
+        predicted_count[start:stop].add_(predicted.sum(dim=0))
+
+
 def _matching_pathologies(association: torch.Tensor) -> dict[str, float]:
     """Directional planted-factor/learned-group multiplicity diagnostics."""
 
@@ -5062,9 +5084,22 @@ def _synthetic_recovery(
     dataset = evaluation_dataset
     n_factors = len(dataset.factors)
     n_groups = model.cfg.n_blocks
-    coactive = torch.zeros(n_factors, n_groups, dtype=torch.float64)
-    truth_count = torch.zeros(n_factors, dtype=torch.float64)
-    predicted_count = torch.zeros(n_groups, dtype=torch.float64)
+    coactive_device = torch.zeros(
+        n_factors,
+        n_groups,
+        dtype=torch.float64,
+        device=device,
+    )
+    truth_count_device = torch.zeros(
+        n_factors,
+        dtype=torch.float64,
+        device=device,
+    )
+    predicted_count_device = torch.zeros(
+        n_groups,
+        dtype=torch.float64,
+        device=device,
+    )
     matching_examples = 0
     for matching_batch in matching_dataset.batches(
         batch_size,
@@ -5076,19 +5111,32 @@ def _synthetic_recovery(
             matching_x,
             observed=matching_batch.observed.to(device),
         )
-        truth = matching_batch.active.bool().cpu()
-        predicted_blocks = matching_out.mask.bool().cpu()
-        coactive += truth.double().T @ predicted_blocks.double()
-        truth_count += truth.sum(dim=0).double()
-        predicted_count += predicted_blocks.sum(dim=0).double()
-        matching_examples += len(truth)
+        if device.type == "cuda":
+            _accumulate_chunked_recovery_association(
+                matching_batch.active,
+                matching_out.mask,
+                coactive_device,
+                truth_count_device,
+                predicted_count_device,
+            )
+            matching_examples += len(matching_batch.active)
+        else:
+            truth = matching_batch.active.bool().cpu()
+            predicted_blocks = matching_out.mask.bool().cpu()
+            coactive_device += truth.double().T @ predicted_blocks.double()
+            truth_count_device += truth.sum(dim=0).double()
+            predicted_count_device += predicted_blocks.sum(dim=0).double()
+            matching_examples += len(truth)
     if matching_examples != calibration_stop - calibration_start:
         raise CellExecutionError("factor-calibration stream ended early")
     association = (
         2
-        * coactive
-        / (truth_count.unsqueeze(1) + predicted_count.unsqueeze(0)).clamp_min(1)
-    )
+        * coactive_device
+        / (
+            truth_count_device.unsqueeze(1)
+            + predicted_count_device.unsqueeze(0)
+        ).clamp_min(1)
+    ).cpu()
     best_association, factor_to_group = association.max(dim=1)
     group_to_factor = association.argmax(dim=0)
     factor_to_group_device = factor_to_group.to(device)

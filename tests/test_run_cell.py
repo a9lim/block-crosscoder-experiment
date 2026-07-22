@@ -24,6 +24,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _Context,
     _RawEndpointErrorCache,
     _VERIFIED_STORE_BINDINGS,
+    _accumulate_chunked_recovery_association,
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
     _evaluate_cached_time_sharing,
@@ -2011,6 +2012,35 @@ def test_declared_but_unimplemented_semantics_fail_closed(tmp_path: Path) -> Non
     assert campaign.record(cell.cell_id).state is RunState.FAILED
     messages = [event["message"] for event in campaign.events(cell.cell_id)]
     assert any("unknown resolved decoder" in message for message in messages)
+
+
+@pytest.mark.parametrize("target", ("cpu", "cuda"))
+def test_chunked_recovery_association_matches_exact_host_counts(target: str) -> None:
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    device = torch.device(target)
+    tokens, factors, groups = 37, 5, 300
+    truth = (
+        torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
+    )
+    predicted = (
+        torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
+    )
+    coactive = torch.zeros(factors, groups, dtype=torch.float64, device=device)
+    truth_count = torch.zeros(factors, dtype=torch.float64, device=device)
+    predicted_count = torch.zeros(groups, dtype=torch.float64, device=device)
+
+    _accumulate_chunked_recovery_association(
+        truth,
+        predicted.to(device),
+        coactive,
+        truth_count,
+        predicted_count,
+    )
+
+    assert torch.equal(coactive.cpu(), truth.double().T @ predicted.double())
+    assert torch.equal(truth_count.cpu(), truth.sum(dim=0).double())
+    assert torch.equal(predicted_count.cpu(), predicted.sum(dim=0).double())
 
 
 def test_support_confusion_distinguishes_fdr_from_false_positive_rate() -> None:
