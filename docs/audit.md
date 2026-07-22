@@ -183,8 +183,8 @@ exit is not evidence by itself.
   tensor. Encoder and decoder cores use their declared contiguous physical
   layouts; stale v1/v2 identities refuse. Low-density bf16 hard-TopK decode
   uses the content-bound Triton forward/backward only at batch size at least
-  2,048 and density at most `1/32`; every other carrier retains dense
-  rank-space decode. Unknown or carrier/objective-incompatible identities
+  2,048 and density at most `1/32`; every other factorized execution retains
+  dense rank-space decode. Unknown or carrier/objective-incompatible identities
   refuse in cells, checkpoints, run bindings, and codecs. Version 4 must
   contract masked site/core pair Grams without materializing either structured
   weight; its fp32/bf16 value, every factor gradient, exact-zero,
@@ -196,6 +196,12 @@ exit is not evidence by itself.
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
   use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
   remains conservative and grants no runtime credit for this optimization.
+  Every carrier also serializes
+  `native_or_rank_hard_topk_cuda_else_dense_v1` or the explicit
+  `dense_reference_v1` sparse-decode oracle. The CUDA identity may consume
+  native contiguous `[S,G,b,d]` directly but must never pack the full decoder;
+  its primitive, tied/untied trajectory, support, bias, padding, and
+  determinism bounds are the release gates in `design.md`.
   Codec fitting, packet encoding, public packet decode, and trusted multi-q
   decode must also remain in rank space. R-D metric D2H uses one packed
   transfer per batch, and fixed one-token rows must never read CUDA scalars

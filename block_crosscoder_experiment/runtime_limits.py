@@ -75,11 +75,20 @@ FACTORIZED_EXECUTION_IMPLEMENTATIONS = (
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
 )
 
+SPARSE_DECODE_CUDA_IMPLEMENTATION = (
+    "native_or_rank_hard_topk_cuda_else_dense_v1"
+)
+SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION = "dense_reference_v1"
+SPARSE_DECODE_IMPLEMENTATIONS = (
+    SPARSE_DECODE_CUDA_IMPLEMENTATION,
+    SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
+)
+
 # The custom CUDA decoder wins only while hard selection retains at most one
 # block in this many.  The gate is shape-derived and therefore introduces no
 # device synchronization or data-dependent algorithm switch.
-FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR = 32
-FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH = 2048
+CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR = 32
+CUDA_SPARSE_DECODE_MIN_BATCH = 2048
 
 # Cholesky-QR1 squares the input condition number.  The admitted fp32 carrier
 # is deliberately narrow enough that the post-retraction Gram remains inside
@@ -94,6 +103,7 @@ MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
     "isolated_loss_decrease_implementation",
     "decoder_retraction_implementation",
     "factorized_execution_implementation",
+    "sparse_decode_implementation",
 )
 
 

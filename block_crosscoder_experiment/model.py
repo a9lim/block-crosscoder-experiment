@@ -45,6 +45,8 @@ from .runtime_limits import (
     DECODER_RETRACTION_IMPLEMENTATIONS,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    CUDA_SPARSE_DECODE_MIN_BATCH,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_IMPLEMENTATIONS,
     DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX,
@@ -52,13 +54,13 @@ from .runtime_limits import (
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
-    FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR,
-    FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH,
     FACTORIZED_EXECUTION_IMPLEMENTATIONS,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_IMPLEMENTATIONS,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    SPARSE_DECODE_CUDA_IMPLEMENTATION,
+    SPARSE_DECODE_IMPLEMENTATIONS,
     decoded_energy_code_norm_eligible,
     isolated_loss_mapped_eligible,
 )
@@ -307,6 +309,7 @@ class BSCConfig:
     # and decode.  The materialized implementation is an explicit release
     # oracle, never an ambient device-dependent fallback.
     factorized_execution_implementation: str | None = None
+    sparse_decode_implementation: str = SPARSE_DECODE_CUDA_IMPLEMENTATION
 
     def __post_init__(self) -> None:
         if self.selection not in {"batch_topk", "token_topk", "threshold", "dense"}:
@@ -567,6 +570,8 @@ class BSCConfig:
             not in FACTORIZED_EXECUTION_IMPLEMENTATIONS
         ):
             raise ValueError("unknown factorized_execution_implementation")
+        if self.sparse_decode_implementation not in SPARSE_DECODE_IMPLEMENTATIONS:
+            raise ValueError("unknown sparse_decode_implementation")
         if self.site_rank is None:
             if (
                 self.factorized_execution_implementation
@@ -2042,19 +2047,24 @@ class BlockCrosscoder(nn.Module):
         mode: str,
     ) -> bool:
         if (
-            not self.uses_direct_factorized_execution
-            or mode != "topk"
+            mode != "topk"
             or self.cfg.selection not in {"batch_topk", "token_topk"}
             or device.type != "cuda"
             or dtype != torch.bfloat16
-            or batch < FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH
+            or batch < CUDA_SPARSE_DECODE_MIN_BATCH
+            or self.cfg.sparse_decode_implementation
+            != SPARSE_DECODE_CUDA_IMPLEMENTATION
+            or (
+                self.cfg.site_rank is not None
+                and not self.uses_direct_factorized_execution
+            )
         ):
             return False
         groups = self.cfg.n_blocks
         selected = self._hard_topk_selected_count(batch)
         return (
             selected > 0
-            and selected * FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR
+            and selected * CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR
             <= batch * groups
         )
 
@@ -2066,35 +2076,52 @@ class BlockCrosscoder(nn.Module):
             return batch * min(max(int(round(self.cfg.k)), 0), groups)
         raise RuntimeError("hard TopK event count requires a hard TopK selector")
 
-    def _decode_factorized_cuda_sparse_topk(
+    def _decode_cuda_sparse_topk(
         self,
         code: torch.Tensor,
         mask: torch.Tensor,
+        *,
+        decoder: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode selected events without a dense zero-filled code tensor."""
 
         from .cuda_sparse_decode import cuda_sparse_topk_decode
 
         cfg = self.cfg
-        assert cfg.site_rank is not None
-        assert self.D_site is not None and self.D_core is not None
-        rank_output = cuda_sparse_topk_decode(
-            code,
-            mask,
-            self._decoder_factor_core_map(),
-            selected_count=self._hard_topk_selected_count(code.shape[0]),
-        ).view(code.shape[0], cfg.site_rank, cfg.d_model)
-        xhat = torch.matmul(
-            rank_output.transpose(1, 2),
-            self.D_site.transpose(0, 1),
-        ).transpose(1, 2)
+        selected_count = self._hard_topk_selected_count(code.shape[0])
+        if self.uses_direct_factorized_execution:
+            assert cfg.site_rank is not None
+            assert self.D_site is not None and self.D_core is not None
+            rank_output = cuda_sparse_topk_decode(
+                code,
+                mask,
+                self._decoder_factor_core_map(),
+                selected_count=selected_count,
+            ).view(code.shape[0], cfg.site_rank, cfg.d_model)
+            xhat = torch.matmul(
+                rank_output.transpose(1, 2),
+                self.D_site.transpose(0, 1),
+            ).transpose(1, 2)
+        else:
+            if cfg.site_rank is not None:
+                raise RuntimeError(
+                    "materialized factorized reference refuses sparse CUDA decode"
+                )
+            if decoder is None:
+                decoder = self.decoder_tensor()
+            xhat = cuda_sparse_topk_decode(
+                code,
+                mask,
+                decoder,
+                selected_count=selected_count,
+            )
         if cfg.decoder_bias:
             xhat = xhat + self.c.unsqueeze(0)
         if self._has_padded_coordinates:
             xhat = xhat * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
         return xhat
 
-    def _forward_factorized_cuda_sparse_topk_training(
+    def _forward_cuda_sparse_topk_training(
         self,
         x: torch.Tensor,
         *,
@@ -2104,22 +2131,47 @@ class BlockCrosscoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Trainer-only sparse forward returning reconstruction and support."""
 
-        z, keep = self._encode_factorized_direct(
-            x,
-            observed=observed,
-            validate_observed=validate_observed,
-        )
+        decoder: torch.Tensor | None
+        if self.uses_direct_factorized_execution:
+            z, keep = self._encode_factorized_direct(
+                x,
+                observed=observed,
+                validate_observed=validate_observed,
+            )
+            decoder = None
+        else:
+            if self.cfg.site_rank is not None:
+                raise RuntimeError(
+                    "materialized factorized reference refuses sparse CUDA decode"
+                )
+            decoder = self.decoder_tensor()
+            encoder = (
+                self._tied_encoder_tensor(decoder)
+                if self.cfg.encoder_mode == "tied"
+                else self.encoder_tensor()
+            )
+            z, keep = self._encode_with_tensor(
+                x,
+                encoder,
+                observed=observed,
+                validate_observed=validate_observed,
+            )
         if not self._cuda_sparse_topk_decode_eligible(z, mode="topk"):
-            raise RuntimeError("factorized CUDA sparse TopK decode is not eligible")
+            raise RuntimeError("CUDA sparse TopK decode is not eligible")
         with torch.set_grad_enabled(torch.is_grad_enabled() and score_grad):
             scores = self.scores(
                 z,
                 x=x,
                 observed=observed,
+                _decoder=decoder,
                 _observation_keep=keep,
             )
         mask = self._select_scores(scores, mode="topk", z=z)
-        return self._decode_factorized_cuda_sparse_topk(z, mask), mask
+        return self._decode_cuda_sparse_topk(
+            z,
+            mask,
+            decoder=decoder,
+        ), mask
 
     def forward(
         self,
@@ -2167,9 +2219,10 @@ class BlockCrosscoder(nn.Module):
             _score_grad=_score_grad,
         )
         if self._cuda_sparse_topk_decode_eligible(selection.z, mode=mode):
-            xhat = self._decode_factorized_cuda_sparse_topk(
+            xhat = self._decode_cuda_sparse_topk(
                 selection.z,
                 selection.mask,
+                decoder=decoder,
             )
         else:
             xhat = self.decode(selection.z_selected, _decoder=decoder)

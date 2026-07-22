@@ -87,6 +87,8 @@ from block_crosscoder_experiment.runtime_limits import (
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
+    SPARSE_DECODE_CUDA_IMPLEMENTATION,
+    SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
     decoded_energy_code_norm_eligible,
     isolated_loss_mapped_eligible,
 )
@@ -2614,6 +2616,14 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     factorized_execution_implementation = str(
         values["implementation.factorized_execution_implementation"]
     )
+    sparse_decode_implementation = str(
+        values["implementation.sparse_decode_implementation"]
+    )
+    if sparse_decode_implementation not in {
+        SPARSE_DECODE_CUDA_IMPLEMENTATION,
+        SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
+    }:
+        raise CellExecutionError("unknown sparse-decode implementation identity")
     known_factorized_implementations = {
         FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
         FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
@@ -2744,6 +2754,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         isolated_loss_decrease_implementation=isolated_loss_implementation,
         decoder_retraction_implementation=decoder_retraction_implementation,
         factorized_execution_implementation=factorized_execution_implementation,
+        sparse_decode_implementation=sparse_decode_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
         site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),

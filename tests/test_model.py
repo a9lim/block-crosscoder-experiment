@@ -31,6 +31,7 @@ from block_crosscoder_experiment.runtime_limits import (
     FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
+    SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
 )
 
 CFG = BSCConfig(n_blocks=16, block_dim=4, n_sites=4, d_model=32, k=3, seed=0)
@@ -243,7 +244,7 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
         )
 
 
-def test_factorized_sparse_cuda_decode_has_static_shape_gate():
+def test_sparse_cuda_decode_has_static_shape_gate():
     eligible = BlockCrosscoder(
         BSCConfig(
             n_blocks=64,
@@ -288,6 +289,40 @@ def test_factorized_sparse_cuda_decode_has_static_shape_gate():
         )
     )
     assert not dense_support._cuda_sparse_topk_decode_shape_eligible(
+        batch=2048,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        mode="topk",
+    )
+
+    unfactorized = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=64,
+            block_dim=2,
+            n_sites=4,
+            d_model=32,
+            k=2,
+            selection="token_topk",
+            decoder_constraint="qr",
+        )
+    )
+    assert unfactorized._cuda_sparse_topk_decode_shape_eligible(
+        batch=2048,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        mode="topk",
+    )
+    dense_reference = BlockCrosscoder(
+        BSCConfig(
+            **{
+                **unfactorized.cfg.__dict__,
+                "sparse_decode_implementation": (
+                    SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION
+                ),
+            }
+        )
+    )
+    assert not dense_reference._cuda_sparse_topk_decode_shape_eligible(
         batch=2048,
         device=torch.device("cuda"),
         dtype=torch.bfloat16,

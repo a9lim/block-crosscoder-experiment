@@ -2434,6 +2434,13 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     ):
         Trainer.load_checkpoint(missing_isolated_path, device=device)
 
+    missing_sparse = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    missing_sparse["model_cfg"].pop("sparse_decode_implementation")
+    missing_sparse_path = tmp_path / "missing-sparse-decode-id.pt"
+    torch.save(missing_sparse, missing_sparse_path)
+    with pytest.raises(ValueError, match="lacks sparse_decode_implementation"):
+        Trainer.load_checkpoint(missing_sparse_path, device=device)
+
     forged = {**payload, "model_cfg": dict(payload["model_cfg"])}
     forged["model_cfg"]["decoded_energy_implementation"] = (
         DECODED_ENERGY_EXACT_IMPLEMENTATION

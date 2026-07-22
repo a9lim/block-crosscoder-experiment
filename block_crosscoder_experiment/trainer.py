@@ -1687,7 +1687,7 @@ class Trainer:
             )
         )
         if sparse_training_decode:
-            xhat, _ = self.fwd._forward_factorized_cuda_sparse_topk_training(
+            xhat, _ = self.fwd._forward_cuda_sparse_topk_training(
                 x,
                 observed=encoder_observed,
                 validate_observed=False,

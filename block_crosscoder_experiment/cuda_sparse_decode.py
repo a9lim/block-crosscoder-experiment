@@ -1,4 +1,4 @@
-"""Low-density CUDA decode for hard-TopK factorized training.
+"""Low-density CUDA decode for hard-TopK training.
 
 Imported lazily by :mod:`block_crosscoder_experiment.model`, so CPU-only
 installations do not need a Triton package.  The kernel consumes the selected
@@ -25,6 +25,8 @@ def _sparse_decode_forward(
     groups: tl.constexpr,
     block_dim: tl.constexpr,
     output_tile: tl.constexpr,
+    native_site_layout: tl.constexpr,
+    site_width: tl.constexpr,
 ):
     row = tl.program_id(0)
     output_offsets = tl.program_id(1) * output_tile + tl.arange(0, output_tile)
@@ -37,10 +39,21 @@ def _sparse_decode_forward(
             value = tl.load(
                 code + row * (groups * block_dim) + group * block_dim + coordinate
             )
+            if native_site_layout:
+                output_site = output_offsets // site_width
+                output_coordinate = output_offsets % site_width
+                weight_offsets = (
+                    output_site * (groups * block_dim * site_width)
+                    + group * (block_dim * site_width)
+                    + coordinate * site_width
+                    + output_coordinate
+                )
+            else:
+                weight_offsets = (
+                    (group * block_dim + coordinate) * output_width + output_offsets
+                )
             decoder = tl.load(
-                weight
-                + (group * block_dim + coordinate) * output_width
-                + output_offsets,
+                weight + weight_offsets,
                 mask=output_offsets < output_width,
                 other=0.0,
             )
@@ -63,6 +76,8 @@ def _sparse_decode_backward_code(
     groups: tl.constexpr,
     block_dim: tl.constexpr,
     output_tile: tl.constexpr,
+    native_site_layout: tl.constexpr,
+    site_width: tl.constexpr,
 ):
     event = tl.program_id(0)
     coordinate = tl.program_id(1)
@@ -76,8 +91,21 @@ def _sparse_decode_backward_code(
             mask=output_offsets < output_width,
             other=0.0,
         )
+        if native_site_layout:
+            output_site = output_offsets // site_width
+            output_coordinate = output_offsets % site_width
+            weight_offsets = (
+                output_site * (groups * block_dim * site_width)
+                + group * (block_dim * site_width)
+                + coordinate * site_width
+                + output_coordinate
+            )
+        else:
+            weight_offsets = (
+                (group * block_dim + coordinate) * output_width + output_offsets
+            )
         decoder = tl.load(
-            weight + (group * block_dim + coordinate) * output_width + output_offsets,
+            weight + weight_offsets,
             mask=output_offsets < output_width,
             other=0.0,
         )
@@ -99,6 +127,8 @@ def _sparse_decode_backward_weight(
     groups: tl.constexpr,
     block_dim: tl.constexpr,
     output_tile: tl.constexpr,
+    native_site_layout: tl.constexpr,
+    site_width: tl.constexpr,
 ):
     group = tl.program_id(0)
     coordinate = tl.program_id(1)
@@ -117,8 +147,21 @@ def _sparse_decode_backward_weight(
             other=0.0,
         )
         accumulator += value * grad
+    if native_site_layout:
+        output_site = output_offsets // site_width
+        output_coordinate = output_offsets % site_width
+        weight_offsets = (
+            output_site * (groups * block_dim * site_width)
+            + group * (block_dim * site_width)
+            + coordinate * site_width
+            + output_coordinate
+        )
+    else:
+        weight_offsets = (
+            (group * block_dim + coordinate) * output_width + output_offsets
+        )
     tl.store(
-        grad_weight + (group * block_dim + coordinate) * output_width + output_offsets,
+        grad_weight + weight_offsets,
         accumulator,
         mask=output_offsets < output_width,
     )
@@ -136,7 +179,14 @@ class _SparseTopKDecode(torch.autograd.Function):
         selected_count: int,
     ) -> torch.Tensor:
         batch, groups, block_dim = code.shape
-        output_width = weight.shape[1]
+        native_site_layout = weight.ndim == 4
+        if native_site_layout:
+            sites, weight_groups, weight_block_dim, site_width = weight.shape
+            if weight_groups != groups or weight_block_dim != block_dim:
+                raise ValueError("native decoder shape does not match sparse code")
+            output_width = sites * site_width
+        else:
+            site_width = output_width = weight.shape[1]
         events = torch.nonzero_static(mask, size=selected_count)
         rows = events[:, 0].to(torch.int32)
         selected_groups = events[:, 1].to(torch.int32)
@@ -170,6 +220,8 @@ class _SparseTopKDecode(torch.autograd.Function):
             groups=groups,
             block_dim=block_dim,
             output_tile=output_tile,
+            native_site_layout=native_site_layout,
+            site_width=site_width,
             num_warps=4,
         )
         ctx.save_for_backward(
@@ -180,8 +232,19 @@ class _SparseTopKDecode(torch.autograd.Function):
             group_rows,
             group_ptr,
         )
-        ctx.shape = (batch, groups, block_dim, output_width)
-        return output
+        ctx.shape = (
+            batch,
+            groups,
+            block_dim,
+            output_width,
+            native_site_layout,
+            site_width,
+        )
+        return (
+            output.view(batch, weight.shape[0], site_width)
+            if native_site_layout
+            else output
+        )
 
     @staticmethod
     def backward(
@@ -196,8 +259,15 @@ class _SparseTopKDecode(torch.autograd.Function):
             group_rows,
             group_ptr,
         ) = ctx.saved_tensors
-        batch, groups, block_dim, output_width = ctx.shape
-        grad_output = grad_output.contiguous()
+        (
+            batch,
+            groups,
+            block_dim,
+            output_width,
+            native_site_layout,
+            site_width,
+        ) = ctx.shape
+        grad_output = grad_output.reshape(batch, output_width).contiguous()
         grad_code = torch.zeros_like(code)
         grad_weight = torch.empty_like(weight)
         output_tile = 128
@@ -212,6 +282,8 @@ class _SparseTopKDecode(torch.autograd.Function):
                 groups=groups,
                 block_dim=block_dim,
                 output_tile=output_tile,
+                native_site_layout=native_site_layout,
+                site_width=site_width,
                 num_warps=4,
             )
         _sparse_decode_backward_weight[
@@ -230,6 +302,8 @@ class _SparseTopKDecode(torch.autograd.Function):
             groups=groups,
             block_dim=block_dim,
             output_tile=output_tile,
+            native_site_layout=native_site_layout,
+            site_width=site_width,
             num_warps=4,
         )
         return grad_code, None, grad_weight, None
@@ -252,8 +326,18 @@ def cuda_sparse_topk_decode(
         raise TypeError("sparse TopK decode mask must be boolean")
     if code.ndim != 3 or mask.shape != code.shape[:2]:
         raise ValueError("sparse TopK decode mask must match [batch, groups]")
-    if weight.ndim != 2 or weight.shape[0] != code.shape[1] * code.shape[2]:
-        raise ValueError("sparse TopK decode weight must have shape [groups*block, d]")
+    if weight.ndim == 2:
+        if weight.shape[0] != code.shape[1] * code.shape[2]:
+            raise ValueError(
+                "packed sparse TopK decoder must have shape [groups*block, d]"
+            )
+    elif weight.ndim == 4:
+        if weight.shape[1:3] != code.shape[1:]:
+            raise ValueError(
+                "native sparse TopK decoder must have shape [sites,groups,block,d]"
+            )
+    else:
+        raise ValueError("sparse TopK decoder must be a packed map or native tensor")
     if (
         isinstance(selected_count, bool)
         or int(selected_count) != selected_count

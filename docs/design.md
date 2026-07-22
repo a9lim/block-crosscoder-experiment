@@ -942,17 +942,20 @@ benchmark at the same canonical bf16 shape reduces complete Trainer
 median from `10.675` to `10.298 ms` (`3.53%`, `1.037x`) and p95 from `11.557`
 to `11.279 ms`; the later workspace still determines peak allocation.
 
-Version 3 retains those contraction-ready layouts and replaces the dense
-zero-filled rank-space decode only for bf16 CUDA hard-TopK batches of at least
-2,048 tokens and support density at most `1/32`. The batch gate retains dense
-Tensor Core decode for Phase-3's 256-token geometry, where the sparse kernel is
-slower. A fixed-size row-major event extraction avoids a dynamic-nonzero host
-synchronization; deterministic Triton kernels reduce by row in the forward
-pass and by group in the decoder-weight backward. Other dtypes, selectors,
-densities, and nonfactorized carriers remain dense. The no-Aux,
-zero-regularizer Trainer also bypasses the otherwise unused dense selected-code
-tensor; objective-bearing consumers keep it while still receiving sparse
-decode.
+Version 3 retains those contraction-ready layouts. The separately serialized
+universal sparse-decode identity replaces dense zero-filled decode for bf16
+CUDA hard-TopK batches of at least 2,048 tokens and support density at most
+`1/32`, for both direct factorized carriers and native contiguous unfactorized
+decoders. The native kernel reads and differentiates `[S,G,b,d]` strides
+directly; packing or transposing the decoder every step is forbidden. The
+batch gate retains dense Tensor Core decode for Phase-3's 256-token geometry,
+where the sparse kernel is slower. A fixed-size row-major event extraction
+avoids a dynamic-nonzero host synchronization; deterministic Triton kernels
+reduce by row in the forward pass and by group in the decoder-weight backward.
+Other dtypes, selectors, densities, and the materialized factorized reference
+remain dense. The no-Aux, zero-regularizer Trainer also bypasses the otherwise
+unused dense selected-code tensor; objective-bearing consumers keep it while
+still receiving sparse decode.
 
 The release kernel bounds forward, code-gradient, and decoder-gradient relative
 L2 drift by `.005`, repeated sparse trajectories deterministically reproduce,
@@ -964,6 +967,19 @@ L2 by `.00265`, and support disagreement over the union by `.0063`. On jobe,
 `3.5712 ms`, and peak allocation from `492.348` to `440.747 MiB`. This bounded
 bf16 reduction-order change is content-bound engineering evidence, not a new
 scientific arm. Old v2 identities refuse rather than migrate.
+
+For the native unfactorized carrier, primitive output, code-gradient, and
+decoder-gradient relative L2 drift are bounded by `.004`, `.004`, and `.005`;
+unselected code gradients remain exactly zero and repeated execution is
+bitwise deterministic. Tied and untied QR trajectory fixtures preserve at
+least `.98` support IoU, `.005` per-step loss drift, `.05` global parameter
+drift, and the existing Gram bound. On jobe at `B=4096`, four width-768 sites,
+2,048 groups, block width four, tied bf16 QR, and fused AdamW, the complete
+Trainer median falls from `11.792` to `8.820 ms` at eight active blocks
+(`25.20%`, `1.337x`) and from `11.810` to `10.548 ms` at 32 active blocks
+(`10.69%`, `1.120x`). Peak allocation falls from `768.31 MiB` to
+`680.70 MiB` and `681.83 MiB`, respectively. The conservative estimator grants
+no credit for this reduction.
 
 Version 4 leaves the version-3 encode, score, selector, and decode carrier
 unchanged, but rank-one/two map and decoder nuclear objectives contract the
