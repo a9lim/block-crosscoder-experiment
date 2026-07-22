@@ -920,6 +920,17 @@ reduce complete Trainer median from `12.469` to `11.349 ms` (`8.98%`,
 `1.099x`) and p95 from `12.803` to `12.279 ms`; the later full-step workspace,
 not the removed 48 MiB pack, remains the allocation peak.
 
+For a tied unfactorized encoder, one shape-polymorphic CUDA Inductor producer
+fuses eager `exp(log_gamma)` scaling with the logical-to-GEMM permutation and
+writes only the packed encoder allocation. Its logical return is a zero-copy
+view, so map regularizers and frozen partial-view evaluation retain the same
+geometry. Calls below one million decoder elements, non-CUDA devices, and
+other dtypes remain eager. The release oracle requires bitwise packed weights,
+codes, losses, decoder gradients, and gamma gradients. A paired alternating
+jobe benchmark at the same canonical bf16 shape reduces complete Trainer
+median from `10.675` to `10.298 ms` (`3.53%`, `1.037x`) and p95 from `11.557`
+to `11.279 ms`; the later workspace still determines peak allocation.
+
 Version 3 retains those contraction-ready layouts and replaces the dense
 zero-filled rank-space decode only for bf16 CUDA hard-TopK batches of at least
 2,048 tokens and support density at most `1/32`. The batch gate retains dense

@@ -710,6 +710,41 @@ def _pack_full_encoder(encoder: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _unpack_full_encoder(
+    packed: torch.Tensor,
+    *,
+    sites: int,
+    groups: int,
+    block_dim: int,
+    d_model: int,
+) -> torch.Tensor:
+    """Logical ``[S,G,b,d]`` view of a packed full encoder map."""
+
+    return packed.view(sites, d_model, groups, block_dim).permute(0, 2, 3, 1)
+
+
+def _eager_scaled_tied_encoder_map(
+    decoder: torch.Tensor,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """Scale and pack a tied decoder into the flattened encoder layout."""
+
+    return _pack_full_encoder(decoder * gamma)
+
+
+@cache
+def _compiled_cuda_scaled_tied_encoder_map():
+    return torch.compile(
+        _eager_scaled_tied_encoder_map,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=True,
+    )
+
+
+_CUDA_TIED_ENCODER_PACK_MIN_ELEMENTS = 1 << 20
+
+
 def _pack_decoder_factor_core(core: torch.Tensor) -> torch.Tensor:
     """Store logical ``[R,G,b,d]`` in decode-GEMM order ``[G*b,R*d]``."""
 
@@ -1077,8 +1112,7 @@ class BlockCrosscoder(nn.Module):
                 self._encoder_factor_core_tensor(),
             )
         elif self.E is None:
-            assert self.D is not None and self.log_gamma is not None
-            encoder = self.D * self.log_gamma.exp()
+            return self._tied_encoder_tensor(self.decoder_tensor())
         else:
             encoder = self._encoder_full_tensor()
         if self._has_padded_coordinates:
@@ -1090,12 +1124,34 @@ class BlockCrosscoder(nn.Module):
 
         cfg = self.cfg
         assert cfg.site_rank is None and self.E is not None
-        return self.E.view(
-            cfg.n_sites,
-            cfg.d_model,
-            cfg.n_blocks,
-            cfg.block_dim,
-        ).permute(0, 2, 3, 1)
+        return _unpack_full_encoder(
+            self.E,
+            sites=cfg.n_sites,
+            groups=cfg.n_blocks,
+            block_dim=cfg.block_dim,
+            d_model=cfg.d_model,
+        )
+
+    def _tied_encoder_tensor(self, decoder: torch.Tensor) -> torch.Tensor:
+        """Build one tied encoder allocation directly in GEMM storage order."""
+
+        cfg = self.cfg
+        assert cfg.encoder_mode == "tied" and self.log_gamma is not None
+        gamma = self.log_gamma.exp()
+        if (
+            decoder.is_cuda
+            and decoder.dtype in {torch.float32, torch.bfloat16}
+            and decoder.numel() >= _CUDA_TIED_ENCODER_PACK_MIN_ELEMENTS
+        ):
+            packed = _compiled_cuda_scaled_tied_encoder_map()(decoder, gamma)
+            return _unpack_full_encoder(
+                packed,
+                sites=cfg.n_sites,
+                groups=cfg.n_blocks,
+                block_dim=cfg.block_dim,
+                d_model=cfg.d_model,
+            )
+        return decoder * gamma
 
     def _factorized_flat_coordinate_mask(self, dtype: torch.dtype) -> torch.Tensor:
         """Return the common rank-major ``[R*d]`` padding mask."""
@@ -2125,8 +2181,7 @@ class BlockCrosscoder(nn.Module):
         decoder = self.decoder_tensor() if _decoder is None else _decoder
         if _encoder is None:
             if self.cfg.encoder_mode == "tied":
-                assert self.log_gamma is not None
-                encoder = decoder * self.log_gamma.exp()
+                encoder = self._tied_encoder_tensor(decoder)
             else:
                 encoder = self.encoder_tensor()
         else:
@@ -2386,7 +2441,7 @@ class BlockCrosscoder(nn.Module):
         else:
             decoder = self.decoder_tensor()
             encoder = (
-                decoder * self.log_gamma.exp()
+                self._tied_encoder_tensor(decoder)
                 if self.cfg.encoder_mode == "tied"
                 else self.encoder_tensor()
             )

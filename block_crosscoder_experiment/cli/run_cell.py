@@ -3731,7 +3731,7 @@ def _apply_encoder_scale_calibration(
     count = 0
     decoder = model.decoder_tensor()
     encoder = (
-        decoder * model.log_gamma.exp()
+        model._tied_encoder_tensor(decoder)
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
@@ -4517,7 +4517,7 @@ def _calibrate(
     with torch.no_grad():
         calibration_decoder = model.decoder_tensor()
         calibration_encoder = (
-            calibration_decoder * model.log_gamma.exp()
+            model._tied_encoder_tensor(calibration_decoder)
             if model.cfg.encoder_mode == "tied"
             else model.encoder_tensor()
         )
@@ -4801,7 +4801,7 @@ def _synthetic_recovery(
 
     materialized_decoder = model.decoder_tensor()
     materialized_encoder = (
-        materialized_decoder * model.log_gamma.exp()
+        model._tied_encoder_tensor(materialized_decoder)
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
@@ -5369,7 +5369,7 @@ def _evaluate_native_selector(
     model = model.to(device).eval()
     materialized_decoder = model.decoder_tensor()
     materialized_encoder = (
-        materialized_decoder * model.log_gamma.exp()
+        model._tied_encoder_tensor(materialized_decoder)
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )

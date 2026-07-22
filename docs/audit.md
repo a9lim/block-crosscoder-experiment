@@ -61,6 +61,11 @@ exit is not evidence by itself.
   must pass, and a checkpoint carrying the superseded four-dimensional shape
   must refuse. Tests that inspect scientific encoder geometry use the logical
   adapter rather than relying on parameter storage order.
+- Large fp32/bf16 CUDA tied encoders fuse gamma scaling and GEMM-order packing
+  in one dynamic compiled producer. The logical view must share its packed
+  allocation, while an eager oracle requires bitwise weights, codes, loss,
+  decoder gradient, and gamma gradient. Small, non-CUDA, and other-dtype calls
+  remain eager; compile dispatch is shape-derived rather than data-dependent.
 - The compiled large-CUDA fp32 quadratic reduction is compared with its eager
   oracle at the fixed loss, prediction/target-gradient, multi-step
   model/optimizer-state, and selector-support bounds in `design.md`. Masked,

@@ -651,6 +651,50 @@ def test_unfactorized_untied_encoder_is_stored_in_gemm_layout():
         BlockCrosscoder(config).load_state_dict(legacy_state)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_tied_encoder_pack_is_bitwise_exact_through_backward():
+    config = BSCConfig(
+        n_blocks=512,
+        block_dim=4,
+        n_sites=4,
+        d_model=128,
+        k=8,
+        seed=4801,
+        encoder_mode="tied",
+        decoder_constraint="free",
+        encoder_fusion="sum",
+    )
+    compiled = BlockCrosscoder(config, device="cuda")
+    eager = BlockCrosscoder(config, device="cuda")
+    eager.load_state_dict(compiled.state_dict())
+    x = torch.randn(
+        64,
+        config.n_sites,
+        config.d_model,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    compiled_decoder = compiled.decoder_tensor()
+    compiled_encoder = compiled._tied_encoder_tensor(compiled_decoder)
+    compiled_z, _ = compiled._encode_with_tensor(x, compiled_encoder)
+    compiled_loss = compiled_z.square().sum()
+    compiled_loss.backward()
+
+    eager_decoder = eager.decoder_tensor()
+    eager_encoder = eager_decoder * eager.log_gamma.exp()
+    eager_z, _ = eager._encode_with_tensor(x, eager_encoder)
+    eager_loss = eager_z.square().sum()
+    eager_loss.backward()
+
+    assert torch.equal(compiled_encoder, eager_encoder)
+    assert torch.equal(compiled_z, eager_z)
+    assert torch.equal(compiled_loss, eager_loss)
+    assert compiled.D is not None and eager.D is not None
+    assert torch.equal(compiled.D.grad, eager.D.grad)
+    assert torch.equal(compiled.log_gamma.grad, eager.log_gamma.grad)
+
+
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
 @pytest.mark.parametrize(
     "case",

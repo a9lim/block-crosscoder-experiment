@@ -670,7 +670,7 @@ def _materialized_model_tensors(
         decoder = model.decoder_tensor()
     if encoder is None:
         encoder = (
-            decoder * model.log_gamma.exp()
+            model._tied_encoder_tensor(decoder)
             if model.cfg.encoder_mode == "tied"
             else model.encoder_tensor()
         )

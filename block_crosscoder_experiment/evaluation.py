@@ -511,7 +511,7 @@ def _evaluate_code_modes(
     )
     materialized_decoder = model.decoder_tensor()
     materialized_encoder = (
-        materialized_decoder * model.log_gamma.exp()
+        model._tied_encoder_tensor(materialized_decoder)
         if cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
