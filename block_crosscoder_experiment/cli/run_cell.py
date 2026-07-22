@@ -126,7 +126,8 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v6"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v7"
+EXECUTOR_PROCESS_MODEL = "persistent_cell_stage_handshake_v1"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -960,6 +961,7 @@ def _implementation_identity() -> dict[str, Any]:
             dependencies[distribution] = None
     return {
         "executor_schema": EXECUTOR_SCHEMA,
+        "executor_process_model": EXECUTOR_PROCESS_MODEL,
         "python_source_sha256": digest.hexdigest(),
         "python_source_files": len(source_files),
         "git_commit": git_commit,
@@ -8744,29 +8746,110 @@ def execute(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cell", type=Path, required=True)
-    parser.add_argument("--stage", choices=STAGES, required=True)
-    parser.add_argument("--artifacts-out", type=Path, required=True)
+    parser.add_argument("--stage", choices=STAGES)
+    parser.add_argument("--artifacts-out", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="serve multiple bound stage requests over stdin/stdout",
+    )
     return parser
+
+
+def _execute_stage_request(
+    cell: Path,
+    *,
+    stage: str,
+    artifacts_out: Path,
+    resume: bool,
+) -> None:
+    # The historical one-process-per-stage contract forced this cache to die at
+    # every boundary.  Preserve that integrity boundary while retaining the
+    # expensive Python/Torch process and compiled kernels around it.
+    _VERIFIED_STORE_BINDINGS.clear()
+    ctx = _Context(cell, artifacts_out, stage)
+    prerequisites = ctx.prerequisites()
+    artifacts = execute(
+        ctx,
+        resume=resume,
+        prerequisites=prerequisites,
+    )
+    _emit_stage_manifest(
+        ctx.artifacts_out,
+        cell_id=ctx.cell.cell_id,
+        stage=ctx.stage,
+        root=ctx.root,
+        artifacts=artifacts,
+        digest=ctx.artifact_sha256,
+    )
+
+
+def _worker_main(cell: Path) -> None:
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"error: malformed worker request: {exc}") from exc
+        if request == {"command": "close"}:
+            return
+        if not isinstance(request, dict) or set(request) != {
+            "stage",
+            "artifacts_out",
+            "resume",
+        }:
+            raise SystemExit("error: malformed worker request fields")
+        stage = request["stage"]
+        artifacts_out = request["artifacts_out"]
+        resume = request["resume"]
+        if (
+            stage not in STAGES
+            or not isinstance(artifacts_out, str)
+            or not isinstance(resume, bool)
+        ):
+            raise SystemExit("error: malformed worker request values")
+        try:
+            _execute_stage_request(
+                cell,
+                stage=stage,
+                artifacts_out=Path(artifacts_out),
+                resume=resume,
+            )
+            response = {"ok": True, "stage": stage}
+        except (
+            CellExecutionError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            response = {
+                "ok": False,
+                "stage": stage,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[-4_000:],
+            }
+        sys.stdout.write(json.dumps(response, sort_keys=True) + "\n")
+        sys.stdout.flush()
+        if response["ok"] is not True:
+            return
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    if args.worker:
+        if args.stage is not None or args.artifacts_out is not None or args.resume:
+            raise SystemExit("error: --worker cannot be combined with stage arguments")
+        _worker_main(args.cell)
+        return
+    if args.stage is None or args.artifacts_out is None:
+        raise SystemExit("error: --stage and --artifacts-out are required")
     try:
-        ctx = _Context(args.cell, args.artifacts_out, args.stage)
-        prerequisites = ctx.prerequisites()
-        artifacts = execute(
-            ctx,
+        _execute_stage_request(
+            args.cell,
+            stage=args.stage,
+            artifacts_out=args.artifacts_out,
             resume=args.resume,
-            prerequisites=prerequisites,
-        )
-        _emit_stage_manifest(
-            ctx.artifacts_out,
-            cell_id=ctx.cell.cell_id,
-            stage=ctx.stage,
-            root=ctx.root,
-            artifacts=artifacts,
-            digest=ctx.artifact_sha256,
         )
     except (CellExecutionError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"error: {exc}") from exc

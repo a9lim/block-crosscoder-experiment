@@ -14,8 +14,11 @@ The runner invokes::
     python -m block_crosscoder_experiment.cli.run_cell \
         --cell CELL_MANIFEST --stage STAGE --artifacts-out OUTPUT
 
-and adds ``--resume`` when requested.  The child atomically writes only the
-new outputs from that stage to ``OUTPUT`` as::
+and adds ``--resume`` when requested.  Production runners keep one isolated
+child alive for all remaining stages of a cell and exchange the same requests
+over a line-delimited control channel.  A custom implementation module retains
+the one-shot command contract above.  The child atomically writes only the new
+outputs from each stage to ``OUTPUT`` as::
 
     {"schema": "bsc-stage-artifacts-v2", "cell_id": "...", "stage": "train",
      "artifacts": [{"kind": "checkpoint", "path": "...", "sha256": "..."}]}
@@ -8422,6 +8425,124 @@ class RunSummary:
         }
 
 
+class _PersistentCellWorker:
+    """One crash-isolated executor process shared by a cell's stage chain."""
+
+    def __init__(
+        self,
+        *,
+        command: Sequence[str],
+        cwd: Path,
+        environment: Mapping[str, str],
+    ) -> None:
+        self._stderr = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+        try:
+            self._process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=dict(environment),
+                text=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr,
+                bufsize=1,
+            )
+        except Exception:
+            self._stderr.close()
+            raise
+        if self._process.stdin is None or self._process.stdout is None:
+            self.close()
+            raise CampaignError("persistent run_cell worker lacks control pipes")
+
+    def _stderr_tail(self) -> str:
+        self._stderr.flush()
+        self._stderr.seek(0, os.SEEK_END)
+        end = self._stderr.tell()
+        self._stderr.seek(max(0, end - 4_000))
+        return self._stderr.read()
+
+    def invoke(self, *, stage: str, artifacts_out: Path, resume: bool) -> None:
+        if self._process.poll() is not None:
+            raise CampaignError(
+                "persistent run_cell worker exited "
+                f"{self._process.returncode} before {stage}: {self._stderr_tail()}"
+            )
+        request = json.dumps(
+            {
+                "stage": stage,
+                "artifacts_out": str(artifacts_out),
+                "resume": resume,
+            },
+            sort_keys=True,
+        )
+        try:
+            assert self._process.stdin is not None
+            self._process.stdin.write(request + "\n")
+            self._process.stdin.flush()
+            assert self._process.stdout is not None
+            response_raw = self._process.stdout.readline()
+        except (BrokenPipeError, OSError) as exc:
+            raise CampaignError(
+                f"persistent run_cell worker control failure during {stage}: "
+                f"{exc}; {self._stderr_tail()}"
+            ) from exc
+        if not response_raw:
+            returncode = self._process.poll()
+            if returncode is None:
+                returncode = self._process.wait()
+            raise CampaignError(
+                f"persistent run_cell worker exited {returncode} during {stage}: "
+                f"{self._stderr_tail()}"
+            )
+        try:
+            response = json.loads(response_raw)
+        except json.JSONDecodeError as exc:
+            raise CampaignError(
+                f"persistent run_cell worker emitted malformed control data "
+                f"during {stage}: {response_raw[-1_000:]!r}"
+            ) from exc
+        if (
+            not isinstance(response, dict)
+            or response.get("stage") != stage
+            or not isinstance(response.get("ok"), bool)
+        ):
+            raise CampaignError(
+                f"persistent run_cell worker response binding mismatch during {stage}"
+            )
+        if response["ok"] is not True:
+            error_type = str(response.get("error_type", "CellExecutionError"))
+            error = str(response.get("error", "unknown worker failure"))
+            raise CampaignError(f"{error_type} during {stage}: {error}")
+
+    def close(self) -> None:
+        process = getattr(self, "_process", None)
+        if process is None:
+            return
+        try:
+            if process.poll() is None and process.stdin is not None:
+                try:
+                    process.stdin.write('{"command":"close"}\n')
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                process.stdin.close()
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            self._stderr.close()
+            self._process = None
+
+
 class CampaignRunner:
     """Drive cells through prepare/train/calibrate/evaluate/qualify.
 
@@ -8508,46 +8629,82 @@ class CampaignRunner:
                 return record.state
 
             stages = self._remaining_stages(record.state)
-            for stage in stages:
-                if (
-                    stage == "train"
-                    and self.campaign.record(cell_id).state is RunState.PREPARED
-                ):
-                    self.campaign.transition(
-                        cell_id,
-                        RunState.RUNNING,
-                        message="training process claimed",
-                        assume_locked=True,
-                    )
-                try:
-                    artifacts = self._invoke(cell_id, stage, resume=resume)
-                    target = STAGE_TARGETS[stage]
-                    self.campaign.transition(
-                        cell_id,
-                        target,
-                        artifacts=artifacts,
-                        message=f"{stage} stage completed",
-                        assume_locked=True,
-                    )
-                except (
-                    ArtifactError,
-                    CampaignError,
-                    OSError,
-                    subprocess.SubprocessError,
-                ) as exc:
-                    current = self.campaign.record(cell_id)
-                    if current.state is not RunState.FAILED:
+            worker: _PersistentCellWorker | None = None
+            try:
+                for stage in stages:
+                    if (
+                        stage == "train"
+                        and self.campaign.record(cell_id).state is RunState.PREPARED
+                    ):
                         self.campaign.transition(
                             cell_id,
-                            RunState.FAILED,
-                            message=f"{stage} stage failed: {exc}",
-                            metadata={"stage": stage, "error_type": type(exc).__name__},
+                            RunState.RUNNING,
+                            message="training process claimed",
                             assume_locked=True,
                         )
-                    return RunState.FAILED
-                if stage == stop_after:
-                    break
+                    try:
+                        if worker is None and self._supports_persistent_worker:
+                            worker = self._start_worker(cell_id)
+                        artifacts = self._invoke(
+                            cell_id,
+                            stage,
+                            resume=resume,
+                            worker=worker,
+                        )
+                        target = STAGE_TARGETS[stage]
+                        self.campaign.transition(
+                            cell_id,
+                            target,
+                            artifacts=artifacts,
+                            message=f"{stage} stage completed",
+                            assume_locked=True,
+                        )
+                    except (
+                        ArtifactError,
+                        CampaignError,
+                        OSError,
+                        subprocess.SubprocessError,
+                    ) as exc:
+                        current = self.campaign.record(cell_id)
+                        if current.state is not RunState.FAILED:
+                            self.campaign.transition(
+                                cell_id,
+                                RunState.FAILED,
+                                message=f"{stage} stage failed: {exc}",
+                                metadata={
+                                    "stage": stage,
+                                    "error_type": type(exc).__name__,
+                                },
+                                assume_locked=True,
+                            )
+                        return RunState.FAILED
+                    if stage == stop_after:
+                        break
+            finally:
+                if worker is not None:
+                    worker.close()
             return self.campaign.record(cell_id).state
+
+    @property
+    def _supports_persistent_worker(self) -> bool:
+        return self.module == "block_crosscoder_experiment.cli.run_cell"
+
+    def _start_worker(self, cell_id: str) -> "_PersistentCellWorker":
+        environment = os.environ.copy()
+        environment.update(self.env)
+        environment["BSC_CAMPAIGN_ROOT"] = str(self.campaign.root.resolve())
+        return _PersistentCellWorker(
+            command=[
+                self.python,
+                "-m",
+                self.module,
+                "--cell",
+                str(self.campaign.cell_manifest_path(cell_id)),
+                "--worker",
+            ],
+            cwd=self.campaign.root,
+            environment=environment,
+        )
 
     @staticmethod
     def _state_reached(state: RunState, target: RunState) -> bool:
@@ -8580,7 +8737,12 @@ class CampaignRunner:
         return tuple(STAGE_TARGETS)[start:]
 
     def _invoke(
-        self, cell_id: str, stage: str, *, resume: bool
+        self,
+        cell_id: str,
+        stage: str,
+        *,
+        resume: bool,
+        worker: "_PersistentCellWorker | None" = None,
     ) -> tuple[ArtifactRef, ...]:
         cell_manifest = self.campaign.cell_manifest_path(cell_id)
         attempt = uuid.uuid4().hex
@@ -8590,35 +8752,38 @@ class CampaignRunner:
             / f"{stage}-{attempt}.json"
         )
         artifacts_out.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            self.python,
-            "-m",
-            self.module,
-            "--cell",
-            str(cell_manifest),
-            "--stage",
-            stage,
-            "--artifacts-out",
-            str(artifacts_out),
-        ]
-        if resume:
-            command.append("--resume")
-        environment = os.environ.copy()
-        environment.update(self.env)
-        environment["BSC_CAMPAIGN_ROOT"] = str(self.campaign.root.resolve())
-        completed = subprocess.run(
-            command,
-            cwd=self.campaign.root,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            tail = (completed.stderr or completed.stdout)[-4_000:]
-            raise CampaignError(
-                f"run_cell exited {completed.returncode} during {stage}: {tail}"
+        if worker is None:
+            command = [
+                self.python,
+                "-m",
+                self.module,
+                "--cell",
+                str(cell_manifest),
+                "--stage",
+                stage,
+                "--artifacts-out",
+                str(artifacts_out),
+            ]
+            if resume:
+                command.append("--resume")
+            environment = os.environ.copy()
+            environment.update(self.env)
+            environment["BSC_CAMPAIGN_ROOT"] = str(self.campaign.root.resolve())
+            completed = subprocess.run(
+                command,
+                cwd=self.campaign.root,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
             )
+            if completed.returncode != 0:
+                tail = (completed.stderr or completed.stdout)[-4_000:]
+                raise CampaignError(
+                    f"run_cell exited {completed.returncode} during {stage}: {tail}"
+                )
+        else:
+            worker.invoke(stage=stage, artifacts_out=artifacts_out, resume=resume)
         manifest_ref = self.campaign._verified_artifact_from_path(
             f"{stage}_manifest",
             artifacts_out,

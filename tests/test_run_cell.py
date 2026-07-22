@@ -678,6 +678,85 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     assert evaluation["rate_distortion"]["points"]["8"]["rate_bits_per_token"] >= 0
 
 
+def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
+    tmp_path: Path,
+) -> None:
+    class OneShotCampaignRunner(CampaignRunner):
+        @property
+        def _supports_persistent_worker(self) -> bool:
+            return False
+
+    cell = _cell(seed=43)
+    persistent = _campaign(tmp_path / "persistent", cell)
+    one_shot = _campaign(tmp_path / "one-shot", cell)
+    persistent_runner = _runner(persistent)
+    one_shot_runner = OneShotCampaignRunner(
+        one_shot,
+        python=persistent_runner.python,
+        env=persistent_runner.env,
+    )
+
+    assert persistent_runner.run(limit=1).failed_cells == 0
+    assert one_shot_runner.run(limit=1).failed_cells == 0
+    persistent_refs = persistent.record(cell.cell_id).artifact_map
+    one_shot_refs = one_shot.record(cell.cell_id).artifact_map
+    assert persistent_refs.keys() == one_shot_refs.keys()
+    assert {
+        kind: (ref.sha256, ref.size_bytes)
+        for kind, ref in persistent_refs.items()
+    } == {
+        kind: (ref.sha256, ref.size_bytes) for kind, ref in one_shot_refs.items()
+    }
+    preparation = json.loads(
+        persistent_refs["preparation"].resolve(persistent.root).read_text()
+    )
+    assert preparation["implementation"]["executor_schema"] == (
+        "bsc-cell-executor-v7"
+    )
+    assert preparation["implementation"]["executor_process_model"] == (
+        "persistent_cell_stage_handshake_v1"
+    )
+
+
+def test_persistent_worker_restarts_are_byte_exact_from_every_stage(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(seed=47)
+    exact_kinds = (
+        "checkpoint",
+        "calibration",
+        "deployment_codec",
+        "deployment_schedules",
+        "evaluation",
+        "qualification",
+    )
+
+    def completed_fingerprints(campaign: Campaign) -> dict[str, tuple[str, int]]:
+        refs = campaign.record(cell.cell_id).artifact_map
+        assert campaign.record(cell.cell_id).state is RunState.QUALIFIED
+        return {
+            kind: (refs[kind].sha256, refs[kind].size_bytes)
+            for kind in exact_kinds
+        }
+
+    uninterrupted = _campaign(tmp_path / "uninterrupted", cell)
+    assert _runner(uninterrupted).run(limit=1).failed_cells == 0
+    expected = completed_fingerprints(uninterrupted)
+
+    repeated = _campaign(tmp_path / "repeated", cell)
+    assert _runner(repeated).run(limit=1).failed_cells == 0
+    assert completed_fingerprints(repeated) == expected
+
+    for stage in ("prepare", "train", "calibrate", "evaluate"):
+        campaign = _campaign(tmp_path / f"restart-{stage}", cell)
+        first = _runner(campaign).run(limit=1, stop_after=stage)
+        assert first.completed_cells == 1
+        restarted = Campaign(campaign.root)
+        resumed = _runner(restarted).run(limit=1, resume=True)
+        assert resumed.failed_cells == 0
+        assert completed_fingerprints(restarted) == expected
+
+
 def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
     tmp_path: Path,
 ) -> None:
