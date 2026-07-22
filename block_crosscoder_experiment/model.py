@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -1586,6 +1587,86 @@ class BlockCrosscoder(nn.Module):
         return theta
 
 
+# A compiled static elementwise graph becomes worthwhile well below the
+# smallest Phase-2 batch (2048 * 4 * 768 = 6,291,456 values).  Keep a fixed
+# one-megavalue gate so tiny Phase-1 cells, calibration tails, and unit tests do
+# not pay shape-specialized TorchInductor compilation churn.  The compiled
+# boundary deliberately ends before the fp32 reduction: changing that sum's
+# kernel changes the experiment's loss and trained state.
+_CUDA_QUADRATIC_FUSION_MIN_ELEMENTS = 1 << 20
+
+
+def _eager_fp32_squared_error_elements(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    return (prediction.float() - target.float()).pow(2)
+
+
+@cache
+def _compiled_cuda_fp32_squared_error_elements():
+    """Create one Torch 2.8 Inductor wrapper; it caches static CUDA graphs."""
+
+    return torch.compile(
+        _eager_fp32_squared_error_elements,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=False,
+    )
+
+
+class _ExactCompiledSquaredError(torch.autograd.Function):
+    """Compile the forward without changing the eager autograd layout.
+
+    Torch 2.8 AOTAutograd returns a contiguous prediction gradient for this
+    graph even when the decoder output has its native transposed site-major
+    stride.  The values are equal, but feeding a different gradient layout to
+    the decoder GEMM changes its accumulation and therefore the trained state.
+    Retain the compiled elementwise forward while spelling the ordinary eager
+    derivative here so both gradient values and strides remain exact.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(prediction, target)
+        return _compiled_cuda_fp32_squared_error_elements()(prediction, target)
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        prediction, target = ctx.saved_tensors
+        residual = prediction.float() - target.float()
+        gradient = 2.0 * residual * grad_output
+        prediction_gradient = (
+            gradient.to(prediction.dtype) if ctx.needs_input_grad[0] else None
+        )
+        target_gradient = (
+            (-gradient).to(target.dtype) if ctx.needs_input_grad[1] else None
+        )
+        return prediction_gradient, target_gradient
+
+
+def _fp32_squared_error_elements(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Exact fp32 elementwise quadratic, fused only for large CUDA tensors."""
+
+    if (
+        prediction.is_cuda
+        and target.is_cuda
+        and prediction.numel() >= _CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+    ):
+        return _ExactCompiledSquaredError.apply(prediction, target)
+    return _eager_fp32_squared_error_elements(prediction, target)
+
+
 def bsc_loss(
     out: BSCOutput,
     x: torch.Tensor,
@@ -1619,6 +1700,24 @@ def bsc_loss(
             raise ValueError("observation_mask excludes the entire batch")
 
     def reconstruction(target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        # The dominant real-model objective is all-observed, rectangular, and
+        # quadratic. Fuse only its elementwise fp32 casts/subtract/square, then
+        # retain the exact eager sum and division below. Missingness, padding,
+        # nonquadratic objectives, small tensors, and non-CUDA devices keep the
+        # ordinary eager implementation.
+        if (
+            all_observed
+            and not model._has_padded_coordinates
+            and cfg.reconstruction_loss in {"mean_squared", "squared_l2"}
+        ):
+            squared_error = _fp32_squared_error_elements(pred, target)
+            denominator = (
+                target.shape[0]
+                if cfg.reconstruction_loss == "squared_l2"
+                else target.shape[0] * sum(cfg.site_dims)
+            )
+            return squared_error.sum() / denominator
+
         residual = pred.float() - target.float()
         if model._has_padded_coordinates:
             residual = residual * coord

@@ -7,6 +7,7 @@ import copy
 import pytest
 import torch
 
+import block_crosscoder_experiment.model as model_module
 from block_crosscoder_experiment.gram import gram_residual, retract_
 from block_crosscoder_experiment.model import (
     BlockCrosscoder,
@@ -73,6 +74,227 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     numerator = (actual.float() - expected.float()).norm()
     denominator = expected.float().norm().clamp_min(1e-12)
     return float((numerator / denominator).detach())
+
+
+def _loss_output(prediction: torch.Tensor, n_blocks: int, block_dim: int) -> BSCOutput:
+    batch = prediction.shape[0]
+    z = torch.zeros(
+        batch,
+        n_blocks,
+        block_dim,
+        device=prediction.device,
+        dtype=prediction.dtype,
+    )
+    scores = torch.zeros(
+        batch,
+        n_blocks,
+        device=prediction.device,
+        dtype=prediction.dtype,
+    )
+    mask = torch.zeros(
+        batch,
+        n_blocks,
+        device=prediction.device,
+        dtype=torch.bool,
+    )
+    return BSCOutput(prediction, z, z, scores, mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("reconstruction_loss", ("mean_squared", "squared_l2"))
+def test_compiled_cuda_quadratic_elements_loss_and_output_gradient_are_exact(
+    dtype, reconstruction_loss
+):
+    device = torch.device("cuda")
+    batch, n_sites, d_model = 256, 4, 1024
+    assert (
+        batch * n_sites * d_model
+        == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+    )
+    cfg = BSCConfig(
+        n_blocks=2,
+        block_dim=2,
+        n_sites=n_sites,
+        d_model=d_model,
+        k=1,
+        seed=997,
+        decoder_constraint="free",
+        reconstruction_loss=reconstruction_loss,
+    )
+    model = BlockCrosscoder(cfg).to(device=device, dtype=dtype)
+    finite_values = torch.tensor(
+        (-4096.0, -17.0, -1.0, -(2.0**-10), 0.0, 2.0**-10, 1.0, 17.0, 4096.0),
+        device=device,
+        dtype=dtype,
+    )
+    repeats = (batch * n_sites * d_model + len(finite_values) - 1) // len(
+        finite_values
+    )
+    prediction = finite_values.repeat(repeats)[: batch * n_sites * d_model]
+    prediction = prediction.reshape(batch, n_sites, d_model)
+    prediction = prediction.transpose(0, 1).contiguous().transpose(0, 1)
+    prediction.requires_grad_()
+    assert prediction.stride() == (d_model, batch * d_model, 1)
+    target = finite_values.flip(0).repeat(repeats)[: batch * n_sites * d_model]
+    target = target.reshape(batch, n_sites, d_model).clone()
+    reference_prediction = prediction.detach().clone().requires_grad_()
+
+    actual_elements = model_module._fp32_squared_error_elements(prediction, target)
+    expected_elements = model_module._eager_fp32_squared_error_elements(
+        reference_prediction,
+        target,
+    )
+    assert torch.equal(actual_elements, expected_elements)
+
+    actual_loss = bsc_loss(
+        _loss_output(prediction, cfg.n_blocks, cfg.block_dim),
+        target,
+        model,
+    )["rec"]
+    denominator = batch if reconstruction_loss == "squared_l2" else target.numel()
+    expected_loss = expected_elements.sum() / denominator
+    assert torch.equal(actual_loss, expected_loss)
+    actual_gradient = torch.autograd.grad(actual_loss, prediction)[0]
+    expected_gradient = torch.autograd.grad(expected_loss, reference_prediction)[0]
+    assert torch.equal(actual_gradient, expected_gradient)
+    assert actual_gradient.stride() == expected_gradient.stride()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_compiled_cuda_quadratic_preserves_nonfinite_refusal_surface(dtype):
+    device = torch.device("cuda")
+    n = model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+    prediction = torch.zeros(n, device=device, dtype=dtype, requires_grad=True)
+    target = torch.zeros_like(prediction)
+    with torch.no_grad():
+        prediction[:3] = torch.tensor(
+            (float("nan"), float("inf"), float("-inf")),
+            device=device,
+            dtype=dtype,
+        )
+    reference_prediction = prediction.detach().clone().requires_grad_()
+    actual = model_module._fp32_squared_error_elements(prediction, target)
+    expected = model_module._eager_fp32_squared_error_elements(
+        reference_prediction,
+        target,
+    )
+
+    for predicate in (torch.isnan, torch.isposinf, torch.isneginf):
+        assert torch.equal(predicate(actual), predicate(expected))
+    finite = torch.isfinite(expected)
+    assert torch.equal(actual[finite], expected[finite])
+    actual_loss = actual.sum() / n
+    expected_loss = expected.sum() / n
+    assert torch.isnan(actual_loss) and torch.isnan(expected_loss)
+    actual_gradient = torch.autograd.grad(actual_loss, prediction)[0]
+    expected_gradient = torch.autograd.grad(expected_loss, reference_prediction)[0]
+    for predicate in (torch.isnan, torch.isposinf, torch.isneginf):
+        assert torch.equal(
+            predicate(actual_gradient),
+            predicate(expected_gradient),
+        )
+    finite_gradient = torch.isfinite(expected_gradient)
+    assert torch.equal(
+        actual_gradient[finite_gradient],
+        expected_gradient[finite_gradient],
+    )
+    assert actual_gradient.stride() == expected_gradient.stride()
+
+
+def test_cuda_quadratic_compile_wrapper_is_lazy_cached_and_size_gated(
+    device, monkeypatch
+):
+    compile_calls: list[dict[str, object]] = []
+    compiled_calls = 0
+
+    def fake_compile(function, **options):
+        compile_calls.append(options)
+
+        def compiled(*args):
+            nonlocal compiled_calls
+            compiled_calls += 1
+            return function(*args)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
+    try:
+        n = model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+        large = torch.linspace(-2.0, 2.0, n, device=device)
+        target = large.flip(0)
+        for _ in range(2):
+            actual = model_module._fp32_squared_error_elements(large, target)
+            expected = model_module._eager_fp32_squared_error_elements(large, target)
+            assert torch.equal(actual, expected)
+        small = large[: n - 1]
+        assert torch.equal(
+            model_module._fp32_squared_error_elements(small, target[: n - 1]),
+            model_module._eager_fp32_squared_error_elements(
+                small,
+                target[: n - 1],
+            ),
+        )
+        if device.type == "cuda":
+            assert compile_calls == [
+                {
+                    "backend": "inductor",
+                    "fullgraph": True,
+                    "dynamic": False,
+                }
+            ]
+            assert compiled_calls == 2
+        else:
+            assert compile_calls == []
+            assert compiled_calls == 0
+    finally:
+        model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("observation_mask", "padding", "mean_l1", "mean_l2"),
+)
+def test_quadratic_compilation_excludes_non_dominant_loss_paths(
+    device, monkeypatch, case
+):
+    overrides: dict[str, object] = {}
+    observation_mask = None
+    if case == "padding":
+        overrides["site_dims"] = (8, 7, 6, 5)
+    elif case in {"mean_l1", "mean_l2"}:
+        overrides["reconstruction_loss"] = case
+    cfg = BSCConfig(
+        n_blocks=2,
+        block_dim=2,
+        n_sites=4,
+        d_model=8,
+        k=1,
+        decoder_constraint="free",
+        **overrides,
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    prediction = torch.randn(5, 4, 8, device=device, requires_grad=True)
+    target = torch.randn_like(prediction)
+    if case == "observation_mask":
+        observation_mask = torch.ones(5, 4, dtype=torch.bool, device=device)
+        observation_mask[::2, -1] = False
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("non-dominant reconstruction entered compiled helper")
+
+    monkeypatch.setattr(model_module, "_fp32_squared_error_elements", forbidden)
+    loss = bsc_loss(
+        _loss_output(prediction, cfg.n_blocks, cfg.block_dim),
+        target,
+        model,
+        observation_mask=observation_mask,
+    )["rec"]
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert prediction.grad is not None
 
 
 def test_selection_score_identity(device):

@@ -5,6 +5,7 @@ from dataclasses import asdict
 import pytest
 import torch
 
+import block_crosscoder_experiment.model as model_module
 import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
@@ -44,6 +45,39 @@ def train_cfg(**overrides):
         log_every=5,
     )
     return TrainConfig(**{**base, **overrides})
+
+
+def _assert_nested_exact(actual, expected) -> None:
+    if torch.is_tensor(actual):
+        assert torch.is_tensor(expected)
+        assert actual.dtype == expected.dtype
+        # Optimizer scalar steps are CPU before serialization and restored to
+        # the parameter device by PyTorch. Device placement is lifecycle
+        # state; compare the serialized numerical state exactly.
+        if actual.device != expected.device:
+            actual = actual.cpu()
+            expected = expected.cpu()
+        if actual.is_floating_point() or actual.is_complex():
+            actual_nan = torch.isnan(actual)
+            expected_nan = torch.isnan(expected)
+            assert torch.equal(actual_nan, expected_nan)
+            actual = torch.where(actual_nan, torch.zeros_like(actual), actual)
+            expected = torch.where(expected_nan, torch.zeros_like(expected), expected)
+        assert torch.equal(actual, expected)
+        return
+    if isinstance(actual, dict):
+        assert isinstance(expected, dict)
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_nested_exact(actual[key], expected[key])
+        return
+    if isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected, strict=True):
+            _assert_nested_exact(actual_item, expected_item)
+        return
+    assert actual == expected
 
 
 def test_fp32_step_ordering_loss_falls(device):
@@ -906,6 +940,91 @@ def test_checkpoint_resume_matches(device, tmp_path):
     assert resumed_trainer.history == trainer.history
     for a, b in zip(trainer.master.parameters(), resumed_trainer.master.parameters()):
         assert torch.allclose(a, b, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+def test_compiled_quadratic_trainer_state_and_resume_match_eager_exactly(
+    tmp_path, monkeypatch
+):
+    device = torch.device("cuda")
+    batch, n_sites, d_model = 512, 4, 512
+    assert (
+        batch * n_sites * d_model
+        == model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+    )
+    cfg = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=n_sites,
+        d_model=d_model,
+        k=2,
+        seed=1701,
+        decoder_constraint="free",
+        reconstruction_loss="mean_squared",
+    )
+    training = train_cfg(
+        total_steps=4,
+        forward_dtype="bf16",
+        warmup_steps=1,
+        log_every=1,
+        retract_every=100,
+    )
+    generator = torch.Generator(device="cpu").manual_seed(1702)
+    batches = [
+        torch.randn(batch, n_sites, d_model, generator=generator).to(device)
+        for _ in range(training.total_steps)
+    ]
+
+    # The oracle changes only the large-CUDA elementwise producer back to its
+    # intentional eager fallback; every trainer and checkpoint operation is
+    # otherwise identical.
+    with monkeypatch.context() as eager_patch:
+        eager_patch.setattr(
+            model_module,
+            "_fp32_squared_error_elements",
+            model_module._eager_fp32_squared_error_elements,
+        )
+        eager = Trainer(BlockCrosscoder(cfg).to(device), training)
+        eager_records = [eager.step(batch_tensor) for batch_tensor in batches]
+
+    model_module._compiled_cuda_fp32_squared_error_elements.cache_clear()
+    compiled_kernel = model_module._compiled_cuda_fp32_squared_error_elements()
+    compiled_calls = 0
+
+    def counted_compiled(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        nonlocal compiled_calls
+        compiled_calls += 1
+        return compiled_kernel(prediction, target)
+
+    monkeypatch.setattr(
+        model_module,
+        "_compiled_cuda_fp32_squared_error_elements",
+        lambda: counted_compiled,
+    )
+    compiled = Trainer(BlockCrosscoder(cfg).to(device), training)
+    compiled_records = [compiled.step(batch_tensor) for batch_tensor in batches[:2]]
+    checkpoint = tmp_path / "compiled-quadratic.pt"
+    compiled.save_checkpoint(checkpoint)
+    resumed = Trainer.load_checkpoint(checkpoint, device=device)
+    compiled_records.extend(
+        resumed.step(batch_tensor) for batch_tensor in batches[2:]
+    )
+
+    assert compiled_calls == training.total_steps
+    _assert_nested_exact(compiled_records, eager_records)
+    _assert_nested_exact(resumed.master.state_dict(), eager.master.state_dict())
+    _assert_nested_exact(resumed.fwd.state_dict(), eager.fwd.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), eager.opt.state_dict())
+    _assert_nested_exact(resumed.sched.state_dict(), eager.sched.state_dict())
+    _assert_nested_exact(resumed.tracker.state_dict(), eager.tracker.state_dict())
+    _assert_nested_exact(resumed.history, eager.history)
+    _assert_nested_exact(resumed._prev_shares, eager._prev_shares)
+    assert resumed.step_idx == eager.step_idx
+    assert resumed.accepted_tokens == eager.accepted_tokens
+    assert resumed.data_cursor == eager.data_cursor
 
 
 def test_clean_target_site_mask_zero_probability_is_exact_rng_identity():
