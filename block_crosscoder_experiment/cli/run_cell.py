@@ -4827,6 +4827,42 @@ def _matching_pathologies(association: torch.Tensor) -> dict[str, float]:
 
 
 @torch.no_grad()
+def _gather_event_factor_blocks(
+    selected_code: torch.Tensor,
+    selected_mask: torch.Tensor | None,
+    event_factor: torch.Tensor,
+    factor_to_group: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gather only each event's truth-matched learned block on its device."""
+
+    if selected_code.ndim != 3 or (
+        selected_mask is not None
+        and selected_mask.shape != selected_code.shape[:2]
+    ):
+        raise CellExecutionError("selected code/mask shapes are inconsistent")
+    event_factor_device = event_factor.to(
+        device=selected_code.device,
+        dtype=torch.long,
+    )
+    factor_to_group_device = factor_to_group.to(
+        device=selected_code.device,
+        dtype=torch.long,
+    )
+    if event_factor_device.shape != (len(selected_code),):
+        raise CellExecutionError("event-factor rows do not match selected codes")
+    event_group = factor_to_group_device[event_factor_device]
+    event_rows = torch.arange(len(selected_code), device=selected_code.device)
+    return (
+        selected_code[event_rows, event_group],
+        (
+            None
+            if selected_mask is None
+            else selected_mask[event_rows, event_group]
+        ),
+    )
+
+
+@torch.no_grad()
 def _synthetic_recovery(
     model: BlockCrosscoder,
     matching_dataset: Phase1Dataset,
@@ -4925,6 +4961,7 @@ def _synthetic_recovery(
     )
     best_association, factor_to_group = association.max(dim=1)
     group_to_factor = association.argmax(dim=0)
+    factor_to_group_device = factor_to_group.to(device)
 
     claim_value = dataset.ground_truth.get("shared_feature_claim_eligible")
     shared_feature_claim_eligible = (
@@ -4996,13 +5033,18 @@ def _synthetic_recovery(
                 matching_batch.contributions, zero_mean_normalization
             ).to(device)
             isolated_out = frozen_select(isolated)
-            selected_codes = isolated_out.z_selected.detach().cpu().double()
+            selected_codes, _ = _gather_event_factor_blocks(
+                isolated_out.z_selected,
+                None,
+                matching_batch.event_factor,
+                factor_to_group_device,
+            )
+            selected_codes = selected_codes.detach().cpu().double()
             for factor in matching_batch.event_factor.unique().tolist():
                 rows = torch.nonzero(
                     matching_batch.event_factor == factor, as_tuple=False
                 ).flatten()
-                group = int(factor_to_group[factor])
-                latent_parts[factor].append(selected_codes[rows, group])
+                latent_parts[factor].append(selected_codes[rows])
                 target_parts[factor].append(
                     matching_batch.coordinates[rows].reshape(len(rows), -1).double()
                 )
@@ -5092,8 +5134,15 @@ def _synthetic_recovery(
             event_total = isolated.double().square().sum(dim=(1, 2)).cpu()
             isolated_error.index_add_(0, batch.event_factor, event_error)
             isolated_total.index_add_(0, batch.event_factor, event_total)
-            selected_codes = isolated_out.z_selected.detach().cpu().double()
-            selected_masks = isolated_out.mask.detach().cpu()
+            selected_codes, selected_masks = _gather_event_factor_blocks(
+                isolated_out.z_selected,
+                isolated_out.mask,
+                batch.event_factor,
+                factor_to_group_device,
+            )
+            selected_codes = selected_codes.detach().cpu().double()
+            assert selected_masks is not None
+            selected_masks = selected_masks.detach().cpu()
             for factor in batch.event_factor.unique().tolist():
                 rows = torch.nonzero(
                     batch.event_factor == factor, as_tuple=False
@@ -5102,8 +5151,7 @@ def _synthetic_recovery(
                 reference = alignment_references[factor]
                 if coefficient is None or reference is None:
                     continue
-                group = int(factor_to_group[factor])
-                latent = selected_codes[rows, group]
+                latent = selected_codes[rows]
                 design = torch.cat(
                     (latent, torch.ones(len(rows), 1, dtype=torch.float64)), dim=1
                 )
@@ -5111,7 +5159,7 @@ def _synthetic_recovery(
                 prediction = design @ coefficient
                 code_error[factor] += (prediction - target).square().sum()
                 code_total[factor] += (target - reference).square().sum()
-                selected_count[factor] += selected_masks[rows, group].sum()
+                selected_count[factor] += selected_masks[rows].sum()
                 isolated_count[factor] += len(rows)
         evaluation_examples += len(batch.x)
     if evaluation_examples != evaluation_stop - evaluation_start:

@@ -31,6 +31,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _expected_capture_allocation,
     _expected_real_source_contract,
     _fixed_rate_raw_score,
+    _gather_event_factor_blocks,
     _lower_convex_rate_envelope,
     _load_deployable_codec,
     _load_deployment_schedule_bundle,
@@ -130,6 +131,46 @@ def test_calibrate_prefetches_and_closes_all_three_cuda_traversals() -> None:
         "",
     )
     assert source.count("with closing(") == 3
+
+
+@pytest.mark.parametrize("target", ("cpu", "cuda"))
+def test_event_factor_blocks_are_gathered_before_host_transfer(target) -> None:
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    device = torch.device(target)
+    selected_code = torch.arange(4 * 5 * 3, device=device).reshape(4, 5, 3)
+    selected_mask = torch.tensor(
+        [
+            [True, False, True, False, True],
+            [False, True, False, True, False],
+            [True, True, False, False, True],
+            [False, False, True, True, False],
+        ],
+        device=device,
+    )
+    event_factor = torch.tensor([2, 0, 1, 2])
+    factor_to_group = torch.tensor([4, 1, 3])
+
+    code, mask = _gather_event_factor_blocks(
+        selected_code,
+        selected_mask,
+        event_factor,
+        factor_to_group,
+    )
+    rows = torch.arange(len(event_factor), device=device)
+    groups = factor_to_group[event_factor].to(device)
+    assert torch.equal(code, selected_code[rows, groups])
+    assert torch.equal(mask, selected_mask[rows, groups])
+    assert code.shape == (4, 3)
+    assert mask.shape == (4,)
+    code_only, absent_mask = _gather_event_factor_blocks(
+        selected_code,
+        None,
+        event_factor,
+        factor_to_group,
+    )
+    assert torch.equal(code_only, code)
+    assert absent_mask is None
 
 
 def test_persisted_view_validation_matches_allclose_contract() -> None:
