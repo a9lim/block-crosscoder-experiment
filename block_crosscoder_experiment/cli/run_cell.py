@@ -128,8 +128,8 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v9"
-EXECUTOR_PROCESS_MODEL = "persistent_exact_model_owner_handoff_v3"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v10"
+EXECUTOR_PROCESS_MODEL = "persistent_verified_digest_cache_v4"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -485,7 +485,14 @@ def _emit_stage_manifest(
 
 
 class _Context:
-    def __init__(self, cell_path: Path, artifacts_out: Path, stage: str) -> None:
+    def __init__(
+        self,
+        cell_path: Path,
+        artifacts_out: Path,
+        stage: str,
+        *,
+        artifact_digests: _ArtifactDigestCache | None = None,
+    ) -> None:
         manifest = _read_object(cell_path, label="cell manifest")
         try:
             self.cell = CellSpec.from_manifest(manifest)
@@ -513,7 +520,11 @@ class _Context:
                 "BSC_CAMPAIGN_ROOT is required; execute cells through `bsc matrix run`"
             )
         self.root = Path(root_raw).resolve()
-        self._artifact_digests = _ArtifactDigestCache()
+        self._artifact_digests = (
+            artifact_digests
+            if artifact_digests is not None
+            else _ArtifactDigestCache()
+        )
         self._prerequisite_receipts: dict[
             str,
             tuple[str, int],
@@ -9247,12 +9258,19 @@ def _execute_stage_request(
     artifacts_out: Path,
     resume: bool,
     execution_cache: _StageExecutionCache | None = None,
+    artifact_digests: _ArtifactDigestCache | None = None,
 ) -> None:
-    # Store verification remains stage-local.  The separate retained-consumer
-    # cache can cross a parent handshake only after rebinding the exact durable
-    # file identity supplied by the newly reconstructed context below.
+    # Journal receipts remain stage-local. A worker digest observation may
+    # cross the parent handshake only while its complete stat fingerprint is
+    # unchanged; the new context still requires the journal's expected hash
+    # and size before trusting that observation.
     _VERIFIED_STORE_BINDINGS.clear()
-    ctx = _Context(cell, artifacts_out, stage)
+    ctx = _Context(
+        cell,
+        artifacts_out,
+        stage,
+        artifact_digests=artifact_digests,
+    )
     prerequisites = ctx.prerequisites()
     artifacts = execute(
         ctx,
@@ -9272,6 +9290,7 @@ def _execute_stage_request(
 
 def _worker_main(cell: Path) -> None:
     execution_cache = _StageExecutionCache()
+    artifact_digests = _ArtifactDigestCache()
     for raw in sys.stdin:
         try:
             request = json.loads(raw)
@@ -9301,6 +9320,7 @@ def _worker_main(cell: Path) -> None:
                 artifacts_out=Path(artifacts_out),
                 resume=resume,
                 execution_cache=execution_cache,
+                artifact_digests=artifact_digests,
             )
             response = {"ok": True, "stage": stage}
         except (

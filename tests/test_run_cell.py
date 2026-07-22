@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import io
 import inspect
 import os
 import subprocess
@@ -414,6 +415,151 @@ def test_stage_digest_cache_hashes_an_unchanged_output_exactly_once(
     )
     assert calls == 1
     assert json.loads(manifest.read_text())["artifacts"][0]["sha256"] == expected
+
+
+def test_worker_digest_cache_reuses_only_a_matching_journal_receipt(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "checkpoint.pt"
+    artifact.write_bytes(b"checkpoint-payload")
+    calls = 0
+    real_sha256 = run_cell_module._sha256
+
+    def counted_sha256(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr(run_cell_module, "_sha256", counted_sha256)
+    cache = run_cell_module._ArtifactDigestCache()
+    expected = cache.digest(artifact)
+    assert cache.verify(
+        artifact,
+        sha256=expected,
+        size_bytes=artifact.stat().st_size,
+    ) == run_cell_module._FileFingerprint.from_path(artifact)
+    assert calls == 1
+
+    with pytest.raises(CellExecutionError, match="size mismatch"):
+        cache.verify(
+            artifact,
+            sha256=expected,
+            size_bytes=artifact.stat().st_size + 1,
+        )
+    with pytest.raises(CellExecutionError, match="hash mismatch"):
+        cache.verify(
+            artifact,
+            sha256="0" * 64,
+            size_bytes=artifact.stat().st_size,
+        )
+    assert cache.verify(
+        artifact,
+        sha256=expected,
+        size_bytes=artifact.stat().st_size,
+    ) == run_cell_module._FileFingerprint.from_path(artifact)
+    assert calls == 1
+
+
+def test_worker_digest_cache_rehashes_and_refuses_same_size_in_place_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "checkpoint.pt"
+    artifact.write_bytes(b"checkpoint-payload")
+    calls = 0
+    real_sha256 = run_cell_module._sha256
+
+    def counted_sha256(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr(run_cell_module, "_sha256", counted_sha256)
+    cache = run_cell_module._ArtifactDigestCache()
+    expected = cache.digest(artifact)
+    before = run_cell_module._FileFingerprint.from_path(artifact)
+    with artifact.open("r+b") as handle:
+        handle.write(b"tampered----------")
+        handle.flush()
+        os.fsync(handle.fileno())
+    stat = artifact.stat()
+    os.utime(
+        artifact,
+        ns=(stat.st_atime_ns, before.mtime_ns),
+    )
+    after = run_cell_module._FileFingerprint.from_path(artifact)
+    assert after.device == before.device
+    assert after.inode == before.inode
+    assert after.size_bytes == before.size_bytes
+    assert after.mtime_ns == before.mtime_ns
+    assert after.ctime_ns != before.ctime_ns
+    assert after != before
+    with pytest.raises(CellExecutionError, match="hash mismatch"):
+        cache.verify(
+            artifact,
+            sha256=expected,
+            size_bytes=before.size_bytes,
+        )
+    assert calls == 2
+
+
+def test_persistent_worker_injects_one_digest_cache_across_stage_requests(
+    monkeypatch,
+) -> None:
+    requests = "\n".join(
+        (
+            json.dumps(
+                {
+                    "stage": stage,
+                    "artifacts_out": f"/{stage}.json",
+                    "resume": False,
+                }
+            )
+            for stage in ("prepare", "train")
+        )
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(requests + "\n"))
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+    observed = []
+
+    def capture_request(*args, **kwargs) -> None:
+        observed.append(kwargs["artifact_digests"])
+
+    monkeypatch.setattr(run_cell_module, "_execute_stage_request", capture_request)
+    run_cell_module._worker_main(Path("/unused-cell.json"))
+    assert len(observed) == 2
+    assert observed[0] is observed[1]
+
+
+def test_persistent_worker_exits_after_digest_bound_stage_failure(
+    monkeypatch,
+) -> None:
+    requests = "\n".join(
+        json.dumps(
+            {
+                "stage": stage,
+                "artifacts_out": f"/{stage}.json",
+                "resume": False,
+            }
+        )
+        for stage in ("prepare", "train")
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(requests + "\n"))
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+    calls = 0
+
+    def fail_request(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        raise CellExecutionError("injected stage failure")
+
+    monkeypatch.setattr(run_cell_module, "_execute_stage_request", fail_request)
+    run_cell_module._worker_main(Path("/unused-cell.json"))
+    assert calls == 1
+    assert json.loads(output.getvalue())["ok"] is False
 
 
 def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
@@ -942,10 +1088,10 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     assert "model_state" in durable_deployment
     assert "codec_payload" in durable_deployment
     assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v9"
+        "bsc-cell-executor-v10"
     )
     assert preparation["implementation"]["executor_process_model"] == (
-        "persistent_exact_model_owner_handoff_v3"
+        "persistent_verified_digest_cache_v4"
     )
 
 
