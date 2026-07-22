@@ -38,6 +38,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _load_deployment_schedule_bundle,
     _load_capture_contract,
     _matching_pathologies,
+    _mapped_support_confusion_counts,
     _model_config,
     _normalization_record,
     _persisted_view_validation,
@@ -2041,6 +2042,62 @@ def test_chunked_recovery_association_matches_exact_host_counts(target: str) -> 
     assert torch.equal(coactive.cpu(), truth.double().T @ predicted.double())
     assert torch.equal(truth_count.cpu(), truth.sum(dim=0).double())
     assert torch.equal(predicted_count.cpu(), predicted.sum(dim=0).double())
+
+
+@pytest.mark.parametrize("target", ("cpu", "cuda"))
+def test_mapped_support_confusion_keeps_exact_device_counts(target: str) -> None:
+    if target == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    device = torch.device(target)
+    tokens, factors, groups = 37, 5, 300
+    truth = (
+        torch.arange(tokens * factors).reshape(tokens, factors).remainder(11) < 3
+    )
+    block_mask = (
+        torch.arange(tokens * groups).reshape(tokens, groups).remainder(17) < 2
+    )
+    group_to_factor = torch.arange(groups).remainder(factors)
+    category_masks = (
+        torch.arange(factors).remainder(2) == 0,
+        torch.arange(factors).remainder(2) == 1,
+    )
+    active_events = block_mask.nonzero(as_tuple=False)
+    predicted = torch.zeros_like(truth)
+    predicted[
+        active_events[:, 0],
+        group_to_factor[active_events[:, 1]],
+    ] = True
+    expected = torch.stack(
+        (
+            (predicted & truth).sum(),
+            (predicted & ~truth).sum(),
+            (~predicted & truth).sum(),
+            (~predicted & ~truth).sum(),
+        )
+    )
+    expected_categories = torch.stack(
+        tuple(
+            torch.stack(
+                (
+                    (predicted[:, mask] & truth[:, mask]).sum(),
+                    (predicted[:, mask] & ~truth[:, mask]).sum(),
+                    (~predicted[:, mask] & truth[:, mask]).sum(),
+                    truth[:, mask].sum(),
+                )
+            )
+            for mask in category_masks
+        )
+    )
+
+    actual, actual_categories = _mapped_support_confusion_counts(
+        truth.to(device),
+        block_mask.to(device),
+        group_to_factor.to(device),
+        tuple(mask.to(device) for mask in category_masks),
+    )
+
+    assert torch.equal(actual.cpu(), expected)
+    assert torch.equal(actual_categories.cpu(), expected_categories)
 
 
 def test_support_confusion_distinguishes_fdr_from_false_positive_rate() -> None:

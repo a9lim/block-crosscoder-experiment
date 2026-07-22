@@ -4946,6 +4946,47 @@ def _accumulate_chunked_recovery_association(
         predicted_count[start:stop].add_(predicted.sum(dim=0))
 
 
+def _mapped_support_confusion_counts(
+    truth_active: torch.Tensor,
+    block_mask: torch.Tensor,
+    group_to_factor: torch.Tensor,
+    category_masks: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map learned groups to factors and return exact device-resident counts."""
+
+    active_events = block_mask.nonzero(as_tuple=False)
+    predicted = torch.zeros_like(truth_active)
+    if len(active_events):
+        predicted[
+            active_events[:, 0],
+            group_to_factor[active_events[:, 1]],
+        ] = True
+    totals = torch.stack(
+        (
+            (predicted & truth_active).sum(),
+            (predicted & ~truth_active).sum(),
+            (~predicted & truth_active).sum(),
+            (~predicted & ~truth_active).sum(),
+        )
+    )
+    if not category_masks:
+        return totals, totals.new_zeros((0, 4))
+    category_totals = torch.stack(
+        tuple(
+            torch.stack(
+                (
+                    (predicted[:, mask] & truth_active[:, mask]).sum(),
+                    (predicted[:, mask] & ~truth_active[:, mask]).sum(),
+                    (~predicted[:, mask] & truth_active[:, mask]).sum(),
+                    truth_active[:, mask].sum(),
+                )
+            )
+            for mask in category_masks
+        )
+    )
+    return totals, category_totals
+
+
 def _matching_pathologies(association: torch.Tensor) -> dict[str, float]:
     """Directional planted-factor/learned-group multiplicity diagnostics."""
 
@@ -5140,6 +5181,7 @@ def _synthetic_recovery(
     best_association, factor_to_group = association.max(dim=1)
     group_to_factor = association.argmax(dim=0)
     factor_to_group_device = factor_to_group.to(device)
+    group_to_factor_device = group_to_factor.to(device)
 
     claim_value = dataset.ground_truth.get("shared_feature_claim_eligible")
     shared_feature_claim_eligible = (
@@ -5239,19 +5281,22 @@ def _synthetic_recovery(
             alignment_coefficients[factor] = torch.linalg.lstsq(design, target).solution
             alignment_references[factor] = target.mean(dim=0, keepdim=True)
 
-    support_totals = {name: 0 for name in ("tp", "fp", "fn", "tn")}
-    category_totals = {
-        name: {key: 0 for key in ("tp", "fp", "fn", "true")}
-        for name in dataset.category_names
-    }
-    category_masks = {
-        name: torch.tensor(
+    category_masks = tuple(
+        torch.tensor(
             [factor.category == name for factor in dataset.factors],
             dtype=torch.bool,
+            device=device,
         )
         for name in dataset.category_names
-    }
-    alive = torch.zeros(n_groups, dtype=torch.bool)
+    )
+    alive = torch.zeros(n_groups, dtype=torch.bool, device=device)
+    support_totals_device = torch.zeros(4, dtype=torch.int64, device=device)
+    category_totals_device = torch.zeros(
+        len(dataset.category_names),
+        4,
+        dtype=torch.int64,
+        device=device,
+    )
     isolated_error = torch.zeros(n_factors, dtype=torch.float64)
     isolated_total = torch.zeros(n_factors, dtype=torch.float64)
     code_error = torch.zeros(n_factors, dtype=torch.float64)
@@ -5277,28 +5322,17 @@ def _synthetic_recovery(
     ):
         x = _apply_normalization(batch.x, normalization).to(device)
         out = frozen_select(x, observed=batch.observed.to(device))
-        truth_active = batch.active.bool().cpu()
-        block_mask = out.mask.bool().cpu()
+        truth_active = batch.active.bool().to(device)
+        block_mask = out.mask.bool()
         alive |= block_mask.any(dim=0)
-        nz = block_mask.nonzero(as_tuple=False)
-        predicted = torch.zeros_like(truth_active)
-        if len(nz):
-            predicted[nz[:, 0], group_to_factor[nz[:, 1]]] = True
-        support_totals["tp"] += int((predicted & truth_active).sum())
-        support_totals["fp"] += int((predicted & ~truth_active).sum())
-        support_totals["fn"] += int((~predicted & truth_active).sum())
-        support_totals["tn"] += int((~predicted & ~truth_active).sum())
-        for name, mask in category_masks.items():
-            category_totals[name]["tp"] += int(
-                (predicted[:, mask] & truth_active[:, mask]).sum()
-            )
-            category_totals[name]["fp"] += int(
-                (predicted[:, mask] & ~truth_active[:, mask]).sum()
-            )
-            category_totals[name]["fn"] += int(
-                (~predicted[:, mask] & truth_active[:, mask]).sum()
-            )
-            category_totals[name]["true"] += int(truth_active[:, mask].sum())
+        support_batch, category_batch = _mapped_support_confusion_counts(
+            truth_active,
+            block_mask,
+            group_to_factor_device,
+            category_masks,
+        )
+        support_totals_device += support_batch
+        category_totals_device += category_batch
 
         if subspace_eligible and batch.n_events:
             isolated = _apply_normalization(
@@ -5342,6 +5376,20 @@ def _synthetic_recovery(
         evaluation_examples += len(batch.x)
     if evaluation_examples != evaluation_stop - evaluation_start:
         raise CellExecutionError("synthetic evaluation stream ended early")
+
+    support_values = support_totals_device.cpu().tolist()
+    support_totals = dict(
+        zip(("tp", "fp", "fn", "tn"), support_values, strict=True)
+    )
+    category_values = category_totals_device.cpu().tolist()
+    category_totals = {
+        name: dict(zip(("tp", "fp", "fn", "true"), values, strict=True))
+        for name, values in zip(
+            dataset.category_names,
+            category_values,
+            strict=True,
+        )
+    }
 
     tp, fp = support_totals["tp"], support_totals["fp"]
     fn, tn = support_totals["fn"], support_totals["tn"]
