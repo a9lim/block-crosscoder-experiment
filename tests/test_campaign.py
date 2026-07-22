@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 from statistics import median
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+import block_crosscoder_experiment.campaign as campaign_module
 from block_crosscoder_experiment.campaign import (
     ArtifactError,
     ArtifactRef,
@@ -3340,6 +3342,7 @@ root = Path(os.environ["BSC_CAMPAIGN_ROOT"])
 outdir = a.cell.parent / "fake-outputs"
 outdir.mkdir(parents=True, exist_ok=True)
 artifacts = []
+outputs = []
 if a.stage != "prepare":
     state = json.loads((a.cell.parent / "state.json").read_text())
     artifacts.extend(state["artifacts"])
@@ -3416,19 +3419,21 @@ for kind in stage_kinds[a.stage]:
         payload = {"cell_id": cell["cell_id"], "stage": a.stage, "resume": a.resume}
     target.write_text(json.dumps(payload, sort_keys=True) + "\n")
     body = target.read_bytes()
-    artifacts.append({
+    entry = {
         "kind": kind,
         "path": str(target),
         "sha256": hashlib.sha256(body).hexdigest(),
         "size_bytes": len(body),
-    })
+    }
+    artifacts.append(entry)
+    outputs.append(entry)
 
 a.artifacts_out.parent.mkdir(parents=True, exist_ok=True)
 a.artifacts_out.write_text(json.dumps({
-    "schema": "bsc-stage-artifacts-v1",
+    "schema": "bsc-stage-artifacts-v2",
     "cell_id": cell["cell_id"],
     "stage": a.stage,
-    "artifacts": artifacts,
+    "artifacts": outputs,
 }, sort_keys=True) + "\n")
 """
 
@@ -3506,7 +3511,7 @@ def test_stage_manifest_rejects_extra_kinds_and_malformed_sizes_cleanly(tmp_path
     manifest.write_text(
         json.dumps(
             {
-                "schema": "bsc-stage-artifacts-v1",
+                "schema": "bsc-stage-artifacts-v2",
                 "cell_id": cell_id,
                 "stage": "prepare",
                 "artifacts": [
@@ -3523,7 +3528,7 @@ def test_stage_manifest_rejects_extra_kinds_and_malformed_sizes_cleanly(tmp_path
     manifest.write_text(
         json.dumps(
             {
-                "schema": "bsc-stage-artifacts-v1",
+                "schema": "bsc-stage-artifacts-v2",
                 "cell_id": cell_id,
                 "stage": "prepare",
                 "artifacts": [entry("preparation", preparation, "not-an-int")],
@@ -3533,3 +3538,277 @@ def test_stage_manifest_rejects_extra_kinds_and_malformed_sizes_cleanly(tmp_path
     )
     with pytest.raises(ArtifactError, match="not an integer"):
         runner._load_artifact_manifest(cell_id, "prepare", manifest)
+
+
+def _write_stage_artifact_manifest(
+    path: Path,
+    *,
+    cell_id: str,
+    stage: str,
+    artifacts: tuple[tuple[str, Path], ...],
+) -> None:
+    entries = []
+    for kind, artifact_path in artifacts:
+        body = artifact_path.read_bytes()
+        entries.append(
+            {
+                "kind": kind,
+                "path": str(artifact_path),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body),
+            }
+        )
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "bsc-stage-artifacts-v2",
+                "cell_id": cell_id,
+                "stage": stage,
+                "artifacts": entries,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def test_runner_hashes_each_new_artifact_once_without_gate_rescans(
+    tmp_path,
+    monkeypatch,
+):
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    runner = CampaignRunner(campaign)
+
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    preparation = output_dir / "preparation.json"
+    preparation.write_text('{"ready": true}\n')
+    prepare_manifest = tmp_path / "prepare-stage.json"
+    _write_stage_artifact_manifest(
+        prepare_manifest,
+        cell_id=cell_id,
+        stage="prepare",
+        artifacts=(("preparation", preparation),),
+    )
+
+    calls: list[Path] = []
+    real_sha256 = campaign_module._sha256
+
+    def counted_sha256(path: Path, chunk_bytes: int = 1 << 20) -> str:
+        calls.append(path.resolve())
+        return real_sha256(path, chunk_bytes)
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    prepare_refs = list(
+        runner._load_artifact_manifest(cell_id, "prepare", prepare_manifest)
+    )
+    prepare_refs.append(
+        campaign._verified_artifact_from_path("prepare_manifest", prepare_manifest)
+    )
+    campaign.transition(cell_id, RunState.PREPARED, artifacts=prepare_refs)
+    assert calls == [preparation.resolve(), prepare_manifest.resolve()]
+
+    campaign.transition(cell_id, RunState.RUNNING)
+    checkpoint = output_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    training_report = output_dir / "training-report.json"
+    training_report.write_text('{"trained": true}\n')
+    train_manifest = tmp_path / "train-stage.json"
+    _write_stage_artifact_manifest(
+        train_manifest,
+        cell_id=cell_id,
+        stage="train",
+        artifacts=(
+            ("checkpoint", checkpoint),
+            ("training_report", training_report),
+        ),
+    )
+    train_refs = list(runner._load_artifact_manifest(cell_id, "train", train_manifest))
+    train_refs.append(
+        campaign._verified_artifact_from_path("train_manifest", train_manifest)
+    )
+    campaign.transition(cell_id, RunState.TRAINED, artifacts=train_refs)
+    assert calls == [
+        preparation.resolve(),
+        prepare_manifest.resolve(),
+        checkpoint.resolve(),
+        training_report.resolve(),
+        train_manifest.resolve(),
+    ]
+
+
+def test_new_campaign_process_rehashes_unchanged_ancestors_once(
+    tmp_path,
+    monkeypatch,
+):
+    plan = one_cell_plan()
+    first = Campaign(tmp_path)
+    register_test_plan(first, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    prepare_manifest = write_artifact(
+        tmp_path,
+        "prepare_manifest",
+        {"stage": "prepare"},
+    )
+    first.transition(
+        cell_id,
+        RunState.PREPARED,
+        artifacts=(preparation, prepare_manifest),
+    )
+    first.transition(cell_id, RunState.RUNNING)
+
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    training_report_path = tmp_path / "training-report.json"
+    training_report_path.write_text('{"trained": true}\n')
+    train_manifest_path = tmp_path / "train-stage.json"
+    _write_stage_artifact_manifest(
+        train_manifest_path,
+        cell_id=cell_id,
+        stage="train",
+        artifacts=(
+            ("checkpoint", checkpoint_path),
+            ("training_report", training_report_path),
+        ),
+    )
+
+    restarted = Campaign(tmp_path)
+    runner = CampaignRunner(restarted)
+    calls: list[Path] = []
+    real_sha256 = campaign_module._sha256
+
+    def counted_sha256(path: Path, chunk_bytes: int = 1 << 20) -> str:
+        calls.append(path.resolve())
+        return real_sha256(path, chunk_bytes)
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    refs = list(
+        runner._load_artifact_manifest(cell_id, "train", train_manifest_path)
+    )
+    refs.append(
+        restarted._verified_artifact_from_path(
+            "train_manifest",
+            train_manifest_path,
+        )
+    )
+    restarted.transition(cell_id, RunState.TRAINED, artifacts=refs)
+    assert sorted(calls) == sorted(
+        [
+            checkpoint_path.resolve(),
+            training_report_path.resolve(),
+            train_manifest_path.resolve(),
+            preparation.resolve(tmp_path),
+            prepare_manifest.resolve(tmp_path),
+        ]
+    )
+
+
+def test_verified_token_refuses_same_size_mutation_with_restored_mtime(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = Campaign(tmp_path)
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"original")
+    token = campaign._verified_artifact_from_path("artifact", path)
+    original_stat = path.stat()
+    time.sleep(0.002)
+    path.write_bytes(b"mutation")
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    calls = 0
+    real_sha256 = campaign_module._sha256
+
+    def counted_sha256(target: Path, chunk_bytes: int = 1 << 20) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(target, chunk_bytes)
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    with pytest.raises(ArtifactError, match="hash mismatch"):
+        campaign._verify_artifact(token)
+    assert calls == 1
+
+
+def test_verified_token_refuses_inode_replacement(tmp_path, monkeypatch):
+    campaign = Campaign(tmp_path)
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"original")
+    token = campaign._verified_artifact_from_path("artifact", path)
+    original_stat = path.stat()
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"mutation")
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.replace(replacement, path)
+    assert path.stat().st_ino != original_stat.st_ino
+
+    calls = 0
+    real_sha256 = campaign_module._sha256
+
+    def counted_sha256(target: Path, chunk_bytes: int = 1 << 20) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(target, chunk_bytes)
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    with pytest.raises(ArtifactError, match="hash mismatch"):
+        campaign._verify_artifact(token)
+    assert calls == 1
+
+
+def test_verified_token_refuses_truncation_before_hash(tmp_path, monkeypatch):
+    campaign = Campaign(tmp_path)
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"original")
+    token = campaign._verified_artifact_from_path("artifact", path)
+    path.write_bytes(b"short")
+
+    calls = 0
+
+    def counted_sha256(target: Path, chunk_bytes: int = 1 << 20) -> str:
+        nonlocal calls
+        calls += 1
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    with pytest.raises(ArtifactError, match="size mismatch"):
+        campaign._verify_artifact(token)
+    assert calls == 0
+
+
+def test_stale_and_foreign_tokens_force_content_reverification(tmp_path, monkeypatch):
+    first = Campaign(tmp_path)
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"original")
+    token = first._verified_artifact_from_path("artifact", path)
+    original_stat = path.stat()
+    time.sleep(0.002)
+    path.write_bytes(b"original")
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    calls = 0
+    real_sha256 = campaign_module._sha256
+
+    def counted_sha256(target: Path, chunk_bytes: int = 1 << 20) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(target, chunk_bytes)
+
+    monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
+    refreshed = first._verify_artifact(token)
+    assert calls == 1
+    assert refreshed._verification != token._verification
+
+    forged_digest = replace(refreshed, sha256="0" * 64)
+    with pytest.raises(ArtifactError, match="hash mismatch"):
+        first._verify_artifact(forged_digest)
+    assert calls == 2
+
+    restarted = Campaign(tmp_path)
+    restarted_ref = restarted._verify_artifact(refreshed)
+    assert calls == 3
+    assert restarted_ref._verification != refreshed._verification

@@ -115,6 +115,7 @@ def test_stiefel_score_specialization_preserves_exact_shared_view_payloads() -> 
 
 def test_load_trained_model_refuses_specialization_binding_and_residual_mutation(
     tmp_path,
+    monkeypatch,
 ) -> None:
     cfg = BSCConfig(
         n_blocks=16,
@@ -148,6 +149,18 @@ def test_load_trained_model_refuses_specialization_binding_and_residual_mutation
     assert metadata["model_cfg"]["decoded_energy_implementation"] == (
         DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
     )
+    verified_digest = "a" * 64
+    with monkeypatch.context() as guarded:
+        guarded.setattr(
+            evaluation_module,
+            "checkpoint_sha256",
+            lambda _path: pytest.fail("verified checkpoint was hashed twice"),
+        )
+        _, verified_metadata = load_trained_model(
+            valid_path,
+            verified_checkpoint_sha256=verified_digest,
+        )
+    assert verified_metadata["checkpoint_sha256"] == verified_digest
 
     rebound = copy.deepcopy(payload)
     rebound["model_cfg"]["decoded_energy_implementation"] = (

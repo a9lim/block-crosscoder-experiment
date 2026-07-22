@@ -113,6 +113,36 @@ import block_crosscoder_experiment.cli.run_cell as run_cell_module
 REPO = Path(__file__).resolve().parents[1]
 
 
+def test_stage_digest_cache_hashes_an_unchanged_output_exactly_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = tmp_path / "checkpoint.pt"
+    artifact.write_bytes(b"checkpoint-payload")
+    manifest = tmp_path / "stage.json"
+    calls = 0
+    real_sha256 = run_cell_module._sha256
+
+    def counted_sha256(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_sha256(path)
+
+    monkeypatch.setattr(run_cell_module, "_sha256", counted_sha256)
+    cache = run_cell_module._ArtifactDigestCache()
+    expected = cache.digest(artifact)
+    run_cell_module._emit_stage_manifest(
+        manifest,
+        cell_id="cell",
+        stage="train",
+        root=tmp_path,
+        artifacts=(("checkpoint", artifact),),
+        digest=cache.digest,
+    )
+    assert calls == 1
+    assert json.loads(manifest.read_text())["artifacts"][0]["sha256"] == expected
+
+
 def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
     source = inspect.getsource(run_cell_module._evaluate)
     assert source.count("_prefetched_evaluation_batches(") == 1

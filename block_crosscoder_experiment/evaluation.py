@@ -325,8 +325,14 @@ def load_trained_model(
     checkpoint: str | Path,
     *,
     device: str | torch.device = "cpu",
+    verified_checkpoint_sha256: str | None = None,
 ) -> tuple[BlockCrosscoder, dict]:
-    """Load the complete saved model configuration without optimizer setup."""
+    """Load model state without repeating an immediately prior content hash."""
+    if verified_checkpoint_sha256 is not None and (
+        len(verified_checkpoint_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in verified_checkpoint_sha256)
+    ):
+        raise ValueError("verified checkpoint SHA-256 is malformed")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     raw_cfg_payload = payload.get("model_cfg")
     if not isinstance(raw_cfg_payload, dict):
@@ -356,7 +362,11 @@ def load_trained_model(
         "step_idx": payload.get("step_idx"),
         "accepted_tokens": payload.get("accepted_tokens"),
         "data_cursor": payload.get("data_cursor"),
-        "checkpoint_sha256": checkpoint_sha256(checkpoint),
+        "checkpoint_sha256": (
+            verified_checkpoint_sha256
+            if verified_checkpoint_sha256 is not None
+            else checkpoint_sha256(checkpoint)
+        ),
     }
 
 

@@ -14,15 +14,17 @@ The runner invokes::
     python -m block_crosscoder_experiment.cli.run_cell \
         --cell CELL_MANIFEST --stage STAGE --artifacts-out OUTPUT
 
-and adds ``--resume`` when requested.  Except for ``prepare``, the child must
-atomically write ``OUTPUT`` as::
+and adds ``--resume`` when requested.  The child atomically writes only the
+new outputs from that stage to ``OUTPUT`` as::
 
-    {"schema": "bsc-stage-artifacts-v1", "cell_id": "...", "stage": "train",
+    {"schema": "bsc-stage-artifacts-v2", "cell_id": "...", "stage": "train",
      "artifacts": [{"kind": "checkpoint", "path": "...", "sha256": "..."}]}
 
 Relative artifact paths are relative to the campaign root.  Hashes are always
-recomputed by this module.  The qualification artifact has the stricter
-contract documented in :meth:`Campaign._validate_qualification`.
+recomputed by this module once.  A process-local stat fingerprint permits
+later gates in the same runner to reuse that verification; a changed file or
+new process forces another content hash.  The qualification artifact has the
+stricter contract documented in :meth:`Campaign._validate_qualification`.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ import uuid
 import fcntl
 from statistics import median
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -82,7 +84,7 @@ from .studies import (
 
 
 CAMPAIGN_SCHEMA = "bsc-campaign-v1"
-ARTIFACT_SCHEMA = "bsc-stage-artifacts-v1"
+ARTIFACT_SCHEMA = "bsc-stage-artifacts-v2"
 QUALIFICATION_SCHEMA = "bsc-qualification-v1"
 EVALUATION_SCHEMA = "bsc-evaluation-v2"
 EVALUATION_EXECUTION_IMPLEMENTATION = "joint_transformed_raw_packet_v1"
@@ -239,16 +241,9 @@ STAGE_TARGETS: Mapping[str, RunState] = {
 
 EXPECTED_STAGE_ARTIFACTS: Mapping[str, frozenset[str]] = {
     "prepare": frozenset({"preparation"}),
-    "train": frozenset(
-        {"preparation", "prepare_manifest", "checkpoint", "training_report"}
-    ),
+    "train": frozenset({"checkpoint", "training_report"}),
     "calibrate": frozenset(
         {
-            "preparation",
-            "prepare_manifest",
-            "checkpoint",
-            "training_report",
-            "train_manifest",
             "calibration",
             "deployment_codec",
             "calibration_record",
@@ -256,36 +251,11 @@ EXPECTED_STAGE_ARTIFACTS: Mapping[str, frozenset[str]] = {
     ),
     "evaluate": frozenset(
         {
-            "preparation",
-            "prepare_manifest",
-            "checkpoint",
-            "training_report",
-            "train_manifest",
-            "calibration",
-            "deployment_codec",
-            "calibration_record",
-            "calibrate_manifest",
             "deployment_schedules",
             "evaluation",
         }
     ),
-    "qualify": frozenset(
-        {
-            "preparation",
-            "prepare_manifest",
-            "checkpoint",
-            "training_report",
-            "train_manifest",
-            "calibration",
-            "deployment_codec",
-            "calibration_record",
-            "calibrate_manifest",
-            "deployment_schedules",
-            "evaluation",
-            "evaluate_manifest",
-            "qualification",
-        }
-    ),
+    "qualify": frozenset({"qualification"}),
 }
 
 
@@ -381,11 +351,45 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class _ArtifactFingerprint:
+    device: int
+    inode: int
+    size_bytes: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def from_path(cls, path: Path) -> "_ArtifactFingerprint":
+        stat = path.stat()
+        return cls(
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            size_bytes=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            ctime_ns=stat.st_ctime_ns,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactVerification:
+    """Unserialized proof that this process hashed one exact file instance."""
+
+    issuer: object
+    key: tuple[str, str, int]
+    fingerprint: _ArtifactFingerprint
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactRef:
     kind: str
     path: str
     sha256: str
     size_bytes: int
+    _verification: _ArtifactVerification | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.kind or "/" in self.kind:
@@ -570,6 +574,109 @@ class Campaign:
         self._events_cache_lock = threading.RLock()
         self._plan_cache: StudyPlan | None = None
         self._plan_cache_signature: tuple[int, int, int, int] | None = None
+        # Verification receipts are intentionally process-local.  They are
+        # never journaled, and their opaque issuer prevents a new Campaign
+        # instance from accepting a token inherited from an older runner.
+        self._artifact_verification_issuer = object()
+        self._artifact_verification_cache: dict[
+            tuple[str, str, int], _ArtifactFingerprint
+        ] = {}
+
+    @staticmethod
+    def _artifact_cache_key(
+        artifact: ArtifactRef,
+        path: Path,
+    ) -> tuple[str, str, int]:
+        return (str(path), artifact.sha256, artifact.size_bytes)
+
+    def _verify_artifact(self, artifact: ArtifactRef) -> ArtifactRef:
+        """Authenticate an artifact once per unchanged file instance.
+
+        Size, device, inode, mtime, and ctime form the reuse guard.  Any
+        difference discards the receipt and performs a full content hash.
+        A before/after fingerprint also refuses files changed during hashing.
+        """
+
+        path = artifact.resolve(self.root).resolve()
+        if not path.is_file():
+            raise ArtifactError(f"artifact disappeared: {path}")
+        try:
+            before = _ArtifactFingerprint.from_path(path)
+        except OSError as exc:
+            raise ArtifactError(f"cannot stat artifact {path}: {exc}") from exc
+        if before.size_bytes != artifact.size_bytes:
+            raise ArtifactError(
+                f"artifact size mismatch for {path}: "
+                f"{before.size_bytes} != {artifact.size_bytes}"
+            )
+        key = self._artifact_cache_key(artifact, path)
+        token = artifact._verification
+        if (
+            token is not None
+            and token.issuer is self._artifact_verification_issuer
+            and token.key == key
+            and token.fingerprint == before
+        ):
+            self._artifact_verification_cache[key] = before
+            return artifact
+        if self._artifact_verification_cache.get(key) == before:
+            return replace(
+                artifact,
+                _verification=_ArtifactVerification(
+                    self._artifact_verification_issuer,
+                    key,
+                    before,
+                ),
+            )
+        try:
+            actual_hash = _sha256(path)
+            after = _ArtifactFingerprint.from_path(path)
+        except OSError as exc:
+            raise ArtifactError(f"cannot hash artifact {path}: {exc}") from exc
+        if after != before:
+            raise ArtifactError(f"artifact changed while hashing: {path}")
+        if actual_hash != artifact.sha256:
+            raise ArtifactError(
+                f"artifact hash mismatch for {path}: "
+                f"{actual_hash} != {artifact.sha256}"
+            )
+        self._artifact_verification_cache[key] = after
+        return replace(
+            artifact,
+            _verification=_ArtifactVerification(
+                self._artifact_verification_issuer,
+                key,
+                after,
+            ),
+        )
+
+    def _verified_artifact_from_path(self, kind: str, path: Path) -> ArtifactRef:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise ArtifactError(f"artifact does not exist or is not a file: {path}")
+        try:
+            before = _ArtifactFingerprint.from_path(resolved)
+            digest = _sha256(resolved)
+            after = _ArtifactFingerprint.from_path(resolved)
+        except OSError as exc:
+            raise ArtifactError(f"cannot hash artifact {resolved}: {exc}") from exc
+        if after != before:
+            raise ArtifactError(f"artifact changed while hashing: {resolved}")
+        try:
+            stored_path = str(resolved.relative_to(self.root.resolve()))
+        except ValueError:
+            stored_path = str(resolved)
+        ref = ArtifactRef(kind, stored_path, digest, after.size_bytes)
+        key = self._artifact_cache_key(ref, resolved)
+        self._artifact_verification_cache[key] = after
+        return replace(
+            ref,
+            _verification=_ArtifactVerification(
+                self._artifact_verification_issuer,
+                key,
+                after,
+            ),
+        )
 
     @property
     def plan(self) -> StudyPlan:
@@ -4198,8 +4305,10 @@ class Campaign:
             )
         merged = record.artifact_map
         new_kinds: set[str] = set()
-        for artifact in artifacts:
-            artifact.verify(self.root)
+        authenticated: list[ArtifactRef] = []
+        for unverified in artifacts:
+            artifact = self._verify_artifact(unverified)
+            authenticated.append(artifact)
             existing = merged.get(artifact.kind)
             if existing is not None and existing != artifact:
                 raise ArtifactError(
@@ -4227,7 +4336,7 @@ class Campaign:
             target=target,
             message=message,
             metadata=event_metadata,
-            artifacts=artifacts,
+            artifacts=tuple(authenticated),
         )
         self._append_event(event)
         updated = self.record(cell_id)
@@ -4271,7 +4380,7 @@ class Campaign:
                 f"{sorted(missing)}"
             )
         for kind in required:
-            artifacts[kind].verify(self.root)
+            self._verify_artifact(artifacts[kind])
         if target is RunState.QUALIFIED:
             self._validate_qualification(cell_id, artifacts)
         elif target is RunState.PROMOTED:
@@ -8510,12 +8619,23 @@ class CampaignRunner:
             raise CampaignError(
                 f"run_cell exited {completed.returncode} during {stage}: {tail}"
             )
-        refs = list(self._load_artifact_manifest(cell_id, stage, artifacts_out))
-        refs.append(
-            ArtifactRef.from_path(
-                f"{stage}_manifest", artifacts_out, root=self.campaign.root
-            )
+        manifest_ref = self.campaign._verified_artifact_from_path(
+            f"{stage}_manifest",
+            artifacts_out,
         )
+        manifest_verification = manifest_ref._verification
+        if manifest_verification is None:  # pragma: no cover - private invariant
+            raise AssertionError("verified manifest lacks its process-local receipt")
+        manifest_fingerprint = manifest_verification.fingerprint
+        refs = list(self._load_artifact_manifest(cell_id, stage, artifacts_out))
+        manifest_ref = self.campaign._verify_artifact(manifest_ref)
+        final_verification = manifest_ref._verification
+        if (
+            final_verification is None  # pragma: no cover - private invariant
+            or final_verification.fingerprint != manifest_fingerprint
+        ):
+            raise ArtifactError("stage-artifact manifest changed while loading")
+        refs.append(manifest_ref)
         return tuple(refs)
 
     def _load_artifact_manifest(
@@ -8544,18 +8664,20 @@ class CampaignRunner:
             artifact_path = Path(str(item.get("path", "")))
             if not artifact_path.is_absolute():
                 artifact_path = self.campaign.root / artifact_path
-            ref = ArtifactRef.from_path(kind, artifact_path, root=self.campaign.root)
             claimed_hash = item.get("sha256")
             claimed_size = item.get("size_bytes")
-            if claimed_hash is not None and claimed_hash != ref.sha256:
-                raise ArtifactError(f"child-reported hash mismatch for {kind}")
-            if claimed_size is not None:
-                if not isinstance(claimed_size, int) or isinstance(claimed_size, bool):
-                    raise ArtifactError(
-                        f"child-reported size is not an integer for {kind}"
-                    )
-                if claimed_size != ref.size_bytes:
-                    raise ArtifactError(f"child-reported size mismatch for {kind}")
+            if not isinstance(claimed_hash, str):
+                raise ArtifactError(f"child-reported hash is not a string for {kind}")
+            if not isinstance(claimed_size, int) or isinstance(claimed_size, bool):
+                raise ArtifactError(
+                    f"child-reported size is not an integer for {kind}"
+                )
+            resolved = artifact_path.resolve()
+            try:
+                stored_path = str(resolved.relative_to(self.campaign.root.resolve()))
+            except ValueError:
+                stored_path = str(resolved)
+            ref = ArtifactRef(kind, stored_path, claimed_hash, claimed_size)
             refs.append(ref)
         observed = frozenset(item.kind for item in refs)
         expected = EXPECTED_STAGE_ARTIFACTS[stage]
@@ -8564,7 +8686,15 @@ class CampaignRunner:
                 f"{stage} stage artifact kinds must be exactly "
                 f"{sorted(expected)}, got {sorted(observed)}"
             )
-        return tuple(refs)
+        verified: list[ArtifactRef] = []
+        for ref in refs:
+            try:
+                verified.append(self.campaign._verify_artifact(ref))
+            except ArtifactError as exc:
+                raise ArtifactError(
+                    f"child-reported artifact mismatch for {ref.kind}: {exc}"
+                ) from exc
+        return tuple(verified)
 
 
 __all__ = [

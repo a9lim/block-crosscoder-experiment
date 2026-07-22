@@ -30,7 +30,7 @@ import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import torch
 import numpy as np
@@ -166,6 +166,76 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _FileFingerprint:
+    device: int
+    inode: int
+    size_bytes: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def from_path(cls, path: Path) -> "_FileFingerprint":
+        stat = path.stat()
+        return cls(
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+
+class _ArtifactDigestCache:
+    """Reuse digests only while the exact local file instance is unchanged."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[_FileFingerprint, str]] = {}
+
+    def digest(self, path: Path) -> str:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise CellExecutionError(f"artifact disappeared: {resolved}")
+        try:
+            before = _FileFingerprint.from_path(resolved)
+        except OSError as exc:
+            raise CellExecutionError(f"cannot stat artifact {resolved}: {exc}") from exc
+        cached = self._entries.get(str(resolved))
+        if cached is not None and cached[0] == before:
+            return cached[1]
+        try:
+            digest = _sha256(resolved)
+            after = _FileFingerprint.from_path(resolved)
+        except OSError as exc:
+            raise CellExecutionError(f"cannot hash artifact {resolved}: {exc}") from exc
+        if after != before:
+            raise CellExecutionError(f"artifact changed while hashing: {resolved}")
+        self._entries[str(resolved)] = (after, digest)
+        return digest
+
+    def verify(
+        self,
+        path: Path,
+        *,
+        sha256: str,
+        size_bytes: int,
+    ) -> _FileFingerprint:
+        resolved = path.resolve()
+        try:
+            actual_size = resolved.stat().st_size
+        except OSError as exc:
+            raise CellExecutionError(f"cannot stat artifact {resolved}: {exc}") from exc
+        if actual_size != size_bytes:
+            raise CellExecutionError(
+                f"prerequisite artifact size mismatch: {resolved}"
+            )
+        if self.digest(resolved) != sha256:
+            raise CellExecutionError(
+                f"prerequisite artifact hash mismatch: {resolved}"
+            )
+        return self._entries[str(resolved)][0]
 
 
 def _tensor_payload_digest(value: Any) -> str:
@@ -363,13 +433,19 @@ def _relative(path: Path, root: Path) -> str:
         return str(resolved)
 
 
-def _artifact_entry(kind: str, path: Path, *, root: Path) -> dict[str, Any]:
+def _artifact_entry(
+    kind: str,
+    path: Path,
+    *,
+    root: Path,
+    digest: Callable[[Path], str] = _sha256,
+) -> dict[str, Any]:
     if not path.is_file():
         raise CellExecutionError(f"stage did not produce {kind}: {path}")
     return {
         "kind": kind,
         "path": _relative(path, root),
-        "sha256": _sha256(path),
+        "sha256": digest(path),
         "size_bytes": path.stat().st_size,
     }
 
@@ -381,8 +457,12 @@ def _emit_stage_manifest(
     stage: str,
     root: Path,
     artifacts: Sequence[tuple[str, Path]],
+    digest: Callable[[Path], str] = _sha256,
 ) -> None:
-    entries = [_artifact_entry(kind, item, root=root) for kind, item in artifacts]
+    entries = [
+        _artifact_entry(kind, item, root=root, digest=digest)
+        for kind, item in artifacts
+    ]
     if len({entry["kind"] for entry in entries}) != len(entries):
         raise CellExecutionError("a stage cannot emit the same artifact kind twice")
     _atomic_bytes(
@@ -427,6 +507,11 @@ class _Context:
                 "BSC_CAMPAIGN_ROOT is required; execute cells through `bsc matrix run`"
             )
         self.root = Path(root_raw).resolve()
+        self._artifact_digests = _ArtifactDigestCache()
+        self._prerequisite_receipts: dict[
+            str,
+            tuple[str, int],
+        ] = {}
         try:
             self.cell_path.relative_to(self.root)
             self.artifacts_out.relative_to(self.root)
@@ -673,6 +758,27 @@ class _Context:
     def values(self) -> dict[str, Any]:
         return self.cell.decision_map
 
+    def artifact_sha256(self, path: Path) -> str:
+        return self._artifact_digests.digest(path)
+
+    def prerequisite_fingerprint(
+        self,
+        path: Path,
+        *,
+        sha256: str,
+    ) -> _FileFingerprint:
+        resolved = path.resolve()
+        receipt = self._prerequisite_receipts.get(str(resolved))
+        if receipt is None or receipt[0] != sha256:
+            raise CellExecutionError(
+                f"artifact lacks a matching prerequisite receipt: {resolved}"
+            )
+        return self._artifact_digests.verify(
+            resolved,
+            sha256=sha256,
+            size_bytes=receipt[1],
+        )
+
     def state(self) -> tuple[str, dict[str, dict[str, Any]]]:
         path = self.cell_dir / "state.json"
         payload = _read_object(path, label="campaign state")
@@ -698,14 +804,17 @@ class _Context:
         path = Path(str(raw.get("path", "")))
         if not path.is_absolute():
             path = self.root / path
-        if not path.is_file():
-            raise CellExecutionError(f"prerequisite artifact disappeared: {path}")
         expected_size = int(raw.get("size_bytes", -1))
-        if path.stat().st_size != expected_size:
-            raise CellExecutionError(f"prerequisite artifact size mismatch: {path}")
         expected_hash = str(raw.get("sha256", ""))
-        if _sha256(path) != expected_hash:
-            raise CellExecutionError(f"prerequisite artifact hash mismatch: {path}")
+        self._artifact_digests.verify(
+            path,
+            sha256=expected_hash,
+            size_bytes=expected_size,
+        )
+        self._prerequisite_receipts[str(path.resolve())] = (
+            expected_hash,
+            expected_size,
+        )
         return path
 
     def prerequisites(self) -> dict[str, tuple[Path, str]]:
@@ -4086,7 +4195,7 @@ def _binding(
     return {
         "cell_id": ctx.cell.cell_id,
         "recipe_id": ctx.cell.recipe_id,
-        "preparation_sha256": _sha256(ctx.preparation),
+        "preparation_sha256": ctx.artifact_sha256(ctx.preparation),
         "model_cfg": asdict(model_cfg),
         "train_cfg": asdict(train_cfg),
         "initialization": dict(initialization),
@@ -4352,14 +4461,15 @@ def _train(
                 _training_report_payload(
                     ctx,
                     metadata=metadata,
-                    checkpoint_hash=_sha256(ctx.checkpoint),
+                    checkpoint_hash=ctx.artifact_sha256(ctx.checkpoint),
                     preparation_hash=prerequisites["preparation"][1],
                     terminal_log=metadata["terminal_log"],
                 ),
             )
         report = _read_object(ctx.training_report, label="training report")
         if (
-            report.get("checkpoint_sha256") != _sha256(ctx.checkpoint)
+            report.get("checkpoint_sha256")
+            != ctx.artifact_sha256(ctx.checkpoint)
             or report.get("attempted_tokens") != int(final_cursor)
             or report.get("data_cursor") != metadata["data_cursor"]
             or report.get("accepted_tokens") != metadata["accepted_tokens"]
@@ -4504,7 +4614,7 @@ def _train(
     report = _training_report_payload(
         ctx,
         metadata=metadata,
-        checkpoint_hash=_sha256(ctx.checkpoint),
+        checkpoint_hash=ctx.artifact_sha256(ctx.checkpoint),
         preparation_hash=prerequisites["preparation"][1],
         terminal_log=history[-1] if history else None,
     )
@@ -4530,12 +4640,26 @@ def _calibrate(
         or training_report.get("checkpoint_sha256") != checkpoint_hash
     ):
         raise CellExecutionError("training report/checkpoint binding mismatch")
+    checkpoint_before_load = ctx.prerequisite_fingerprint(
+        checkpoint_path,
+        sha256=checkpoint_hash,
+    )
     try:
-        model, metadata = load_trained_model(checkpoint_path, device=_device(ctx))
+        model, metadata = load_trained_model(
+            checkpoint_path,
+            device=_device(ctx),
+            verified_checkpoint_sha256=checkpoint_hash,
+        )
     except Exception as exc:  # noqa: BLE001
         raise CellExecutionError(
             f"cannot load checkpoint for calibration: {exc}"
         ) from exc
+    checkpoint_after_load = ctx.prerequisite_fingerprint(
+        checkpoint_path,
+        sha256=checkpoint_hash,
+    )
+    if checkpoint_after_load != checkpoint_before_load:
+        raise CellExecutionError("checkpoint changed while loading for calibration")
     binding = metadata.get("run_binding") or {}
     if binding.get("cell_id") != ctx.cell.cell_id:
         raise CellExecutionError("checkpoint is not bound to this cell")
@@ -4691,7 +4815,7 @@ def _calibrate(
         model,
         checkpoint_hash=checkpoint_hash,
         checkpoint_metadata=metadata,
-        calibration_hash=_sha256(ctx.calibration),
+        calibration_hash=ctx.artifact_sha256(ctx.calibration),
         preparation_hash=prerequisites["preparation"][1],
     )
     _save_immutable_torch(ctx.deployment_codec, deployment_payload)
@@ -4701,7 +4825,7 @@ def _calibrate(
         ctx.deployment_codec,
         cell_id=ctx.cell.cell_id,
         checkpoint_hash=checkpoint_hash,
-        calibration_hash=_sha256(ctx.calibration),
+        calibration_hash=ctx.artifact_sha256(ctx.calibration),
         preparation_hash=prerequisites["preparation"][1],
         device=torch.device("cpu"),
     )
@@ -4709,7 +4833,8 @@ def _calibrate(
         frozen_deployment.get("schema") != "bsc-deployable-codec-v2"
         or frozen_deployment.get("cell_id") != ctx.cell.cell_id
         or frozen_deployment.get("checkpoint_sha256") != checkpoint_hash
-        or frozen_deployment.get("calibration_sha256") != _sha256(ctx.calibration)
+        or frozen_deployment.get("calibration_sha256")
+        != ctx.artifact_sha256(ctx.calibration)
     ):
         raise CellExecutionError("deployable codec artifact binding mismatch")
     if frozen_consumer_codec.meta != frozen.meta:
@@ -4722,8 +4847,8 @@ def _calibrate(
         "schema": "bsc-calibration-record-v1",
         "cell_id": ctx.cell.cell_id,
         "checkpoint_sha256": checkpoint_hash,
-        "codec_sha256": _sha256(ctx.calibration),
-        "deployment_codec_sha256": _sha256(ctx.deployment_codec),
+        "codec_sha256": ctx.artifact_sha256(ctx.calibration),
+        "deployment_codec_sha256": ctx.artifact_sha256(ctx.deployment_codec),
         "deployment_codec_size_bytes": ctx.deployment_codec.stat().st_size,
         "theta": float(frozen.meta["theta"]),
         "target_avg_blocks": target,
@@ -8516,16 +8641,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             prerequisites=prerequisites,
         )
-        complete_artifacts = (
-            *((kind, value[0]) for kind, value in prerequisites.items()),
-            *artifacts,
-        )
         _emit_stage_manifest(
             ctx.artifacts_out,
             cell_id=ctx.cell.cell_id,
             stage=ctx.stage,
             root=ctx.root,
-            artifacts=complete_artifacts,
+            artifacts=artifacts,
+            digest=ctx.artifact_sha256,
         )
     except (CellExecutionError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"error: {exc}") from exc
