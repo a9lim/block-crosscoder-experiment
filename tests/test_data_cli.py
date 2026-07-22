@@ -11,9 +11,11 @@ import pytest
 import torch
 
 from block_crosscoder_experiment.cli.data import (
+    _overlap_cuda_capture_copies,
     _canonical_hash,
     capture,
     derive_views,
+    estimate_capture_pipeline_residency_bytes,
     estimate_store_bytes,
     estimate_writer_residency_bytes,
     fit_transform_artifacts,
@@ -234,6 +236,24 @@ def test_split_parser_and_estimate():
         "pending_shard_bytes": 480,
         "staging_shard_bytes": 480,
         "writer_residency_bytes": 960,
+    }
+    assert estimate_capture_pipeline_residency_bytes(
+        writer,
+        (4, 6),
+        batch_rows=2,
+        context=8,
+        drop_positions=1,
+        cuda_overlap=True,
+    ) == {
+        "contract": "two_pinned_activation_d2h_lookahead_v1",
+        "activation_batch_bytes": 336,
+        "row_identity_batch_bytes": 336,
+        "pinned_activation_buffer_count": 2,
+        "pinned_activation_host_bytes": 672,
+        "retained_row_identity_host_bytes": 672,
+        "retained_cuda_source_bytes": 672,
+        "peak_host_pipeline_bytes": 2304,
+        "peak_cuda_capture_lookahead_bytes": 672,
     }
     with pytest.raises(ValueError):
         parse_split_sizes(["train=2"])
@@ -642,14 +662,55 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
             assert torch.equal(left_ids, right_ids)
 
 
-def test_capture_refuses_writer_residency_before_creating_output(tmp_path, monkeypatch):
+def test_capture_refuses_pipeline_residency_before_creating_output(
+    tmp_path, monkeypatch
+):
     _, _, make_args = _mock_capture_runtime(monkeypatch)
     out = tmp_path / "refused"
     args = make_args(out)
     args.max_writer_residency_bytes = 1
-    with pytest.raises(ValueError, match="writer residency.*required=.*limit=1"):
+    with pytest.raises(
+        ValueError,
+        match="pipeline host residency.*required=.*limit=1",
+    ):
         capture(args)
     assert not out.exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_capture_copy_overlap_is_byte_exact_ordered_and_close_safe():
+    identities = [torch.full((5, 3), index, dtype=torch.int64) for index in range(4)]
+    expected = [
+        (torch.arange(60, dtype=torch.bfloat16).reshape(5, 3, 4) + index).cuda()
+        for index in range(4)
+    ]
+
+    def source():
+        for activation, row_ids in zip(expected, identities, strict=True):
+            yield activation.clone(), row_ids
+
+    observed = list(_overlap_cuda_capture_copies(source()))
+    assert all(
+        torch.equal(row_ids, reference)
+        for (_, row_ids), reference in zip(observed, identities, strict=True)
+    )
+    assert all(host.is_pinned() for host, _ in observed)
+    for (host, _), reference in zip(observed, expected, strict=True):
+        assert torch.equal(host, reference.cpu())
+
+    closed = False
+
+    def closing_source():
+        nonlocal closed
+        try:
+            yield from source()
+        finally:
+            closed = True
+
+    stream = _overlap_cuda_capture_copies(closing_source())
+    next(stream)
+    stream.close()
+    assert closed
 
 
 def test_capture_streams_slices_without_torch_cat(tmp_path, monkeypatch):

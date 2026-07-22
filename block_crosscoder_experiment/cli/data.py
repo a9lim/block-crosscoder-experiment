@@ -110,6 +110,87 @@ class SourceSpec:
         return cls(parts[0], parts[1] or None, parts[2])
 
 
+@dataclass(slots=True)
+class _PendingCaptureCopy:
+    """One activation batch retained until its asynchronous D2H copy lands."""
+
+    source: torch.Tensor
+    host: torch.Tensor
+    row_ids: torch.Tensor
+    ready: torch.cuda.Event
+
+    def resolve(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self.ready.synchronize()
+        return self.host, self.row_ids
+
+
+def _overlap_cuda_capture_copies(
+    batches: Iterator[tuple[torch.Tensor, torch.Tensor]],
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Overlap one bounded pinned activation D2H copy with the next forward.
+
+    The source iterator performs the model forward synchronously on CUDA. We
+    pull one item ahead before resolving the preceding transfer, which lets a
+    dedicated copy stream drain the previous activations while the default
+    stream executes the next model batch. Both CUDA source storage and pinned
+    host storage stay live until the copy event completes.
+    """
+
+    source = iter(batches)
+    transfer_stream: torch.cuda.Stream | None = None
+
+    def enqueue(
+        item: tuple[torch.Tensor, torch.Tensor],
+    ) -> _PendingCaptureCopy:
+        nonlocal transfer_stream
+        activations, row_ids = item
+        if not activations.is_cuda:
+            raise ValueError("overlapped capture requires CUDA activations")
+        if row_ids.device.type != "cpu":
+            raise ValueError("capture row identities must remain on CPU")
+        if transfer_stream is None:
+            transfer_stream = torch.cuda.Stream(device=activations.device)
+        elif transfer_stream.device != activations.device:
+            raise ValueError("capture activation device changed between batches")
+        host = torch.empty_like(
+            activations,
+            device="cpu",
+            pin_memory=True,
+        )
+        produced = torch.cuda.Event()
+        produced.record(torch.cuda.current_stream(activations.device))
+        with torch.cuda.stream(transfer_stream):
+            transfer_stream.wait_event(produced)
+            host.copy_(activations, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(transfer_stream)
+        return _PendingCaptureCopy(activations, host, row_ids, ready)
+
+    pending: _PendingCaptureCopy | None = None
+    try:
+        try:
+            pending = enqueue(next(source))
+        except StopIteration:
+            return
+        for item in source:
+            following = enqueue(item)
+            host, row_ids = pending.resolve()
+            pending = following
+            yield host, row_ids
+        host, row_ids = pending.resolve()
+        pending = None
+        yield host, row_ids
+    finally:
+        # A consumer-side close or a source exception may leave the lookahead
+        # transfer in flight. Drain it before either pinned host storage or its
+        # retained CUDA source can leave scope.
+        if transfer_stream is not None:
+            transfer_stream.synchronize()
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
+
+
 def _canonical_hash(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -368,6 +449,52 @@ def estimate_writer_residency_bytes(
     }
 
 
+def estimate_capture_pipeline_residency_bytes(
+    writer: dict[str, int],
+    site_dims: Iterable[int],
+    *,
+    batch_rows: int,
+    context: int,
+    drop_positions: int,
+    cuda_overlap: bool,
+) -> dict[str, int | str]:
+    """Price the bounded activation-copy lookahead beside the shard writer."""
+
+    dimensions = tuple(int(width) for width in site_dims)
+    if not dimensions or any(width <= 0 for width in dimensions):
+        raise ValueError("site dimensions must be nonempty and positive")
+    if batch_rows <= 0 or context <= 0 or not 0 <= drop_positions < context:
+        raise ValueError("capture batch/context geometry is invalid")
+    batch_tokens = batch_rows * (context - drop_positions)
+    activation_bytes = batch_tokens * len(dimensions) * max(dimensions) * 2
+    row_identity_bytes = batch_tokens * 3 * 8
+    # Pulling one item ahead owns the current consumer batch and one pending
+    # batch. The previous CUDA source is deliberately retained until its D2H
+    # event completes; row identities remain CPU-resident throughout.
+    lookahead = 2 if cuda_overlap else 0
+    pinned_host_bytes = lookahead * activation_bytes
+    retained_row_identity_bytes = lookahead * row_identity_bytes
+    retained_cuda_bytes = lookahead * activation_bytes
+    writer_bytes = int(writer["writer_residency_bytes"])
+    return {
+        "contract": (
+            "two_pinned_activation_d2h_lookahead_v1"
+            if cuda_overlap
+            else "synchronous_cpu_capture_v1"
+        ),
+        "activation_batch_bytes": activation_bytes,
+        "row_identity_batch_bytes": row_identity_bytes,
+        "pinned_activation_buffer_count": lookahead,
+        "pinned_activation_host_bytes": pinned_host_bytes,
+        "retained_row_identity_host_bytes": retained_row_identity_bytes,
+        "retained_cuda_source_bytes": retained_cuda_bytes,
+        "peak_host_pipeline_bytes": (
+            writer_bytes + pinned_host_bytes + retained_row_identity_bytes
+        ),
+        "peak_cuda_capture_lookahead_bytes": retained_cuda_bytes,
+    }
+
+
 def _enforce_writer_residency(
     estimate: dict[str, int], *, max_writer_residency_bytes: int
 ) -> None:
@@ -379,6 +506,20 @@ def _enforce_writer_residency(
             "one-deep shard writer residency exceeds the configured refusal "
             f"limit: required={required} bytes, "
             f"limit={max_writer_residency_bytes} bytes"
+        )
+
+
+def _enforce_capture_pipeline_residency(
+    estimate: dict[str, int | str], *, max_host_residency_bytes: int
+) -> None:
+    if max_host_residency_bytes <= 0:
+        raise ValueError("max_host_residency_bytes must be positive")
+    required = int(estimate["peak_host_pipeline_bytes"])
+    if required > max_host_residency_bytes:
+        raise ValueError(
+            "capture pipeline host residency exceeds the configured refusal "
+            f"limit: required={required} bytes, "
+            f"limit={max_host_residency_bytes} bytes"
         )
 
 
@@ -873,9 +1014,18 @@ def capture(
         tokens_per_shard=args.tokens_per_shard,
         row_id_width=3,
     )
-    _enforce_writer_residency(
+    cuda_capture_overlap = str(args.device).startswith("cuda")
+    capture_pipeline_residency = estimate_capture_pipeline_residency_bytes(
         writer_residency,
-        max_writer_residency_bytes=max_writer_residency_bytes,
+        site_dims,
+        batch_rows=args.batch_rows,
+        context=args.context,
+        drop_positions=args.drop_positions,
+        cuda_overlap=cuda_capture_overlap,
+    )
+    _enforce_capture_pipeline_residency(
+        capture_pipeline_residency,
+        max_host_residency_bytes=max_writer_residency_bytes,
     )
 
     corpus_info = hf.dataset_info(args.corpus, revision=args.corpus_revision)
@@ -946,6 +1096,7 @@ def capture(
             **writer_residency,
             "max_writer_residency_bytes": max_writer_residency_bytes,
         },
+        "capture_transfer_pipeline": capture_pipeline_residency,
     }
     binding_sha256 = _canonical_hash(binding)
     state_path = args.out / CAPTURE_STATE_NAME
@@ -1229,9 +1380,9 @@ def capture(
             ),
             dim=-1,
         ).reshape(-1, 3)
-        return stacked[skip:].cpu(), identity[skip:]
+        return stacked[skip:], identity[skip:]
 
-    def activation_batches() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    def device_activation_batches() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         batch_rows: list[tuple[int, torch.Tensor]] = []
         skip = first_offset
         for sequence_id, row in enumerate(remaining_rows, start=start_sequence):
@@ -1242,6 +1393,14 @@ def capture(
                 skip = 0
         if batch_rows:
             yield process_rows(batch_rows, skip)
+
+    def activation_batches() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        batches = device_activation_batches()
+        if cuda_capture_overlap:
+            yield from _overlap_cuda_capture_copies(batches)
+            return
+        for activations, row_ids in batches:
+            yield activations.cpu(), row_ids
 
     stream = iter(activation_batches())
     pending_x: torch.Tensor | None = None
@@ -1406,7 +1565,10 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--max-writer-residency-bytes",
         type=int,
         default=DEFAULT_MAX_WRITER_RESIDENCY_BYTES,
-        help="refuse capture if staging plus one pending shard exceeds this bound",
+        help=(
+            "refuse capture if the shard writer plus bounded pinned activation "
+            "lookahead exceed this host-memory bound"
+        ),
     )
     cap.add_argument(
         "--profile",
