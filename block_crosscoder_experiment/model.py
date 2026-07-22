@@ -2167,8 +2167,8 @@ class BlockCrosscoder(nn.Module):
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
         score_grad: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Trainer-only sparse forward returning reconstruction and support."""
+    ) -> torch.Tensor:
+        """Trainer-only sparse forward returning only the reconstruction."""
 
         decoder: torch.Tensor | None
         if self.uses_direct_factorized_execution:
@@ -2210,7 +2210,7 @@ class BlockCrosscoder(nn.Module):
             z,
             mask,
             decoder=decoder,
-        ), mask
+        )
 
     def forward(
         self,
