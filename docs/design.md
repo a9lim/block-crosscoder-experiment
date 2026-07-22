@@ -1065,6 +1065,16 @@ complete R-D payload. In paired jobe measurements, support reuse reduces an
 8,192-token evaluation from `32.634` to `31.898 ms` with 512-token batches
 (`2.26%`) and from `25.582` to `25.258 ms` with 2,048-token batches (`1.26%`).
 
+Shared-code concordance likewise constructs each blockwise full/partial
+support intersection once. The same mask feeds concordance moments and exact
+intersection cardinality; union cardinality is derived as
+`|A| + |B| - |A intersection B|`, with all integer counts exactly representable
+in fp64 at campaign limits. This removes the full-shape intersection and union
+allocations without changing any code, Gram, energy, covariance, or reduction
+order. On the Phase-2 jobe evaluator, median falls from `473.741` to
+`470.680 ms` (`0.65%`), cumulative CUDA allocation traffic falls by `1.25 GiB`,
+and the isolated set-algebra loop falls from `.891` to `.534 ms` (`40.0%`).
+
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M
 parameters per cell, 22GB peak VRAM, 55GB peak host RAM, 850GB storage against

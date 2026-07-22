@@ -223,6 +223,9 @@ exit is not evidence by itself.
   default and selected-copy contracts. Included support mask/count/index
   tensors are constructed once per batch and shared by rate and packet paths;
   an explicit duplicated-support oracle must produce the identical payload.
+  Shared-code concordance constructs one intersection per block and derives
+  union counts by exact inclusion-exclusion; legacy full-mask AND/OR oracles,
+  511/512/513-group boundaries, short batches, and complete payloads must agree.
 - Phase-1 masking has a preceding scale-control panel: literal sum at `p=0`,
   nonpromotable literal sum at `p=.10`, and availability-rescaled sum at
   `p=.10`. Its fixed rescaled carrier enters the subsequent

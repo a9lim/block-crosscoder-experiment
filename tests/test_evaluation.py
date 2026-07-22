@@ -651,6 +651,12 @@ def test_batched_mode_quadratics_exactly_match_per_mode_reference(
             )
         )
 
+    precomputed = evaluation_module._batched_mode_concordance(
+        full,
+        partial,
+        gram,
+        intersection=full_masks & partial_masks,
+    )
     equations: list[str] = []
     original_einsum = torch.einsum
 
@@ -667,10 +673,59 @@ def test_batched_mode_quadratics_exactly_match_per_mode_reference(
         partial_masks,
     )
     actual_fields = tuple(actual)
+    for actual_field, precomputed_field in zip(
+        actual,
+        precomputed,
+        strict=True,
+    ):
+        assert torch.equal(actual_field, precomputed_field)
     for mode, reference in enumerate(references):
         for field, expected in zip(actual_fields, reference, strict=True):
             assert torch.equal(field[mode], expected)
     assert equations == ([] if block_dim == 1 else ["ngb,gbc->ngc", "ngb,gbc,ngc->ng"])
+
+
+def test_batched_mode_concordance_intersection_interface_refuses_ambiguity() -> None:
+    code = torch.zeros(2, 3, 1)
+    gram = torch.ones(3, 1, 1, dtype=torch.float64)
+    masks = torch.zeros(1, 2, 3, dtype=torch.bool)
+    with pytest.raises(ValueError, match="need masks or a precomputed intersection"):
+        evaluation_module._batched_mode_concordance(code, code, gram)
+    with pytest.raises(ValueError, match="not both"):
+        evaluation_module._batched_mode_concordance(
+            code,
+            code,
+            gram,
+            masks,
+            masks,
+            intersection=masks,
+        )
+
+
+@pytest.mark.parametrize("groups", (1, 511, 512, 513, 2048))
+@pytest.mark.parametrize("tokens", (1, 63))
+def test_blockwise_intersection_and_derived_union_counts_match_set_oracle(
+    groups,
+    tokens,
+) -> None:
+    generator = torch.Generator().manual_seed(groups * 100 + tokens)
+    full = torch.rand(2, tokens, groups, generator=generator) > 0.47
+    partial = torch.rand(2, tokens, groups, generator=generator) > 0.53
+    expected_intersection = (full & partial).sum(dim=(1, 2)).double()
+    expected_union = (full | partial).sum(dim=(1, 2)).double()
+    actual_intersection = torch.zeros(2, dtype=torch.float64)
+    for start in range(0, groups, 512):
+        actual_intersection += (
+            full[:, :, start : start + 512]
+            & partial[:, :, start : start + 512]
+        ).sum(dim=(1, 2)).double()
+    actual_union = (
+        full.sum(dim=(1, 2)).double()
+        + partial.sum(dim=(1, 2)).double()
+        - actual_intersection
+    )
+    assert torch.equal(actual_intersection, expected_intersection)
+    assert torch.equal(actual_union, expected_union)
 
 
 def test_batched_mode_geometry_suppresses_unselected_nonfinite_values() -> None:

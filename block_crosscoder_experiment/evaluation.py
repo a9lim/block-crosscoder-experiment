@@ -168,8 +168,10 @@ def _batched_mode_concordance(
     full_code: torch.Tensor,
     partial_code: torch.Tensor,
     gram: torch.Tensor,
-    full_masks: torch.Tensor,
-    partial_masks: torch.Tensor,
+    full_masks: torch.Tensor | None = None,
+    partial_masks: torch.Tensor | None = None,
+    *,
+    intersection: torch.Tensor | None = None,
 ) -> _ModeConcordanceReductions:
     """Reduce both selector modes from one raw fp64 concordance geometry."""
 
@@ -177,7 +179,12 @@ def _batched_mode_concordance(
     partial64 = partial_code.double()
     full_q, partial_q, cross = _raw_quadratic_terms(full64, gram, partial64)
     assert partial_q is not None and cross is not None
-    intersection = full_masks & partial_masks
+    if intersection is None:
+        if full_masks is None or partial_masks is None:
+            raise ValueError("need masks or a precomputed intersection")
+        intersection = full_masks & partial_masks
+    elif full_masks is not None or partial_masks is not None:
+        raise ValueError("pass masks or a precomputed intersection, not both")
     zero = torch.zeros((), dtype=torch.float64, device=full_code.device)
 
     # Materialize only one mode-expanded value family at a time.  This keeps
@@ -730,6 +737,7 @@ def _evaluate_code_modes(
                 del selector_residual, selector_counts, selector_state
             full.xhat = None
         full_mask_count64 = full_mode_masks.sum(dim=1).double()
+        full_support_total64 = full_mask_count64.sum(dim=1)
         all_full_energy64 = torch.zeros(
             len(selection_modes),
             G,
@@ -805,31 +813,31 @@ def _evaluate_code_modes(
             partial_mode_masks = torch.stack(
                 tuple(partial_outputs[mode].mask for mode in selection_modes)
             )
-            intersections = partial_mode_masks & full_mode_masks
-            intersection_totals = intersections.sum(dim=(1, 2)).double()
-            union_totals = (
-                (partial_mode_masks | full_mode_masks).sum(dim=(1, 2)).double()
+            partial_totals = partial_mode_masks.sum(dim=(1, 2)).double()
+            intersection_totals = torch.zeros(
+                len(selection_modes),
+                dtype=torch.float64,
+                device=device,
             )
             for mode_index, state in enumerate(mode_states):
-                state[support_intersection_key][index] += intersection_totals[
-                    mode_index
-                ]
-                state[support_union_key][index] += union_totals[mode_index]
                 state[f"{prefix}_full_count"][index] += full_mask_count64[mode_index]
                 state[f"{prefix}_full_energy"][index] += all_full_energy64[mode_index]
-            del intersections, intersection_totals, union_totals
 
             raw_partial_code = partial_outputs[primary_mode].z
             for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
                 stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
                 block_slice = slice(start, stop)
+                intersection = (
+                    full_mode_masks[:, :, block_slice]
+                    & partial_mode_masks[:, :, block_slice]
+                )
                 reductions = _batched_mode_concordance(
                     raw_full_code[:, block_slice],
                     raw_partial_code[:, block_slice],
                     all_site_decoder_gram[block_slice],
-                    full_mode_masks[:, :, block_slice],
-                    partial_mode_masks[:, :, block_slice],
+                    intersection=intersection,
                 )
+                intersection_totals += reductions.intersection_count.sum(dim=1)
                 for mode_index, state in enumerate(mode_states):
                     state[f"{prefix}_intersection_count"][index, block_slice] += (
                         reductions.intersection_count[mode_index]
@@ -849,7 +857,16 @@ def _evaluate_code_modes(
                     state[f"{prefix}_intersection_full_energy"][index, block_slice] += (
                         reductions.intersection_full_energy[mode_index]
                     )
-                del reductions
+                del intersection, reductions
+            union_totals = (
+                full_support_total64 + partial_totals - intersection_totals
+            )
+            for mode_index, state in enumerate(mode_states):
+                state[support_intersection_key][index] += intersection_totals[
+                    mode_index
+                ]
+                state[support_union_key][index] += union_totals[mode_index]
+            del partial_totals, intersection_totals, union_totals
             return partial_mode_masks
 
         for source in range(S):
@@ -946,6 +963,7 @@ def _evaluate_code_modes(
             full_outputs,
             full_mode_masks,
             full_mask_count64,
+            full_support_total64,
             all_full_energy64,
             raw_full_code,
         )
