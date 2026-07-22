@@ -9,7 +9,8 @@ import inspect
 import os
 import subprocess
 import sys
-from dataclasses import replace
+import weakref
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,8 +31,10 @@ from block_crosscoder_experiment.cli.run_cell import (
     _StageExecutionCache,
     _VERIFIED_STORE_BINDINGS,
     _accumulate_chunked_recovery_association,
+    _assert_model_matches_durable_state,
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
+    _execution_rng_snapshot,
     _evaluate_cached_time_sharing,
     _balanced_schedule_uses_upper,
     _expected_capture_allocation,
@@ -45,6 +48,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _matching_pathologies,
     _mapped_support_confusion_counts,
     _model_config,
+    _normalize_model_only_consumer_state,
     _normalization_record,
     _persisted_view_validation,
     _production_precision_preflight,
@@ -68,7 +72,7 @@ from block_crosscoder_experiment.cli.run_cell import (
 )
 from block_crosscoder_experiment.cli.data import fit_transform_artifacts
 from block_crosscoder_experiment.codec import Codec
-from block_crosscoder_experiment.model import BlockCrosscoder
+from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
     CODE_NORM_CUDA_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
@@ -187,7 +191,12 @@ def test_retained_checkpoint_refuses_every_cache_key_mismatch(
             },
         )
     cache = _StageExecutionCache()
-    cache.remember_checkpoint(actual, _WeakrefableCacheOwner(), {})
+    cache.remember_checkpoint(
+        actual,
+        _WeakrefableCacheOwner(),
+        {},
+        released_owner_refs={},
+    )
     with pytest.raises(
         CellExecutionError,
         match="binding differs from journaled artifact",
@@ -196,24 +205,141 @@ def test_retained_checkpoint_refuses_every_cache_key_mismatch(
     assert cache.checkpoint is None
 
 
-def test_retained_deployment_refuses_a_live_calibration_model() -> None:
+def test_retained_checkpoint_refuses_a_live_released_training_owner() -> None:
     cache = _StageExecutionCache()
-    key = _retained_cache_key()
-    producer = _WeakrefableCacheOwner()
-    cache.remember_deployment(
-        key,
-        {},
+    owner = _WeakrefableCacheOwner()
+    cache.remember_checkpoint(
+        _retained_cache_key(),
         _WeakrefableCacheOwner(),
-        object(),
         {},
-        producer_model=producer,
+        released_owner_refs={"optimizer": weakref.ref(owner)},
     )
     with pytest.raises(
         CellExecutionError,
-        match="calibration model remains live before retained evaluation",
+        match="released training owners remain live",
+    ):
+        cache.take_checkpoint(_retained_cache_key())
+    assert cache.checkpoint is None
+
+
+def test_retained_deployment_refuses_a_live_durable_validation_model() -> None:
+    cache = _StageExecutionCache()
+    key = _retained_cache_key()
+    validation_model = _WeakrefableCacheOwner()
+    cache.remember_deployment(
+        key,
+        {"model_cfg": {}},
+        _WeakrefableCacheOwner(),
+        object(),
+        {},
+        discarded_validation_model_ref=weakref.ref(validation_model),
+    )
+    with pytest.raises(
+        CellExecutionError,
+        match="durable validation model remains live",
     ):
         cache.take_deployment(key)
     assert cache.deployment is None
+
+
+@pytest.mark.parametrize("heavy_field", ("model_state", "codec_payload"))
+def test_retained_deployment_refuses_heavy_durable_fields(
+    heavy_field: str,
+) -> None:
+    cache = _StageExecutionCache()
+    discarded = _WeakrefableCacheOwner()
+    discarded_ref = weakref.ref(discarded)
+    del discarded
+    with pytest.raises(
+        CellExecutionError,
+        match="contains heavy durable fields",
+    ):
+        cache.remember_deployment(
+            _retained_cache_key(),
+            {"model_cfg": {}, heavy_field: {}},
+            _WeakrefableCacheOwner(),
+            object(),
+            {},
+            discarded_validation_model_ref=discarded_ref,
+        )
+
+
+def _model_only_handoff_fixture(*, decoder_bias: bool = True) -> BlockCrosscoder:
+    return BlockCrosscoder(
+        BSCConfig(
+            n_blocks=2,
+            block_dim=2,
+            n_sites=2,
+            d_model=3,
+            k=1,
+            decoder_constraint="free",
+            decoder_bias=decoder_bias,
+            decoder_init_preconditioning="none",
+            decoder_init_operation_order=(
+                "gaussian_mask_rescale_then_declared_constraint"
+            ),
+        )
+    )
+
+
+def test_model_only_owner_validation_does_not_consume_process_rng() -> None:
+    model = _model_only_handoff_fixture()
+    cfg = model.cfg
+    durable_state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+    rng_before = _execution_rng_snapshot()
+    _assert_model_matches_durable_state(model, asdict(cfg), durable_state)
+    assert _execution_rng_snapshot() == rng_before
+
+    tampered = dict(durable_state)
+    tensor_name = next(
+        name for name, tensor in tampered.items() if tensor.is_floating_point()
+    )
+    tampered[tensor_name] = tampered[tensor_name].clone()
+    tampered[tensor_name].view(-1)[0] += 1.0
+    with pytest.raises(
+        CellExecutionError,
+        match="live model differs from durable tensor",
+    ):
+        _assert_model_matches_durable_state(model, asdict(cfg), tampered)
+    assert _execution_rng_snapshot() == rng_before
+
+
+def test_model_only_handoff_clears_every_parameter_gradient() -> None:
+    model = _model_only_handoff_fixture()
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    _normalize_model_only_consumer_state(model)
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("decoder_bias", (False, True))
+def test_model_only_handoff_matches_fresh_requires_grad_schema(
+    decoder_bias: bool,
+) -> None:
+    model = _model_only_handoff_fixture(decoder_bias=decoder_bias)
+    fresh = _model_only_handoff_fixture(decoder_bias=decoder_bias)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    _normalize_model_only_consumer_state(model)
+    assert {
+        name: parameter.requires_grad for name, parameter in model.named_parameters()
+    } == {
+        name: parameter.requires_grad for name, parameter in fresh.named_parameters()
+    }
+    assert model.c.requires_grad is decoder_bias
+
+
+def test_model_only_handoff_invalidates_threshold_validation_cache() -> None:
+    model = _model_only_handoff_fixture()
+    with torch.no_grad():
+        model.theta.fill_(0.25)
+    model._require_calibrated_threshold("test")
+    assert model._validated_theta_key is not None
+    _normalize_model_only_consumer_state(model)
+    assert model._validated_theta_key is None
 
 
 def test_immutable_torch_save_is_byte_exact_across_fresh_processes(
@@ -808,11 +934,18 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     preparation = json.loads(
         persistent_refs["preparation"].resolve(persistent.root).read_text()
     )
+    durable_deployment = torch.load(
+        persistent_refs["deployment_codec"].resolve(persistent.root),
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert "model_state" in durable_deployment
+    assert "codec_payload" in durable_deployment
     assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v8"
+        "bsc-cell-executor-v9"
     )
     assert preparation["implementation"]["executor_process_model"] == (
-        "persistent_durable_consumer_handoff_v2"
+        "persistent_exact_model_owner_handoff_v3"
     )
 
 

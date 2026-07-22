@@ -128,8 +128,8 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v8"
-EXECUTOR_PROCESS_MODEL = "persistent_durable_consumer_handoff_v2"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v9"
+EXECUTOR_PROCESS_MODEL = "persistent_exact_model_owner_handoff_v3"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -901,6 +901,7 @@ class _RetainedCheckpointModel:
     key: _RetainedArtifactKey
     model: BlockCrosscoder
     metadata: dict[str, Any]
+    released_owner_refs: dict[str, weakref.ReferenceType[Any]]
 
 
 @dataclass(slots=True)
@@ -910,11 +911,11 @@ class _RetainedDeploymentConsumer:
     model: BlockCrosscoder
     codec: Codec
     training_summary: dict[str, int]
-    producer_model_ref: weakref.ReferenceType[BlockCrosscoder]
+    discarded_validation_model_ref: weakref.ReferenceType[BlockCrosscoder]
 
 
 class _StageExecutionCache:
-    """Retain only consumers reconstructed from immutable durable bytes."""
+    """Transfer the sole model owner, never optimizer/checkpoint RNG state."""
 
     def __init__(self) -> None:
         self.checkpoint: _RetainedCheckpointModel | None = None
@@ -931,10 +932,17 @@ class _StageExecutionCache:
         key: _RetainedArtifactKey,
         model: BlockCrosscoder,
         metadata: Mapping[str, Any],
+        *,
+        released_owner_refs: Mapping[str, weakref.ReferenceType[Any]],
     ) -> None:
         if self.checkpoint is not None or self.deployment is not None:
             raise CellExecutionError("retained-consumer cache is not empty after train")
-        self.checkpoint = _RetainedCheckpointModel(key, model, dict(metadata))
+        self.checkpoint = _RetainedCheckpointModel(
+            key,
+            model,
+            dict(metadata),
+            dict(released_owner_refs),
+        )
 
     def take_checkpoint(
         self,
@@ -950,6 +958,18 @@ class _StageExecutionCache:
             raise CellExecutionError(
                 "retained checkpoint model binding differs from journaled artifact"
             )
+        gc.collect()
+        live_owners = sorted(
+            name for name, reference in entry.released_owner_refs.items()
+            if reference() is not None
+        )
+        if live_owners:
+            del entry
+            self._release_unused_model_memory()
+            raise CellExecutionError(
+                "released training owners remain live at calibration handoff: "
+                + ", ".join(live_owners)
+            )
         return entry.model, entry.metadata
 
     def remember_deployment(
@@ -960,11 +980,21 @@ class _StageExecutionCache:
         codec: Codec,
         training_summary: Mapping[str, int],
         *,
-        producer_model: BlockCrosscoder,
+        discarded_validation_model_ref: weakref.ReferenceType[BlockCrosscoder],
     ) -> None:
         if self.checkpoint is not None or self.deployment is not None:
             raise CellExecutionError(
                 "retained-consumer cache is not empty after calibration"
+            )
+        heavy_fields = {"model_state", "codec_payload"} & set(deployment)
+        if heavy_fields:
+            raise CellExecutionError(
+                "volatile retained deployment contains heavy durable fields: "
+                + ", ".join(sorted(heavy_fields))
+            )
+        if not isinstance(deployment.get("model_cfg"), dict):
+            raise CellExecutionError(
+                "volatile retained deployment lacks model config provenance"
             )
         self.deployment = _RetainedDeploymentConsumer(
             key,
@@ -972,7 +1002,7 @@ class _StageExecutionCache:
             model,
             codec,
             dict(training_summary),
-            weakref.ref(producer_model),
+            discarded_validation_model_ref,
         )
 
     def take_deployment(
@@ -983,16 +1013,18 @@ class _StageExecutionCache:
         self.deployment = None
         if entry is None:
             return None
-        gc.collect()
-        if entry.producer_model_ref() is not None:
-            raise CellExecutionError(
-                "calibration model remains live before retained evaluation"
-            )
         if entry.key != expected:
             del entry
             self._release_unused_model_memory()
             raise CellExecutionError(
                 "retained deployment binding differs from journaled artifact"
+            )
+        gc.collect()
+        if entry.discarded_validation_model_ref() is not None:
+            del entry
+            self._release_unused_model_memory()
+            raise CellExecutionError(
+                "durable validation model remains live before retained evaluation"
             )
         return entry.deployment, entry.model, entry.codec, entry.training_summary
 
@@ -4527,26 +4559,108 @@ def _training_report_payload(
     }
 
 
-def _model_from_validated_checkpoint_state(
+def _execution_rng_snapshot() -> tuple[Any, ...]:
+    """Snapshot process RNGs to prove validation itself consumes none.
+
+    This is deliberately not a checkpoint-RNG handoff: only the exact model
+    consumer crosses the parent-verified durable artifact boundary.
+    """
+
+    numpy_state = np.random.get_state()
+    torch_mps = (
+        torch.mps.get_rng_state().cpu().numpy().tobytes()
+        if torch.backends.mps.is_available()
+        else None
+    )
+    return (
+        random.getstate(),
+        (
+            numpy_state[0],
+            numpy_state[1].tobytes(),
+            numpy_state[2],
+            numpy_state[3],
+            numpy_state[4],
+        ),
+        torch.get_rng_state().numpy().tobytes(),
+        tuple(
+            state.cpu().numpy().tobytes()
+            for state in (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else ()
+            )
+        ),
+        torch_mps,
+    )
+
+
+def _assert_model_matches_durable_state(
+    model: BlockCrosscoder,
     model_cfg: Mapping[str, Any],
     model_state: Mapping[str, torch.Tensor],
-    *,
-    device: torch.device,
-) -> BlockCrosscoder:
-    cfg_payload = dict(model_cfg)
-    if cfg_payload.get("site_dims") is not None:
-        cfg_payload["site_dims"] = tuple(cfg_payload["site_dims"])
+) -> None:
+    """Prove the transferred model matches durable bytes without consuming RNG."""
+
+    rng_before = _execution_rng_snapshot()
     try:
-        model = BlockCrosscoder(BSCConfig(**cfg_payload), device=device)
-        if set(model_state) != set(model.state_dict()):
+        if canonical_json(asdict(model.cfg)) != canonical_json(dict(model_cfg)):
+            raise ValueError("live model config differs from durable model config")
+        live_state = model.state_dict()
+        if set(model_state) != set(live_state):
             raise ValueError("model state field set differs from resolved model")
-        model.load_state_dict(model_state, strict=True)
+        for name, live_tensor in live_state.items():
+            durable_tensor = model_state[name]
+            if (
+                not torch.is_tensor(durable_tensor)
+                or durable_tensor.device.type != "cpu"
+                or live_tensor.shape != durable_tensor.shape
+                or live_tensor.dtype != durable_tensor.dtype
+                or live_tensor.layout != durable_tensor.layout
+            ):
+                raise ValueError(f"model state tensor contract mismatch for {name}")
+            live_bytes = (
+                live_tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+            )
+            durable_bytes = durable_tensor.contiguous().reshape(-1).view(torch.uint8)
+            if not torch.equal(live_bytes, durable_bytes):
+                raise ValueError(f"live model differs from durable tensor {name}")
+            del live_bytes, durable_bytes
         model.validate_decoded_energy_implementation()
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         raise CellExecutionError(
-            f"cannot retain model from validated checkpoint bytes: {exc}"
+            f"cannot transfer model ownership from durable bytes: {exc}"
         ) from exc
-    return model.eval()
+    finally:
+        if _execution_rng_snapshot() != rng_before:
+            raise CellExecutionError(
+                "durable model ownership validation perturbed global RNG state"
+            )
+
+
+def _normalize_model_only_consumer_state(model: BlockCrosscoder) -> None:
+    """Match a fresh artifact consumer's ephemeral autograd/cache state."""
+
+    bad_gradients: list[str] = []
+    bad_requires_grad: list[str] = []
+    for name, parameter in model.named_parameters():
+        parameter.grad = None
+        expected_requires_grad = model.cfg.decoder_bias if name == "c" else True
+        parameter.requires_grad_(expected_requires_grad)
+        if parameter.grad is not None:
+            bad_gradients.append(name)
+        if parameter.requires_grad is not expected_requires_grad:
+            bad_requires_grad.append(name)
+    if bad_gradients:
+        raise CellExecutionError(
+            "model-only handoff retained parameter gradients: "
+            + ", ".join(bad_gradients)
+        )
+    if bad_requires_grad:
+        raise CellExecutionError(
+            "model-only handoff differs from fresh requires-grad schema: "
+            + ", ".join(bad_requires_grad)
+        )
+    model._validated_theta_key = None
+    if model._validated_theta_key is not None:
+        raise CellExecutionError("model-only handoff retained threshold cache state")
 
 
 def _seed_fresh_training_rng(seed: int) -> None:
@@ -4827,32 +4941,36 @@ def _train(
     if execution_cache is not None:
         if not isinstance(retained_model_state, dict):
             raise CellExecutionError("validated checkpoint state was not retained")
-        training_owner_refs = {
-            "master": weakref.ref(trainer.master),
+        retained_model = trainer.master
+        _normalize_model_only_consumer_state(retained_model)
+        _assert_model_matches_durable_state(
+            retained_model,
+            metadata["model_cfg"],
+            retained_model_state,
+        )
+        retained_model.eval()
+        released_owner_refs = {
+            "trainer": weakref.ref(trainer),
             "forward": (
-                None if trainer.fwd is trainer.master else weakref.ref(trainer.fwd)
+                None if trainer.fwd is retained_model else weakref.ref(trainer.fwd)
             ),
             "optimizer": weakref.ref(trainer.opt),
         }
+        del retained_model_state
         del trainer
         gc.collect()
-        live_training_owners = sorted(
+        live_released_owners = sorted(
             name
-            for name, reference in training_owner_refs.items()
+            for name, reference in released_owner_refs.items()
             if reference is not None and reference() is not None
         )
-        if live_training_owners:
+        if live_released_owners:
             raise CellExecutionError(
-                "training owners remain live before retained calibration: "
-                + ", ".join(live_training_owners)
+                "released training owners remain live before calibration handoff: "
+                + ", ".join(live_released_owners)
             )
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        retained_model = _model_from_validated_checkpoint_state(
-            metadata["model_cfg"],
-            retained_model_state,
-            device=device,
-        )
         retained_metadata = dict(metadata)
         retained_metadata["checkpoint_sha256"] = checkpoint_hash
         execution_cache.remember_checkpoint(
@@ -4868,6 +4986,11 @@ def _train(
             ),
             retained_model,
             retained_metadata,
+            released_owner_refs={
+                name: reference
+                for name, reference in released_owner_refs.items()
+                if reference is not None
+            },
         )
     return (
         ("checkpoint", ctx.checkpoint),
@@ -5093,6 +5216,11 @@ def _calibrate(
         preparation_hash=prerequisites["preparation"][1],
     )
     _save_immutable_torch(ctx.deployment_codec, deployment_payload)
+    # The immutable file now owns this CPU snapshot. Keeping the producer-side
+    # construction payload alive while reloading validation bytes would triple
+    # the model-state RSS during the handoff.
+    del deployment_payload
+    gc.collect()
     # Reconstruct the exact consumer before pricing; truncated, incomplete, or
     # internally inconsistent bytes never reach evaluation.
     deployment_before_load = _FileFingerprint.from_path(ctx.deployment_codec)
@@ -5156,6 +5284,39 @@ def _calibrate(
     }
     _write_immutable_json(ctx.calibration_record, record)
     if execution_cache is not None:
+        if any(
+            tensor.device.type != "cpu"
+            for tensor in frozen_consumer_model.state_dict().values()
+        ):
+            raise CellExecutionError(
+                "durable validation model unexpectedly occupies an accelerator"
+            )
+        durable_model_state = frozen_deployment["model_state"]
+        _assert_model_matches_durable_state(
+            model,
+            frozen_deployment["model_cfg"],
+            durable_model_state,
+        )
+        del durable_model_state
+        _normalize_model_only_consumer_state(model)
+        model.eval()
+        frozen_model_cfg = asdict(frozen_consumer_model.cfg)
+        discarded_validation_model_ref = weakref.ref(frozen_consumer_model)
+        del frozen_consumer_model
+        gc.collect()
+        if discarded_validation_model_ref() is not None:
+            raise CellExecutionError(
+                "durable validation model remains live after exact comparison"
+            )
+        retained_deployment = dict(frozen_deployment)
+        for heavy_field in ("model_state", "codec_payload"):
+            del retained_deployment[heavy_field]
+        if {"model_state", "codec_payload"} & set(retained_deployment):
+            raise CellExecutionError(
+                "volatile deployment retained a heavy durable consumer field"
+            )
+        del frozen_deployment
+        gc.collect()
         execution_cache.remember_deployment(
             _retained_artifact_key(
                 ctx,
@@ -5165,13 +5326,13 @@ def _calibrate(
                 path=ctx.deployment_codec,
                 sha256=deployment_hash,
                 fingerprint=deployment_after_load,
-                model_cfg=asdict(frozen_consumer_model.cfg),
+                model_cfg=frozen_model_cfg,
             ),
-            frozen_deployment,
-            frozen_consumer_model,
+            retained_deployment,
+            model,
             frozen_consumer_codec,
             frozen_training_summary,
-            producer_model=model,
+            discarded_validation_model_ref=discarded_validation_model_ref,
         )
     return (
         ("calibration", ctx.calibration),
@@ -7960,7 +8121,9 @@ def _evaluate(
         )
     else:
         deployment, model, codec, training_summary = retained_deployment
-        model = model.to(device).eval()
+        if next(model.parameters()).device != device:
+            raise CellExecutionError("retained deployment model is on the wrong device")
+        model.eval()
     deployment_after_load = ctx.prerequisite_fingerprint(
         deployment_path,
         sha256=deployment_hash,
