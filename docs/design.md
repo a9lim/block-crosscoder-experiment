@@ -892,6 +892,26 @@ gates, not a tunable scientific matrix row; changing either kernel or bound
 requires a new clean implementation identity and a fresh audit before any
 campaign starts.
 
+Native reconstruction in the joint fp32 CUDA evaluator uses a per-site CSR
+SpMM only when the complete batch support contains at most
+`floor(tokens * groups / 32)` block events. Per-token counts and the scalar
+event count are resolved before any dynamic event tensor is allocated; support
+above the inclusive cap, non-fp32 tensors, and every non-CUDA device retain the
+dense decoder. The sparse path fills one preallocated site slice at a time,
+releases that temporary before the next site, and applies the identical decoder
+bias and structural coordinate mask. This changes only the floating reduction
+order of native reconstruction. The standardized Phase-2 and Phase-3 direct
+dense-oracle gates cover both hard selectors and every full, site-only, and
+leave-one-out view: prediction maximum absolute drift is at most `1e-6`,
+prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
+drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
+deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
+the exact density boundary, the first event above it, bias, padding, and dtype
+fallbacks are release fixtures. Estimator `dense-linear-memory-v8-...-s32`
+content-binds and prices the capped coordinates, values, columns, row pointer,
+and one live site output. Any kernel, density, or bound change requires a new
+clean implementation identity and fresh audit before launch.
+
 The dominant all-observed, unpadded CUDA quadratic objective compiles the fp32
 cast, residual, square, scalar sum, and declared normalization division as one
 static reduction. That parallel reduction is an authorized implementation-order

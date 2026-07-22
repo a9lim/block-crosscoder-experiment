@@ -25,15 +25,17 @@ from typing import Any, Iterable, Mapping, Sequence
 from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
+    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
     TRUSTED_DECODE_Q_CHUNK,
 )
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v7"
+    "dense-linear-memory-v8"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
+    f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
 )
 CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v1"
 BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v3"
@@ -3736,6 +3738,7 @@ def _evaluation_workspace_bytes(
     operational_decoder_elements: int,
     quantizer_count: int,
     sites: int,
+    site_dim: int,
     selection_score: str,
 ) -> int:
     """Conservative peak for the fixed-shape CUDA evaluation kernels.
@@ -3755,10 +3758,7 @@ def _evaluation_workspace_bytes(
     # The q-independent event stream remains live with every int32 packet.
     # The chunk decoder additionally holds float symbols/canonical codes,
     # rotated codes, CSR columns/rows, and q_chunk reconstructed activations.
-    retained_packet_bytes = (
-        batch_tokens * 4
-        + events * (32 + 12 * block_width)
-    )
+    retained_packet_bytes = batch_tokens * 4 + events * (32 + 12 * block_width)
     trusted_decode_bytes = (
         retained_packet_bytes
         + q_chunk * events * block_width * 16
@@ -3771,16 +3771,9 @@ def _evaluation_workspace_bytes(
     # Fused native/deployed sharing evaluation retains the full and one
     # partial BSC output for both selector modes. Site-only and leave-one-out
     # outputs are released between views.
-    output_bytes = 4 * batch_tokens * (
-        total_dim * 4 + latents * 8 + groups * 5
-    )
+    output_bytes = 4 * batch_tokens * (total_dim * 4 + latents * 8 + groups * 5)
     concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
-    concordance_bytes = (
-        batch_tokens
-        * concordance_groups
-        * (8 * block_width + 4)
-        * 8
-    )
+    concordance_bytes = batch_tokens * concordance_groups * (8 * block_width + 4) * 8
     reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
     reduction_bytes = reduction_tokens * total_dim * 4 * 8
     decoder_gram_bytes = (sites + 1) * groups * block_width**2 * 8
@@ -3794,14 +3787,29 @@ def _evaluation_workspace_bytes(
     # shared-code accumulators stream the same batches.  A third target-width
     # tensor conservatively prices the fp64 padded-coordinate mask.
     selector_accumulator_bytes = (
-        3 * total_dim
-        + 2 * (sites + (groups + 1) + 3)
-        + 3
+        3 * total_dim + 2 * (sites + (groups + 1) + 3) + 3
     ) * 8
     # Shared-view evaluation retains one exact per-site encoder contraction
     # while materializing one equally sized masked view.  This removes repeat
     # BMMs but must remain a hard-gated, explicitly priced multi-GiB workspace.
     frozen_encoder_site_bytes = sites * batch_tokens * latents * 4
+    sparse_decode_events = (
+        batch_tokens * groups // EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR
+    )
+    # The conditional native decoder resolves int64 per-token counts before
+    # allocating any sparse events. At the inclusive density cap it retains
+    # the [event, (row, block)] coordinates, gathered fp32 block values,
+    # expanded int64 latent columns, CSR row pointer, block-coordinate range,
+    # event-count scalar, and one per-site SpMM output beside its preallocated
+    # full prediction. The full prediction is already in ``output_bytes``.
+    sparse_native_decode_bytes = (
+        sparse_decode_events * (16 + 12 * block_width)
+        + batch_tokens * 8
+        + (batch_tokens + 1) * 8
+        + block_width * 8
+        + 8
+        + batch_tokens * site_dim * 4
+    )
     shared_code_bytes = (
         output_bytes
         + concordance_bytes
@@ -3810,6 +3818,7 @@ def _evaluation_workspace_bytes(
         + 2 * per_mode_accumulator_bytes
         + selector_accumulator_bytes
         + 2 * frozen_encoder_site_bytes
+        + sparse_native_decode_bytes
     )
     if selection_score == "decoded_energy":
         score_geometry_bytes = groups * block_width**2 * 4
@@ -3932,6 +3941,7 @@ def _estimate_components(
         operational_decoder_elements=operational_decoder_elements,
         quantizer_count=len(quantizer_bits),
         sites=len(site_dims),
+        site_dim=max(site_dims),
         selection_score=str(values["model.selection_score"]),
     )
     factorized_materialization_bytes = (
@@ -3951,8 +3961,8 @@ def _estimate_components(
             tracker_checkpoint_bytes = dead_window_tokens * active_blocks * 4
         elif selector in {"block_batchtopk", "decoder_weighted_batchtopk"}:
             tracker_checkpoint_bytes = (
-                dead_window_tokens + batch_tokens - 1
-            ) * active_blocks * 4
+                (dead_window_tokens + batch_tokens - 1) * active_blocks * 4
+            )
         else:
             tracker_checkpoint_bytes = dead_window_tokens * ((groups + 7) // 8)
         tracker_residency_bytes = tracker_checkpoint_bytes + groups * 8
@@ -3982,9 +3992,7 @@ def _estimate_components(
         operational_decoder_elements * 4 if tied else 0
     )
     evaluation_residency_bytes = (
-        parameters * 8
-        + evaluation_materialization_bytes
-        + evaluation_workspace_bytes
+        parameters * 8 + evaluation_materialization_bytes + evaluation_workspace_bytes
     )
     peak_vram_bytes = 2 * 1024**3 + max(
         training_residency_bytes,

@@ -13,6 +13,9 @@ from block_crosscoder_experiment.evaluation import (
     evaluate_shared_code_modes,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
+from block_crosscoder_experiment.runtime_limits import (
+    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+)
 
 
 def test_centered_fvu_excludes_padding() -> None:
@@ -34,6 +37,334 @@ def test_centered_fvu_centers_each_coordinate_not_one_site_scalar() -> None:
     actual = centered_fvu(target, prediction)
     assert actual.shape == (1,)
     assert torch.allclose(actual[0], expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_sparse_evaluation_decode_dispatches_at_exact_density_cap(
+    monkeypatch,
+) -> None:
+    cfg = BSCConfig(
+        n_blocks=64,
+        block_dim=2,
+        n_sites=2,
+        d_model=5,
+        site_dims=(5, 3),
+        k=2,
+        encoder_mode="tied",
+        decoder_constraint="free",
+        decoder_bias=True,
+    )
+    model = BlockCrosscoder(cfg, device="cuda").eval()
+    with torch.no_grad():
+        model.c.uniform_(-0.25, 0.25)
+    decoder = model.decoder_tensor()
+    mask = torch.zeros(4, cfg.n_blocks, dtype=torch.bool, device="cuda")
+    max_events = mask.numel() // EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR
+    assert max_events == 8
+    mask[:, :2] = True
+    selected = torch.zeros(
+        4,
+        cfg.n_blocks,
+        cfg.block_dim,
+        device="cuda",
+    )
+    selected[mask] = torch.randn(max_events, cfg.block_dim, device="cuda")
+    dense_at_cap = model.decode(selected, _decoder=decoder)
+
+    sparse_mm = torch.sparse.mm
+    sparse_csr_tensor = torch.sparse_csr_tensor
+    tensor_nonzero = torch.Tensor.nonzero
+    native_decode = model.decode
+    sparse_calls = 0
+    dense_calls = 0
+    nonzero_calls = 0
+    csr_terminal_offsets = []
+    previous_site_result = None
+
+    def counted_sparse_mm(*args, **kwargs):
+        nonlocal sparse_calls, previous_site_result
+        assert previous_site_result is None or previous_site_result() is None
+        sparse_calls += 1
+        result = sparse_mm(*args, **kwargs)
+        previous_site_result = weakref.ref(result)
+        return result
+
+    def counted_sparse_csr(crow, columns, values, *args, **kwargs):
+        csr_terminal_offsets.append(int(crow[-1].item()))
+        assert len(columns) == len(values) == csr_terminal_offsets[-1]
+        return sparse_csr_tensor(crow, columns, values, *args, **kwargs)
+
+    def counted_nonzero(tensor, *args, **kwargs):
+        nonlocal nonzero_calls
+        nonzero_calls += 1
+        return tensor_nonzero(tensor, *args, **kwargs)
+
+    def counted_dense(*args, **kwargs):
+        nonlocal dense_calls
+        dense_calls += 1
+        return native_decode(*args, **kwargs)
+
+    monkeypatch.setattr(torch.sparse, "mm", counted_sparse_mm)
+    monkeypatch.setattr(torch, "sparse_csr_tensor", counted_sparse_csr)
+    monkeypatch.setattr(torch.Tensor, "nonzero", counted_nonzero)
+    monkeypatch.setattr(model, "decode", counted_dense)
+    sparse_at_cap = evaluation_module._decode_selected_for_evaluation(
+        model,
+        selected,
+        mask,
+        decoder,
+    )
+    torch.testing.assert_close(sparse_at_cap, dense_at_cap, rtol=3e-7, atol=5e-7)
+    assert sparse_calls == cfg.n_sites
+    assert dense_calls == 0
+    assert nonzero_calls == 1
+    assert csr_terminal_offsets == [max_events * cfg.block_dim]
+    assert not sparse_at_cap.requires_grad
+    assert previous_site_result is not None and previous_site_result() is None
+    assert torch.equal(
+        sparse_at_cap[:, 1, 3:],
+        torch.zeros_like(sparse_at_cap[:, 1, 3:]),
+    )
+
+    active_zero_dense = native_decode(torch.zeros_like(selected), _decoder=decoder)
+    active_zero_sparse = evaluation_module._decode_selected_for_evaluation(
+        model,
+        torch.zeros_like(selected),
+        mask,
+        decoder,
+    )
+    torch.testing.assert_close(
+        active_zero_sparse,
+        active_zero_dense,
+        rtol=0,
+        atol=0,
+    )
+    assert sparse_calls == 2 * cfg.n_sites
+    assert nonzero_calls == 2
+    assert csr_terminal_offsets[-1] == max_events * cfg.block_dim
+    assert not active_zero_sparse.requires_grad
+
+    zero_mask = torch.zeros_like(mask)
+    zero_selected = torch.zeros_like(selected)
+    dense_zero = native_decode(zero_selected, _decoder=decoder)
+    sparse_zero = evaluation_module._decode_selected_for_evaluation(
+        model,
+        zero_selected,
+        zero_mask,
+        decoder,
+    )
+    assert torch.equal(sparse_zero, dense_zero)
+    assert sparse_calls == 2 * cfg.n_sites
+    assert dense_calls == 0
+    assert nonzero_calls == 2
+
+    above_mask = mask.clone()
+    above_mask[0, 2] = True
+    above_selected = selected.clone()
+    above_selected[0, 2] = torch.randn(cfg.block_dim, device="cuda")
+    dense_above = native_decode(above_selected, _decoder=decoder)
+    actual_above = evaluation_module._decode_selected_for_evaluation(
+        model,
+        above_selected,
+        above_mask,
+        decoder,
+    )
+    assert torch.equal(actual_above, dense_above)
+    assert sparse_calls == 2 * cfg.n_sites
+    assert dense_calls == 1
+    assert nonzero_calls == 2
+
+    bf16_selected = selected.bfloat16()
+    bf16_decoder = decoder.bfloat16()
+    dense_bf16 = native_decode(bf16_selected, _decoder=bf16_decoder)
+    actual_bf16 = evaluation_module._decode_selected_for_evaluation(
+        model,
+        bf16_selected,
+        mask,
+        bf16_decoder,
+    )
+    assert torch.equal(actual_bf16, dense_bf16)
+    assert sparse_calls == 2 * cfg.n_sites
+    assert dense_calls == 2
+    assert nonzero_calls == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_sparse_evaluation_preserves_full_site_and_loo_mode_payloads(
+    monkeypatch,
+) -> None:
+    cfg = BSCConfig(
+        n_blocks=128,
+        block_dim=2,
+        n_sites=2,
+        d_model=8,
+        k=1,
+        encoder_fusion="availability_rescaled_sum",
+    )
+    model = BlockCrosscoder(cfg, device="cuda").eval()
+    with torch.no_grad():
+        assert model.E is not None
+        model.E.zero_()
+        model.E[:, 0, 0, 0] = 4.0
+        model.E[:, 1, 0, 0] = 3.0
+        model.E[:, 2, 0, 0] = 1.0
+        model.theta.fill_(4.0)
+    scale = torch.linspace(0.9, 1.1, 64, device="cuda").view(-1, 1, 1)
+    x = scale.expand(-1, cfg.n_sites, cfg.d_model).clone()
+    monkeypatch.setattr(
+        evaluation_module,
+        "EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR",
+        mask_denominator := x.shape[0] * cfg.n_blocks + 1,
+    )
+    assert mask_denominator > x.shape[0] * cfg.n_blocks
+    dense = evaluate_shared_code_modes(
+        model,
+        [x],
+        device="cuda",
+        selection_modes=("topk", "threshold"),
+    )
+
+    sparse_mm = torch.sparse.mm
+    native_decode = model.decode
+    sparse_calls = 0
+    dense_calls = 0
+
+    def counted_sparse_mm(*args, **kwargs):
+        nonlocal sparse_calls
+        sparse_calls += 1
+        return sparse_mm(*args, **kwargs)
+
+    def counted_dense(*args, **kwargs):
+        nonlocal dense_calls
+        dense_calls += 1
+        return native_decode(*args, **kwargs)
+
+    monkeypatch.setattr(torch.sparse, "mm", counted_sparse_mm)
+    monkeypatch.setattr(model, "decode", counted_dense)
+    monkeypatch.setattr(
+        evaluation_module,
+        "EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR",
+        EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    )
+    actual = evaluate_shared_code_modes(
+        model,
+        [x],
+        device="cuda",
+        selection_modes=("topk", "threshold"),
+    )
+
+    def assert_nested_close(left, right) -> None:
+        if isinstance(left, dict):
+            assert left.keys() == right.keys()
+            for key in left:
+                assert_nested_close(left[key], right[key])
+        elif isinstance(left, list):
+            assert len(left) == len(right)
+            for left_item, right_item in zip(left, right, strict=True):
+                assert_nested_close(left_item, right_item)
+        elif isinstance(left, float):
+            assert left == pytest.approx(right, rel=2e-6, abs=1e-8)
+        else:
+            assert left == right
+
+    assert_nested_close(actual, dense)
+    assert sparse_calls == 2 * cfg.n_sites * (1 + 2 * cfg.n_sites)
+    assert dense_calls == 0
+    assert actual["topk"]["fire_count"] != actual["threshold"]["fire_count"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("batch_tokens", "n_sites", "d_model", "n_blocks", "active_blocks"),
+    (
+        (8192, 4, 768, 2048, 8),
+        (2048, 4, 2560, 4096, 32),
+    ),
+)
+def test_cuda_sparse_evaluation_decode_campaign_release_gate(
+    batch_tokens,
+    n_sites,
+    d_model,
+    n_blocks,
+    active_blocks,
+) -> None:
+    cfg = BSCConfig(
+        n_blocks=n_blocks,
+        block_dim=4,
+        n_sites=n_sites,
+        d_model=d_model,
+        k=active_blocks,
+        encoder_mode="tied",
+        decoder_constraint="unit_latent",
+    )
+    model = BlockCrosscoder(cfg, device="cuda").eval()
+    decoder = model.decoder_tensor()
+    token = torch.arange(batch_tokens, device="cuda").unsqueeze(1)
+    within = torch.arange(active_blocks, device="cuda").unsqueeze(0)
+
+    for seed in (2511, 2521):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        ids = (token * 131 + within + seed) % n_blocks
+        mask = torch.zeros(
+            batch_tokens,
+            n_blocks,
+            dtype=torch.bool,
+            device="cuda",
+        )
+        mask.scatter_(1, ids, True)
+        selected = torch.zeros(
+            batch_tokens,
+            n_blocks,
+            cfg.block_dim,
+            device="cuda",
+        )
+        selected.scatter_(
+            1,
+            ids.unsqueeze(-1).expand(-1, -1, cfg.block_dim),
+            torch.randn(
+                batch_tokens,
+                active_blocks,
+                cfg.block_dim,
+                device="cuda",
+                generator=generator,
+            ),
+        )
+        target = torch.randn(
+            batch_tokens,
+            n_sites,
+            d_model,
+            device="cuda",
+            generator=generator,
+        )
+        dense = model.decode(selected, _decoder=decoder)
+        sparse = evaluation_module._decode_selected_for_evaluation(
+            model,
+            selected,
+            mask,
+            decoder,
+        )
+        difference = sparse - dense
+        dense_sse = (target - dense).double().square().sum(dim=(0, 2))
+        sparse_sse = (target - sparse).double().square().sum(dim=(0, 2))
+        assert difference.abs().max().item() <= 1e-6
+        assert (difference.norm() / dense.norm().clamp_min(1e-30)).item() <= 3e-7
+        assert (
+            (sparse_sse - dense_sse).abs() / dense_sse.clamp_min(1e-30)
+        ).max().item() <= 1e-9
+        repeat_max_abs = 0.0
+        for _ in range(8):
+            repeated = evaluation_module._decode_selected_for_evaluation(
+                model,
+                selected,
+                mask,
+                decoder,
+            )
+            repeat_max_abs = max(
+                repeat_max_abs,
+                (repeated - sparse).abs().max().item(),
+            )
+            del repeated
+        assert repeat_max_abs <= 1e-6
 
 
 def test_shared_code_endpoints_work_for_tied_and_untied_encoders() -> None:
@@ -61,9 +392,7 @@ def test_shared_code_endpoints_work_for_tied_and_untied_encoders() -> None:
 
 
 def test_shared_code_builds_frozen_score_geometry_once(monkeypatch) -> None:
-    model = BlockCrosscoder(
-        BSCConfig(8, 2, 2, 6, 2, selection_score="decoded_energy")
-    )
+    model = BlockCrosscoder(BSCConfig(8, 2, 2, 6, 2, selection_score="decoded_energy"))
     original = model._frozen_score_geometry
     calls = 0
 
@@ -154,11 +483,7 @@ def test_batched_mode_quadratics_exactly_match_per_mode_reference(
     for mode, reference in enumerate(references):
         for field, expected in zip(actual_fields, reference, strict=True):
             assert torch.equal(field[mode], expected)
-    assert equations == (
-        []
-        if block_dim == 1
-        else ["ngb,gbc->ngc", "ngb,gbc,ngc->ng"]
-    )
+    assert equations == ([] if block_dim == 1 else ["ngb,gbc->ngc", "ngb,gbc,ngc->ng"])
 
 
 def test_batched_mode_geometry_suppresses_unselected_nonfinite_values() -> None:
@@ -225,8 +550,7 @@ def test_batched_selected_moments_and_delta_preserve_exact_reductions(
         partial_selected = (partial * partial_masks[mode].unsqueeze(-1)).double()
         if block_dim == 1:
             expected_energy = (
-                full_selected[..., 0].square()
-                * gram[:, 0, 0].unsqueeze(0)
+                full_selected[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
             ).sum(dim=0)
         else:
             expected_energy = torch.einsum(
@@ -274,18 +598,20 @@ def test_batched_selected_mode_reductions_are_cuda_bit_exact_for_short_batches(
         block_dim,
         generator=generator,
     ).cuda()
-    full_masks = (
-        torch.rand(modes, n_tokens, groups, generator=generator) > 0.4
-    ).cuda()
+    full_masks = (torch.rand(modes, n_tokens, groups, generator=generator) > 0.4).cuda()
     partial_masks = (
         torch.rand(modes, n_tokens, groups, generator=generator) > 0.6
     ).cuda()
-    decoder = torch.randn(
-        groups,
-        block_dim,
-        block_dim,
-        generator=generator,
-    ).double().cuda()
+    decoder = (
+        torch.randn(
+            groups,
+            block_dim,
+            block_dim,
+            generator=generator,
+        )
+        .double()
+        .cuda()
+    )
     gram = decoder @ decoder.transpose(-1, -2)
 
     moments = evaluation_module._batched_mode_selected_moments(
@@ -574,9 +900,7 @@ def test_joint_mode_endpoints_apply_max_tokens_before_every_reduction() -> None:
         for mode in ("topk", "threshold")
     }
     assert all(payload["n_tokens"] == 13 for payload in joint.selector.values())
-    assert all(
-        payload["n_tokens"] == 13 for payload in joint.shared_code.values()
-    )
+    assert all(payload["n_tokens"] == 13 for payload in joint.shared_code.values())
 
 
 @pytest.mark.parametrize("include_selector_payloads", (False, True))

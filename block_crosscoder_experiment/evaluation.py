@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, NamedTuple
@@ -18,6 +19,7 @@ from .model import BSCConfig, BSCOutput, BlockCrosscoder
 from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
+    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
 )
 
 __all__ = [
@@ -108,9 +110,7 @@ def _batched_mode_selected_moments(
 
     code64 = code.double()
     if code.shape[-1] == 1:
-        raw_energy = (
-            code64[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
-        )
+        raw_energy = code64[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
     else:
         # Retain the direct three-operand contraction.  Concordance uses a
         # mapped full code because it also needs the cross term, while this
@@ -212,9 +212,7 @@ def _batched_mode_selected_delta_sq(
     # on short final batches.
     return torch.stack(
         tuple(
-            (partial_selected[mode] - full_selected[mode])
-            .square()
-            .sum(dim=(0, 2))
+            (partial_selected[mode] - full_selected[mode]).square().sum(dim=(0, 2))
             for mode in range(full_masks.shape[0])
         )
     )
@@ -275,6 +273,102 @@ def centered_fvu(
 
 
 @torch.no_grad()
+def _decode_selected_for_evaluation(
+    model: BlockCrosscoder,
+    selected: torch.Tensor,
+    mask: torch.Tensor,
+    decoder: torch.Tensor,
+) -> torch.Tensor:
+    """Decode sparse CUDA support below the fixed density crossover.
+
+    The event count is resolved before ``nonzero`` allocates a dynamic event
+    stream.  Denser CUDA support and every non-CUDA device retain the native
+    dense reduction.
+    """
+    if (
+        not selected.is_cuda
+        or selected.dtype != torch.float32
+        or decoder.dtype != torch.float32
+    ):
+        return model.decode(selected, _decoder=decoder)
+
+    counts = mask.sum(dim=1, dtype=torch.long)
+    event_count = int(counts.sum().item())
+    max_block_events = mask.numel() // EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR
+    if event_count > max_block_events:
+        return model.decode(selected, _decoder=decoder)
+
+    cfg = model.cfg
+    if event_count:
+        prediction = torch.empty(
+            selected.shape[0],
+            cfg.n_sites,
+            cfg.d_model,
+            dtype=selected.dtype,
+            device=selected.device,
+        )
+        events = mask.nonzero(as_tuple=False)
+        rows = events[:, 0]
+        block_ids = events[:, 1]
+        values = selected[rows, block_ids]
+        crow = torch.empty(
+            selected.shape[0] + 1,
+            dtype=torch.long,
+            device=selected.device,
+        )
+        crow[0] = 0
+        crow[1:].copy_(counts).mul_(cfg.block_dim).cumsum_(dim=0)
+        block_coordinates = torch.arange(
+            cfg.block_dim,
+            dtype=torch.long,
+            device=selected.device,
+        ).unsqueeze(0)
+        # Values no longer need dictionary IDs. Mutating this view of the
+        # private event tensor avoids an additional int64 [events] start array.
+        block_ids.mul_(cfg.block_dim)
+        columns = (block_ids.unsqueeze(1) + block_coordinates).reshape(-1)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Sparse CSR tensor support is in beta state.*",
+                category=UserWarning,
+            )
+            sparse_code = torch.sparse_csr_tensor(
+                crow,
+                columns,
+                values.reshape(-1),
+                size=(selected.shape[0], cfg.n_latents),
+                device=selected.device,
+                check_invariants=False,
+            )
+        decoder_by_site = decoder.reshape(
+            cfg.n_sites,
+            cfg.n_latents,
+            cfg.d_model,
+        )
+        for site in range(cfg.n_sites):
+            site_prediction = torch.sparse.mm(sparse_code, decoder_by_site[site])
+            prediction[:, site].copy_(site_prediction)
+            # Release the previous site before the next SpMM allocates its
+            # output; the estimator prices exactly one [tokens, site_dim].
+            del site_prediction
+    else:
+        prediction = torch.zeros(
+            selected.shape[0],
+            cfg.n_sites,
+            cfg.d_model,
+            dtype=selected.dtype,
+            device=selected.device,
+        )
+
+    if cfg.decoder_bias:
+        prediction.add_(model.c.unsqueeze(0))
+    if model._has_padded_coordinates:
+        prediction.mul_(model.coordinate_mask[:, 0, 0].to(prediction.dtype))
+    return prediction
+
+
+@torch.no_grad()
 def _evaluate_code_modes(
     model: BlockCrosscoder,
     batches: Iterable[torch.Tensor],
@@ -320,9 +414,7 @@ def _evaluate_code_modes(
         torch.zeros_like(target_sum) if include_selector_payloads else None
     )
     selector_coordinate_mask = (
-        coord.double()
-        if include_selector_payloads and has_padded_coordinates
-        else None
+        coord.double() if include_selector_payloads and has_padded_coordinates else None
     )
     selector_candidate_gain_counts = (
         torch.zeros(3, dtype=torch.int64, device=device)
@@ -337,9 +429,7 @@ def _evaluate_code_modes(
             "full_sse": torch.zeros(S, dtype=torch.float64, device=device),
             "site_sse": torch.zeros(S, S, dtype=torch.float64, device=device),
             "loo_sse": torch.zeros(S, S, dtype=torch.float64, device=device),
-            "support_intersection": torch.zeros(
-                S, dtype=torch.float64, device=device
-            ),
+            "support_intersection": torch.zeros(S, dtype=torch.float64, device=device),
             "support_union": torch.zeros(S, dtype=torch.float64, device=device),
             "loo_intersection": torch.zeros(S, dtype=torch.float64, device=device),
             "loo_union": torch.zeros(S, dtype=torch.float64, device=device),
@@ -404,9 +494,7 @@ def _evaluate_code_modes(
         decoder_chunk = materialized_decoder[
             :, start : start + _DECODER_GRAM_BLOCK_CHUNK
         ].double()
-        site_gram_chunk = torch.einsum(
-            "sgbd,sgcd->sgbc", decoder_chunk, decoder_chunk
-        )
+        site_gram_chunk = torch.einsum("sgbd,sgcd->sgbc", decoder_chunk, decoder_chunk)
         decoder_gram_chunks.append(site_gram_chunk)
         all_site_decoder_gram_chunks.append(site_gram_chunk.sum(dim=0))
         del decoder_chunk
@@ -476,7 +564,12 @@ def _evaluate_code_modes(
                     z=selection.z,
                 )
                 selected = selection.z * mask.unsqueeze(-1)
-            prediction = model.decode(selected, _decoder=materialized_decoder)
+            prediction = _decode_selected_for_evaluation(
+                model,
+                selected,
+                mask,
+                materialized_decoder,
+            )
             result[mode] = BSCOutput(
                 prediction,
                 selection.z,
@@ -513,7 +606,9 @@ def _evaluate_code_modes(
         full_outputs = outputs_for_view(
             x,
             observed=explicit_full_observed,
-            encoder_sites=(None if explicit_full_observed is not None else encoder_sites),
+            encoder_sites=(
+                None if explicit_full_observed is not None else encoder_sites
+            ),
         )
         full_mode_masks = torch.stack(
             tuple(full_outputs[mode].mask for mode in selection_modes)
@@ -534,9 +629,7 @@ def _evaluate_code_modes(
                 selector_scores = full_outputs[primary_mode].scores
                 assert selector_states is not None
                 candidate_batch_counts = []
-                selected_batch_counts = {
-                    mode: [] for mode in selection_modes
-                }
+                selected_batch_counts = {mode: [] for mode in selection_modes}
                 for sign in ("negative", "zero", "positive"):
                     if sign == "negative":
                         selector_sign = selector_scores < 0
@@ -550,9 +643,7 @@ def _evaluate_code_modes(
                             (selector_sign & full_outputs[mode].mask).sum()
                         )
                     del selector_sign
-                selector_candidate_gain_counts += torch.stack(
-                    candidate_batch_counts
-                )
+                selector_candidate_gain_counts += torch.stack(candidate_batch_counts)
                 for mode in selection_modes:
                     selector_states[mode]["selected_gain_counts"] += torch.stack(
                         selected_batch_counts[mode]
@@ -572,12 +663,8 @@ def _evaluate_code_modes(
                 # batch rather than the shared metric's bounded token chunks.
                 selector_residual = (x - full.xhat).double()
                 if selector_coordinate_mask is not None:
-                    selector_residual = (
-                        selector_residual * selector_coordinate_mask
-                    )
-                selector_state["error"] += selector_residual.square().sum(
-                    dim=(0, 2)
-                )
+                    selector_residual = selector_residual * selector_coordinate_mask
+                selector_state["error"] += selector_residual.square().sum(dim=(0, 2))
                 selector_counts = full.mask.sum(dim=1)
                 selector_state["support_counts"] += torch.bincount(
                     selector_counts,
@@ -607,7 +694,10 @@ def _evaluate_code_modes(
                 state["zsum"][block_slice] += moments.code_sum[mode_index]
                 state["zz"][block_slice] += moments.code_outer[mode_index]
             del moments
-        if include_selector_payloads and cfg.selection_score == "isolated_loss_decrease":
+        if (
+            include_selector_payloads
+            and cfg.selection_score == "isolated_loss_decrease"
+        ):
             del selector_scores
         zero_x: torch.Tensor | None = None
         null_outputs: dict[str, BSCOutput] | None = None
@@ -659,20 +749,16 @@ def _evaluate_code_modes(
             )
             intersections = partial_mode_masks & full_mode_masks
             intersection_totals = intersections.sum(dim=(1, 2)).double()
-            union_totals = (partial_mode_masks | full_mode_masks).sum(
-                dim=(1, 2)
-            ).double()
+            union_totals = (
+                (partial_mode_masks | full_mode_masks).sum(dim=(1, 2)).double()
+            )
             for mode_index, state in enumerate(mode_states):
                 state[support_intersection_key][index] += intersection_totals[
                     mode_index
                 ]
                 state[support_union_key][index] += union_totals[mode_index]
-                state[f"{prefix}_full_count"][index] += full_mask_count64[
-                    mode_index
-                ]
-                state[f"{prefix}_full_energy"][index] += all_full_energy64[
-                    mode_index
-                ]
+                state[f"{prefix}_full_count"][index] += full_mask_count64[mode_index]
+                state[f"{prefix}_full_energy"][index] += all_full_energy64[mode_index]
             del intersections, intersection_totals, union_totals
 
             raw_partial_code = partial_outputs[primary_mode].z
@@ -690,21 +776,21 @@ def _evaluate_code_modes(
                     state[f"{prefix}_intersection_count"][index, block_slice] += (
                         reductions.intersection_count[mode_index]
                     )
-                    state[f"{prefix}_concordance_numerator"][
-                        index, block_slice
-                    ] += reductions.concordance_numerator[mode_index]
-                    state[f"{prefix}_concordance_denominator"][
-                        index, block_slice
-                    ] += reductions.concordance_denominator[mode_index]
+                    state[f"{prefix}_concordance_numerator"][index, block_slice] += (
+                        reductions.concordance_numerator[mode_index]
+                    )
+                    state[f"{prefix}_concordance_denominator"][index, block_slice] += (
+                        reductions.concordance_denominator[mode_index]
+                    )
                     state[f"{prefix}_full_code_sum"][index, block_slice] += (
                         reductions.full_code_sum[mode_index]
                     )
                     state[f"{prefix}_partial_code_sum"][index, block_slice] += (
                         reductions.partial_code_sum[mode_index]
                     )
-                    state[f"{prefix}_intersection_full_energy"][
-                        index, block_slice
-                    ] += reductions.intersection_full_energy[mode_index]
+                    state[f"{prefix}_intersection_full_energy"][index, block_slice] += (
+                        reductions.intersection_full_energy[mode_index]
+                    )
                 del reductions
             return partial_mode_masks
 
@@ -775,9 +861,9 @@ def _evaluate_code_modes(
                     missing_mode_masks[:, :, block_slice],
                 )
                 for mode_index, state in enumerate(mode_states):
-                    state["post_selection_loo_delta_sq"][
-                        source, block_slice
-                    ] += selected_delta_sq[mode_index]
+                    state["post_selection_loo_delta_sq"][source, block_slice] += (
+                        selected_delta_sq[mode_index]
+                    )
                 del selected_delta_sq
             del (
                 missing,
@@ -811,9 +897,7 @@ def _evaluate_code_modes(
         # target-square accumulator for centering so the planner's three
         # target-width selector tensors remain a hard upper bound.
         del selector_coordinate_mask
-        selector_target_sumsq.sub_(
-            selector_target_sum.square().div_(n_tokens)
-        )
+        selector_target_sumsq.sub_(selector_target_sum.square().div_(n_tokens))
         selector_denominator = selector_target_sumsq.sum(dim=1).clamp_min(1e-30)
 
     # Functional-dependence profiles are descriptive block endpoints. For
@@ -868,9 +952,7 @@ def _evaluate_code_modes(
         mean_delta = mean_full - mean_partial
         mean_offset_energy = intersection_count * (
             (mapped_means[0] - mapped_means[1]) * mean_delta
-        ).sum(
-            dim=-1
-        )
+        ).sum(dim=-1)
         # Lin-style concordance in decoded-coordinate geometry.  Centering the
         # covariance prevents a common bias from dominating, while the mean-
         # offset term prevents an additive partial-view coordinate drift from
@@ -1015,8 +1097,8 @@ def _evaluate_code_modes(
         site_matrix = state["site_sse"] / denominator.unsqueeze(0)
         loo_matrix = state["loo_sse"] / denominator.unsqueeze(0)
         post_delta = (
-            state["post_selection_loo_delta_sq"] / n_tokens
-        ).clamp_min(0).sqrt()
+            (state["post_selection_loo_delta_sq"] / n_tokens).clamp_min(0).sqrt()
+        )
         post_profile, post_coherence, post_defined = normalized_profile(post_delta)
 
         site_coordinate = concordance_payload(
@@ -1045,9 +1127,7 @@ def _evaluate_code_modes(
         # Centering keeps a constant nonzero code from masquerading as a
         # varying used direction. The algebra is batched in bounded chunks; a
         # Python loop over S*G is prohibitive for Phase-3 scalar dictionaries.
-        used_eigenvalues = torch.zeros(
-            S, G, b, dtype=torch.float64, device=device
-        )
+        used_eigenvalues = torch.zeros(S, G, b, dtype=torch.float64, device=device)
         chunk_size = 4096
         for start in range(0, G, chunk_size):
             stop = min(start + chunk_size, G)
@@ -1072,9 +1152,9 @@ def _evaluate_code_modes(
                 torch.matmul(root.unsqueeze(0), decoder_gram[:, start:stop]),
                 root.unsqueeze(0),
             )
-            used_eigenvalues[:, start:stop] = torch.linalg.eigvalsh(
-                contribution
-            ).flip(-1)
+            used_eigenvalues[:, start:stop] = torch.linalg.eigvalsh(contribution).flip(
+                -1
+            )
 
         payload = {
             "schema_version": 5,
@@ -1082,14 +1162,11 @@ def _evaluate_code_modes(
             "n_tokens": n_tokens,
             "model_cfg": asdict(cfg),
             "full_fvu_per_site": full_fvu.tolist(),
-            "full_fvu_pooled": float(
-                state["full_sse"].sum() / denominator.sum()
-            ),
+            "full_fvu_pooled": float(state["full_sse"].sum() / denominator.sum()),
             "site_only_fvu": site_matrix.tolist(),
             "leave_one_site_out_fvu": loo_matrix.tolist(),
             "site_only_support_iou": (
-                state["support_intersection"]
-                / state["support_union"].clamp_min(1)
+                state["support_intersection"] / state["support_union"].clamp_min(1)
             ).tolist(),
             "leave_one_site_out_support_iou": (
                 state["loo_intersection"] / state["loo_union"].clamp_min(1)
@@ -1134,8 +1211,7 @@ def _evaluate_code_modes(
         return payload
 
     shared_payloads = {
-        mode: finalize_mode(mode, states[mode])
-        for mode in selection_modes
+        mode: finalize_mode(mode, states[mode]) for mode in selection_modes
     }
 
     if not include_selector_payloads:

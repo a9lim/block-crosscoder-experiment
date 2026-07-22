@@ -67,6 +67,14 @@ exit is not evidence by itself.
   oracle. The trusted decoder resolves selected rotations once across bounded
   quantizer chunks, and Phase-2/Phase-3 campaign-shape benchmarks include the
   complete decoded prediction.
+- The joint fp32 CUDA evaluator uses per-site CSR native reconstruction only at
+  or below the fixed `1/32` support-density cap. Counts gate allocation before
+  `nonzero`; denser, non-fp32, and non-CUDA cases remain dense. Direct dense
+  oracles cover both hard selectors, all full/site-only/leave-one-out views,
+  zero support, the inclusive cap and first dense event, bias, and padding at
+  the prediction, SSE, and repeated-SpMM bounds in `design.md`. The estimator
+  version content-binds the density denominator and exactly prices the capped
+  live tensors and one released-per-site output.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.

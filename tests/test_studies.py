@@ -9,6 +9,7 @@ from block_crosscoder_experiment.cli.run_cell import validate_cell_config
 from block_crosscoder_experiment.runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
+    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
     TRUSTED_DECODE_Q_CHUNK,
 )
 from block_crosscoder_experiment.studies import (
@@ -1452,10 +1453,11 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v7"
+        "dense-linear-memory-v8"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
+        f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
     )
     assert phase1_estimate.storage_bytes == phase1_estimate.parameters * 16
     assert phase1_estimate.peak_vram_bytes > phase1_estimate.parameters * 28
@@ -1503,8 +1505,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     active = sasa.decision_map["model.active_blocks"]
     expected_sparse_delta = (64 - 32) * active * 4
     assert (
-        estimate_cell(larger_window).storage_bytes
-        - estimate_cell(sasa).storage_bytes
+        estimate_cell(larger_window).storage_bytes - estimate_cell(sasa).storage_bytes
         == expected_sparse_delta
     )
     assert (
@@ -1526,10 +1527,14 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         - estimate_cell(dense_sasa).parameters * 16
     )
     batch_tracker_bytes = (
-        sasa.decision_map["auxiliary.dead_window_tokens"]
-        + sasa.decision_map["optimizer.batch_tokens"]
-        - 1
-    ) * active * 4
+        (
+            sasa.decision_map["auxiliary.dead_window_tokens"]
+            + sasa.decision_map["optimizer.batch_tokens"]
+            - 1
+        )
+        * active
+        * 4
+    )
     dense_tracker_bytes = sasa.decision_map["auxiliary.dead_window_tokens"] * (
         (sasa.decision_map["model.groups"] + 7) // 8
     )
@@ -1550,6 +1555,7 @@ def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
         "total_dim": 96,
         "operational_decoder_elements": groups * 2 * 96,
         "sites": 3,
+        "site_dim": 32,
         "selection_score": "decoded_energy",
     }
     one_q = _evaluation_workspace_bytes(quantizer_count=1, **common)
@@ -1597,6 +1603,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         operational_decoder_elements=decoder_elements,
         quantizer_count=1,
         sites=sites,
+        site_dim=1,
         selection_score="code_norm",
     )
     events = batch_tokens * groups
@@ -1610,16 +1617,9 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + batch_tokens * total_dim * 4
         + decoder_elements * 4
     )
-    output = 4 * batch_tokens * (
-        total_dim * 4 + latents * 8 + groups * 5
-    )
+    output = 4 * batch_tokens * (total_dim * 4 + latents * 8 + groups * 5)
     concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
-    concordance = (
-        batch_tokens
-        * concordance_groups
-        * (8 * block_width + 4)
-        * 8
-    )
+    concordance = batch_tokens * concordance_groups * (8 * block_width + 4) * 8
     reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
     reduction = reduction_tokens * total_dim * 4 * 8
     decoder_grams = (sites + 1) * groups * block_width**2 * 8
@@ -1628,12 +1628,19 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + groups * block_width**2
         + groups * block_width
     ) * 8
-    selector_accumulators = (
-        3 * total_dim
-        + 2 * (sites + (groups + 1) + 3)
-        + 3
-    ) * 8
+    selector_accumulators = (3 * total_dim + 2 * (sites + (groups + 1) + 3) + 3) * 8
     one_site_tensor = sites * batch_tokens * latents * 4
+    sparse_events = (
+        batch_tokens * groups // EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR
+    )
+    sparse_native_decode = (
+        sparse_events * (16 + 12 * block_width)
+        + batch_tokens * 8
+        + (batch_tokens + 1) * 8
+        + block_width * 8
+        + 8
+        + batch_tokens * 4
+    )
     shared_code = (
         output
         + concordance
@@ -1642,6 +1649,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + 2 * per_mode_accumulators
         + selector_accumulators
         + 2 * one_site_tensor
+        + sparse_native_decode
     )
     assert shared_code > trusted_decode
     assert actual == shared_code
