@@ -186,7 +186,13 @@ def _retract_count_tensor_(
         floor_hits += (evals < eig_floor).sum()
         evals = evals.clamp_min(eig_floor)
         inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
-        chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
+        if chunk.device.type == "cuda":
+            scratch = torch.empty_like(chunk[0])
+            for site in range(chunk.shape[0]):
+                torch.bmm(inv_sqrt, chunk[site], out=scratch)
+                chunk[site].copy_(scratch)
+        else:
+            chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
     return floor_hits
 
 

@@ -1160,6 +1160,14 @@ runtime fallback. `householder_qr_positive_diagonal_v1` is an admitted
 reference/test oracle but is never canonically derived. QR versus polar remains
 scientific; Cholesky versus Householder within QR is engineering.
 
+On CUDA, the polar identity applies its already computed inverse square root
+to one site at a time through a single reusable block scratch. This is bitwise
+equal to the former CUDA broadcast einsum for output tensors and floor counts
+across one, four, and six sites; CPU retains the existing einsum. At `S=4`,
+`G=2048`, `b=4`, `d=768` on jobe, the polar primitive falls from `1.558` to
+`1.175 ms` (`24.6%`); the complete Phase-2 polar step is projected to improve
+by about `3.0%` with no peak increase.
+
 The fixed jobe benchmark uses five warmups and 31 separately synchronized
 CUDA-event samples, with nearest-rank p95, peak reset after warmup, and all
 input preparation outside the timed region. At the Phase-2 QR geometry

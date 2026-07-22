@@ -838,6 +838,32 @@ def test_chunked_gram_and_retraction_match(monkeypatch, device):
     assert gram_residual(D).max().item() < 1e-5
 
 
+@pytest.mark.parametrize("sites", (1, 4, 6))
+def test_sitewise_polar_application_is_bitwise_einsum_exact(
+    monkeypatch,
+    device,
+    sites,
+):
+    generator = torch.Generator(device="cpu").manual_seed(5280 + sites)
+    source = torch.randn(sites, 17, 4, 33, generator=generator).to(device)
+    expected = source.clone()
+    actual = source.clone()
+    gram = torch.einsum("sgbd,sgcd->gbc", expected, expected)
+    evals, evecs = torch.linalg.eigh(gram)
+    expected_hits = int((evals < 1e-6).sum())
+    inv_sqrt = (
+        evecs
+        @ torch.diag_embed(evals.clamp_min(1e-6).rsqrt())
+        @ evecs.transpose(-1, -2)
+    )
+    expected.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, expected))
+    monkeypatch.setattr(gram_module, "_GRAM_BLOCK_CHUNK", 7)
+    monkeypatch.setattr(gram_module, "_RETRACT_UNCHUNKED_MAX", 0)
+    actual_hits = retract_(actual)
+    assert actual_hits == expected_hits
+    assert torch.equal(actual, expected)
+
+
 def test_chunked_site_spectrum_matches_and_has_grad(monkeypatch, device):
     D = random_stack(device, seed=10)
     expected = site_singular_values(D)
