@@ -159,7 +159,10 @@ exit is not evidence by itself.
   The Trainer may pass its immediately preceding global finite result into QR;
   QR's factor and post-Gram guards must still refuse injected nonfinite input
   or candidates transactionally, and no other decoder projection may reuse
-  that specialization.
+  that specialization. Canonical QR may speculatively compute a private
+  candidate and combine its precondition, factor, rank, and post-Gram
+  predicates into one admitted-path host fence; every failure-only diagnostic
+  and the no-mutation refusal remain release gates.
 - Site-axis factorization includes an exact selected-parent carrier. Phase 1
   records full and rank `1/2/4` as nonpromotable capability evidence and
   advances the exact carrier. In Phase 2 the common free carrier must pass the

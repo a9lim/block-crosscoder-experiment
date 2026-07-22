@@ -216,18 +216,24 @@ def _qr_retract_count_tensor_(
     concatenated = D.permute(1, 0, 3, 2).reshape(groups, sites * width, block_dim)
     q, r = torch.linalg.qr(concatenated, mode="reduced")
     diagonal = torch.diagonal(r, dim1=-2, dim2=-1)
-    if not bool(torch.isfinite(q).all() & torch.isfinite(diagonal).all()):
-        raise ValueError("Householder QR produced non-finite factors")
-    if bool((diagonal == 0).any()):
-        raise ValueError("Householder QR requires full-column-rank blocks")
+    factors_finite = torch.isfinite(q).all() & torch.isfinite(diagonal).all()
+    full_rank = (diagonal != 0).all()
     signs = torch.where(diagonal < 0, -torch.ones_like(diagonal), 1.0)
     q = q * signs.unsqueeze(-2)
     candidate = q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2)
     residual = gram_residual(candidate)
-    if not bool(
+    post_ok = (
         torch.isfinite(residual).all()
         & (residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
-    ):
+    )
+    # The candidate is private until every predicate passes. On the admitted
+    # path, one combined host fence replaces three sequential scalar reads;
+    # failure-only branches retain the specific refusal diagnostics.
+    if not bool(factors_finite & full_rank & post_ok):
+        if not bool(factors_finite):
+            raise ValueError("Householder QR produced non-finite factors")
+        if not bool(full_rank):
+            raise ValueError("Householder QR requires full-column-rank blocks")
         raise ValueError("Householder QR candidate violates the Gram bound")
     D.copy_(candidate)
     count = torch.zeros((), dtype=torch.int64, device=D.device)
@@ -272,13 +278,6 @@ def _cholesky_qr_retract_count_tensor_(
         & (info == 0).all()
         & (diagonal > 0).all()
     )
-    if not bool(precondition_ok):
-        failed = int((info != 0).sum())
-        raise CholeskyQRRetractionError(
-            "Cholesky-QR requires finite positive-definite decoder Grams "
-            f"({failed} Cholesky failures)"
-        )
-
     block_dim = D.shape[2]
     eye = torch.eye(block_dim, dtype=D.dtype, device=D.device).expand(
         D.shape[1], -1, -1
@@ -304,26 +303,6 @@ def _cholesky_qr_retract_count_tensor_(
             reconstruction_residual <= CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX
         ).all()
     )
-    if not bool(factor_ok):
-        max_condition = float(
-            condition.nan_to_num(
-                nan=float("inf"), posinf=float("inf"), neginf=float("inf")
-            ).max()
-        )
-        max_reconstruction = float(
-            reconstruction_residual.nan_to_num(
-                nan=float("inf"), posinf=float("inf"), neginf=float("inf")
-            ).max()
-        )
-        raise CholeskyQRRetractionError(
-            "Cholesky-QR conditioning/reconstruction guard failed: "
-            f"condition_inf={max_condition:.6g} "
-            f"(max {CHOLESKY_QR_GRAM_CONDITION_MAX:g}), "
-            f"relative_residual={max_reconstruction:.6g} "
-            "(max "
-            f"{CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX:g})"
-        )
-
     candidate = torch.empty_like(D)
     # Write each site directly into its contiguous destination.  The former
     # broadcast einsum also materialized an [S, chunk(G), b, d] result before
@@ -342,7 +321,37 @@ def _cholesky_qr_retract_count_tensor_(
         torch.isfinite(post_residual).all()
         & (post_residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
     )
-    if not bool(post_ok):
+    # Cholesky, factor, and post-Gram predicates are all transactional: the
+    # master is untouched until their conjunction passes. Speculatively
+    # completing a rejected candidate is cheap relative to training and lets
+    # the admitted path pay one host fence instead of three. Detailed scalar
+    # diagnostics execute only after that combined refusal.
+    if not bool(precondition_ok & factor_ok & post_ok):
+        if not bool(precondition_ok):
+            failed = int((info != 0).sum())
+            raise CholeskyQRRetractionError(
+                "Cholesky-QR requires finite positive-definite decoder Grams "
+                f"({failed} Cholesky failures)"
+            )
+        if not bool(factor_ok):
+            max_condition = float(
+                condition.nan_to_num(
+                    nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+                ).max()
+            )
+            max_reconstruction = float(
+                reconstruction_residual.nan_to_num(
+                    nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+                ).max()
+            )
+            raise CholeskyQRRetractionError(
+                "Cholesky-QR conditioning/reconstruction guard failed: "
+                f"condition_inf={max_condition:.6g} "
+                f"(max {CHOLESKY_QR_GRAM_CONDITION_MAX:g}), "
+                f"relative_residual={max_reconstruction:.6g} "
+                "(max "
+                f"{CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX:g})"
+            )
         maximum = float(
             post_residual.nan_to_num(
                 nan=float("inf"), posinf=float("inf"), neginf=float("inf")

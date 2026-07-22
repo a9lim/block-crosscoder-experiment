@@ -1153,6 +1153,18 @@ geometry, 21 post-warmup complete-Trainer samples fall from `8.836` to
 `8.563 ms` median (`3.09%`, `1.032x`) and from `9.768` to `9.354 ms` p95;
 peak allocation is unchanged.
 
+The same transactional boundary lets QR finish its private candidate before
+reading any intermediate predicate on the admitted path. Cholesky-QR combines
+the positive-definite Gram, conditioning/reconstruction, and post-Gram guards;
+Householder QR combines finite-factor, full-rank, and post-Gram guards. Only
+their conjunction permits the master copy. A rejected conjunction then enters
+the former failure-specific diagnostics, so speculative work changes neither
+the refusal predicates nor the accepted state. CUDA profiling at the same
+Phase-2 geometry reduces scalar host reads per complete Trainer step from five
+to three. Two 21-sample reverse-order jobe repetitions improve the median from
+`8.483` to `8.426 ms` (`0.66%`, `1.007x`) and from `8.616` to `8.480 ms`
+(`1.58%`, `1.016x`); peak allocation remains `656.31 MiB`.
+
 The shared kernels also retain guarded configuration values used only by unit
 fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted

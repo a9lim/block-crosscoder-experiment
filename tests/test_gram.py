@@ -224,6 +224,45 @@ def test_cholesky_qr_failures_are_transactional_and_have_no_fallback(
     assert torch.equal(torch.nan_to_num(D), torch.nan_to_num(before))
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        ("factor", "non-finite factors"),
+        ("rank", "full-column-rank"),
+        ("post_gram", "Gram bound"),
+    ),
+)
+def test_householder_qr_combined_guard_failures_remain_transactional(
+    device,
+    monkeypatch,
+    failure,
+    expected,
+):
+    D = random_stack(device, seed=1221)
+    if failure == "factor":
+        original_qr = torch.linalg.qr
+
+        def poisoned_qr(*args, **kwargs):
+            q, r = original_qr(*args, **kwargs)
+            q[(0,) * q.ndim] = float("inf")
+            return q, r
+
+        monkeypatch.setattr(torch.linalg, "qr", poisoned_qr)
+    elif failure == "rank":
+        D[:, 0].zero_()
+    else:
+        assert failure == "post_gram"
+        monkeypatch.setattr(
+            gram_module,
+            "CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX",
+            -1.0,
+        )
+    before = D.clone()
+    with pytest.raises(ValueError, match=expected):
+        gram_module.qr_retract_(D)
+    assert torch.equal(D, before)
+
+
 def test_cholesky_qr_requires_fp32_and_sufficient_geometry(device):
     D = random_stack(device, seed=123).to(torch.bfloat16)
     with pytest.raises(TypeError, match="fp32"):
