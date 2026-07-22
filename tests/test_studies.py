@@ -1628,6 +1628,11 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + groups * block_width**2
         + groups * block_width
     ) * 8
+    selector_accumulators = (
+        3 * total_dim
+        + 2 * (sites + (groups + 1) + 3)
+        + 3
+    ) * 8
     one_site_tensor = sites * batch_tokens * latents * 4
     shared_code = (
         output
@@ -1635,6 +1640,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + reduction
         + decoder_grams
         + 2 * per_mode_accumulators
+        + selector_accumulators
         + 2 * one_site_tensor
     )
     assert shared_code > trusted_decode

@@ -52,7 +52,7 @@ from block_crosscoder_experiment.codec import (
     fit_codec,
 )
 from block_crosscoder_experiment.evaluation import (
-    evaluate_shared_code_modes,
+    evaluate_selector_and_shared_code_modes,
     load_trained_model,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
@@ -6950,26 +6950,16 @@ def _evaluate(
         raise CellExecutionError("deployable codec/input binding mismatch")
 
     device = _device(ctx)
-    native = _evaluate_native_selector(
-        model,
-        _prefetched_evaluation_batches(ctx, preparation),
-        device=device,
-        selection_mode="topk",
-    )
-    deployed = _evaluate_native_selector(
-        model,
-        _prefetched_evaluation_batches(ctx, preparation),
-        device=device,
-        selection_mode="threshold",
-    )
-    shared_endpoints = evaluate_shared_code_modes(
+    mode_endpoints = evaluate_selector_and_shared_code_modes(
         model,
         _prefetched_evaluation_batches(ctx, preparation),
         device=device,
         selection_modes=("topk", "threshold"),
     )
-    shared_native = shared_endpoints["topk"]
-    shared_deployed = shared_endpoints["threshold"]
+    native = mode_endpoints.selector["topk"]
+    deployed = mode_endpoints.selector["threshold"]
+    shared_native = mode_endpoints.shared_code["topk"]
+    shared_deployed = mode_endpoints.shared_code["threshold"]
     rd = evaluate_rd(
         model,
         codec,

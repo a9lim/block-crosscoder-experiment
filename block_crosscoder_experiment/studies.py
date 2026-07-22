@@ -3789,6 +3789,15 @@ def _evaluation_workspace_bytes(
         + groups * block_width**2
         + groups * block_width
     ) * 8
+    # Joint selector summaries retain their native-order fp64 target moments,
+    # per-mode SSE, support histograms, and signed-gain counters while the
+    # shared-code accumulators stream the same batches.  A third target-width
+    # tensor conservatively prices the fp64 padded-coordinate mask.
+    selector_accumulator_bytes = (
+        3 * total_dim
+        + 2 * (sites + (groups + 1) + 3)
+        + 3
+    ) * 8
     # Shared-view evaluation retains one exact per-site encoder contraction
     # while materializing one equally sized masked view.  This removes repeat
     # BMMs but must remain a hard-gated, explicitly priced multi-GiB workspace.
@@ -3799,6 +3808,7 @@ def _evaluation_workspace_bytes(
         + reduction_bytes
         + decoder_gram_bytes
         + 2 * per_mode_accumulator_bytes
+        + selector_accumulator_bytes
         + 2 * frozen_encoder_site_bytes
     )
     if selection_score == "decoded_energy":

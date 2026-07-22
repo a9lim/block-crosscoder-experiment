@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import inspect
 import os
 import sys
 from dataclasses import replace
@@ -90,6 +91,13 @@ import block_crosscoder_experiment.cli.run_cell as run_cell_module
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
+    source = inspect.getsource(run_cell_module._evaluate)
+    assert source.count("_prefetched_evaluation_batches(") == 1
+    assert "evaluate_selector_and_shared_code_modes(" in source
+    assert "_evaluate_native_selector(" not in source
 
 
 def test_subspace_overlap_is_bound_to_the_support_selected_group() -> None:

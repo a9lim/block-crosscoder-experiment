@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import torch
 
@@ -23,12 +23,21 @@ from .runtime_limits import (
 __all__ = [
     "centered_fvu",
     "checkpoint_sha256",
+    "EvaluationModeEndpoints",
+    "evaluate_selector_and_shared_code_modes",
     "evaluate_shared_code",
     "evaluate_shared_code_modes",
     "load_trained_model",
 ]
 
 _DECODER_GRAM_BLOCK_CHUNK = 256
+
+
+class EvaluationModeEndpoints(NamedTuple):
+    """Selector and shared-code payloads produced by one evaluation stream."""
+
+    selector: dict[str, dict]
+    shared_code: dict[str, dict]
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -86,14 +95,15 @@ def centered_fvu(
 
 
 @torch.no_grad()
-def evaluate_shared_code_modes(
+def _evaluate_code_modes(
     model: BlockCrosscoder,
     batches: Iterable[torch.Tensor],
     *,
     device: str | torch.device = "cpu",
     max_tokens: int | None = None,
     selection_modes: tuple[str, ...] = ("topk", "threshold"),
-) -> dict[str, dict]:
+    include_selector_payloads: bool,
+) -> tuple[dict[str, dict], dict[str, dict] | None]:
     """Evaluate one or more selector endpoints over one shared view pass.
 
     Site-only and leave-one-site-out views are operational re-encodings through
@@ -122,6 +132,23 @@ def evaluate_shared_code_modes(
     target_sum = torch.zeros(S, cfg.d_model, dtype=torch.float64, device=device)
     target_sumsq = torch.zeros_like(target_sum)
     pre_selection_loo_delta_sq = torch.zeros(S, G, dtype=torch.float64, device=device)
+
+    selector_target_sum = (
+        torch.zeros_like(target_sum) if include_selector_payloads else None
+    )
+    selector_target_sumsq = (
+        torch.zeros_like(target_sum) if include_selector_payloads else None
+    )
+    selector_coordinate_mask = (
+        coord.double()
+        if include_selector_payloads and has_padded_coordinates
+        else None
+    )
+    selector_candidate_gain_counts = (
+        torch.zeros(3, dtype=torch.int64, device=device)
+        if include_selector_payloads
+        else None
+    )
 
     def new_mode_state() -> dict[str, torch.Tensor]:
         site_block = torch.zeros(S, G, dtype=torch.float64, device=device)
@@ -159,6 +186,26 @@ def evaluate_shared_code_modes(
         }
 
     states = {mode: new_mode_state() for mode in selection_modes}
+    selector_states = (
+        {
+            mode: {
+                "error": torch.zeros(S, dtype=torch.float64, device=device),
+                "support_counts": torch.zeros(
+                    G + 1,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                "selected_gain_counts": torch.zeros(
+                    3,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            }
+            for mode in selection_modes
+        }
+        if include_selector_payloads
+        else None
+    )
     materialized_decoder = model.decoder_tensor()
     materialized_encoder = (
         materialized_decoder * model.log_gamma.exp()
@@ -330,18 +377,92 @@ def evaluate_shared_code_modes(
             x = x[: max_tokens - n_tokens]
         if not x.numel():
             break
+        observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
         encoder_sites = (
             None
             if cfg.encoder_fusion == "source" or S == 1
             else model._frozen_encoder_sites(x, materialized_encoder)
         )
-        full_outputs = outputs_for_view(x, encoder_sites=encoder_sites)
+        # The legacy selector summaries explicitly supplied an all-observed
+        # mask for isolated-loss scoring.  Preserve that operational path in
+        # the joint evaluator; bypassing the partial-view cache keeps this full
+        # endpoint on the same direct flattened contraction as native forward.
+        explicit_full_observed = (
+            observed_all
+            if include_selector_payloads
+            and cfg.selection_score == "isolated_loss_decrease"
+            else None
+        )
+        full_outputs = outputs_for_view(
+            x,
+            observed=explicit_full_observed,
+            encoder_sites=(None if explicit_full_observed is not None else encoder_sites),
+        )
         accumulate_target_statistics(x)
+        if include_selector_payloads:
+            assert selector_target_sum is not None
+            assert selector_target_sumsq is not None
+            selector_values = x.double()
+            if selector_coordinate_mask is not None:
+                selector_values = selector_values * selector_coordinate_mask
+            selector_target_sum += selector_values.sum(dim=0)
+            selector_target_sumsq += selector_values.square().sum(dim=0)
+            del selector_values
+
+            if cfg.selection_score == "isolated_loss_decrease":
+                assert selector_candidate_gain_counts is not None
+                selector_scores = full_outputs[primary_mode].scores
+                assert selector_states is not None
+                candidate_batch_counts = []
+                selected_batch_counts = {
+                    mode: [] for mode in selection_modes
+                }
+                for sign in ("negative", "zero", "positive"):
+                    if sign == "negative":
+                        selector_sign = selector_scores < 0
+                    elif sign == "zero":
+                        selector_sign = selector_scores == 0
+                    else:
+                        selector_sign = selector_scores > 0
+                    candidate_batch_counts.append(selector_sign.sum())
+                    for mode in selection_modes:
+                        selected_batch_counts[mode].append(
+                            (selector_sign & full_outputs[mode].mask).sum()
+                        )
+                    del selector_sign
+                selector_candidate_gain_counts += torch.stack(
+                    candidate_batch_counts
+                )
+                for mode in selection_modes:
+                    selector_states[mode]["selected_gain_counts"] += torch.stack(
+                        selected_batch_counts[mode]
+                    )
+                del candidate_batch_counts, selected_batch_counts
         full_mask_counts: dict[str, torch.Tensor] = {}
         full_energies: dict[str, torch.Tensor] = {}
         for mode, full in full_outputs.items():
             state = states[mode]
             state["full_sse"] += squared_error_by_site(x, full.xhat)
+            if include_selector_payloads:
+                assert selector_states is not None
+                selector_state = selector_states[mode]
+                # Preserve the former selector evaluator exactly: subtract in
+                # fp32, cast that residual to fp64, then reduce the complete
+                # batch rather than the shared metric's bounded token chunks.
+                selector_residual = (x - full.xhat).double()
+                if selector_coordinate_mask is not None:
+                    selector_residual = (
+                        selector_residual * selector_coordinate_mask
+                    )
+                selector_state["error"] += selector_residual.square().sum(
+                    dim=(0, 2)
+                )
+                selector_counts = full.mask.sum(dim=1)
+                selector_state["support_counts"] += torch.bincount(
+                    selector_counts,
+                    minlength=G + 1,
+                )
+                del selector_residual, selector_counts, selector_state
             full_mask_count64 = full.mask.sum(dim=0).double()
             all_full_energy64 = torch.zeros(
                 G, dtype=torch.float64, device=device
@@ -371,8 +492,8 @@ def evaluate_shared_code_modes(
             full_mask_counts[mode] = full_mask_count64
             full_energies[mode] = all_full_energy64
         del selected, selected_energy, gram
-
-        observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
+        if include_selector_payloads and cfg.selection_score == "isolated_loss_decrease":
+            del selector_scores
         zero_x: torch.Tensor | None = None
         null_outputs: dict[str, BSCOutput] | None = None
 
@@ -521,6 +642,18 @@ def evaluate_shared_code_modes(
         raise ValueError("evaluation stream produced no tokens")
     centered_ss = target_sumsq - target_sum.square() / n_tokens
     denominator = centered_ss.sum(dim=1).clamp_min(1e-30)
+    selector_denominator: torch.Tensor | None = None
+    if include_selector_payloads:
+        assert selector_target_sum is not None
+        assert selector_target_sumsq is not None
+        # The coordinate mask is no longer needed after streaming. Reuse the
+        # target-square accumulator for centering so the planner's three
+        # target-width selector tensors remain a hard upper bound.
+        del selector_coordinate_mask
+        selector_target_sumsq.sub_(
+            selector_target_sum.square().div_(n_tokens)
+        )
+        selector_denominator = selector_target_sumsq.sum(dim=1).clamp_min(1e-30)
 
     # Functional-dependence profiles are descriptive block endpoints. For
     # each omitted site and block, delta is the RMS Euclidean code change over
@@ -839,10 +972,175 @@ def evaluate_shared_code_modes(
         json.dumps(payload, allow_nan=False)
         return payload
 
-    return {
+    shared_payloads = {
         mode: finalize_mode(mode, states[mode])
         for mode in selection_modes
     }
+
+    if not include_selector_payloads:
+        return shared_payloads, None
+
+    assert selector_states is not None
+    assert selector_denominator is not None
+    assert selector_candidate_gain_counts is not None
+    gain_count_names = (
+        "candidate_negative",
+        "candidate_zero",
+        "candidate_positive",
+        "selected_negative",
+        "selected_zero",
+        "selected_positive",
+    )
+    candidate_gain_counts = selector_candidate_gain_counts.cpu().tolist()
+
+    def finalize_selector_mode(
+        selection_mode: str,
+        state: dict[str, torch.Tensor],
+    ) -> dict:
+        error = state["error"]
+        fvu = error / selector_denominator
+        support_histogram = {
+            count: frequency
+            for count, frequency in enumerate(state["support_counts"].cpu().tolist())
+            if frequency
+        }
+        selected_gain_counts = state["selected_gain_counts"].cpu().tolist()
+        gain_counts = dict(
+            zip(
+                gain_count_names,
+                candidate_gain_counts + selected_gain_counts,
+                strict=True,
+            )
+        )
+        event_total = sum(
+            count * frequency for count, frequency in support_histogram.items()
+        )
+        if cfg.selection_score == "isolated_loss_decrease":
+            candidate_total = sum(
+                gain_counts[f"candidate_{sign}"]
+                for sign in ("negative", "zero", "positive")
+            )
+            selected_total = sum(
+                gain_counts[f"selected_{sign}"]
+                for sign in ("negative", "zero", "positive")
+            )
+            if candidate_total != n_tokens * G:
+                raise ValueError(
+                    "isolated-loss candidate diagnostic count does not cover "
+                    "every block"
+                )
+            if selected_total != event_total:
+                raise ValueError(
+                    "isolated-loss selected diagnostic count differs from "
+                    "selector support"
+                )
+            isolated_loss_diagnostics: dict[str, object] = {
+                "schema": "bsc-isolated-loss-gain-diagnostics-v1",
+                "applicable": True,
+                "observation_contract": "explicit_true_observed_sites_only_v1",
+                "candidate_event_count": candidate_total,
+                "candidate_negative_gain_count": gain_counts["candidate_negative"],
+                "candidate_zero_gain_count": gain_counts["candidate_zero"],
+                "candidate_positive_gain_count": gain_counts["candidate_positive"],
+                "candidate_negative_gain_fraction": (
+                    gain_counts["candidate_negative"] / candidate_total
+                ),
+                "candidate_zero_gain_fraction": (
+                    gain_counts["candidate_zero"] / candidate_total
+                ),
+                "candidate_positive_gain_fraction": (
+                    gain_counts["candidate_positive"] / candidate_total
+                ),
+                "selected_event_count": selected_total,
+                "selected_negative_gain_count": gain_counts["selected_negative"],
+                "selected_zero_gain_count": gain_counts["selected_zero"],
+                "selected_positive_gain_count": gain_counts["selected_positive"],
+                "selected_negative_gain_fraction": (
+                    None
+                    if selected_total == 0
+                    else gain_counts["selected_negative"] / selected_total
+                ),
+                "selected_zero_gain_fraction": (
+                    None
+                    if selected_total == 0
+                    else gain_counts["selected_zero"] / selected_total
+                ),
+                "selected_positive_gain_fraction": (
+                    None
+                    if selected_total == 0
+                    else gain_counts["selected_positive"] / selected_total
+                ),
+            }
+        else:
+            isolated_loss_diagnostics = {
+                "applicable": False,
+                "reason": "selection_score_not_isolated_loss_decrease",
+            }
+        payload = {
+            "selector": cfg.selection,
+            "selection_score": cfg.selection_score,
+            "mode": selection_mode,
+            "n_tokens": n_tokens,
+            "fvu_per_site": fvu.cpu().tolist(),
+            "fvu_pooled": float(error.sum() / selector_denominator.sum()),
+            "avg_active_blocks": event_total / n_tokens,
+            "active_block_count_histogram": {
+                str(key): support_histogram[key] for key in sorted(support_histogram)
+            },
+            "isolated_loss_gain_diagnostics": isolated_loss_diagnostics,
+        }
+        json.dumps(payload, allow_nan=False)
+        return payload
+
+    selector_payloads = {
+        mode: finalize_selector_mode(mode, selector_states[mode])
+        for mode in selection_modes
+    }
+    return shared_payloads, selector_payloads
+
+
+@torch.no_grad()
+def evaluate_shared_code_modes(
+    model: BlockCrosscoder,
+    batches: Iterable[torch.Tensor],
+    *,
+    device: str | torch.device = "cpu",
+    max_tokens: int | None = None,
+    selection_modes: tuple[str, ...] = ("topk", "threshold"),
+) -> dict[str, dict]:
+    """Evaluate shared-code endpoints for one or more selector modes."""
+    shared_code, selector = _evaluate_code_modes(
+        model,
+        batches,
+        device=device,
+        max_tokens=max_tokens,
+        selection_modes=selection_modes,
+        include_selector_payloads=False,
+    )
+    assert selector is None
+    return shared_code
+
+
+@torch.no_grad()
+def evaluate_selector_and_shared_code_modes(
+    model: BlockCrosscoder,
+    batches: Iterable[torch.Tensor],
+    *,
+    device: str | torch.device = "cpu",
+    max_tokens: int | None = None,
+    selection_modes: tuple[str, ...] = ("topk", "threshold"),
+) -> EvaluationModeEndpoints:
+    """Evaluate selector summaries and shared-code endpoints in one traversal."""
+    shared_code, selector = _evaluate_code_modes(
+        model,
+        batches,
+        device=device,
+        max_tokens=max_tokens,
+        selection_modes=selection_modes,
+        include_selector_payloads=True,
+    )
+    assert selector is not None
+    return EvaluationModeEndpoints(selector=selector, shared_code=shared_code)
 
 
 @torch.no_grad()
