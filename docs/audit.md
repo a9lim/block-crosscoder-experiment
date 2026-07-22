@@ -60,6 +60,13 @@ exit is not evidence by itself.
   model/optimizer-state, and selector-support bounds in `design.md`. Masked,
   padded, nonquadratic, small, and non-CUDA paths remain eager, and exact
   checkpoint resume is tested inside the compiled path.
+- The multi-quantizer CUDA codec rotation uses broadcast row-vector matmul only
+  for block widths of at least two. Its 65,536-event standardized fixtures pass
+  the fixed maximum-absolute and relative-L2 drift bounds in `design.md` for
+  widths `2/4/6/8`; width one and CPU remain exact against the direct einsum
+  oracle. The trusted decoder resolves selected rotations once across bounded
+  quantizer chunks, and Phase-2/Phase-3 campaign-shape benchmarks include the
+  complete decoded prediction.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.

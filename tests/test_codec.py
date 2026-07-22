@@ -15,6 +15,7 @@ from block_crosscoder_experiment.codec import (
     _decode_trusted_packet_events_q_chunks,
     _encode_batch_all_q_events,
     _packet_from_output,
+    _rotate_multi_q_events,
     decode_batch,
     decode_batch_all_q,
     encode_batch,
@@ -389,6 +390,83 @@ def test_explicit_sparse_packet_round_trip():
             decode_batch(model, codec, replace(packet, amplitude_symbols=bad_symbols))
 
 
+@pytest.mark.parametrize("block_dim", (1, 2, 4, 8))
+def test_multi_q_event_rotation_preserves_cpu_reduction(block_dim):
+    generator = torch.Generator().manual_seed(1701 + block_dim)
+    event_rotation = torch.randn(97, block_dim, block_dim, generator=generator)
+    canonical_codes = torch.randn(6, 97, block_dim, generator=generator)
+    expected = torch.einsum(
+        "eji,qej->qei",
+        event_rotation,
+        canonical_codes,
+    )
+
+    actual = _rotate_multi_q_events(event_rotation, canonical_codes)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_multi_q_scalar_cuda_rotation_is_exact_and_skips_matmul(monkeypatch):
+    generator = torch.Generator(device="cuda").manual_seed(1702)
+    event_rotation = torch.randn(65_536, 1, 1, device="cuda", generator=generator)
+    canonical_codes = torch.randn(6, 65_536, 1, device="cuda", generator=generator)
+    expected = torch.einsum(
+        "eji,qej->qei",
+        event_rotation,
+        canonical_codes,
+    )
+
+    def unexpected_matmul(*args, **kwargs):
+        raise AssertionError("scalar multi-q rotation must not launch matmul")
+
+    monkeypatch.setattr(torch, "matmul", unexpected_matmul)
+    actual = _rotate_multi_q_events(event_rotation, canonical_codes)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("block_dim", (2, 4, 6, 8))
+def test_multi_q_cuda_rotation_stays_within_release_bound(monkeypatch, block_dim):
+    generator = torch.Generator(device="cuda").manual_seed(1701 + block_dim)
+    event_rotation = torch.randn(
+        65_536,
+        block_dim,
+        block_dim,
+        device="cuda",
+        generator=generator,
+    )
+    canonical_codes = torch.randn(
+        2,
+        65_536,
+        block_dim,
+        device="cuda",
+        generator=generator,
+    )
+    expected = torch.einsum(
+        "eji,qej->qei",
+        event_rotation,
+        canonical_codes,
+    )
+    original_matmul = torch.matmul
+    matmul_calls = 0
+
+    def counted_matmul(*args, **kwargs):
+        nonlocal matmul_calls
+        matmul_calls += 1
+        return original_matmul(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "matmul", counted_matmul)
+    actual = _rotate_multi_q_events(event_rotation, canonical_codes)
+
+    difference = actual - expected
+    relative_l2 = difference.norm() / expected.norm().clamp_min(1e-30)
+    assert matmul_calls == 1
+    assert difference.abs().max().item() <= 5e-6
+    assert relative_l2.item() <= 3e-7
+
+
 @pytest.mark.parametrize("encoder_mode", ("untied", "tied"))
 def test_all_q_encoding_runs_one_selection_and_matches_packets(
     monkeypatch, encoder_mode
@@ -465,15 +543,25 @@ def test_all_q_encoding_runs_one_selection_and_matches_packets(
     )
     with torch.no_grad():
         expected_alternate = model.forward_with_materialized(
-                x[48:],
-                mode="threshold",
-                _decoder=alternate_decoder,
-                _score_geometry=model._frozen_score_geometry(alternate_decoder),
+            x[48:],
+            mode="threshold",
+            _decoder=alternate_decoder,
+            _score_geometry=model._frozen_score_geometry(alternate_decoder),
         )[0]
     for actual, expected in zip(alternate_out, expected_alternate, strict=True):
         assert torch.equal(actual, expected)
 
     sparse_calls = 0
+    tensor_on = codec._tensor_on
+    rotation_lookups = 0
+
+    def counted_tensor_on(name, *args, **kwargs):
+        nonlocal rotation_lookups
+        if name == "rotation":
+            rotation_lookups += 1
+        return tensor_on(name, *args, **kwargs)
+
+    monkeypatch.setattr(codec, "_tensor_on", counted_tensor_on)
     trusted = {}
     for chunk in _decode_trusted_packet_events_q_chunks(
         model,
@@ -484,6 +572,8 @@ def test_all_q_encoding_runs_one_selection_and_matches_packets(
     ):
         trusted.update(chunk)
     assert sparse_calls == 2
+    assert rotation_lookups == 1
+    monkeypatch.setattr(codec, "_tensor_on", tensor_on)
     rows = torch.repeat_interleave(
         torch.arange(events.n_tokens, device=events.counts.device),
         events.counts.long(),
@@ -493,8 +583,7 @@ def test_all_q_encoding_runs_one_selection_and_matches_packets(
         levels = (1 << q) - 1
         lo = codec._tensor_on("lo", events.original_ids.device)[events.original_ids]
         span = (
-            codec._tensor_on("hi", events.original_ids.device)[events.original_ids]
-            - lo
+            codec._tensor_on("hi", events.original_ids.device)[events.original_ids] - lo
         ).clamp_min(1e-12)
         canonical = lo + packet.amplitude_symbols.float() / levels * span
         values = torch.einsum(

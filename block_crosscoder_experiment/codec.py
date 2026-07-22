@@ -103,7 +103,9 @@ _CALIBRATION_MOMENT_CHUNK = 262_144
 def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int:
     """Conservative host-memory estimate shared by preflight and fitting."""
     if selected_events < 0 or block_dim <= 0:
-        raise ValueError("calibration events must be nonnegative and block_dim positive")
+        raise ValueError(
+            "calibration events must be nonnegative and block_dim positive"
+        )
     moment_events = min(selected_events, _CALIBRATION_MOMENT_CHUNK)
     return selected_events * (32 + 24 * block_dim) + moment_events * (
         8 * block_dim * block_dim + 8 * block_dim
@@ -648,9 +650,7 @@ def encode_batch(model, codec: Codec, x: torch.Tensor, q: int) -> EncodedBatch:
     device = next(model.parameters()).device
     x = x.to(device, torch.float32)
     decoder, encoder = _materialized_model_tensors(model)
-    score_geometry = (
-        None if decoder is None else model._frozen_score_geometry(decoder)
-    )
+    score_geometry = None if decoder is None else model._frozen_score_geometry(decoder)
     out = _threshold_select(model, x, decoder, encoder, score_geometry)
     return _packet_from_output(model, codec, out, q)
 
@@ -669,9 +669,7 @@ def _encode_batch_events(
     device = next(model.parameters()).device
     x = x.to(device, torch.float32, non_blocking=True)
     if _decoder is None or _encoder is None:
-        _decoder, _encoder = _materialized_model_tensors(
-            model, _decoder, _encoder
-        )
+        _decoder, _encoder = _materialized_model_tensors(model, _decoder, _encoder)
     if _score_geometry is None and _decoder is not None:
         _score_geometry = model._frozen_score_geometry(_decoder)
     out = _threshold_select(
@@ -722,9 +720,7 @@ def encode_batch_all_q(
 ) -> tuple[object, dict[int, EncodedBatch]]:
     """Run threshold inference once and emit the full output plus every packet."""
     if _decoder is None or _encoder is None:
-        _decoder, _encoder = _materialized_model_tensors(
-            model, _decoder, _encoder
-        )
+        _decoder, _encoder = _materialized_model_tensors(model, _decoder, _encoder)
     selection, _, packets = _encode_batch_all_q_events(
         model,
         codec,
@@ -808,17 +804,17 @@ def decode_batch(
         if not bool(valid_values & ~duplicate):
             if bool(duplicate):
                 raise ValueError("packet repeats a block id within one token")
-            if not bool(
-                (block_ids >= 0).all() & (block_ids < codec.n_included).all()
-            ):
-                raise ValueError("packet block rank is outside the frozen support alphabet")
+            if not bool((block_ids >= 0).all() & (block_ids < codec.n_included).all()):
+                raise ValueError(
+                    "packet block rank is outside the frozen support alphabet"
+                )
             raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
         block_ids = block_ids[order]
         amplitude_symbols = amplitude_symbols[order]
     else:
-        valid_values = (
-            (amplitude_symbols >= 0).all() & (amplitude_symbols <= levels).all()
-        )
+        valid_values = (amplitude_symbols >= 0).all() & (
+            amplitude_symbols <= levels
+        ).all()
         if not bool(valid_values):
             raise ValueError("packet amplitude symbol is outside the q-bit alphabet")
 
@@ -878,6 +874,26 @@ def decode_batch(
     if model._has_padded_coordinates:
         xhat = xhat * model.coordinate_mask[:, 0, 0].to(xhat.dtype)
     return xhat
+
+
+def _rotate_multi_q_events(
+    event_rotation: torch.Tensor,
+    canonical_codes: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate ``[q, event, b]`` row codes through ``[event, b, b]`` frames.
+
+    CUDA's broadcast matmul is substantially faster than the equivalent
+    three-operand einsum at the campaign event counts.  The scalar case has no
+    reduction to optimize, while CPU retains the existing reduction order.
+    """
+    if canonical_codes.shape[-1] == 1:
+        return canonical_codes * event_rotation[:, 0, 0].view(1, -1, 1)
+    if canonical_codes.is_cuda:
+        return torch.matmul(
+            canonical_codes.unsqueeze(-2),
+            event_rotation.unsqueeze(0),
+        ).squeeze(-2)
+    return torch.einsum("eji,qej->qei", event_rotation, canonical_codes)
 
 
 @torch.no_grad()
@@ -1021,9 +1037,9 @@ def decode_batch_all_q(
         device=device,
     ).view(-1, 1, 1)
     z_can = lo.unsqueeze(0) + symbol_stack.float() / levels * span.unsqueeze(0)
-    z_events = torch.einsum(
-        "eji,qej->qei",
-        codec._tensor_on("rotation", device)[ids],
+    event_rotation = codec._tensor_on("rotation", device)[ids]
+    z_events = _rotate_multi_q_events(
+        event_rotation,
         z_can,
     )
     expanded_counts = counts.to(device=device, non_blocking=True) * b
@@ -1102,8 +1118,10 @@ def _decode_trusted_packet_events_q_chunks(
     """
     if q_chunk_size <= 0:
         raise ValueError("trusted decode q_chunk_size must be positive")
-    requested = tuple(packets) if packets is not None else (
-        codec.spec.qs if qs is None else tuple(qs)
+    requested = (
+        tuple(packets)
+        if packets is not None
+        else (codec.spec.qs if qs is None else tuple(qs))
     )
     if not requested:
         return
@@ -1134,6 +1152,7 @@ def _decode_trusted_packet_events_q_chunks(
     counts = events.counts
     lo = codec._tensor_on("lo", device)[ids]
     span = (codec._tensor_on("hi", device)[ids] - lo).clamp_min(1e-12)
+    event_rotation = codec._tensor_on("rotation", device)[ids]
     normalized_codes = (
         None
         if packets is not None
@@ -1166,13 +1185,10 @@ def _decode_trusted_packet_events_q_chunks(
                 torch.int32
             )
         else:
-            symbols = torch.stack(
-                [packets[q].amplitude_symbols for q in chunk_qs]
-            )
+            symbols = torch.stack([packets[q].amplitude_symbols for q in chunk_qs])
         z_can = lo.unsqueeze(0) + symbols / levels * span.unsqueeze(0)
-        z_events = torch.einsum(
-            "eji,qej->qei",
-            codec._tensor_on("rotation", device)[ids],
+        z_events = _rotate_multi_q_events(
+            event_rotation,
             z_can,
         )
         crow = torch.cat(
@@ -1213,10 +1229,7 @@ def _decode_trusted_packet_events_q_chunks(
             predictions = predictions * model.coordinate_mask[:, 0, 0].to(
                 predictions.dtype
             ).unsqueeze(0)
-        decoded_chunk = {
-            q: predictions[index]
-            for index, q in enumerate(chunk_qs)
-        }
+        decoded_chunk = {q: predictions[index] for index, q in enumerate(chunk_qs)}
         yield decoded_chunk
         # The consumer deletes its chunk before requesting the next one.  Drop
         # the generator frame's aliases as soon as it resumes so two SpMM
@@ -1532,14 +1545,14 @@ def evaluate_rd(
                 codec.n_included, counts_host
             )
             act_p = (
-                (
-                    codec._tensor_on("bernoulli_log2p", device) * mask.float()
-                ).sum(dim=1).double()
+                (codec._tensor_on("bernoulli_log2p", device) * mask.float())
+                .sum(dim=1)
+                .double()
             )
             act_q = (
-                (
-                    codec._tensor_on("bernoulli_log2q", device) * mask.float()
-                ).sum(dim=1).double()
+                (codec._tensor_on("bernoulli_log2q", device) * mask.float())
+                .sum(dim=1)
+                .double()
             )
             bern_bits = -(act_p.cpu() + (log2_1mq_total - act_q.cpu()))
         else:
@@ -1560,9 +1573,7 @@ def evaluate_rd(
             for q, xhat in decoded_chunk.items():
                 # Distortion uses the exact integer packet a saved artifact
                 # will decode. Only redundant validation is elided here.
-                err_site[q] = (
-                    (x - xhat).double().pow(2).sum(dim=2).cpu()
-                )  # [n, S]
+                err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
             del xhat, decoded_chunk
         tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
 
@@ -1647,9 +1658,7 @@ def evaluate_rd(
         "row_len": row_len if sequence_mode == "fixed_length_fallback" else None,
         "avg_count": float(cnt.sum() / n_tok.sum()),
         "codec_meta": dict(codec.meta),
-        "eval_excluded_event_share": float(
-            excluded_events / total_events.clamp_min(1)
-        ),
+        "eval_excluded_event_share": float(excluded_events / total_events.clamp_min(1)),
         "support_count_width_bits": count_width,
         "support_id_width_bits": id_width,
         "support_bits_per_token": float(fixed_support.sum() / n_tok.sum()),

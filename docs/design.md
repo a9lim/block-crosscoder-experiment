@@ -835,6 +835,19 @@ threshold, included-block table, rotations, clipping bounds, quantizers, and
 side-information contract. Evaluation reloads both artifacts and performs a
 source-free round trip.
 
+The multi-quantizer CUDA decoder gathers each selected event's inverse
+canonical rotation once per batch and applies every bounded quantizer chunk as
+a broadcast row-vector matmul when the block width is at least two. Scalar
+width one and every CPU decode retain their direct scalar/einsum reduction.
+This authorized CUDA reduction-order change has a fixed standardized release
+fixture at 65,536 events: against the direct einsum oracle, widths `2/4/6/8`
+require maximum absolute drift at most `5e-6` and relative L2 drift at most
+`3e-7`, while width one remains exact. The Phase-2 and Phase-3 campaign-shape
+benchmarks additionally cover their complete quantizer chunks and decoded
+predictions. Hoisting the gathered rotations replaces the repeated per-chunk
+gather and does not add trusted-decoder workspace. Any kernel or bound change
+requires a new clean implementation identity and fresh audit before launch.
+
 ## 9. Training and resumption
 
 Every cell resolves optimizer, betas, epsilon, parameter-group weight decay,
