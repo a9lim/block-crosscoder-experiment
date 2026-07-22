@@ -100,6 +100,11 @@ from block_crosscoder_experiment.runtime_limits import (
     decoded_energy_code_norm_eligible,
     isolated_loss_mapped_eligible,
 )
+from block_crosscoder_experiment.serialization import (
+    MODEL_STATE_DIGEST_CONTRACT,
+    model_state_digest,
+    tensor_payload_digest as _tensor_payload_digest,
+)
 from block_crosscoder_experiment.studies import (
     CellSpec,
     Phase,
@@ -126,10 +131,11 @@ from block_crosscoder_experiment.trainer import (
 )
 
 
+_NATIVE_TORCH_SAVE = torch.save
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v10"
-EXECUTOR_PROCESS_MODEL = "persistent_verified_digest_cache_v4"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v11"
+EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -242,39 +248,6 @@ class _ArtifactDigestCache:
                 f"prerequisite artifact hash mismatch: {resolved}"
             )
         return self._entries[str(resolved)][0]
-
-
-def _tensor_payload_digest(value: Any) -> str:
-    """Canonical digest for nested JSON scalars and dense tensor payloads."""
-
-    digest = hashlib.sha256()
-
-    def add(item: Any) -> None:
-        if torch.is_tensor(item):
-            tensor = item.detach().cpu().contiguous()
-            digest.update(b"tensor\0")
-            digest.update(str(tensor.dtype).encode("ascii"))
-            digest.update(canonical_json(list(tensor.shape)).encode("ascii"))
-            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-        elif isinstance(item, dict):
-            digest.update(b"dict\0")
-            for key in sorted(item):
-                digest.update(str(key).encode("utf-8") + b"\0")
-                add(item[key])
-        elif isinstance(item, (list, tuple)):
-            digest.update(b"seq\0")
-            for child in item:
-                add(child)
-        else:
-            digest.update(
-                json.dumps(item, sort_keys=True, allow_nan=False, default=str).encode(
-                    "utf-8"
-                )
-            )
-            digest.update(b"\0")
-
-    add(value)
-    return digest.hexdigest()
 
 
 def _verify_store_reader_once(
@@ -907,11 +880,46 @@ class _RetainedArtifactKey:
     model_config_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class _TensorSnapshotDescriptor:
+    name: str
+    object_id: int
+    object_type: str
+    storage_identity: int
+    storage_data_ptr: int
+    storage_nbytes: int
+    tensor_data_ptr: int
+    storage_offset: int
+    version: int
+    device: str
+    dtype: str
+    layout: str
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    requires_grad: bool
+    gradient_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelSnapshotLineage:
+    model_object_id: int
+    model_type: str
+    model_config_sha256: str
+    model_training: bool
+    threshold_cache_empty: bool
+    live_state: tuple[_TensorSnapshotDescriptor, ...]
+    snapshot_mapping_id: int
+    snapshot_state: tuple[_TensorSnapshotDescriptor, ...]
+    snapshot_digest_contract: str | None
+    snapshot_sha256: str | None
+
+
 @dataclass(slots=True)
 class _RetainedCheckpointModel:
     key: _RetainedArtifactKey
     model: BlockCrosscoder
     metadata: dict[str, Any]
+    lineage: _ModelSnapshotLineage
     released_owner_refs: dict[str, weakref.ReferenceType[Any]]
 
 
@@ -922,6 +930,7 @@ class _RetainedDeploymentConsumer:
     model: BlockCrosscoder
     codec: Codec
     training_summary: dict[str, int]
+    lineage: _ModelSnapshotLineage
     discarded_validation_model_ref: weakref.ReferenceType[BlockCrosscoder]
 
 
@@ -943,6 +952,7 @@ class _StageExecutionCache:
         key: _RetainedArtifactKey,
         model: BlockCrosscoder,
         metadata: Mapping[str, Any],
+        lineage: _ModelSnapshotLineage,
         *,
         released_owner_refs: Mapping[str, weakref.ReferenceType[Any]],
     ) -> None:
@@ -952,6 +962,7 @@ class _StageExecutionCache:
             key,
             model,
             dict(metadata),
+            lineage,
             dict(released_owner_refs),
         )
 
@@ -981,6 +992,16 @@ class _StageExecutionCache:
                 "released training owners remain live at calibration handoff: "
                 + ", ".join(live_owners)
             )
+        try:
+            _assert_model_snapshot_lineage_current(
+                entry.model,
+                entry.lineage,
+                label="retained checkpoint model",
+            )
+        except CellExecutionError:
+            del entry
+            self._release_unused_model_memory()
+            raise
         return entry.model, entry.metadata
 
     def remember_deployment(
@@ -990,6 +1011,7 @@ class _StageExecutionCache:
         model: BlockCrosscoder,
         codec: Codec,
         training_summary: Mapping[str, int],
+        lineage: _ModelSnapshotLineage,
         *,
         discarded_validation_model_ref: weakref.ReferenceType[BlockCrosscoder],
     ) -> None:
@@ -1013,6 +1035,7 @@ class _StageExecutionCache:
             model,
             codec,
             dict(training_summary),
+            lineage,
             discarded_validation_model_ref,
         )
 
@@ -1037,6 +1060,16 @@ class _StageExecutionCache:
             raise CellExecutionError(
                 "durable validation model remains live before retained evaluation"
             )
+        try:
+            _assert_model_snapshot_lineage_current(
+                entry.model,
+                entry.lineage,
+                label="retained deployment model",
+            )
+        except CellExecutionError:
+            del entry
+            self._release_unused_model_memory()
+            raise
         return entry.deployment, entry.model, entry.codec, entry.training_summary
 
 
@@ -3534,6 +3567,7 @@ def _deployment_codec_payload(
     checkpoint_metadata: Mapping[str, Any],
     calibration_hash: str,
     preparation_hash: str,
+    model_state: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Build the actual saved consumer artifact priced by the R-D policy.
 
@@ -3573,6 +3607,19 @@ def _deployment_codec_payload(
                     "transform_hash": transform.hash,
                 }
             )
+    serialized_model_state: Mapping[str, torch.Tensor]
+    if model_state is None:
+        serialized_model_state = {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in model.state_dict().items()
+        }
+    else:
+        expected_state = model.state_dict()
+        if set(model_state) != set(expected_state):
+            raise CellExecutionError(
+                "deployment model snapshot field set differs from live model"
+            )
+        serialized_model_state = model_state
     payload = {
         "format_version": 2,
         "schema": "bsc-deployable-codec-v2",
@@ -3581,10 +3628,7 @@ def _deployment_codec_payload(
         "calibration_sha256": calibration_hash,
         "preparation_sha256": preparation_hash,
         "model_cfg": asdict(model.cfg),
-        "model_state": {
-            name: tensor.detach().cpu().contiguous()
-            for name, tensor in model.state_dict().items()
-        },
+        "model_state": serialized_model_state,
         "codec_payload": codec_payload,
         "training_summary": {
             "step_idx": int(checkpoint_metadata["step_idx"]),
@@ -3615,7 +3659,7 @@ def _load_deployable_codec(
     calibration_hash: str,
     preparation_hash: str,
     device: torch.device,
-) -> tuple[dict[str, Any], BlockCrosscoder, Codec, dict[str, int]]:
+) -> tuple[dict[str, Any], BlockCrosscoder, Codec, dict[str, int], str]:
     """Load the complete consumer path solely from the priced artifact."""
 
     try:
@@ -3858,15 +3902,62 @@ def _load_deployable_codec(
         raise CellExecutionError(
             "deployable model and nested codec thresholds disagree"
         )
-    return value, model, codec, training_summary
+    return value, model, codec, training_summary, claimed
 
 
-def _save_immutable_torch(path: Path, payload: Mapping[str, Any]) -> None:
+def _assert_deployment_snapshot_digest(
+    *,
+    expected: str,
+    verified: str,
+) -> None:
+    def canonical(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    if not canonical(expected) or not canonical(verified) or verified != expected:
+        raise CellExecutionError(
+            "durable deployable payload differs from the exact pre-save snapshot"
+        )
+
+
+def _save_immutable_torch(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    model_lineage: _ModelSnapshotLineage | None = None,
+    model_state_field: str | None = None,
+) -> None:
+    serialized_model_state: Mapping[str, torch.Tensor] | None = None
+    if model_lineage is not None:
+        if not isinstance(model_state_field, str) or not model_state_field:
+            raise CellExecutionError(
+                "snapshot-bound save requires a model-state field"
+            )
+        candidate = payload.get(model_state_field)
+        if not isinstance(candidate, Mapping):
+            raise CellExecutionError(
+                "snapshot-bound save lacks its model-state mapping"
+            )
+        serialized_model_state = candidate
+        _assert_serialized_snapshot_current(
+            serialized_model_state,
+            model_lineage,
+            label="deployable artifact",
+        )
     if path.exists():
         existing = torch.load(path, map_location="cpu", weights_only=True)
         if _tensor_payload_digest(existing) != _tensor_payload_digest(dict(payload)):
             raise CellExecutionError(
                 f"immutable torch artifact changed binding: {path}"
+            )
+        if serialized_model_state is not None:
+            _assert_serialized_snapshot_current(
+                serialized_model_state,
+                model_lineage,
+                label="deployable artifact",
             )
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3880,8 +3971,19 @@ def _save_immutable_torch(path: Path, payload: Mapping[str, Any]) -> None:
         # object gives PyTorch the canonical ``archive/`` member prefix, so the
         # exact same tensor/scalar payload is byte-identical across fresh and
         # resumed executor processes.
+        if model_lineage is not None and torch.save is not _NATIVE_TORCH_SAVE:
+            raise CellExecutionError(
+                "snapshot lineage requires native blocking torch.save"
+            )
+        save = _NATIVE_TORCH_SAVE if model_lineage is not None else torch.save
         with temporary.open("wb") as handle:
-            torch.save(dict(payload), handle)
+            save(dict(payload), handle)
+        if serialized_model_state is not None:
+            _assert_serialized_snapshot_current(
+                serialized_model_state,
+                model_lineage,
+                label="deployable artifact",
+            )
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -4416,6 +4518,7 @@ def _validate_final_checkpoint(
     binding: Mapping[str, Any],
     *,
     retain_model_state: bool = False,
+    expected_model_lineage: _ModelSnapshotLineage | None = None,
 ) -> dict[str, Any]:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -4423,6 +4526,32 @@ def _validate_final_checkpoint(
         raise CellExecutionError(
             f"cannot load immutable checkpoint {path}: {exc}"
         ) from exc
+    model_state = payload.get("model")
+    claimed_digest_contract = payload.get("model_state_digest_contract")
+    claimed_model_state_sha256 = payload.get("model_state_sha256")
+    if (
+        not isinstance(model_state, Mapping)
+        or not model_state
+        or claimed_digest_contract != MODEL_STATE_DIGEST_CONTRACT
+        or not isinstance(claimed_model_state_sha256, str)
+        or len(claimed_model_state_sha256) != 64
+        or model_state_digest(model_state) != claimed_model_state_sha256
+    ):
+        raise CellExecutionError("final checkpoint model-state digest mismatch")
+    if (
+        expected_model_lineage is not None
+        and (
+            expected_model_lineage.snapshot_digest_contract
+            != MODEL_STATE_DIGEST_CONTRACT
+            or not isinstance(expected_model_lineage.snapshot_sha256, str)
+            or claimed_digest_contract
+            != expected_model_lineage.snapshot_digest_contract
+            or claimed_model_state_sha256 != expected_model_lineage.snapshot_sha256
+        )
+    ):
+        raise CellExecutionError(
+            "final checkpoint model-state digest differs from synchronous snapshot"
+        )
     if payload.get("run_binding") != binding:
         raise CellExecutionError("existing checkpoint has a different run binding")
     try:
@@ -4484,6 +4613,19 @@ def _validate_final_checkpoint(
     model_payload = payload.get("model_cfg")
     if not isinstance(model_payload, dict):
         raise CellExecutionError("final checkpoint lacks model configuration")
+    if expected_model_lineage is not None:
+        durable_config_sha256 = hashlib.sha256(
+            canonical_json(model_payload).encode("utf-8")
+        ).hexdigest()
+        if durable_config_sha256 != expected_model_lineage.model_config_sha256:
+            raise CellExecutionError(
+                "final checkpoint model config differs from synchronous snapshot"
+            )
+        _assert_durable_snapshot_schema(
+            payload.get("model"),
+            expected_model_lineage,
+            label="final checkpoint",
+        )
     for identity in MODEL_IMPLEMENTATION_IDENTITY_FIELDS:
         if identity not in model_payload:
             raise CellExecutionError(f"final checkpoint lacks {identity} identity")
@@ -4603,46 +4745,240 @@ def _execution_rng_snapshot() -> tuple[Any, ...]:
     )
 
 
-def _assert_model_matches_durable_state(
+def _model_config_sha256(model: BlockCrosscoder) -> str:
+    return hashlib.sha256(
+        canonical_json(asdict(model.cfg)).encode("utf-8")
+    ).hexdigest()
+
+
+def _assert_callback_free_state_dict(model: BlockCrosscoder) -> None:
+    if type(model) is not BlockCrosscoder:
+        raise CellExecutionError(
+            "exact model snapshot requires the canonical BlockCrosscoder type"
+        )
+    callbacks: list[str] = []
+    for module_name, module in model.named_modules():
+        label = module_name or "<root>"
+        state_dict_method = getattr(module.state_dict, "__func__", None)
+        if state_dict_method is not torch.nn.Module.state_dict:
+            callbacks.append(f"{label}:state_dict")
+        save_to_state_dict = getattr(module._save_to_state_dict, "__func__", None)
+        if save_to_state_dict is not torch.nn.Module._save_to_state_dict:
+            callbacks.append(f"{label}:_save_to_state_dict")
+        for attribute in ("_state_dict_pre_hooks", "_state_dict_hooks"):
+            hooks = getattr(module, attribute, None)
+            if hooks:
+                callbacks.append(f"{label}:{attribute}")
+    if callbacks:
+        raise CellExecutionError(
+            "exact model snapshot requires canonical callback-free state_dict: "
+            + ", ".join(callbacks)
+        )
+
+
+def _synchronize_state_devices(state: Mapping[str, torch.Tensor]) -> None:
+    devices = sorted({tensor.device for tensor in state.values()}, key=str)
+    for device in devices:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+
+def _tensor_snapshot_descriptor(
+    name: str,
+    tensor: torch.Tensor,
+) -> _TensorSnapshotDescriptor:
+    if type(tensor) not in {torch.Tensor, torch.nn.Parameter}:
+        raise CellExecutionError(
+            f"exact model snapshot forbids tensor subclass for {name}"
+        )
+    if tensor.layout != torch.strided:
+        raise CellExecutionError(
+            f"exact model snapshot requires dense strided tensor {name}"
+        )
+    storage = tensor.untyped_storage()
+    try:
+        version = int(tensor._version)
+    except RuntimeError as exc:
+        raise CellExecutionError(
+            f"exact model snapshot cannot inspect version for {name}: {exc}"
+        ) from exc
+    return _TensorSnapshotDescriptor(
+        name=name,
+        object_id=id(tensor),
+        object_type=f"{type(tensor).__module__}.{type(tensor).__qualname__}",
+        storage_identity=int(storage._cdata),
+        storage_data_ptr=int(storage.data_ptr()),
+        storage_nbytes=int(storage.nbytes()),
+        tensor_data_ptr=int(tensor.data_ptr()),
+        storage_offset=int(tensor.storage_offset()),
+        version=version,
+        device=str(tensor.device),
+        dtype=str(tensor.dtype),
+        layout=str(tensor.layout),
+        shape=tuple(tensor.shape),
+        stride=tuple(tensor.stride()),
+        requires_grad=bool(tensor.requires_grad),
+        gradient_present=getattr(tensor, "grad", None) is not None,
+    )
+
+
+def _state_snapshot_descriptors(
+    state: Mapping[str, torch.Tensor],
+) -> tuple[_TensorSnapshotDescriptor, ...]:
+    if not isinstance(state, Mapping) or not state:
+        raise CellExecutionError("exact model snapshot state is empty")
+    descriptors: list[_TensorSnapshotDescriptor] = []
+    for name, tensor in state.items():
+        if not isinstance(name, str) or not name:
+            raise CellExecutionError("exact model snapshot has an invalid field name")
+        if not torch.is_tensor(tensor):
+            raise CellExecutionError(
+                f"exact model snapshot field {name} is not a tensor"
+            )
+        descriptors.append(_tensor_snapshot_descriptor(name, tensor))
+    return tuple(descriptors)
+
+
+def _live_model_snapshot_descriptors(
     model: BlockCrosscoder,
-    model_cfg: Mapping[str, Any],
-    model_state: Mapping[str, torch.Tensor],
+) -> tuple[_TensorSnapshotDescriptor, ...]:
+    _assert_callback_free_state_dict(model)
+    state = model.state_dict(keep_vars=True)
+    return _state_snapshot_descriptors(state)
+
+
+def _assert_model_snapshot_lineage_current(
+    model: BlockCrosscoder,
+    lineage: _ModelSnapshotLineage,
+    *,
+    label: str,
 ) -> None:
-    """Prove the transferred model matches durable bytes without consuming RNG."""
+    _assert_callback_free_state_dict(model)
+    live_state = model.state_dict(keep_vars=True)
+    _synchronize_state_devices(live_state)
+    current = _state_snapshot_descriptors(live_state)
+    drift: list[str] = []
+    if id(model) != lineage.model_object_id:
+        drift.append("model identity")
+    if f"{type(model).__module__}.{type(model).__qualname__}" != lineage.model_type:
+        drift.append("model type")
+    if _model_config_sha256(model) != lineage.model_config_sha256:
+        drift.append("model config")
+    if bool(model.training) != lineage.model_training:
+        drift.append("training mode")
+    if (model._validated_theta_key is None) != lineage.threshold_cache_empty:
+        drift.append("threshold cache")
+    if current != lineage.live_state:
+        drift.append("tensor identity/storage/version/schema")
+    if drift:
+        raise CellExecutionError(
+            f"{label} drifted after its exact durable snapshot: "
+            + ", ".join(drift)
+        )
+
+
+def _assert_serialized_snapshot_current(
+    state: Mapping[str, torch.Tensor],
+    lineage: _ModelSnapshotLineage,
+    *,
+    label: str,
+) -> None:
+    if id(state) != lineage.snapshot_mapping_id:
+        raise CellExecutionError(f"{label} replaced the serialized state mapping")
+    current = _state_snapshot_descriptors(state)
+    if current != lineage.snapshot_state:
+        raise CellExecutionError(
+            f"{label} mutated or replaced the serialized snapshot tensors"
+        )
+
+
+def _assert_durable_snapshot_schema(
+    state: Any,
+    lineage: _ModelSnapshotLineage,
+    *,
+    label: str,
+) -> None:
+    if not isinstance(state, Mapping):
+        raise CellExecutionError(f"{label} model state is not a mapping")
+    expected = lineage.snapshot_state
+    if tuple(state) != tuple(item.name for item in expected):
+        raise CellExecutionError(f"{label} model state field order differs from snapshot")
+    for descriptor in expected:
+        tensor = state[descriptor.name]
+        if (
+            not torch.is_tensor(tensor)
+            or tensor.device.type != "cpu"
+            or str(tensor.dtype) != descriptor.dtype
+            or str(tensor.layout) != descriptor.layout
+            or tuple(tensor.shape) != descriptor.shape
+            or tuple(tensor.stride()) != descriptor.stride
+            or int(tensor.storage_offset()) != descriptor.storage_offset
+            or int(tensor.untyped_storage().nbytes()) != descriptor.storage_nbytes
+        ):
+            raise CellExecutionError(
+                f"{label} model state schema differs for {descriptor.name}"
+            )
+
+
+def _synchronous_model_snapshot(
+    model: BlockCrosscoder,
+    *,
+    include_model_digest: bool = True,
+) -> tuple[dict[str, torch.Tensor], _ModelSnapshotLineage]:
+    """Copy one quiescent model state to CPU and bind its exact live owner.
+
+    Every package-owned tensor mutation is versioned. Raw-pointer writes and
+    external concurrent writers are outside the executor contract; admitting
+    either would require restoring a second full byte comparison.
+    """
 
     rng_before = _execution_rng_snapshot()
     try:
-        if canonical_json(asdict(model.cfg)) != canonical_json(dict(model_cfg)):
-            raise ValueError("live model config differs from durable model config")
-        live_state = model.state_dict()
-        if set(model_state) != set(live_state):
-            raise ValueError("model state field set differs from resolved model")
-        for name, live_tensor in live_state.items():
-            durable_tensor = model_state[name]
-            if (
-                not torch.is_tensor(durable_tensor)
-                or durable_tensor.device.type != "cpu"
-                or live_tensor.shape != durable_tensor.shape
-                or live_tensor.dtype != durable_tensor.dtype
-                or live_tensor.layout != durable_tensor.layout
-            ):
-                raise ValueError(f"model state tensor contract mismatch for {name}")
-            live_bytes = (
-                live_tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        _assert_callback_free_state_dict(model)
+        live_state = model.state_dict(keep_vars=True)
+        _synchronize_state_devices(live_state)
+        config_before = _model_config_sha256(model)
+        live_before = _state_snapshot_descriptors(live_state)
+        with torch.no_grad():
+            snapshot = {
+                name: tensor.detach().to(device="cpu", copy=True).contiguous()
+                for name, tensor in live_state.items()
+            }
+        _synchronize_state_devices(live_state)
+        config_after = _model_config_sha256(model)
+        live_after = _live_model_snapshot_descriptors(model)
+        if config_after != config_before or live_after != live_before:
+            raise CellExecutionError(
+                "live model changed while taking its synchronous durable snapshot"
             )
-            durable_bytes = durable_tensor.contiguous().reshape(-1).view(torch.uint8)
-            if not torch.equal(live_bytes, durable_bytes):
-                raise ValueError(f"live model differs from durable tensor {name}")
-            del live_bytes, durable_bytes
-        model.validate_decoded_energy_implementation()
-    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-        raise CellExecutionError(
-            f"cannot transfer model ownership from durable bytes: {exc}"
-        ) from exc
+        lineage = _ModelSnapshotLineage(
+            model_object_id=id(model),
+            model_type=f"{type(model).__module__}.{type(model).__qualname__}",
+            model_config_sha256=config_after,
+            model_training=bool(model.training),
+            threshold_cache_empty=model._validated_theta_key is None,
+            live_state=live_after,
+            snapshot_mapping_id=id(snapshot),
+            snapshot_state=_state_snapshot_descriptors(snapshot),
+            snapshot_digest_contract=(
+                MODEL_STATE_DIGEST_CONTRACT if include_model_digest else None
+            ),
+            snapshot_sha256=(
+                model_state_digest(snapshot) if include_model_digest else None
+            ),
+        )
+        _assert_serialized_snapshot_current(
+            snapshot,
+            lineage,
+            label="synchronous model snapshot",
+        )
+        return snapshot, lineage
     finally:
         if _execution_rng_snapshot() != rng_before:
             raise CellExecutionError(
-                "durable model ownership validation perturbed global RNG state"
+                "exact model snapshot perturbed global RNG state"
             )
 
 
@@ -4919,17 +5255,42 @@ def _train(
             "training reached its step budget without consuming the exact "
             "declared token budget"
         )
+    retained_model = trainer.master
+    _normalize_model_only_consumer_state(retained_model)
+    retained_model.eval()
+    checkpoint_model_state, checkpoint_lineage = _synchronous_model_snapshot(
+        retained_model
+    )
+    checkpoint_model_sha256 = checkpoint_lineage.snapshot_sha256
+    if not isinstance(checkpoint_model_sha256, str):
+        raise CellExecutionError("final checkpoint snapshot lacks its model digest")
     # The final durable payload replaces the progress payload atomically.  At
     # no point do we retain two complete optimizer checkpoints for one cell.
-    trainer.save_checkpoint(ctx.progress)
+    trainer.save_checkpoint(
+        ctx.progress,
+        model_state=checkpoint_model_state,
+        model_state_sha256=checkpoint_model_sha256,
+        require_native_blocking_save=True,
+    )
+    _assert_serialized_snapshot_current(
+        checkpoint_model_state,
+        checkpoint_lineage,
+        label="final checkpoint",
+    )
+    _assert_model_snapshot_lineage_current(
+        retained_model,
+        checkpoint_lineage,
+        label="final checkpoint source model",
+    )
     ctx.progress.replace(ctx.checkpoint)
     checkpoint_before_validation = _FileFingerprint.from_path(ctx.checkpoint)
+    del checkpoint_model_state
+    gc.collect()
     metadata = _validate_final_checkpoint(
         ctx.checkpoint,
         binding,
-        retain_model_state=execution_cache is not None,
+        expected_model_lineage=checkpoint_lineage,
     )
-    retained_model_state = metadata.pop("_retained_model_state", None)
     checkpoint_hash = ctx.artifact_sha256(ctx.checkpoint)
     checkpoint_after_validation = _FileFingerprint.from_path(ctx.checkpoint)
     if checkpoint_after_validation != checkpoint_before_validation:
@@ -4950,16 +5311,6 @@ def _train(
     )
     _write_immutable_json(ctx.training_report, report)
     if execution_cache is not None:
-        if not isinstance(retained_model_state, dict):
-            raise CellExecutionError("validated checkpoint state was not retained")
-        retained_model = trainer.master
-        _normalize_model_only_consumer_state(retained_model)
-        _assert_model_matches_durable_state(
-            retained_model,
-            metadata["model_cfg"],
-            retained_model_state,
-        )
-        retained_model.eval()
         released_owner_refs = {
             "trainer": weakref.ref(trainer),
             "forward": (
@@ -4967,7 +5318,6 @@ def _train(
             ),
             "optimizer": weakref.ref(trainer.opt),
         }
-        del retained_model_state
         del trainer
         gc.collect()
         live_released_owners = sorted(
@@ -4997,6 +5347,7 @@ def _train(
             ),
             retained_model,
             retained_metadata,
+            checkpoint_lineage,
             released_owner_refs={
                 name: reference
                 for name, reference in released_owner_refs.items()
@@ -5217,6 +5568,12 @@ def _calibrate(
     # Always reload the exact durable bytes before reporting calibration.
     frozen = Codec.load(ctx.calibration)
     calibration_hash = ctx.artifact_sha256(ctx.calibration)
+    _normalize_model_only_consumer_state(model)
+    model.eval()
+    deployment_model_state, deployment_lineage = _synchronous_model_snapshot(
+        model,
+        include_model_digest=False,
+    )
     deployment_payload = _deployment_codec_payload(
         ctx,
         preparation,
@@ -5225,12 +5582,31 @@ def _calibrate(
         checkpoint_metadata=metadata,
         calibration_hash=calibration_hash,
         preparation_hash=prerequisites["preparation"][1],
+        model_state=deployment_model_state,
     )
-    _save_immutable_torch(ctx.deployment_codec, deployment_payload)
+    expected_deployment_snapshot_digest = deployment_payload.get("artifact_sha256")
+    if not isinstance(expected_deployment_snapshot_digest, str):
+        raise CellExecutionError("deployable snapshot lacks its full-payload digest")
+    _assert_serialized_snapshot_current(
+        deployment_payload["model_state"],
+        deployment_lineage,
+        label="deployable artifact",
+    )
+    _save_immutable_torch(
+        ctx.deployment_codec,
+        deployment_payload,
+        model_lineage=deployment_lineage,
+        model_state_field="model_state",
+    )
+    _assert_model_snapshot_lineage_current(
+        model,
+        deployment_lineage,
+        label="deployable artifact source model",
+    )
     # The immutable file now owns this CPU snapshot. Keeping the producer-side
     # construction payload alive while reloading validation bytes would triple
     # the model-state RSS during the handoff.
-    del deployment_payload
+    del deployment_payload, deployment_model_state
     gc.collect()
     # Reconstruct the exact consumer before pricing; truncated, incomplete, or
     # internally inconsistent bytes never reach evaluation.
@@ -5240,6 +5616,7 @@ def _calibrate(
         frozen_consumer_model,
         frozen_consumer_codec,
         frozen_training_summary,
+        verified_deployment_snapshot_digest,
     ) = _load_deployable_codec(
         ctx.deployment_codec,
         cell_id=ctx.cell.cell_id,
@@ -5247,6 +5624,10 @@ def _calibrate(
         calibration_hash=calibration_hash,
         preparation_hash=prerequisites["preparation"][1],
         device=torch.device("cpu"),
+    )
+    _assert_deployment_snapshot_digest(
+        expected=expected_deployment_snapshot_digest,
+        verified=verified_deployment_snapshot_digest,
     )
     deployment_hash = ctx.artifact_sha256(ctx.deployment_codec)
     deployment_after_load = _FileFingerprint.from_path(ctx.deployment_codec)
@@ -5259,6 +5640,11 @@ def _calibrate(
         or frozen_deployment.get("calibration_sha256") != calibration_hash
     ):
         raise CellExecutionError("deployable codec artifact binding mismatch")
+    _assert_durable_snapshot_schema(
+        frozen_deployment.get("model_state"),
+        deployment_lineage,
+        label="deployable artifact",
+    )
     if frozen_consumer_codec.meta != frozen.meta:
         raise CellExecutionError("deployable codec differs from calibrated codec")
     excluded_calibration_events = int(
@@ -5302,15 +5688,6 @@ def _calibrate(
             raise CellExecutionError(
                 "durable validation model unexpectedly occupies an accelerator"
             )
-        durable_model_state = frozen_deployment["model_state"]
-        _assert_model_matches_durable_state(
-            model,
-            frozen_deployment["model_cfg"],
-            durable_model_state,
-        )
-        del durable_model_state
-        _normalize_model_only_consumer_state(model)
-        model.eval()
         frozen_model_cfg = asdict(frozen_consumer_model.cfg)
         discarded_validation_model_ref = weakref.ref(frozen_consumer_model)
         del frozen_consumer_model
@@ -5343,6 +5720,7 @@ def _calibrate(
             model,
             frozen_consumer_codec,
             frozen_training_summary,
+            deployment_lineage,
             discarded_validation_model_ref=discarded_validation_model_ref,
         )
     return (
@@ -8122,7 +8500,13 @@ def _evaluate(
     )
     device = _device(ctx)
     if retained_deployment is None:
-        deployment, model, codec, training_summary = _load_deployable_codec(
+        (
+            deployment,
+            model,
+            codec,
+            training_summary,
+            _verified_deployment_snapshot_digest,
+        ) = _load_deployable_codec(
             deployment_path,
             cell_id=ctx.cell.cell_id,
             checkpoint_hash=checkpoint_hash,

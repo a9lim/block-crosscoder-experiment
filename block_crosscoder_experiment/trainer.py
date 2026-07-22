@@ -42,7 +42,7 @@ import random
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -60,6 +60,10 @@ from .runtime_limits import (
     MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
     decoded_energy_code_norm_eligible,
 )
+from .serialization import MODEL_STATE_DIGEST_CONTRACT, model_state_digest
+
+
+_NATIVE_TORCH_SAVE = torch.save
 
 __all__ = [
     "TrainConfig",
@@ -1490,8 +1494,12 @@ def _project_decoder_(
             device=next(model.parameters()).device,
         )
         return count, tuple(model.parameters()), ()
-    count = _retract_count_tensor_(model.D.data, eig_floor=model.cfg.eig_floor)
-    return count, (model.D,), ()
+    decoder = model.D
+    if decoder is None:
+        raise RuntimeError("generic decoder projection has no materialized decoder")
+    with torch.no_grad():
+        count = _retract_count_tensor_(decoder, eig_floor=model.cfg.eig_floor)
+    return count, (decoder,), ()
 
 
 def _constraint_residual(model: BlockCrosscoder) -> float | None:
@@ -2166,7 +2174,14 @@ class Trainer:
 
     # -- checkpointing ------------------------------------------------------
 
-    def save_checkpoint(self, path: str | Path) -> None:
+    def save_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        model_state: Mapping[str, torch.Tensor] | None = None,
+        model_state_sha256: str | None = None,
+        require_native_blocking_save: bool = False,
+    ) -> None:
         # Checkpoint boundaries are hard refusal points: a model outside the
         # declared score-geometry envelope must never become durable evidence.
         self.master.validate_decoded_energy_implementation()
@@ -2184,8 +2199,43 @@ class Trainer:
             raise RuntimeError("live optimizer implementation contract changed")
         _validate_optimizer_state_shapes(optimizer_state, self.opt)
         np_state = np.random.get_state()
+        if require_native_blocking_save and model_state is None:
+            raise RuntimeError(
+                "native blocking checkpoint save requires an explicit model snapshot"
+            )
+        if model_state is None:
+            serialized_model_state: Mapping[str, torch.Tensor] = {
+                name: tensor.detach().to(device="cpu", copy=True).contiguous()
+                for name, tensor in self.master.state_dict().items()
+            }
+        else:
+            expected_state = self.master.state_dict()
+            if set(model_state) != set(expected_state):
+                raise RuntimeError("model snapshot field set differs from live model")
+            for name, expected in expected_state.items():
+                actual = model_state[name]
+                if (
+                    not torch.is_tensor(actual)
+                    or actual.device.type != "cpu"
+                    or actual.shape != expected.shape
+                    or actual.dtype != expected.dtype
+                    or actual.layout != expected.layout
+                ):
+                    raise RuntimeError(
+                        f"model snapshot tensor contract mismatch for {name}"
+                    )
+            serialized_model_state = model_state
+        if model_state_sha256 is None:
+            model_state_sha256 = model_state_digest(serialized_model_state)
+        elif (
+            len(model_state_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in model_state_sha256)
+        ):
+            raise RuntimeError("model-state digest is not canonical SHA-256")
         payload = {
-            "model": self.master.state_dict(),
+            "model": serialized_model_state,
+            "model_state_digest_contract": MODEL_STATE_DIGEST_CONTRACT,
+            "model_state_sha256": model_state_sha256,
             "optimizer": optimizer_state,
             "scheduler": self.sched.state_dict(),
             "tracker": self.tracker.state_dict(),
@@ -2235,7 +2285,10 @@ class Trainer:
                 f"({usage.free / 1e9:.1f} GB free, payload {nbytes / 1e9:.2f} GB)"
             )
         tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save(payload, tmp)  # atomic write-then-rename
+        if require_native_blocking_save and torch.save is not _NATIVE_TORCH_SAVE:
+            raise RuntimeError("checkpoint lineage requires native blocking torch.save")
+        save = _NATIVE_TORCH_SAVE if require_native_blocking_save else torch.save
+        save(payload, tmp)  # native blocking write, followed by atomic rename
         tmp.rename(path)
 
     @classmethod
@@ -2246,7 +2299,19 @@ class Trainer:
         device: torch.device | str = "cpu",
         expected_binding: dict | None = None,
     ) -> "Trainer":
-        payload = torch.load(path, map_location=device, weights_only=True)
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        model_state = payload.get("model")
+        claimed_digest_contract = payload.get("model_state_digest_contract")
+        claimed_model_state_sha256 = payload.get("model_state_sha256")
+        if (
+            not isinstance(model_state, Mapping)
+            or not model_state
+            or claimed_digest_contract != MODEL_STATE_DIGEST_CONTRACT
+            or not isinstance(claimed_model_state_sha256, str)
+            or len(claimed_model_state_sha256) != 64
+            or model_state_digest(model_state) != claimed_model_state_sha256
+        ):
+            raise ValueError("checkpoint model-state digest mismatch")
         model_payload = payload.get("model_cfg")
         if not isinstance(model_payload, dict):
             raise ValueError("checkpoint lacks model configuration")

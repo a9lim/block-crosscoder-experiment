@@ -2,7 +2,9 @@
 and gradient masking, init conventions, and a smoke test of the full
 step -> retract loop on tiny synthetic data."""
 
+import ast
 import copy
+from pathlib import Path
 
 import pytest
 import torch
@@ -1582,6 +1584,9 @@ def test_frozen_encoder_sites_fail_closed_on_stale_state(device):
             ("D", "E", "c"),
         ),
         ({"decoder_constraint": "gram"}, ("D",)),
+        ({"decoder_constraint": "qr"}, ("D",)),
+        ({"decoder_constraint": "frobenius"}, ("D",)),
+        ({"decoder_constraint": "unit_frobenius"}, ("D",)),
         (
             {
                 "decoder_constraint": "free",
@@ -1623,12 +1628,31 @@ def test_projection_reports_exact_mutated_parameter_set(
 ):
     model = make_model(device, **overrides)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
+    versions = {
+        id(parameter): parameter._version for parameter in model.parameters()
+    }
     count, mutated = model._project_decoder_with_state_()
     assert count.shape == ()
     assert count.dtype == torch.int64
     assert count.device == next(model.parameters()).device
     assert tuple(names[id(parameter)] for parameter in mutated) == expected_mutated
+    assert all(
+        parameter._version > versions[id(parameter)] for parameter in mutated
+    )
     assert isinstance(model.project_decoder_(), int)
+
+
+def test_package_contains_no_unversioned_data_attribute_access() -> None:
+    package = Path(model_module.__file__).resolve().parent
+    offenders: list[str] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        if any(
+            isinstance(node, ast.Attribute) and node.attr == "data"
+            for node in ast.walk(tree)
+        ):
+            offenders.append(str(path.relative_to(package)))
+    assert offenders == []
 
 
 def test_batchtopk_exact_count_and_variable_per_token(device):

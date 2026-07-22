@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import weakref
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,7 +32,10 @@ from block_crosscoder_experiment.cli.run_cell import (
     _StageExecutionCache,
     _VERIFIED_STORE_BINDINGS,
     _accumulate_chunked_recovery_association,
-    _assert_model_matches_durable_state,
+    _assert_deployment_snapshot_digest,
+    _assert_durable_snapshot_schema,
+    _assert_model_snapshot_lineage_current,
+    _assert_serialized_snapshot_current,
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
     _execution_rng_snapshot,
@@ -58,6 +61,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _synthetic_batches,
     _synthetic_dataset,
     _synthetic_source_contract,
+    _synchronous_model_snapshot,
     _support_confusion,
     _support_matched_subspace_overlap,
     _tensor_payload_digest,
@@ -70,6 +74,10 @@ from block_crosscoder_experiment.cli.run_cell import (
     _verify_store_reader_once,
     _write_deployment_schedule_bundle,
     validate_cell_config,
+)
+from block_crosscoder_experiment.serialization import (
+    MODEL_STATE_DIGEST_CONTRACT,
+    model_state_digest,
 )
 from block_crosscoder_experiment.cli.data import fit_transform_artifacts
 from block_crosscoder_experiment.codec import Codec
@@ -196,6 +204,7 @@ def test_retained_checkpoint_refuses_every_cache_key_mismatch(
         actual,
         _WeakrefableCacheOwner(),
         {},
+        object(),
         released_owner_refs={},
     )
     with pytest.raises(
@@ -213,6 +222,7 @@ def test_retained_checkpoint_refuses_a_live_released_training_owner() -> None:
         _retained_cache_key(),
         _WeakrefableCacheOwner(),
         {},
+        object(),
         released_owner_refs={"optimizer": weakref.ref(owner)},
     )
     with pytest.raises(
@@ -233,6 +243,7 @@ def test_retained_deployment_refuses_a_live_durable_validation_model() -> None:
         _WeakrefableCacheOwner(),
         object(),
         {},
+        object(),
         discarded_validation_model_ref=weakref.ref(validation_model),
     )
     with pytest.raises(
@@ -261,6 +272,7 @@ def test_retained_deployment_refuses_heavy_durable_fields(
             _WeakrefableCacheOwner(),
             object(),
             {},
+            object(),
             discarded_validation_model_ref=discarded_ref,
         )
 
@@ -283,29 +295,195 @@ def _model_only_handoff_fixture(*, decoder_bias: bool = True) -> BlockCrosscoder
     )
 
 
-def test_model_only_owner_validation_does_not_consume_process_rng() -> None:
+def _normalized_model_snapshot():
     model = _model_only_handoff_fixture()
-    cfg = model.cfg
-    durable_state = {
-        name: tensor.detach().cpu().clone()
-        for name, tensor in model.state_dict().items()
-    }
+    _normalize_model_only_consumer_state(model)
+    model.eval()
+    snapshot, lineage = _synchronous_model_snapshot(model)
+    return model, snapshot, lineage
+
+
+def test_model_snapshot_lineage_does_not_consume_process_rng() -> None:
+    model = _model_only_handoff_fixture()
+    _normalize_model_only_consumer_state(model)
+    model.eval()
     rng_before = _execution_rng_snapshot()
-    _assert_model_matches_durable_state(model, asdict(cfg), durable_state)
+    snapshot, lineage = _synchronous_model_snapshot(model)
+    assert _execution_rng_snapshot() == rng_before
+    _assert_model_snapshot_lineage_current(
+        model,
+        lineage,
+        label="test model",
+    )
+    _assert_serialized_snapshot_current(
+        snapshot,
+        lineage,
+        label="test snapshot",
+    )
+    _assert_durable_snapshot_schema(
+        snapshot,
+        lineage,
+        label="test durable artifact",
+    )
     assert _execution_rng_snapshot() == rng_before
 
-    tampered = dict(durable_state)
-    tensor_name = next(
-        name for name, tensor in tampered.items() if tensor.is_floating_point()
+
+def test_model_snapshot_lineage_can_defer_value_binding_to_parent_payload(
+    monkeypatch,
+) -> None:
+    model = _model_only_handoff_fixture()
+    _normalize_model_only_consumer_state(model)
+    model.eval()
+    monkeypatch.setattr(
+        run_cell_module,
+        "model_state_digest",
+        lambda *_args, **_kwargs: pytest.fail("unexpected model-only digest"),
     )
-    tampered[tensor_name] = tampered[tensor_name].clone()
-    tampered[tensor_name].view(-1)[0] += 1.0
-    with pytest.raises(
-        CellExecutionError,
-        match="live model differs from durable tensor",
-    ):
-        _assert_model_matches_durable_state(model, asdict(cfg), tampered)
-    assert _execution_rng_snapshot() == rng_before
+    snapshot, lineage = _synchronous_model_snapshot(
+        model,
+        include_model_digest=False,
+    )
+    assert lineage.snapshot_digest_contract is None
+    assert lineage.snapshot_sha256 is None
+    _assert_serialized_snapshot_current(snapshot, lineage, label="deployment snapshot")
+
+
+def test_model_snapshot_lineage_refuses_version_drift() -> None:
+    model, _, lineage = _normalized_model_snapshot()
+    assert model.D is not None
+    with torch.no_grad():
+        model.D.add_(1.0)
+    with pytest.raises(CellExecutionError, match="tensor identity/storage/version"):
+        _assert_model_snapshot_lineage_current(
+            model,
+            lineage,
+            label="test model",
+        )
+
+
+def test_model_snapshot_lineage_refuses_parameter_replacement() -> None:
+    model, _, lineage = _normalized_model_snapshot()
+    assert model.D is not None
+    model.D = torch.nn.Parameter(model.D.detach().clone())
+    with pytest.raises(CellExecutionError, match="tensor identity/storage/version"):
+        _assert_model_snapshot_lineage_current(
+            model,
+            lineage,
+            label="test model",
+        )
+
+
+def test_model_snapshot_lineage_refuses_config_drift() -> None:
+    model, _, lineage = _normalized_model_snapshot()
+    model.cfg.k += 1
+    with pytest.raises(CellExecutionError, match="model config"):
+        _assert_model_snapshot_lineage_current(
+            model,
+            lineage,
+            label="test model",
+        )
+
+
+def test_model_snapshot_lineage_refuses_serialized_mapping_replacement() -> None:
+    _, snapshot, lineage = _normalized_model_snapshot()
+    with pytest.raises(CellExecutionError, match="replaced the serialized state mapping"):
+        _assert_serialized_snapshot_current(
+            dict(snapshot),
+            lineage,
+            label="test snapshot",
+        )
+
+
+def test_model_snapshot_lineage_refuses_serialized_tensor_replacement() -> None:
+    _, snapshot, lineage = _normalized_model_snapshot()
+    name = next(iter(snapshot))
+    snapshot[name] = snapshot[name].clone()
+    with pytest.raises(CellExecutionError, match="mutated or replaced"):
+        _assert_serialized_snapshot_current(
+            snapshot,
+            lineage,
+            label="test snapshot",
+        )
+
+
+def test_model_snapshot_lineage_refuses_state_dict_callbacks() -> None:
+    model = _model_only_handoff_fixture()
+    model.register_state_dict_pre_hook(lambda *_: None)
+    with pytest.raises(CellExecutionError, match="callback-free state_dict"):
+        _synchronous_model_snapshot(model)
+
+
+def test_model_snapshot_lineage_refuses_model_subclasses() -> None:
+    class DerivedBlockCrosscoder(BlockCrosscoder):
+        pass
+
+    base = _model_only_handoff_fixture()
+    model = DerivedBlockCrosscoder(base.cfg)
+    with pytest.raises(CellExecutionError, match="canonical BlockCrosscoder type"):
+        _synchronous_model_snapshot(model)
+
+
+def test_model_snapshot_lineage_refuses_state_dict_override() -> None:
+    model = _model_only_handoff_fixture()
+    model.state_dict = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    with pytest.raises(CellExecutionError, match="callback-free state_dict"):
+        _synchronous_model_snapshot(model)
+
+
+def test_model_snapshot_lineage_refuses_save_to_state_dict_override() -> None:
+    model = _model_only_handoff_fixture()
+    model._save_to_state_dict = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: None
+    )
+    with pytest.raises(CellExecutionError, match="callback-free state_dict"):
+        _synchronous_model_snapshot(model)
+
+
+def test_retained_checkpoint_recertifies_snapshot_lineage() -> None:
+    model, _, lineage = _normalized_model_snapshot()
+    cache = _StageExecutionCache()
+    cache.remember_checkpoint(
+        _retained_cache_key(),
+        model,
+        {},
+        lineage,
+        released_owner_refs={},
+    )
+    assert model.D is not None
+    with torch.no_grad():
+        model.D.add_(1.0)
+    with pytest.raises(CellExecutionError, match="drifted after"):
+        cache.take_checkpoint(_retained_cache_key())
+    assert cache.checkpoint is None
+
+
+def test_durable_snapshot_schema_refuses_tensor_contract_drift() -> None:
+    _, snapshot, lineage = _normalized_model_snapshot()
+    name = next(iter(snapshot))
+    forged = dict(snapshot)
+    forged[name] = forged[name].reshape(-1)
+    with pytest.raises(CellExecutionError, match="schema differs"):
+        _assert_durable_snapshot_schema(
+            forged,
+            lineage,
+            label="forged artifact",
+        )
+
+
+def test_snapshot_bound_save_refuses_replaced_torch_save(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, snapshot, lineage = _normalized_model_snapshot()
+    monkeypatch.setattr(run_cell_module.torch, "save", lambda *_args, **_kwargs: None)
+    with pytest.raises(CellExecutionError, match="native blocking torch.save"):
+        run_cell_module._save_immutable_torch(
+            tmp_path / "artifact.pt",
+            {"model_state": snapshot},
+            model_lineage=lineage,
+            model_state_field="model_state",
+        )
+
 
 
 def test_model_only_handoff_clears_every_parameter_gradient() -> None:
@@ -1088,10 +1266,10 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     assert "model_state" in durable_deployment
     assert "codec_payload" in durable_deployment
     assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v10"
+        "bsc-cell-executor-v11"
     )
     assert preparation["implementation"]["executor_process_model"] == (
-        "persistent_verified_digest_cache_v4"
+        "persistent_exact_snapshot_lineage_v5"
     )
 
 
@@ -1219,14 +1397,17 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
     payload = torch.load(deployment_path, map_location="cpu", weights_only=True)
     preparation_hash = refs["preparation"].sha256
 
-    loaded, model, codec, summary = _load_deployable_codec(
-        deployment_path,
-        cell_id=cell.cell_id,
-        checkpoint_hash=refs["checkpoint"].sha256,
-        calibration_hash=refs["calibration"].sha256,
-        preparation_hash=preparation_hash,
-        device=torch.device("cpu"),
+    loaded, model, codec, summary, verified_deployment_digest = (
+        _load_deployable_codec(
+            deployment_path,
+            cell_id=cell.cell_id,
+            checkpoint_hash=refs["checkpoint"].sha256,
+            calibration_hash=refs["calibration"].sha256,
+            preparation_hash=preparation_hash,
+            device=torch.device("cpu"),
+        )
     )
+    assert verified_deployment_digest == payload["artifact_sha256"]
     assert loaded["schema"] == "bsc-deployable-codec-v2"
     assert model.cfg.n_blocks == codec.included.numel()
     assert (
@@ -1239,11 +1420,77 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
     )
     assert summary["accepted_tokens"] > 0
 
+    self_consistent_substitution = copy.deepcopy(payload)
+    substitution_name = "E"
+    assert substitution_name in self_consistent_substitution["model_state"]
+    self_consistent_substitution["model_state"][substitution_name].view(-1)[0].add_(
+        1e-3
+    )
+    unsigned_substitution = {
+        key: value
+        for key, value in self_consistent_substitution.items()
+        if key != "artifact_sha256"
+    }
+    self_consistent_substitution["artifact_sha256"] = _tensor_payload_digest(
+        unsigned_substitution
+    )
+    substitution_path = tmp_path / "self-consistent-model-substitution.pt"
+    torch.save(self_consistent_substitution, substitution_path)
+    (
+        _substituted_payload,
+        _substituted_model,
+        _substituted_codec,
+        _substituted_summary,
+        verified_substitution_digest,
+    ) = _load_deployable_codec(
+        substitution_path,
+        cell_id=cell.cell_id,
+        checkpoint_hash=refs["checkpoint"].sha256,
+        calibration_hash=refs["calibration"].sha256,
+        preparation_hash=preparation_hash,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(CellExecutionError, match="exact pre-save snapshot"):
+        _assert_deployment_snapshot_digest(
+            expected=verified_deployment_digest,
+            verified=verified_substitution_digest,
+        )
+
     checkpoint_payload = torch.load(
         refs["checkpoint"].resolve(campaign.root),
         map_location="cpu",
         weights_only=True,
     )
+    assert (
+        checkpoint_payload["model_state_digest_contract"]
+        == MODEL_STATE_DIGEST_CONTRACT
+    )
+    assert checkpoint_payload["model_state_sha256"] == model_state_digest(
+        checkpoint_payload["model"]
+    )
+    wrong_digest_contract = copy.deepcopy(checkpoint_payload)
+    wrong_digest_contract["model_state_digest_contract"] = "sha256_merkle_16m_v0"
+    wrong_digest_contract_path = tmp_path / "wrong-model-digest-contract.pt"
+    torch.save(wrong_digest_contract, wrong_digest_contract_path)
+    with pytest.raises(CellExecutionError, match="model-state digest mismatch"):
+        _validate_final_checkpoint(
+            wrong_digest_contract_path,
+            checkpoint_payload["run_binding"],
+        )
+    bitflipped_checkpoint = copy.deepcopy(checkpoint_payload)
+    bitflipped_name = next(
+        name
+        for name, tensor in bitflipped_checkpoint["model"].items()
+        if tensor.is_floating_point() and tensor.numel()
+    )
+    bitflipped_checkpoint["model"][bitflipped_name].view(-1)[0].add_(1.0)
+    bitflipped_path = tmp_path / "same-schema-bitflipped-checkpoint.pt"
+    torch.save(bitflipped_checkpoint, bitflipped_path)
+    with pytest.raises(CellExecutionError, match="model-state digest mismatch"):
+        _validate_final_checkpoint(
+            bitflipped_path,
+            checkpoint_payload["run_binding"],
+        )
     assert (
         checkpoint_payload["model_cfg"]["decoder_retraction_implementation"]
         == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
@@ -1520,13 +1767,15 @@ def test_mapped_isolated_loss_identity_round_trips_and_refuses_forgery(
     assert _runner(campaign).run(limit=1).failed_cells == 0
     refs = campaign.record(cell.cell_id).artifact_map
     deployment_path = refs["deployment_codec"].resolve(campaign.root)
-    payload, model, codec, _summary = _load_deployable_codec(
-        deployment_path,
-        cell_id=cell.cell_id,
-        checkpoint_hash=refs["checkpoint"].sha256,
-        calibration_hash=refs["calibration"].sha256,
-        preparation_hash=refs["preparation"].sha256,
-        device=torch.device("cpu"),
+    payload, model, codec, _summary, _verified_deployment_digest = (
+        _load_deployable_codec(
+            deployment_path,
+            cell_id=cell.cell_id,
+            checkpoint_hash=refs["checkpoint"].sha256,
+            calibration_hash=refs["calibration"].sha256,
+            preparation_hash=refs["preparation"].sha256,
+            device=torch.device("cpu"),
+        )
     )
     assert model.cfg.isolated_loss_decrease_implementation == (
         ISOLATED_LOSS_MAPPED_IMPLEMENTATION

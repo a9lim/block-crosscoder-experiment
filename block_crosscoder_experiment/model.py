@@ -2474,11 +2474,11 @@ class BlockCrosscoder(nn.Module):
         else:
             assert self.D is not None
             if self._has_padded_coordinates:
-                self.D.data.mul_(self.coordinate_mask)
+                self.D.mul_(self.coordinate_mask)
                 mark(self.D)
             if self.cfg.decoder_constraint == "gram":
                 bad = _retract_count_tensor_(
-                    self.D.data,
+                    self.D,
                     eig_floor=self.cfg.eig_floor,
                     implementation=self.cfg.decoder_retraction_implementation,
                 )
@@ -2489,7 +2489,7 @@ class BlockCrosscoder(nn.Module):
                     == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
                 ):
                     bad = _cholesky_qr_retract_count_tensor_(
-                        self.D.data,
+                        self.D,
                         input_finite=qr_input_finite,
                     )
                 else:
@@ -2498,22 +2498,22 @@ class BlockCrosscoder(nn.Module):
                         == DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
                     )
                     bad = _qr_retract_count_tensor_(
-                        self.D.data,
+                        self.D,
                         input_finite=qr_input_finite,
                     )
                 mark(self.D)
             elif self.cfg.decoder_constraint == "frobenius":
-                bad = _project_block_frobenius_count_tensor_(self.D.data)
+                bad = _project_block_frobenius_count_tensor_(self.D)
                 mark(self.D)
             elif self.cfg.decoder_constraint == "unit_frobenius":
-                bad = _normalize_block_frobenius_count_tensor_(self.D.data)
+                bad = _normalize_block_frobenius_count_tensor_(self.D)
                 mark(self.D)
             elif self.cfg.decoder_constraint == "unit_latent":
-                bad = _project_latent_rows_count_tensor_(self.D.data)
+                bad = _project_latent_rows_count_tensor_(self.D)
                 mark(self.D)
             assert torch.is_tensor(bad)
             if self._has_padded_coordinates:
-                self.D.data.mul_(self.coordinate_mask)
+                self.D.mul_(self.coordinate_mask)
                 mark(self.D)
             if self.E is not None:
                 encoder = self._encoder_full_tensor()
@@ -2527,10 +2527,10 @@ class BlockCrosscoder(nn.Module):
                         encoder.mul_(self.coordinate_mask)
                         mark(self.E)
         if not self.cfg.decoder_bias:
-            self.c.data.zero_()
+            self.c.zero_()
             mark(self.c)
         elif self._has_padded_coordinates:
-            self.c.data.mul_(self.coordinate_mask[:, 0, 0])
+            self.c.mul_(self.coordinate_mask[:, 0, 0])
             mark(self.c)
         return bad, tuple(mutated)
 

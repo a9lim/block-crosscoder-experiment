@@ -25,6 +25,10 @@ from block_crosscoder_experiment.runtime_limits import (
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
 )
+from block_crosscoder_experiment.serialization import (
+    MODEL_STATE_DIGEST_CONTRACT,
+    model_state_digest,
+)
 from block_crosscoder_experiment.trainer import (
     DeadTracker,
     TrainConfig,
@@ -615,6 +619,54 @@ def test_bf16_threshold_cache_survives_steps_and_revalidates_resume(
     assert resumed.fwd._validated_theta_key is None
     resumed.step(batches[2])
     assert resumed.fwd._validated_theta_key is not None
+
+
+def test_snapshot_bound_checkpoint_refuses_replaced_torch_save(
+    device,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=1),
+    )
+    snapshot = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in trainer.master.state_dict().items()
+    }
+    monkeypatch.setattr(trainer_module.torch, "save", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match="native blocking torch.save"):
+        trainer.save_checkpoint(
+            tmp_path / "checkpoint.pt",
+            model_state=snapshot,
+            require_native_blocking_save=True,
+        )
+
+
+def test_resume_refuses_same_schema_model_state_bitflip(device, tmp_path) -> None:
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=1),
+    )
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert payload["model_state_digest_contract"] == MODEL_STATE_DIGEST_CONTRACT
+    assert payload["model_state_sha256"] == model_state_digest(payload["model"])
+    wrong_digest_contract = copy.deepcopy(payload)
+    wrong_digest_contract["model_state_digest_contract"] = "sha256_merkle_16m_v0"
+    torch.save(wrong_digest_contract, checkpoint)
+    with pytest.raises(ValueError, match="model-state digest mismatch"):
+        Trainer.load_checkpoint(checkpoint, device=device)
+    name = next(
+        name
+        for name, tensor in payload["model"].items()
+        if tensor.is_floating_point() and tensor.numel()
+    )
+    payload["model"][name].view(-1)[0].add_(1.0)
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="model-state digest mismatch"):
+        Trainer.load_checkpoint(checkpoint, device=device)
 
 
 def test_dead_tracker_criteria(device):
@@ -2402,6 +2454,22 @@ def test_norm_projection_certificate_handles_finite_overflow_extrema(
     assert mutated
     assert len(certified) == len(mutated)
     assert all(bool(torch.isfinite(parameter).all()) for parameter in certified)
+
+
+def test_generic_projection_fallback_increments_parameter_version(device) -> None:
+    from types import SimpleNamespace
+
+    parameter = torch.nn.Parameter(
+        torch.randn(2, 3, 2, 4, device=device, dtype=torch.float32)
+    )
+    model = SimpleNamespace(
+        D=parameter,
+        cfg=SimpleNamespace(eig_floor=1e-6),
+    )
+    version = parameter._version
+    _, mutated, _ = trainer_module._project_decoder_(model)
+    assert mutated == (parameter,)
+    assert parameter._version > version
 
 
 def test_qr_step_refuses_optimizer_poison_before_trusting_input(
