@@ -409,6 +409,187 @@ def test_bf16_forward_gradients_are_released_without_skipping_zero_updates(devic
     assert all(parameter.grad is None for parameter in trainer.fwd.parameters())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_certified_gradient_copy_preserves_absent_grad_and_resume(
+    monkeypatch,
+    tmp_path,
+):
+    import block_crosscoder_experiment.cuda_gradient_copy as gradient_copy_module
+
+    cfg = BSCConfig(**{**CFG.__dict__, "encoder_bias": True})
+    training = train_cfg(
+        total_steps=4,
+        forward_dtype="bf16",
+        optimizer="adamw",
+        fused=True,
+        log_every=100,
+        retract_every=100,
+    )
+    base = BlockCrosscoder(cfg).cuda()
+    optimized = Trainer(copy.deepcopy(base), training)
+    reference = Trainer(copy.deepcopy(base), training)
+    # Exercise the CUDA path on this deliberately small exact-state fixture.
+    monkeypatch.setattr(trainer_module, "CUDA_GRADIENT_COPY_MIN_ELEMENTS", 0)
+    reference._cuda_gradient_copy_unsafe = None
+    original_copy = gradient_copy_module.cuda_copy_bf16_gradient_and_flag_
+    copy_calls = 0
+
+    def counted_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gradient_copy_module,
+        "cuda_copy_bf16_gradient_and_flag_",
+        counted_copy,
+    )
+    batches = planted_batches("cuda", n_batches=3, seed=2610)
+
+    # Step zero is a logging step and therefore remains the common exact L2
+    # reference. It also creates Adam state for the parameter removed below.
+    optimized.step(batches[0], materialize_record=False)
+    reference.step(batches[0], materialize_record=False)
+    assert optimized.master.a is not None and optimized.fwd.a is not None
+    assert reference.master.a is not None and reference.fwd.a is not None
+    optimized_first_step = optimized.opt.state[optimized.master.a]["step"].clone()
+    reference_first_step = reference.opt.state[reference.master.a]["step"].clone()
+    optimized.fwd.a.requires_grad_(False)
+    reference.fwd.a.requires_grad_(False)
+
+    optimized.step(batches[1], materialize_record=False)
+    reference.step(batches[1], materialize_record=False)
+    assert copy_calls > 0
+    assert torch.count_nonzero(optimized.master.a.grad) == 0
+    assert optimized.opt.state[optimized.master.a]["step"] == optimized_first_step + 1
+    assert reference.opt.state[reference.master.a]["step"] == reference_first_step + 1
+    assert all(parameter.grad is None for parameter in optimized.fwd.parameters())
+    _assert_nested_exact(optimized.master.state_dict(), reference.master.state_dict())
+    _assert_nested_exact(optimized.fwd.state_dict(), reference.fwd.state_dict())
+    _assert_nested_exact(optimized.opt.state_dict(), reference.opt.state_dict())
+    _assert_nested_exact(optimized.sched.state_dict(), reference.sched.state_dict())
+
+    checkpoint = tmp_path / "certified-gradient-copy.pt"
+    optimized.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cuda", weights_only=True)
+    assert "_cuda_gradient_copy_unsafe" not in payload
+    resumed = Trainer.load_checkpoint(checkpoint, device="cuda")
+    assert resumed._cuda_gradient_copy_unsafe is not None
+    assert not bool(resumed._cuda_gradient_copy_unsafe)
+    _assert_nested_exact(resumed.master.state_dict(), reference.master.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), reference.opt.state_dict())
+    # Gradients are intentionally transient rather than checkpoint state.
+    # Restore the artificial requires-grad intervention before comparing the
+    # next ordinary all-parameter update.
+    reference.fwd.a.requires_grad_(True)
+    resumed.step(batches[2], materialize_record=False)
+    reference.step(batches[2], materialize_record=False)
+    _assert_nested_exact(resumed.master.state_dict(), reference.master.state_dict())
+    _assert_nested_exact(resumed.fwd.state_dict(), reference.fwd.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), reference.opt.state_dict())
+    _assert_nested_exact(resumed.sched.state_dict(), reference.sched.state_dict())
+    assert resumed.step_idx == reference.step_idx
+    assert resumed.accepted_tokens == reference.accepted_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("nonfinite", (float("nan"), float("inf")))
+def test_cuda_certified_gradient_copy_refuses_before_optimizer(
+    monkeypatch,
+    nonfinite,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "free",
+            "decoder_retraction_implementation": None,
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).cuda(),
+        train_cfg(
+            total_steps=3,
+            forward_dtype="bf16",
+            fused=True,
+            log_every=100,
+            retract_every=100,
+        ),
+    )
+    monkeypatch.setattr(trainer_module, "CUDA_GRADIENT_COPY_MIN_ELEMENTS", 0)
+    batches = planted_batches("cuda", n_batches=2, seed=2611)
+    trainer.step(batches[0], materialize_record=False)
+    parameter = next(parameter for parameter in trainer.fwd.parameters())
+    handle = parameter.register_hook(lambda gradient: gradient.fill_(nonfinite))
+    optimizer_calls = 0
+    original_step = trainer.opt.step
+
+    def counted_step(*args, **kwargs):
+        nonlocal optimizer_calls
+        optimizer_calls += 1
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.opt, "step", counted_step)
+    with pytest.raises(RuntimeError, match="non-finite loss/gradient"):
+        trainer.step(batches[1], materialize_record=False)
+    handle.remove()
+    assert optimizer_calls == 0
+    assert trainer.step_idx == 1
+    assert trainer.accepted_tokens == len(batches[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_certified_gradient_copy_large_finite_uses_exact_fallback(monkeypatch):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": "free",
+            "decoder_retraction_implementation": None,
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).cuda(),
+        train_cfg(
+            total_steps=3,
+            forward_dtype="bf16",
+            fused=True,
+            log_every=100,
+            retract_every=100,
+        ),
+    )
+    monkeypatch.setattr(trainer_module, "CUDA_GRADIENT_COPY_MIN_ELEMENTS", 0)
+    batches = planted_batches("cuda", n_batches=2, seed=2612)
+    trainer.step(batches[0], materialize_record=False)
+    parameter = next(parameter for parameter in trainer.fwd.parameters())
+
+    def sparse_large_gradient(gradient):
+        gradient.zero_()
+        gradient[(0,) * gradient.ndim] = 1e18
+        return gradient
+
+    handle = parameter.register_hook(sparse_large_gradient)
+    original_guard = trainer_module._finite_gradients_with_l2_guard
+    guard_calls = 0
+
+    def counted_guard(*args, **kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        return original_guard(*args, **kwargs)
+
+    monkeypatch.setattr(
+        trainer_module,
+        "_finite_gradients_with_l2_guard",
+        counted_guard,
+    )
+    trainer.step(batches[1], materialize_record=False)
+    handle.remove()
+    assert guard_calls == 1
+    assert trainer.step_idx == 2
+    assert trainer.accepted_tokens == sum(len(batch) for batch in batches)
+    assert all(
+        torch.isfinite(parameter).all() for parameter in trainer.master.parameters()
+    )
+
+
 def test_bf16_threshold_cache_survives_steps_and_revalidates_resume(
     device,
     tmp_path,

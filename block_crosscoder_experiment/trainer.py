@@ -80,6 +80,9 @@ AUX_VARIANTS = (
     "fel",
 )
 CHECKPOINT_FREE_FLOOR_FRAC = 0.15  # same safety floor as store.ShardWriter
+# Keep small CUDA smoke and unit fixtures on the dependency-light eager path;
+# every live Phase-2/3 bf16 geometry lies comfortably above this admission.
+CUDA_GRADIENT_COPY_MIN_ELEMENTS = 1 << 20
 
 
 def _payload_nbytes(obj) -> int:
@@ -1365,6 +1368,26 @@ def _floating_tensors(obj) -> Iterator[torch.Tensor]:
             yield from _floating_tensors(value)
 
 
+def _has_dense_base_storage(tensor: torch.Tensor) -> bool:
+    """Whether linear storage traversal visits every logical element once."""
+
+    if tensor.layout != torch.strided or tensor.storage_offset() != 0:
+        return False
+    expected_stride = 1
+    for size, stride in sorted(
+        (
+            (size, stride)
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            if size > 1
+        ),
+        key=lambda item: item[1],
+    ):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return expected_stride == tensor.numel()
+
+
 @torch.no_grad()
 def _all_finite(obj) -> bool:
     tensors = [tensor for tensor in _floating_tensors(obj) if tensor.numel()]
@@ -1578,6 +1601,15 @@ class Trainer:
         )
         self.history: list[dict] = []
         self._log_file = Path(log_path).open("a") if log_path is not None else None
+        # Ephemeral execution scratch, deliberately absent from checkpoints.
+        # Its value is reset before every certified transfer and carries no
+        # state across accepted updates or exact resume boundaries.
+        parameter_device = next(self.master.parameters()).device
+        self._cuda_gradient_copy_unsafe = (
+            torch.zeros((), dtype=torch.int32, device=parameter_device)
+            if self.fwd is not self.master and parameter_device.type == "cuda"
+            else None
+        )
 
     # -- one training step -------------------------------------------------
 
@@ -1796,8 +1828,57 @@ class Trainer:
             self.opt.zero_grad(set_to_none=True)
         parts["total"].backward()
 
+        fused_gradient_certificate: bool | None = None
         if self.fwd is not self.master:
-            for m, f in zip(self.master.parameters(), self.fwd.parameters()):
+            parameter_pairs = tuple(
+                zip(self.master.parameters(), self.fwd.parameters(), strict=True)
+            )
+            total_gradient_elements = sum(
+                master.numel()
+                for master, forward in parameter_pairs
+                if forward.grad is not None or master.grad is not None
+            )
+            present_gradient_pairs = tuple(
+                (master, forward)
+                for master, forward in parameter_pairs
+                if forward.grad is not None
+            )
+            use_fused_gradient_certificate = (
+                self._cuda_gradient_copy_unsafe is not None
+                and not want_record
+                and cfg.gradient_clip_norm is None
+                and total_gradient_elements >= CUDA_GRADIENT_COPY_MIN_ELEMENTS
+                and bool(present_gradient_pairs)
+                and all(
+                    forward.grad is not None
+                    and forward.grad.dtype == torch.bfloat16
+                    and master.dtype == torch.float32
+                    and forward.grad.is_cuda
+                    and master.is_cuda
+                    and forward.grad.stride() == master.stride()
+                    and _has_dense_base_storage(forward.grad)
+                    and _has_dense_base_storage(master)
+                    and (
+                        master.grad is None
+                        or (
+                            master.grad.stride() == master.stride()
+                            and _has_dense_base_storage(master.grad)
+                        )
+                    )
+                    for master, forward in present_gradient_pairs
+                )
+            )
+            if use_fused_gradient_certificate:
+                from .cuda_gradient_copy import (
+                    cuda_copy_bf16_gradient_and_flag_,
+                )
+
+                assert self._cuda_gradient_copy_unsafe is not None
+                self._cuda_gradient_copy_unsafe.zero_()
+                safe_l2_limit = math.sqrt(
+                    torch.finfo(torch.float32).max / total_gradient_elements
+                )
+            for m, f in parameter_pairs:
                 if f.grad is None:
                     # Retained bf16 gradients historically became explicit
                     # zeros when a previously used parameter was absent from a
@@ -1807,11 +1888,25 @@ class Trainer:
                     continue
                 if m.grad is None:
                     m.grad = torch.empty_like(m)
-                m.grad.copy_(f.grad.detach())
+                if use_fused_gradient_certificate:
+                    cuda_copy_bf16_gradient_and_flag_(
+                        f.grad.detach(),
+                        m.grad,
+                        self._cuda_gradient_copy_unsafe,
+                        parts["rec"].detach(),
+                        parts["total"].detach(),
+                        safe_l2_limit=safe_l2_limit,
+                    )
+                else:
+                    m.grad.copy_(f.grad.detach())
                 # The fp32 master now owns the gradient. Releasing the bf16
                 # leaf allocation avoids zero-filling and retaining a second
                 # full gradient set between backward passes.
                 f.grad = None
+            if use_fused_gradient_certificate:
+                fused_gradient_certificate = not bool(
+                    self._cuda_gradient_copy_unsafe
+                )
         parameters = [p for p in self.master.parameters() if p.grad is not None]
         gradients = [p.grad for p in parameters]
         if not gradients:
@@ -1881,13 +1976,16 @@ class Trainer:
             ):
                 raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
         else:
-            finite = (
-                _all_finite((parts["rec"], parts["total"], unclipped_grad_norm_t))
-                if unclipped_grad_norm_t is not None
-                else _finite_gradients_with_l2_guard(
+            if unclipped_grad_norm_t is not None:
+                finite = _all_finite(
+                    (parts["rec"], parts["total"], unclipped_grad_norm_t)
+                )
+            elif fused_gradient_certificate is True:
+                finite = True
+            else:
+                finite = _finite_gradients_with_l2_guard(
                     parts["rec"], parts["total"], gradients
                 )
-            )
             if not finite:
                 raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
 
