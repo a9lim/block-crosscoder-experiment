@@ -83,7 +83,11 @@ def gram_residual(D: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
+def _retract_count_tensor_(
+    D: torch.Tensor,
+    *,
+    eig_floor: float = 1e-6,
+) -> torch.Tensor:
     """In-place retraction onto the Gram manifold: D_g^s <- M_g^{-1/2} D_g^s.
 
     Operates on the fp32 master decoders (design: optimizer step on master ->
@@ -108,11 +112,17 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
         evals = evals.clamp_min(eig_floor)
         inv_sqrt = evecs @ torch.diag_embed(evals.rsqrt()) @ evecs.transpose(-1, -2)
         chunk.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, chunk))
-    return int(floor_hits.item())
+    return floor_hits
 
 
 @torch.no_grad()
-def qr_retract_(D: torch.Tensor) -> int:
+def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
+    """Public integer-count wrapper for the Gram-manifold retraction."""
+    return int(_retract_count_tensor_(D, eig_floor=eig_floor).item())
+
+
+@torch.no_grad()
+def _qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
     """Thin-QR Stiefel retraction used by the BSF Grassmannian procedure.
 
     Each block's site-concatenated decoder is a ``b x sum(d_s)`` matrix.  QR
@@ -126,6 +136,14 @@ def qr_retract_(D: torch.Tensor) -> int:
     concatenated = D.permute(1, 0, 3, 2).reshape(groups, sites * width, block_dim)
     q, _ = torch.linalg.qr(concatenated, mode="reduced")
     D.copy_(q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2))
+    count = torch.zeros((), dtype=torch.int64, device=D.device)
+    return count
+
+
+@torch.no_grad()
+def qr_retract_(D: torch.Tensor) -> int:
+    """Public integer-count wrapper for the thin-QR retraction."""
+    _qr_retract_count_tensor_(D)
     return 0
 
 
@@ -238,7 +256,11 @@ def decoder_nuclear_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tens
 
 
 @torch.no_grad()
-def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
+def _project_block_frobenius_count_tensor_(
+    D: torch.Tensor,
+    *,
+    max_norm: float = 1.0,
+) -> torch.Tensor:
     """Project concatenated decoder blocks onto a Frobenius ball.
 
     At S=1 this is Fel's Vanilla-BSF decoder constraint. For S>1 it is the
@@ -247,11 +269,23 @@ def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
     norms = D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()  # [G]
     scale = (max_norm / norms.clamp_min(1e-12)).clamp(max=1.0)
     D.mul_(scale.to(D.dtype).view(1, -1, 1, 1))
-    return int((norms > max_norm).sum().item())
+    return (norms > max_norm).sum()
 
 
 @torch.no_grad()
-def normalize_block_frobenius_(D: torch.Tensor, *, target_norm: float = 1.0) -> int:
+def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
+    """Public integer-count wrapper for the concatenated block projection."""
+    return int(
+        _project_block_frobenius_count_tensor_(D, max_norm=max_norm).item()
+    )
+
+
+@torch.no_grad()
+def _normalize_block_frobenius_count_tensor_(
+    D: torch.Tensor,
+    *,
+    target_norm: float = 1.0,
+) -> torch.Tensor:
     """Normalize every site-concatenated decoder block to one Frobenius norm.
 
     This is the exact scale control used by the pinned BSF release trainer for
@@ -264,11 +298,25 @@ def normalize_block_frobenius_(D: torch.Tensor, *, target_norm: float = 1.0) -> 
         raise ValueError("target_norm must be positive")
     norms = D.float().pow(2).sum(dim=(0, 2, 3)).sqrt()
     D.mul_((target_norm / norms.clamp_min(1e-12)).to(D.dtype).view(1, -1, 1, 1))
-    return int((norms > 0).sum().item())
+    return (norms > 0).sum()
 
 
 @torch.no_grad()
-def project_latent_rows_(W: torch.Tensor, *, target_norm: float = 1.0) -> int:
+def normalize_block_frobenius_(D: torch.Tensor, *, target_norm: float = 1.0) -> int:
+    """Public integer-count wrapper for equality Frobenius normalization."""
+    return int(
+        _normalize_block_frobenius_count_tensor_(
+            D, target_norm=target_norm
+        ).item()
+    )
+
+
+@torch.no_grad()
+def _project_latent_rows_count_tensor_(
+    W: torch.Tensor,
+    *,
+    target_norm: float = 1.0,
+) -> torch.Tensor:
     """Normalize every scalar latent row over its input/output coordinates.
 
     ``W`` has shape ``[site, block, coordinate, activation]``.  This matches
@@ -285,7 +333,15 @@ def project_latent_rows_(W: torch.Tensor, *, target_norm: float = 1.0) -> int:
         torch.ones_like(norms),
     )
     W.mul_(scale.to(W.dtype))
-    return int(nonzero.sum().item())
+    return nonzero.sum()
+
+
+@torch.no_grad()
+def project_latent_rows_(W: torch.Tensor, *, target_norm: float = 1.0) -> int:
+    """Public integer-count wrapper for latent-row normalization."""
+    return int(
+        _project_latent_rows_count_tensor_(W, target_norm=target_norm).item()
+    )
 
 
 def site_frobenius_shares(D: torch.Tensor) -> torch.Tensor:

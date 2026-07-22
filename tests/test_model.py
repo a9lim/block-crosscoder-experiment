@@ -219,6 +219,68 @@ def test_frozen_encoder_sites_fail_closed_on_stale_state(device):
     assert set(model.state_dict()) == state_keys
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected_mutated"),
+    (
+        ({"decoder_constraint": "free"}, ()),
+        ({"decoder_constraint": "free", "decoder_bias": False}, ("c",)),
+        (
+            {
+                "decoder_constraint": "free",
+                "site_dims": (32, 24, 16, 8),
+            },
+            ("D", "E", "c"),
+        ),
+        ({"decoder_constraint": "gram"}, ("D",)),
+        (
+            {
+                "decoder_constraint": "free",
+                "encoder_constraint": "unit_latent",
+            },
+            ("E",),
+        ),
+        (
+            {
+                "decoder_constraint": "unit_latent",
+                "encoder_constraint": "unit_latent",
+            },
+            ("D", "E"),
+        ),
+        (
+            {"decoder_constraint": "free", "site_rank": 2},
+            (),
+        ),
+        (
+            {
+                "decoder_constraint": "free",
+                "site_rank": 2,
+                "site_dims": (24, 24, 24, 24),
+            },
+            ("c",),
+        ),
+        (
+            {
+                "decoder_constraint": "free",
+                "encoder_mode": "tied",
+                "site_dims": (32, 24, 16, 8),
+            },
+            ("D", "c"),
+        ),
+    ),
+)
+def test_projection_reports_exact_mutated_parameter_set(
+    device, overrides, expected_mutated
+):
+    model = make_model(device, **overrides)
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    count, mutated = model._project_decoder_with_state_()
+    assert count.shape == ()
+    assert count.dtype == torch.int64
+    assert count.device == next(model.parameters()).device
+    assert tuple(names[id(parameter)] for parameter in mutated) == expected_mutated
+    assert isinstance(model.project_decoder_(), int)
+
+
 def test_batchtopk_exact_count_and_variable_per_token(device):
     B, G = 64, CFG.n_blocks
     gen = torch.Generator(device="cpu").manual_seed(2)

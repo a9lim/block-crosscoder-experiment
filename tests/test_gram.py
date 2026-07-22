@@ -167,6 +167,34 @@ def test_frobenius_projection(device):
     assert norms.max() <= 1.0 + 1e-5
 
 
+def test_private_projection_counts_remain_device_resident_and_exact(device):
+    for private, public in (
+        (gram_module._retract_count_tensor_, retract_),
+        (gram_module._qr_retract_count_tensor_, gram_module.qr_retract_),
+        (
+            gram_module._project_block_frobenius_count_tensor_,
+            project_block_frobenius_,
+        ),
+        (
+            gram_module._normalize_block_frobenius_count_tensor_,
+            gram_module.normalize_block_frobenius_,
+        ),
+        (
+            gram_module._project_latent_rows_count_tensor_,
+            gram_module.project_latent_rows_,
+        ),
+    ):
+        private_input = random_stack(device, seed=119, scale=3.0)
+        public_input = private_input.clone()
+        count = private(private_input)
+        public_count = public(public_input)
+        assert count.shape == ()
+        assert count.dtype == torch.int64
+        assert count.device == private_input.device
+        assert int(count.cpu()) == public_count
+        assert torch.equal(private_input, public_input)
+
+
 def test_site_singular_values_casts_before_gram(device):
     D = random_stack(device, seed=22)
     expected = site_singular_values(D)

@@ -48,7 +48,7 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from .gram import gram_residual, retract_, site_frobenius_shares
+from .gram import _retract_count_tensor_, gram_residual, site_frobenius_shares
 from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
 
 __all__ = [
@@ -771,12 +771,23 @@ def _finite_gradients_with_l2_guard(
     return bool(torch.isfinite(historical_norm))
 
 
-def _project_decoder_(model: BlockCrosscoder) -> int:
+def _project_decoder_(
+    model: BlockCrosscoder,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    project_with_state = getattr(model, "_project_decoder_with_state_", None)
+    if project_with_state is not None:
+        return project_with_state()
     project = getattr(model, "project_decoder_", None)
     if project is not None:
         result = project()
-        return 0 if result is None else int(result)
-    return retract_(model.D.data, eig_floor=model.cfg.eig_floor)
+        count = torch.tensor(
+            0 if result is None else int(result),
+            dtype=torch.int64,
+            device=next(model.parameters()).device,
+        )
+        return count, tuple(model.parameters())
+    count = _retract_count_tensor_(model.D.data, eig_floor=model.cfg.eig_floor)
+    return count, (model.D,)
 
 
 def _constraint_residual(model: BlockCrosscoder) -> float | None:
@@ -1102,13 +1113,14 @@ class Trainer:
                 "continue (reload the last atomic checkpoint)"
             )
         self.sched.step()
-        floor_hits = 0
+        floor_hits_t: torch.Tensor | None = None
+        projected_parameters: tuple[torch.Tensor, ...] = ()
         # ``step_idx`` is zero-based while ``retract_every`` is a cadence
         # in completed optimizer updates. Initialization applies the declared
         # constraint separately, so cadence 20 means updates 20, 40, ....
         if projected_decoder:
-            floor_hits = _project_decoder_(self.master)
-        if projected_decoder and not _all_finite(tuple(self.master.parameters())):
+            floor_hits_t, projected_parameters = _project_decoder_(self.master)
+        if projected_parameters and not _all_finite(projected_parameters):
             raise RuntimeError(
                 "decoder projection produced non-finite parameters; refusing "
                 "to continue (reload the last atomic checkpoint)"
@@ -1140,7 +1152,9 @@ class Trainer:
                 "total": scalar_values["total"],
                 "lr": self.sched.get_last_lr()[0],
                 "grad_norm": scalar_values["grad_norm"],
-                "floor_hits": floor_hits,
+                "floor_hits": (
+                    int(floor_hits_t) if floor_hits_t is not None else 0
+                ),
                 "encoder_site_keep_fraction": scalar_values["keep"],
             }
             if cfg.gradient_clip_norm is not None:

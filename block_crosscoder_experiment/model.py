@@ -22,14 +22,14 @@ import torch
 from torch import nn
 
 from .gram import (
+    _normalize_block_frobenius_count_tensor_,
+    _project_block_frobenius_count_tensor_,
+    _project_latent_rows_count_tensor_,
+    _qr_retract_count_tensor_,
+    _retract_count_tensor_,
     decoder_nuclear_penalty,
     init_decoder_stack,
     map_nuclear_penalty,
-    normalize_block_frobenius_,
-    project_block_frobenius_,
-    project_latent_rows_,
-    qr_retract_,
-    retract_,
 )
 
 __all__ = [
@@ -625,15 +625,15 @@ class BlockCrosscoder(nn.Module):
         # the declared constraint only after those operations, so the very
         # first forward has the same geometry as every post-step forward.
         if cfg.decoder_constraint == "gram":
-            retract_(D, eig_floor=cfg.eig_floor)
+            _retract_count_tensor_(D, eig_floor=cfg.eig_floor)
         elif cfg.decoder_constraint == "qr":
-            qr_retract_(D)
+            _qr_retract_count_tensor_(D)
         elif cfg.decoder_constraint == "frobenius":
-            project_block_frobenius_(D)
+            _project_block_frobenius_count_tensor_(D)
         elif cfg.decoder_constraint == "unit_frobenius":
-            normalize_block_frobenius_(D)
+            _normalize_block_frobenius_count_tensor_(D)
         elif cfg.decoder_constraint == "unit_latent":
-            project_latent_rows_(D)
+            _project_latent_rows_count_tensor_(D)
         D.mul_(coordinate_mask)
         if cfg.site_rank is None:
             self.D = nn.Parameter(D)
@@ -666,7 +666,7 @@ class BlockCrosscoder(nn.Module):
                 self.register_parameter("E_site", None)
                 self.register_parameter("E_core", None)
                 if cfg.encoder_constraint == "unit_latent":
-                    project_latent_rows_(self.E.data)
+                    _project_latent_rows_count_tensor_(self.E.data)
             else:
                 encoder_site, encoder_core = _site_axis_factorize(
                     encoder, cfg.site_rank
@@ -1422,44 +1422,78 @@ class BlockCrosscoder(nn.Module):
         return self.D_core.dtype
 
     @torch.no_grad()
-    def project_decoder_(self) -> int:
-        """Apply the configured decoder constraint after an optimizer step."""
+    def _project_decoder_with_state_(
+        self,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Project and return a device count plus the exact mutated tensors."""
+        mutated: list[torch.Tensor] = []
+
+        def mark(tensor: torch.Tensor) -> None:
+            if not any(existing is tensor for existing in mutated):
+                mutated.append(tensor)
+
+        bad = torch.zeros((), dtype=torch.int64, device=self.parameter_device)
         if self.cfg.site_rank is not None:
             # BSCConfig permits only the free-decoder factorized arm.  There
             # is no exact factor-space equivalent of the full-tensor Stiefel
             # or norm projections, so silently materializing/projecting and
             # refactorizing would change the optimizer state and is forbidden.
-            bad = 0
+            pass
         else:
             assert self.D is not None
             if self._has_padded_coordinates:
                 self.D.data.mul_(self.coordinate_mask)
+                mark(self.D)
             if self.cfg.decoder_constraint == "gram":
-                bad = retract_(self.D.data, eig_floor=self.cfg.eig_floor)
+                bad = _retract_count_tensor_(
+                    self.D.data,
+                    eig_floor=self.cfg.eig_floor,
+                )
+                mark(self.D)
             elif self.cfg.decoder_constraint == "qr":
-                bad = qr_retract_(self.D.data)
+                bad = _qr_retract_count_tensor_(self.D.data)
+                mark(self.D)
             elif self.cfg.decoder_constraint == "frobenius":
-                bad = project_block_frobenius_(self.D.data)
+                bad = _project_block_frobenius_count_tensor_(self.D.data)
+                mark(self.D)
             elif self.cfg.decoder_constraint == "unit_frobenius":
-                bad = normalize_block_frobenius_(self.D.data)
+                bad = _normalize_block_frobenius_count_tensor_(self.D.data)
+                mark(self.D)
             elif self.cfg.decoder_constraint == "unit_latent":
-                bad = project_latent_rows_(self.D.data)
-            else:
-                bad = 0
+                bad = _project_latent_rows_count_tensor_(self.D.data)
+                mark(self.D)
+            assert torch.is_tensor(bad)
             if self._has_padded_coordinates:
                 self.D.data.mul_(self.coordinate_mask)
+                mark(self.D)
             if self.E is not None:
                 if self._has_padded_coordinates:
                     self.E.data.mul_(self.coordinate_mask)
+                    mark(self.E)
                 if self.cfg.encoder_constraint == "unit_latent":
-                    project_latent_rows_(self.E.data)
+                    _project_latent_rows_count_tensor_(self.E.data)
+                    mark(self.E)
                     if self._has_padded_coordinates:
                         self.E.data.mul_(self.coordinate_mask)
+                        mark(self.E)
         if not self.cfg.decoder_bias:
             self.c.data.zero_()
+            mark(self.c)
         elif self._has_padded_coordinates:
             self.c.data.mul_(self.coordinate_mask[:, 0, 0])
-        return bad
+            mark(self.c)
+        return bad, tuple(mutated)
+
+    @torch.no_grad()
+    def project_decoder_(self) -> int:
+        """Apply the configured decoder constraint after an optimizer step."""
+        bad, _ = self._project_decoder_with_state_()
+        if self.cfg.site_rank is not None or self.cfg.decoder_constraint in {
+            "free",
+            "qr",
+        }:
+            return 0
+        return int(bad.item())
 
     @torch.no_grad()
     def fit_threshold_(
