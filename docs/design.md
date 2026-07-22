@@ -1160,6 +1160,15 @@ step peak falls `12.0 MiB` and `48.0 MiB`. Twenty-four-step model, optimizer,
 support, and loss hashes remain bitwise identical at ranks one and four. The
 planner retains its larger pre-optimization gradient allowance.
 
+The post-optimizer global finite scan is also a reusable certificate for every
+canonical projection composed only of finite masks, zeroing, Frobenius-ball or
+unit-Frobenius scaling, and latent-row scaling. Even an overflowed finite fp32
+norm produces a finite zero scale. Decoder/encoder/bias tensors mutated only by
+those operations therefore skip the redundant post-projection scan; polar
+eigensolve output remains uncertified and scanned. On jobe this removes
+`.144 ms` for a decoder-only projection and `.251 ms` when decoder and encoder
+are both normalized, roughly `1–2%` of affected every-step cells.
+
 Decoder retraction has a separate serialized implementation identity. Canonical
 QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar cells derive
 `symmetric_polar_site_bmm_guard_g1024_w8192_c512_f2_r1e-4_v2`, and other decoder carriers derive

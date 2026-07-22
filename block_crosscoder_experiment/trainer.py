@@ -1436,14 +1436,24 @@ def _project_decoder_(
             count, mutated = project_with_state(
                 qr_input_finite=qr_input_finite,
             )
-            certified = (
-                tuple(
-                    parameter
-                    for parameter in mutated
-                    if parameter is model.D or parameter is model.c
+            # The immediately preceding global scan proves every input finite.
+            # Masks, zeroing, Frobenius scaling, and latent-row scaling preserve
+            # that fact even when their fp32 norm accumulation overflows: the
+            # resulting scale is finite zero. Polar eigensolve/reconstruction
+            # is the sole canonical projection that does not inherit the proof.
+            certified = tuple(
+                parameter
+                for parameter in mutated
+                if parameter is model.c
+                or (
+                    parameter is model.E
+                    and model.cfg.decoder_constraint
+                    in {"frobenius", "unit_frobenius", "unit_latent", "free"}
                 )
-                if model.cfg.decoder_constraint == "qr"
-                else ()
+                or (
+                    parameter is model.D
+                    and model.cfg.decoder_constraint != "gram"
+                )
             )
             return count, mutated, certified
         count, mutated = project_with_state()

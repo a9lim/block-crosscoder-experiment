@@ -2132,6 +2132,97 @@ def test_qr_step_reuses_global_input_and_transactional_output_finite_checks(
     assert gram_calls == 0
 
 
+@pytest.mark.parametrize(
+    "constraint",
+    ("frobenius", "unit_frobenius", "unit_latent", "free"),
+)
+def test_finiteness_preserving_projection_reuses_global_scan(
+    device,
+    monkeypatch,
+    constraint,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": constraint,
+            "decoder_retraction_implementation": None,
+            "encoder_mode": "untied",
+            "encoder_constraint": (
+                "unit_latent" if constraint == "unit_latent" else "none"
+            ),
+            "decoder_bias": False,
+        }
+    )
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+    original = trainer_module._all_finite
+    finite_calls = 0
+
+    def counted(value):
+        nonlocal finite_calls
+        finite_calls += 1
+        return original(value)
+
+    monkeypatch.setattr(trainer_module, "_all_finite", counted)
+    trainer.step(planted_batches(device, n_batches=1, seed=434)[0])
+    assert finite_calls == 1
+
+
+def test_polar_projection_retains_post_projection_finite_scan(device, monkeypatch):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=2, log_every=100),
+    )
+    original = trainer_module._all_finite
+    finite_calls = 0
+
+    def counted(value):
+        nonlocal finite_calls
+        finite_calls += 1
+        return original(value)
+
+    monkeypatch.setattr(trainer_module, "_all_finite", counted)
+    trainer.step(planted_batches(device, n_batches=1, seed=435)[0])
+    assert finite_calls == 2
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    ("frobenius", "unit_frobenius", "unit_latent"),
+)
+def test_norm_projection_certificate_handles_finite_overflow_extrema(
+    device,
+    constraint,
+):
+    cfg = BSCConfig(
+        **{
+            **CFG.__dict__,
+            "decoder_constraint": constraint,
+            "decoder_retraction_implementation": None,
+            "encoder_mode": "untied",
+            "encoder_constraint": (
+                "unit_latent" if constraint == "unit_latent" else "none"
+            ),
+            "decoder_bias": False,
+        }
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    with torch.no_grad():
+        assert model.D is not None
+        model.D.fill_(torch.finfo(model.D.dtype).max)
+        if model.E is not None:
+            model.E.fill_(torch.finfo(model.E.dtype).max)
+    _, mutated, certified = trainer_module._project_decoder_(
+        model,
+        qr_input_finite=True,
+    )
+    assert mutated
+    assert len(certified) == len(mutated)
+    assert all(bool(torch.isfinite(parameter).all()) for parameter in certified)
+
+
 def test_qr_step_refuses_optimizer_poison_before_trusting_input(
     device,
     monkeypatch,
