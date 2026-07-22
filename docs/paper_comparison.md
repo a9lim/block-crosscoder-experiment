@@ -439,9 +439,10 @@ Deployment evaluation binds the engineering identity
 paired raw-space selection endpoints consume one threshold/event/decode
 traversal, while the public codec result, raw evidence contract, and independent
 source-free packet validation remain unchanged. This is not a paper-method
-adaptation or experimental condition. Evaluation schema v2, executor schema v5,
+adaptation or experimental condition. Evaluation schema v2, executor schema v6,
 the campaign gate, and estimator v14 bind and price the joint implementation.
-Executor v5 overlaps one ordered device transfer with the current CUDA batch;
+Executor v6 overlaps one ordered device transfer with the current CUDA batch
+and applies the same explicitly closed pipeline to all calibration traversals;
 this does not alter the data stream or scientific method.
 
 QR versus symmetric-polar retraction remains a scientific architecture choice.

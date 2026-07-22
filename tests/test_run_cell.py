@@ -122,6 +122,16 @@ def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
     assert "encode_batch(" not in source
 
 
+def test_calibrate_prefetches_and_closes_all_three_cuda_traversals() -> None:
+    source = inspect.getsource(run_cell_module._calibrate)
+    assert source.count("_prefetched_evaluation_batches(") == 3
+    assert "_evaluation_batches(" not in source.replace(
+        "_prefetched_evaluation_batches(",
+        "",
+    )
+    assert source.count("with closing(") == 3
+
+
 def test_persisted_view_validation_matches_allclose_contract() -> None:
     expected = torch.tensor([1.0, -2.0, 0.0], dtype=torch.bfloat16)
     actual = expected.float() + torch.tensor([0.01, -0.02, 0.011])

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import closing
 import functools
 import hashlib
 import importlib.metadata
@@ -123,7 +124,7 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v5"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v6"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -4550,11 +4551,14 @@ def _calibrate(
             "the saved codec requires heldout_target_rate/calibration_quantile"
         )
     quantile_method = "exact" if ctx.cell.phase is Phase.PHASE1 else "streaming"
-    model.fit_threshold_(
-        _evaluation_batches(ctx, preparation, "calibration"),
-        target_avg_blocks=target,
-        method=quantile_method,
-    )
+    with closing(
+        _prefetched_evaluation_batches(ctx, preparation, "calibration")
+    ) as batches:
+        model.fit_threshold_(
+            batches,
+            target_avg_blocks=target,
+            method=quantile_method,
+        )
     threshold_source: dict[str, Any] = {
         "split": str(ctx.values["evaluation.calibration_split"]),
         "quantile_method": quantile_method,
@@ -4570,19 +4574,22 @@ def _calibrate(
             else model.encoder_tensor()
         )
         calibration_score_geometry = model._frozen_score_geometry(calibration_decoder)
-        for batch in _evaluation_batches(ctx, preparation, "calibration"):
-            x = batch.to(device=_device(ctx), dtype=torch.float32)
-            z, keep = model._encode_with_tensor(x, calibration_encoder)
-            scores = model.scores(
-                z,
-                x=x,
-                _decoder=calibration_decoder,
-                _observation_keep=keep,
-                _score_geometry=calibration_score_geometry,
-            )
-            selected = model._select_scores(scores, mode="threshold", z=z)
-            achieved_events += int(selected.sum())
-            achieved_tokens += len(x)
+        with closing(
+            _prefetched_evaluation_batches(ctx, preparation, "calibration")
+        ) as batches:
+            for batch in batches:
+                x = batch.to(device=_device(ctx), dtype=torch.float32)
+                z, keep = model._encode_with_tensor(x, calibration_encoder)
+                scores = model.scores(
+                    z,
+                    x=x,
+                    _decoder=calibration_decoder,
+                    _observation_keep=keep,
+                    _score_geometry=calibration_score_geometry,
+                )
+                selected = model._select_scores(scores, mode="threshold", z=z)
+                achieved_events += int(selected.sum())
+                achieved_tokens += len(x)
     if achieved_tokens == 0:
         raise CellExecutionError("calibration split is empty")
     achieved_avg_blocks = achieved_events / achieved_tokens
@@ -4621,12 +4628,15 @@ def _calibrate(
             f"estimated {preflight_event_bytes} > "
             f"{spec.max_calibration_event_bytes} bytes"
         )
-    codec = fit_codec(
-        model,
-        _evaluation_batches(ctx, preparation, "calibration"),
-        spec,
-        device=str(_device(ctx)),
-    )
+    with closing(
+        _prefetched_evaluation_batches(ctx, preparation, "calibration")
+    ) as batches:
+        codec = fit_codec(
+            model,
+            batches,
+            spec,
+            device=str(_device(ctx)),
+        )
     codec.meta.update(
         {
             "schema": "bsc-calibration-v1",

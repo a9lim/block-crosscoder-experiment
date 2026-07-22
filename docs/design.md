@@ -1316,7 +1316,7 @@ operation or endpoint schema changes.
 
 Rate-distortion evaluation serializes
 `evaluation_execution_implementation=joint_transformed_raw_packet_v1` under
-evaluation schema v2 and executor schema v5. One paired evaluation stream now
+evaluation schema v2 and executor schema v6. One paired evaluation stream now
 owns threshold selection, the q-independent packet events, and exactly
 `ceil(number_of_quantizers / 2)` trusted sparse decodes per batch. The codec
 accumulator preserves transformed-space rate arithmetic, sequence grouping,
@@ -1325,10 +1325,13 @@ observer consumes those same decoded chunks, applies the deployment inverse,
 and accumulates paired raw-space endpoints and schedule-cache errors. The first
 packet event stream is also reused for the independent public source-free
 roundtrip. The executor no longer rereads or re-encodes the first batch.
-Executor v5 composes ordered pinned-host prefetch with a one-batch-ahead
+Executor v6 composes ordered pinned-host prefetch with a one-batch-ahead
 dedicated CUDA copy stream for training, ordinary metric evaluation, and the
-paired rate-distortion stream. Per-batch events and allocator stream recording
-preserve consumer order without a device-wide synchronization.
+paired rate-distortion stream. Threshold fitting, achieved-rate preflight, and
+codec fitting independently use the same pipeline and explicitly close each
+iterator so early return or failure drains its CUDA stream and host producer.
+Per-batch events and allocator stream recording preserve consumer order without
+a device-wide synchronization.
 
 On jobe at the canonical Phase-2 throughput shape (`B=4096`, four width-768
 sites, 2,048 groups, block width four, site rank one, bf16 fused AdamW), seven
@@ -1338,6 +1341,15 @@ copy stream: a `28.93%` throughput reduction (`1.407x`). P95 falls from
 `6.078` to `4.319 ms`; the deliberate one-batch lookahead adds `24.0 MiB`
 incremental peak allocation. Twenty-four paired steps leave both fp32 master
 and bf16 forward states bitwise equal.
+
+For the 250,000-token Phase-2 calibration split at `B=4096`, four width-768
+sites, 2,048 groups, and block width four, seven alternating jobe pairs reduce
+threshold fitting from `.8958` to `.3157 s`, achieved-rate traversal from
+`.8682` to `.3092 s`, and codec fitting from `1.4384` to `.5850 s`. Total
+calibration falls from `3.2034` to `1.2505 s` (`60.96%`, `2.562x`); p95 falls
+from `3.2176` to `1.2711 s`. Peak allocation rises by one prefetched activation
+batch, `840.66` to `888.66 MiB`. Threshold, selected-event/token counts, and
+all ten codec tensors remain bitwise equal.
 
 Phase 3 prefetches the one raw bf16 view, transfers it once, and applies the
 serialized normalization on CUDA. Phase 2 prefetches paired raw and persisted

@@ -114,7 +114,7 @@ exit is not evidence by itself.
   payload-equality, selector-sharing, and call-count tests preserve every
   endpoint and decode.
 - Rate-distortion artifacts bind `joint_transformed_raw_packet_v1` under
-  evaluation schema v2 and executor schema v5. One paired stream, one threshold
+  evaluation schema v2 and executor schema v6. One paired stream, one threshold
   selection, one packet-event construction, and `ceil(Q/2)` trusted decodes
   must produce both transformed and raw endpoints; the first event stream must
   also feed the independent public packet roundtrip. Codec payload equality,
@@ -124,7 +124,9 @@ exit is not evidence by itself.
   Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
   Estimator v14 prices the complete joint lifetime and dedicated-stream device
   lookahead without a traversal credit. Training and ordinary metric iterators
-  use the same ordered event-bound transfer pipeline.
+  use the same ordered event-bound transfer pipeline. All three calibration
+  traversals use separately closed instances of that host/CUDA prefetch
+  pipeline; exception and early-close tests require producer and stream cleanup.
 - Decoded energy has an explicit serialized implementation identity. The
   bounded code-norm kernel is admitted only for decoded-energy scoring on an
   unfactorized Gram/QR Stiefel decoder, a hard token- or batch-TopK selector,
