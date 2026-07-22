@@ -40,6 +40,186 @@ class EvaluationModeEndpoints(NamedTuple):
     shared_code: dict[str, dict]
 
 
+class _ModeSelectedMoments(NamedTuple):
+    """Mode-first reductions of one shared raw code geometry."""
+
+    decoded_energy: torch.Tensor
+    code_sum: torch.Tensor
+    code_outer: torch.Tensor
+
+
+class _ModeConcordanceReductions(NamedTuple):
+    """Mode-first matched-support reductions for one concordance chunk."""
+
+    intersection_count: torch.Tensor
+    concordance_numerator: torch.Tensor
+    concordance_denominator: torch.Tensor
+    full_code_sum: torch.Tensor
+    partial_code_sum: torch.Tensor
+    intersection_full_energy: torch.Tensor
+
+
+def _raw_quadratic_terms(
+    full_code: torch.Tensor,
+    gram: torch.Tensor,
+    partial_code: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Compute fp64 per-event decoder-Gram terms before selector masking."""
+
+    block_width = full_code.shape[-1]
+    if block_width == 1:
+        full_scalar = full_code[..., 0]
+        weight = gram[:, 0, 0].unsqueeze(0)
+        full_q = full_scalar.square() * weight
+        if partial_code is None:
+            return full_q, None, None
+        partial_scalar = partial_code[..., 0]
+        return (
+            full_q,
+            partial_scalar.square() * weight,
+            full_scalar * partial_scalar * weight,
+        )
+
+    full_mapped = torch.einsum("ngb,gbc->ngc", full_code, gram)
+    full_q = (full_mapped * full_code).sum(dim=-1)
+    if partial_code is None:
+        return full_q, None, None
+    partial_q = torch.einsum(
+        "ngb,gbc,ngc->ng",
+        partial_code,
+        gram,
+        partial_code,
+    )
+    cross = (full_mapped * partial_code).sum(dim=-1)
+    return full_q, partial_q, cross
+
+
+def _batched_mode_selected_moments(
+    code: torch.Tensor,
+    gram: torch.Tensor,
+    mode_masks: torch.Tensor,
+) -> _ModeSelectedMoments:
+    """Reduce selected-code moments for every selector from one raw geometry.
+
+    ``mode_masks`` is ``[M,N,G]``.  Applying it with ``torch.where`` is
+    intentional: an unselected non-finite raw coordinate must not leak through
+    a multiplication by zero into an otherwise finite selector endpoint.
+    """
+
+    code64 = code.double()
+    if code.shape[-1] == 1:
+        raw_energy = (
+            code64[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
+        )
+    else:
+        # Retain the direct three-operand contraction.  Concordance uses a
+        # mapped full code because it also needs the cross term, while this
+        # standalone decoded-energy reduction must match per-mode execution.
+        raw_energy = torch.einsum(
+            "ngb,gbc,ngc->ng",
+            code64,
+            gram,
+            code64,
+        )
+    zero = torch.zeros((), dtype=torch.float64, device=code.device)
+    decoded_energy = torch.where(
+        mode_masks,
+        raw_energy.unsqueeze(0),
+        zero,
+    ).sum(dim=1)
+    del raw_energy
+    selected = torch.where(
+        mode_masks.unsqueeze(-1),
+        code64.unsqueeze(0),
+        zero,
+    )
+    code_sum = selected.sum(dim=1)
+    # Keep the per-mode contraction schedule.  It benchmarks faster at the
+    # campaign payload size, and folding the mode axis into this einsum also
+    # changes CUDA's reduction order for short final batches.
+    code_outer = torch.stack(
+        tuple(
+            torch.einsum("ngb,ngc->gbc", selected[mode], selected[mode])
+            for mode in range(mode_masks.shape[0])
+        )
+    )
+    return _ModeSelectedMoments(decoded_energy, code_sum, code_outer)
+
+
+def _batched_mode_concordance(
+    full_code: torch.Tensor,
+    partial_code: torch.Tensor,
+    gram: torch.Tensor,
+    full_masks: torch.Tensor,
+    partial_masks: torch.Tensor,
+) -> _ModeConcordanceReductions:
+    """Reduce both selector modes from one raw fp64 concordance geometry."""
+
+    full64 = full_code.double()
+    partial64 = partial_code.double()
+    full_q, partial_q, cross = _raw_quadratic_terms(full64, gram, partial64)
+    assert partial_q is not None and cross is not None
+    intersection = full_masks & partial_masks
+    zero = torch.zeros((), dtype=torch.float64, device=full_code.device)
+
+    # Materialize only one mode-expanded value family at a time.  This keeps
+    # the peak below the existing 8*b+4 fp64 concordance workspace bound.
+    full_code_sum = torch.where(
+        intersection.unsqueeze(-1),
+        full64.unsqueeze(0),
+        zero,
+    ).sum(dim=1)
+    partial_code_sum = torch.where(
+        intersection.unsqueeze(-1),
+        partial64.unsqueeze(0),
+        zero,
+    ).sum(dim=1)
+    masked_full_q = torch.where(intersection, full_q.unsqueeze(0), zero)
+    intersection_full_energy = masked_full_q.sum(dim=1)
+    masked_partial_q = torch.where(intersection, partial_q.unsqueeze(0), zero)
+    masked_cross = torch.where(intersection, cross.unsqueeze(0), zero)
+    return _ModeConcordanceReductions(
+        intersection.sum(dim=1).double(),
+        2.0 * masked_cross.sum(dim=1),
+        intersection_full_energy + masked_partial_q.sum(dim=1),
+        full_code_sum,
+        partial_code_sum,
+        intersection_full_energy,
+    )
+
+
+def _batched_mode_selected_delta_sq(
+    full_code: torch.Tensor,
+    partial_code: torch.Tensor,
+    full_masks: torch.Tensor,
+    partial_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Mode-first selected-code squared deltas with exact mask suppression."""
+
+    zero = torch.zeros((), dtype=torch.float64, device=full_code.device)
+    full_selected = torch.where(
+        full_masks.unsqueeze(-1),
+        full_code.double().unsqueeze(0),
+        zero,
+    )
+    partial_selected = torch.where(
+        partial_masks.unsqueeze(-1),
+        partial_code.double().unsqueeze(0),
+        zero,
+    )
+    # Preserve the per-mode CUDA reduction schedule.  The mode-first multi-axis
+    # sum does not improve campaign-scale throughput and is not bit-identical
+    # on short final batches.
+    return torch.stack(
+        tuple(
+            (partial_selected[mode] - full_selected[mode])
+            .square()
+            .sum(dim=(0, 2))
+            for mode in range(full_masks.shape[0])
+        )
+    )
+
+
 def checkpoint_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -264,71 +444,8 @@ def _evaluate_code_modes(
             result.add_(residual.square().sum(dim=(0, 2)))
         return result
 
-    def accumulate_coordinate_concordance(
-        partial,
-        full,
-        index: int,
-        *,
-        full_mask_count64: torch.Tensor,
-        all_full_energy64: torch.Tensor,
-        intersection_count: torch.Tensor,
-        full_count: torch.Tensor,
-        concordance_numerator: torch.Tensor,
-        concordance_denominator: torch.Tensor,
-        full_code_sum: torch.Tensor,
-        partial_code_sum: torch.Tensor,
-        intersection_full_energy: torch.Tensor,
-        full_energy: torch.Tensor,
-    ) -> None:
-        """Accumulate gauge-invariant agreement on matched support events."""
-
-        full_count[index] += full_mask_count64
-        full_energy[index] += all_full_energy64
-        for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-            stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-            block_slice = slice(start, stop)
-            intersection = (
-                partial.mask[:, block_slice] & full.mask[:, block_slice]
-            )
-            full_code = full.z[:, block_slice].double()
-            partial_code = partial.z[:, block_slice].double()
-            intersection_f = intersection.unsqueeze(-1).double()
-            full_intersection = full_code * intersection_f
-            partial_intersection = partial_code * intersection_f
-            gram = all_site_decoder_gram[block_slice]
-            if b == 1:
-                full_scalar = full_intersection[..., 0]
-                partial_scalar = partial_intersection[..., 0]
-                weight = gram[:, 0, 0].unsqueeze(0)
-                full_q = full_scalar.square() * weight
-                partial_q = partial_scalar.square() * weight
-                cross = full_scalar * partial_scalar * weight
-            else:
-                full_mapped = torch.einsum(
-                    "ngb,gbc->ngc",
-                    full_intersection,
-                    gram,
-                )
-                full_q = (full_mapped * full_intersection).sum(dim=-1)
-                partial_q = torch.einsum(
-                    "ngb,gbc,ngc->ng",
-                    partial_intersection,
-                    gram,
-                    partial_intersection,
-                )
-                cross = (full_mapped * partial_intersection).sum(dim=-1)
-            intersection_count[index, block_slice] += intersection.sum(
-                dim=0
-            ).double()
-            concordance_numerator[index, block_slice] += 2.0 * cross.sum(dim=0)
-            concordance_denominator[index, block_slice] += full_q.sum(
-                dim=0
-            ) + partial_q.sum(dim=0)
-            full_code_sum[index, block_slice] += full_intersection.sum(dim=0)
-            partial_code_sum[index, block_slice] += partial_intersection.sum(dim=0)
-            intersection_full_energy[index, block_slice] += full_q.sum(dim=0)
-
     primary_mode = selection_modes[0]
+    mode_states = tuple(states[mode] for mode in selection_modes)
 
     def outputs_for_view(
         value: torch.Tensor,
@@ -398,6 +515,9 @@ def _evaluate_code_modes(
             observed=explicit_full_observed,
             encoder_sites=(None if explicit_full_observed is not None else encoder_sites),
         )
+        full_mode_masks = torch.stack(
+            tuple(full_outputs[mode].mask for mode in selection_modes)
+        )
         accumulate_target_statistics(x)
         if include_selector_payloads:
             assert selector_target_sum is not None
@@ -438,10 +558,11 @@ def _evaluate_code_modes(
                         selected_batch_counts[mode]
                     )
                 del candidate_batch_counts, selected_batch_counts
-        full_mask_counts: dict[str, torch.Tensor] = {}
-        full_energies: dict[str, torch.Tensor] = {}
         for mode, full in full_outputs.items():
             state = states[mode]
+            # Dense reconstruction SSE remains intentionally per mode.  It is
+            # not interchangeable with a sparse quadratic shortcut when the
+            # decoder has a bias or padded coordinates.
             state["full_sse"] += squared_error_by_site(x, full.xhat)
             if include_selector_payloads:
                 assert selector_states is not None
@@ -463,35 +584,29 @@ def _evaluate_code_modes(
                     minlength=G + 1,
                 )
                 del selector_residual, selector_counts, selector_state
-            full_mask_count64 = full.mask.sum(dim=0).double()
-            all_full_energy64 = torch.zeros(
-                G, dtype=torch.float64, device=device
+        full_mask_count64 = full_mode_masks.sum(dim=1).double()
+        all_full_energy64 = torch.zeros(
+            len(selection_modes),
+            G,
+            dtype=torch.float64,
+            device=device,
+        )
+        for mode_index, state in enumerate(mode_states):
+            state["fire"] += full_mask_count64[mode_index]
+        raw_full_code = full_outputs[primary_mode].z
+        for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+            stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+            block_slice = slice(start, stop)
+            moments = _batched_mode_selected_moments(
+                raw_full_code[:, block_slice],
+                all_site_decoder_gram[block_slice],
+                full_mode_masks[:, :, block_slice],
             )
-            state["fire"] += full_mask_count64
-            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-                block_slice = slice(start, stop)
-                selected = full.z_selected[:, block_slice].double()
-                gram = all_site_decoder_gram[block_slice]
-                if b == 1:
-                    selected_energy = (
-                        selected[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
-                    )
-                else:
-                    selected_energy = torch.einsum(
-                        "ngb,gbc,ngc->ng",
-                        selected,
-                        gram,
-                        selected,
-                    )
-                all_full_energy64[block_slice] = selected_energy.sum(dim=0)
-                state["zsum"][block_slice] += selected.sum(dim=0)
-                state["zz"][block_slice] += torch.einsum(
-                    "ngb,ngc->gbc", selected, selected
-                )
-            full_mask_counts[mode] = full_mask_count64
-            full_energies[mode] = all_full_energy64
-        del selected, selected_energy, gram
+            all_full_energy64[:, block_slice] = moments.decoded_energy
+            for mode_index, state in enumerate(mode_states):
+                state["zsum"][block_slice] += moments.code_sum[mode_index]
+                state["zz"][block_slice] += moments.code_outer[mode_index]
+            del moments
         if include_selector_payloads and cfg.selection_score == "isolated_loss_decrease":
             del selector_scores
         zero_x: torch.Tensor | None = None
@@ -529,6 +644,70 @@ def _evaluate_code_modes(
                 encoder_sites=frozen_encoder_sites,
             )
 
+        def accumulate_coordinate_concordance_modes(
+            partial_outputs: dict[str, BSCOutput],
+            index: int,
+            *,
+            prefix: str,
+            support_intersection_key: str,
+            support_union_key: str,
+        ) -> torch.Tensor:
+            """Accumulate every selector from one raw partial-view geometry."""
+
+            partial_mode_masks = torch.stack(
+                tuple(partial_outputs[mode].mask for mode in selection_modes)
+            )
+            intersections = partial_mode_masks & full_mode_masks
+            intersection_totals = intersections.sum(dim=(1, 2)).double()
+            union_totals = (partial_mode_masks | full_mode_masks).sum(
+                dim=(1, 2)
+            ).double()
+            for mode_index, state in enumerate(mode_states):
+                state[support_intersection_key][index] += intersection_totals[
+                    mode_index
+                ]
+                state[support_union_key][index] += union_totals[mode_index]
+                state[f"{prefix}_full_count"][index] += full_mask_count64[
+                    mode_index
+                ]
+                state[f"{prefix}_full_energy"][index] += all_full_energy64[
+                    mode_index
+                ]
+            del intersections, intersection_totals, union_totals
+
+            raw_partial_code = partial_outputs[primary_mode].z
+            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+                block_slice = slice(start, stop)
+                reductions = _batched_mode_concordance(
+                    raw_full_code[:, block_slice],
+                    raw_partial_code[:, block_slice],
+                    all_site_decoder_gram[block_slice],
+                    full_mode_masks[:, :, block_slice],
+                    partial_mode_masks[:, :, block_slice],
+                )
+                for mode_index, state in enumerate(mode_states):
+                    state[f"{prefix}_intersection_count"][index, block_slice] += (
+                        reductions.intersection_count[mode_index]
+                    )
+                    state[f"{prefix}_concordance_numerator"][
+                        index, block_slice
+                    ] += reductions.concordance_numerator[mode_index]
+                    state[f"{prefix}_concordance_denominator"][
+                        index, block_slice
+                    ] += reductions.concordance_denominator[mode_index]
+                    state[f"{prefix}_full_code_sum"][index, block_slice] += (
+                        reductions.full_code_sum[mode_index]
+                    )
+                    state[f"{prefix}_partial_code_sum"][index, block_slice] += (
+                        reductions.partial_code_sum[mode_index]
+                    )
+                    state[f"{prefix}_intersection_full_energy"][
+                        index, block_slice
+                    ] += reductions.intersection_full_energy[mode_index]
+                del reductions
+            return partial_mode_masks
+
         for source in range(S):
             only_observed = torch.zeros_like(observed_all)
             only_observed[:, source] = True
@@ -541,31 +720,16 @@ def _evaluate_code_modes(
                 frozen_encoder_sites=encoder_sites,
             )
             for mode, only in only_outputs.items():
-                full = full_outputs[mode]
                 state = states[mode]
                 state["site_sse"][source] += squared_error_by_site(x, only.xhat)
-                state["support_intersection"][source] += (
-                    only.mask & full.mask
-                ).sum()
-                state["support_union"][source] += (only.mask | full.mask).sum()
-                accumulate_coordinate_concordance(
-                    only,
-                    full,
-                    source,
-                    full_mask_count64=full_mask_counts[mode],
-                    all_full_energy64=full_energies[mode],
-                    intersection_count=state["site_intersection_count"],
-                    full_count=state["site_full_count"],
-                    concordance_numerator=state["site_concordance_numerator"],
-                    concordance_denominator=state["site_concordance_denominator"],
-                    full_code_sum=state["site_full_code_sum"],
-                    partial_code_sum=state["site_partial_code_sum"],
-                    intersection_full_energy=state[
-                        "site_intersection_full_energy"
-                    ],
-                    full_energy=state["site_full_energy"],
-                )
-            del only, full, state, only_outputs
+            only_mode_masks = accumulate_coordinate_concordance_modes(
+                only_outputs,
+                source,
+                prefix="site",
+                support_intersection_key="support_intersection",
+                support_union_key="support_union",
+            )
+            del only, state, only_outputs, only_mode_masks
 
             missing_observed = observed_all.clone()
             missing_observed[:, source] = False
@@ -591,50 +755,47 @@ def _evaluate_code_modes(
                     .sum(dim=(0, 2))
                 )
             for mode, missing in missing_outputs.items():
-                full = full_outputs[mode]
                 state = states[mode]
                 state["loo_sse"][source] += squared_error_by_site(x, missing.xhat)
-                state["loo_intersection"][source] += (
-                    missing.mask & full.mask
-                ).sum()
-                state["loo_union"][source] += (missing.mask | full.mask).sum()
-                accumulate_coordinate_concordance(
-                    missing,
-                    full,
-                    source,
-                    full_mask_count64=full_mask_counts[mode],
-                    all_full_energy64=full_energies[mode],
-                    intersection_count=state["loo_intersection_count"],
-                    full_count=state["loo_full_count"],
-                    concordance_numerator=state["loo_concordance_numerator"],
-                    concordance_denominator=state["loo_concordance_denominator"],
-                    full_code_sum=state["loo_full_code_sum"],
-                    partial_code_sum=state["loo_partial_code_sum"],
-                    intersection_full_energy=state[
-                        "loo_intersection_full_energy"
-                    ],
-                    full_energy=state["loo_full_energy"],
+            missing_mode_masks = accumulate_coordinate_concordance_modes(
+                missing_outputs,
+                source,
+                prefix="loo",
+                support_intersection_key="loo_intersection",
+                support_union_key="loo_union",
+            )
+            raw_missing_code = missing_outputs[primary_mode].z
+            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+                block_slice = slice(start, stop)
+                selected_delta_sq = _batched_mode_selected_delta_sq(
+                    raw_full_code[:, block_slice],
+                    raw_missing_code[:, block_slice],
+                    full_mode_masks[:, :, block_slice],
+                    missing_mode_masks[:, :, block_slice],
                 )
-                for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-                    stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-                    block_slice = slice(start, stop)
-                    state["post_selection_loo_delta_sq"][source, block_slice] += (
-                        (
-                            missing.z_selected[:, block_slice].double()
-                            - full.z_selected[:, block_slice].double()
-                        )
-                        .square()
-                        .sum(dim=(0, 2))
-                    )
-            del missing, full, state, primary_missing, primary_full, missing_outputs
+                for mode_index, state in enumerate(mode_states):
+                    state["post_selection_loo_delta_sq"][
+                        source, block_slice
+                    ] += selected_delta_sq[mode_index]
+                del selected_delta_sq
+            del (
+                missing,
+                state,
+                primary_missing,
+                primary_full,
+                missing_outputs,
+                missing_mode_masks,
+                raw_missing_code,
+            )
         del (
             encoder_sites,
             null_outputs,
             full_outputs,
-            full_mask_counts,
-            full_energies,
+            full_mode_masks,
             full_mask_count64,
             all_full_energy64,
+            raw_full_code,
         )
         n_tokens += x.shape[0]
 

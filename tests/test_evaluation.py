@@ -83,6 +83,244 @@ def test_shared_code_builds_frozen_score_geometry_once(monkeypatch) -> None:
     assert calls == 1
 
 
+@pytest.mark.parametrize("block_dim", (1, 3))
+def test_batched_mode_quadratics_exactly_match_per_mode_reference(
+    block_dim,
+    monkeypatch,
+) -> None:
+    generator = torch.Generator().manual_seed(805)
+    n_tokens, groups, modes = 19, 11, 2
+    full = torch.randn(n_tokens, groups, block_dim, generator=generator)
+    partial = torch.randn(n_tokens, groups, block_dim, generator=generator)
+    decoder = torch.randn(groups, block_dim, block_dim, generator=generator).double()
+    gram = decoder @ decoder.transpose(-1, -2)
+    full_masks = torch.rand(modes, n_tokens, groups, generator=generator) > 0.45
+    partial_masks = torch.rand(modes, n_tokens, groups, generator=generator) > 0.55
+
+    references = []
+    for mode in range(modes):
+        intersection = full_masks[mode] & partial_masks[mode]
+        intersection_f = intersection.unsqueeze(-1).double()
+        full_selected = full.double() * intersection_f
+        partial_selected = partial.double() * intersection_f
+        if block_dim == 1:
+            full_scalar = full_selected[..., 0]
+            partial_scalar = partial_selected[..., 0]
+            weight = gram[:, 0, 0].unsqueeze(0)
+            full_q = full_scalar.square() * weight
+            partial_q = partial_scalar.square() * weight
+            cross = full_scalar * partial_scalar * weight
+        else:
+            full_mapped = torch.einsum(
+                "ngb,gbc->ngc",
+                full_selected,
+                gram,
+            )
+            full_q = (full_mapped * full_selected).sum(dim=-1)
+            partial_q = torch.einsum(
+                "ngb,gbc,ngc->ng",
+                partial_selected,
+                gram,
+                partial_selected,
+            )
+            cross = (full_mapped * partial_selected).sum(dim=-1)
+        references.append(
+            (
+                intersection.sum(dim=0).double(),
+                2.0 * cross.sum(dim=0),
+                full_q.sum(dim=0) + partial_q.sum(dim=0),
+                full_selected.sum(dim=0),
+                partial_selected.sum(dim=0),
+                full_q.sum(dim=0),
+            )
+        )
+
+    equations: list[str] = []
+    original_einsum = torch.einsum
+
+    def counted_einsum(equation, *operands):
+        equations.append(equation)
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(torch, "einsum", counted_einsum)
+    actual = evaluation_module._batched_mode_concordance(
+        full,
+        partial,
+        gram,
+        full_masks,
+        partial_masks,
+    )
+    actual_fields = tuple(actual)
+    for mode, reference in enumerate(references):
+        for field, expected in zip(actual_fields, reference, strict=True):
+            assert torch.equal(field[mode], expected)
+    assert equations == (
+        []
+        if block_dim == 1
+        else ["ngb,gbc->ngc", "ngb,gbc,ngc->ng"]
+    )
+
+
+def test_batched_mode_geometry_suppresses_unselected_nonfinite_values() -> None:
+    generator = torch.Generator().manual_seed(1337)
+    full = torch.randn(4, 3, 2, generator=generator)
+    partial = torch.randn(4, 3, 2, generator=generator)
+    full[0, 0, 0] = torch.nan
+    partial[2, 1, 1] = torch.inf
+    gram = torch.eye(2, dtype=torch.float64).expand(3, 2, 2).clone()
+    full_masks = torch.ones(2, 4, 3, dtype=torch.bool)
+    partial_masks = torch.ones_like(full_masks)
+    full_masks[:, 0, 0] = False
+    partial_masks[:, 2, 1] = False
+
+    concordance = evaluation_module._batched_mode_concordance(
+        full,
+        partial,
+        gram,
+        full_masks,
+        partial_masks,
+    )
+    moments = evaluation_module._batched_mode_selected_moments(
+        full,
+        gram,
+        full_masks,
+    )
+    delta = evaluation_module._batched_mode_selected_delta_sq(
+        full,
+        partial,
+        full_masks,
+        partial_masks,
+    )
+
+    for tensor in (*concordance, *moments, delta):
+        assert bool(torch.isfinite(tensor).all())
+
+
+@pytest.mark.parametrize("block_dim", (1, 3))
+def test_batched_selected_moments_and_delta_preserve_exact_reductions(
+    block_dim,
+) -> None:
+    generator = torch.Generator().manual_seed(911)
+    n_tokens, groups, modes = 23, 9, 2
+    full = torch.randn(n_tokens, groups, block_dim, generator=generator)
+    partial = torch.randn(n_tokens, groups, block_dim, generator=generator)
+    decoder = torch.randn(groups, block_dim, block_dim, generator=generator).double()
+    gram = decoder @ decoder.transpose(-1, -2)
+    full_masks = torch.rand(modes, n_tokens, groups, generator=generator) > 0.4
+    partial_masks = torch.rand(modes, n_tokens, groups, generator=generator) > 0.6
+
+    moments = evaluation_module._batched_mode_selected_moments(
+        full,
+        gram,
+        full_masks,
+    )
+    delta = evaluation_module._batched_mode_selected_delta_sq(
+        full,
+        partial,
+        full_masks,
+        partial_masks,
+    )
+    for mode in range(modes):
+        full_selected = (full * full_masks[mode].unsqueeze(-1)).double()
+        partial_selected = (partial * partial_masks[mode].unsqueeze(-1)).double()
+        if block_dim == 1:
+            expected_energy = (
+                full_selected[..., 0].square()
+                * gram[:, 0, 0].unsqueeze(0)
+            ).sum(dim=0)
+        else:
+            expected_energy = torch.einsum(
+                "ngb,gbc,ngc->ng",
+                full_selected,
+                gram,
+                full_selected,
+            ).sum(dim=0)
+        assert torch.equal(moments.decoded_energy[mode], expected_energy)
+        assert torch.equal(moments.code_sum[mode], full_selected.sum(dim=0))
+        assert torch.equal(
+            moments.code_outer[mode],
+            torch.einsum("ngb,ngc->gbc", full_selected, full_selected),
+        )
+        assert torch.equal(
+            delta[mode],
+            (partial_selected - full_selected).square().sum(dim=(0, 2)),
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA exactness regression",
+)
+@pytest.mark.parametrize("block_dim", (2, 4, 6, 8))
+def test_batched_selected_mode_reductions_are_cuda_bit_exact_for_short_batches(
+    block_dim,
+) -> None:
+    # These M=2 short-batch cases differ bitwise under both rejected batched
+    # CUDA schedules: ``mngb,mngc->mgbc`` for the outer product and a
+    # ``sum(dim=(1, 3))`` for the selected-code delta.
+    generator = torch.Generator().manual_seed(
+        100_000 * block_dim + 63_150 + int(block_dim == 2)
+    )
+    n_tokens, groups, modes = 63, 15, 2
+    full = torch.randn(
+        n_tokens,
+        groups,
+        block_dim,
+        generator=generator,
+    ).cuda()
+    partial = torch.randn(
+        n_tokens,
+        groups,
+        block_dim,
+        generator=generator,
+    ).cuda()
+    full_masks = (
+        torch.rand(modes, n_tokens, groups, generator=generator) > 0.4
+    ).cuda()
+    partial_masks = (
+        torch.rand(modes, n_tokens, groups, generator=generator) > 0.6
+    ).cuda()
+    decoder = torch.randn(
+        groups,
+        block_dim,
+        block_dim,
+        generator=generator,
+    ).double().cuda()
+    gram = decoder @ decoder.transpose(-1, -2)
+
+    moments = evaluation_module._batched_mode_selected_moments(
+        full,
+        gram,
+        full_masks,
+    )
+    delta = evaluation_module._batched_mode_selected_delta_sq(
+        full,
+        partial,
+        full_masks,
+        partial_masks,
+    )
+    for mode in range(modes):
+        zero = torch.zeros((), dtype=torch.float64, device="cuda")
+        full_selected = torch.where(
+            full_masks[mode].unsqueeze(-1),
+            full.double(),
+            zero,
+        )
+        partial_selected = torch.where(
+            partial_masks[mode].unsqueeze(-1),
+            partial.double(),
+            zero,
+        )
+        assert torch.equal(
+            moments.code_outer[mode],
+            torch.einsum("ngb,ngc->gbc", full_selected, full_selected),
+        )
+        assert torch.equal(
+            delta[mode],
+            (partial_selected - full_selected).square().sum(dim=(0, 2)),
+        )
+
+
 @pytest.mark.parametrize(
     "config",
     (
