@@ -2349,23 +2349,34 @@ class BlockCrosscoder(nn.Module):
         |Δ avg-blocks| <= 0.1.
         """
         q = 1.0 - target_avg_blocks / self.cfg.n_blocks
-        decoder = self.decoder_tensor()
-        encoder = (
-            decoder * self.log_gamma.exp()
-            if self.cfg.encoder_mode == "tied"
-            else self.encoder_tensor()
-        )
-        score_geometry = self._frozen_score_geometry(decoder)
+        if self.uses_direct_factorized_execution:
 
-        def batch_scores(value: torch.Tensor) -> torch.Tensor:
-            z, keep = self._encode_with_tensor(value, encoder)
-            return self.scores(
-                z,
-                x=value,
-                _decoder=decoder,
-                _observation_keep=keep,
-                _score_geometry=score_geometry,
+            def batch_scores(value: torch.Tensor) -> torch.Tensor:
+                z, keep = self._encode_factorized_direct(value)
+                return self.scores(
+                    z,
+                    x=value,
+                    _observation_keep=keep,
+                )
+
+        else:
+            decoder = self.decoder_tensor()
+            encoder = (
+                decoder * self.log_gamma.exp()
+                if self.cfg.encoder_mode == "tied"
+                else self.encoder_tensor()
             )
+            score_geometry = self._frozen_score_geometry(decoder)
+
+            def batch_scores(value: torch.Tensor) -> torch.Tensor:
+                z, keep = self._encode_with_tensor(value, encoder)
+                return self.scores(
+                    z,
+                    x=value,
+                    _decoder=decoder,
+                    _observation_keep=keep,
+                    _score_geometry=score_geometry,
+                )
 
         if method == "streaming":
             histogram_type = (

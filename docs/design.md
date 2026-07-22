@@ -930,6 +930,12 @@ L2 by `.00265`, and support disagreement over the union by `.0063`. On jobe,
 bf16 reduction-order change is content-bound engineering evidence, not a new
 scientific arm. Old v2 identities refuse rather than migrate.
 
+Frozen threshold fitting also stays in the direct rank carrier instead of
+materializing full encoder and decoder site tensors. On eight canonical
+4,096-token calibration batches, the streaming pass falls from `17.747` to
+`10.499 ms` (`40.84%`, `1.690x`) and peak allocation falls by `96.0 MiB`; the
+fitted threshold remains bitwise identical.
+
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M
 parameters per cell, 22GB peak VRAM, 55GB peak host RAM, 850GB storage against

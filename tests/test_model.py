@@ -2093,6 +2093,36 @@ def test_fit_threshold_streaming_matches_exact(device):
     assert abs(float(counts_stream.mean()) - float(counts_exact.mean())) <= 0.1
 
 
+def test_factorized_threshold_fit_stays_in_rank_space(device, monkeypatch):
+    cfg = BSCConfig(
+        n_blocks=16,
+        block_dim=2,
+        n_sites=4,
+        d_model=8,
+        k=3,
+        decoder_constraint="free",
+        site_rank=2,
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    generator = torch.Generator().manual_seed(1913)
+    calibration = [
+        torch.randn(64, 4, 8, generator=generator).to(device) for _ in range(4)
+    ]
+    pooled = torch.cat(
+        [model.scores(model.encode(batch)).flatten() for batch in calibration]
+    )
+    quantile = 1.0 - cfg.k / cfg.n_blocks
+    index = min(max(int(round(quantile * pooled.numel())), 1), pooled.numel())
+    expected = float(pooled.detach().cpu().kthvalue(index).values)
+
+    def refuse_materialization():
+        raise AssertionError("direct factorized calibration must stay in rank space")
+
+    monkeypatch.setattr(model, "decoder_tensor", refuse_materialization)
+    monkeypatch.setattr(model, "encoder_tensor", refuse_materialization)
+    assert model.fit_threshold_(calibration, cfg.k, method="exact") == expected
+
+
 def test_decoded_energy_score_equals_isolated_decoded_contribution_norm():
     cfg = BSCConfig(
         n_blocks=5,
