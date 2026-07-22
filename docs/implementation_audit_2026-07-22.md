@@ -408,8 +408,17 @@ was:
   slice.
 
 The Mac editable install exposes the `bsc` console entry point and `python -m
-pip check` reports no broken requirements. The containing code revision is
-published and independently rerun on Jobe before this audit is closed.
+pip check` reports no broken requirements. The signed remediation revision
+`2e3730c08c7df1cfe036979116dfd126abd31516` was pushed to `origin/main`,
+fast-forwarded onto a clean Jobe checkout, and installed editable with Jobe's
+existing constraint file. Jobe then completed the exact full suite with `1276
+passed, 4 skipped` in 637.81 seconds; Ruff, compileall, `git diff --check`,
+`pip check`, and CLI checks were also green. Its RTX 4090 was visible under
+Torch `2.8.0+cu128`/CUDA 12.8 with bf16 support and `/data` had 983,312,363,520
+free bytes. A second isolated current-schema smoke again qualified one of one
+selected cells with zero failures and 23 journal events. The preserved
+`/data/runs/bsc-phase1` root was only read-probed: it refused as unsupported
+`bsc-study-v1`, remained unmodified, and no scientific runner was started.
 
 Estimator v18 default-plan checks pass at 198 Phase-1 cells, 158 realized
 Phase-2 cells under the 414-cell pre-elision ceiling, and 48 Phase-3 cells.
