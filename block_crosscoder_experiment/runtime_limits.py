@@ -86,7 +86,7 @@ FACTORIZED_EXECUTION_IMPLEMENTATIONS = (
 )
 
 SPARSE_DECODE_CUDA_IMPLEMENTATION = (
-    "native_or_rank_hard_topk_cuda_else_dense_v1"
+    "native_or_rank_hard_topk_cuda_tile256_else_dense_v2"
 )
 SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION = "dense_reference_v1"
 SPARSE_DECODE_IMPLEMENTATIONS = (

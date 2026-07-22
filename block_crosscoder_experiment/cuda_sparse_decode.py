@@ -219,7 +219,7 @@ class _SparseTopKDecode(torch.autograd.Function):
             dtype=code.dtype,
             device=code.device,
         )
-        output_tile = 128
+        output_tile = 256
         _sparse_decode_forward[(batch, triton.cdiv(output_width, output_tile))](
             code,
             weight,
@@ -280,7 +280,7 @@ class _SparseTopKDecode(torch.autograd.Function):
         grad_output = grad_output.reshape(batch, output_width).contiguous()
         grad_code = torch.zeros_like(code)
         grad_weight = torch.empty_like(weight)
-        output_tile = 128
+        output_tile = 256
         if len(rows):
             _sparse_decode_backward_code[(len(rows), block_dim)](
                 grad_output,

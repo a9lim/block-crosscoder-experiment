@@ -208,7 +208,7 @@ exit is not evidence by itself.
   value/gradient, rank-deficient, near-singular refusal, branch, trajectory,
   checkpoint, and exact-resume gates use the fixed bounds in `design.md`.
   Every carrier also serializes
-  `native_or_rank_hard_topk_cuda_else_dense_v1` or the explicit
+  `native_or_rank_hard_topk_cuda_tile256_else_dense_v2` or the explicit
   `dense_reference_v1` sparse-decode oracle. The CUDA identity may consume
   native contiguous `[S,G,b,d]` directly but must never pack the full decoder;
   token TopK must derive its exact constant-count row pointer without a
