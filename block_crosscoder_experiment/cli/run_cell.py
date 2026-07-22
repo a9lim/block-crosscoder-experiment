@@ -52,7 +52,7 @@ from block_crosscoder_experiment.codec import (
     fit_codec,
 )
 from block_crosscoder_experiment.evaluation import (
-    evaluate_shared_code,
+    evaluate_shared_code_modes,
     load_trained_model,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
@@ -6962,18 +6962,14 @@ def _evaluate(
         device=device,
         selection_mode="threshold",
     )
-    shared_native = evaluate_shared_code(
+    shared_endpoints = evaluate_shared_code_modes(
         model,
         _prefetched_evaluation_batches(ctx, preparation),
         device=device,
-        selection_mode="topk",
+        selection_modes=("topk", "threshold"),
     )
-    shared_deployed = evaluate_shared_code(
-        model,
-        _prefetched_evaluation_batches(ctx, preparation),
-        device=device,
-        selection_mode="threshold",
-    )
+    shared_native = shared_endpoints["topk"]
+    shared_deployed = shared_endpoints["threshold"]
     rd = evaluate_rd(
         model,
         codec,

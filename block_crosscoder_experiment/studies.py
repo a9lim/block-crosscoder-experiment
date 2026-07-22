@@ -3768,8 +3768,10 @@ def _evaluation_workspace_bytes(
         + operational_decoder_elements * 4
     )
 
-    # Full and one partial BSC output coexist during sharing evaluation.
-    output_bytes = 2 * batch_tokens * (
+    # Fused native/deployed sharing evaluation retains the full and one
+    # partial BSC output for both selector modes. Site-only and leave-one-out
+    # outputs are released between views.
+    output_bytes = 4 * batch_tokens * (
         total_dim * 4 + latents * 8 + groups * 5
     )
     concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
@@ -3782,7 +3784,7 @@ def _evaluation_workspace_bytes(
     reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
     reduction_bytes = reduction_tokens * total_dim * 4 * 8
     decoder_gram_bytes = (sites + 1) * groups * block_width**2 * 8
-    accumulator_bytes = (
+    per_mode_accumulator_bytes = (
         (20 * sites * groups + 4 * sites * groups * block_width)
         + groups * block_width**2
         + groups * block_width
@@ -3796,7 +3798,7 @@ def _evaluation_workspace_bytes(
         + concordance_bytes
         + reduction_bytes
         + decoder_gram_bytes
-        + accumulator_bytes
+        + 2 * per_mode_accumulator_bytes
         + 2 * frozen_encoder_site_bytes
     )
     if selection_score == "decoded_energy":

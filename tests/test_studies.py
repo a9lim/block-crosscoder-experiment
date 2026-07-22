@@ -1610,7 +1610,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + batch_tokens * total_dim * 4
         + decoder_elements * 4
     )
-    output = 2 * batch_tokens * (
+    output = 4 * batch_tokens * (
         total_dim * 4 + latents * 8 + groups * 5
     )
     concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
@@ -1623,7 +1623,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
     reduction_tokens = min(batch_tokens, EVALUATION_REDUCTION_TOKEN_CHUNK)
     reduction = reduction_tokens * total_dim * 4 * 8
     decoder_grams = (sites + 1) * groups * block_width**2 * 8
-    accumulators = (
+    per_mode_accumulators = (
         (20 * sites * groups + 4 * sites * groups * block_width)
         + groups * block_width**2
         + groups * block_width
@@ -1634,7 +1634,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + concordance
         + reduction
         + decoder_grams
-        + accumulators
+        + 2 * per_mode_accumulators
         + 2 * one_site_tensor
     )
     assert shared_code > trusted_decode

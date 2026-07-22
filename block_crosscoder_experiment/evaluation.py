@@ -14,7 +14,7 @@ from typing import Iterable
 
 import torch
 
-from .model import BSCConfig, BlockCrosscoder
+from .model import BSCConfig, BSCOutput, BlockCrosscoder
 from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
@@ -24,6 +24,7 @@ __all__ = [
     "centered_fvu",
     "checkpoint_sha256",
     "evaluate_shared_code",
+    "evaluate_shared_code_modes",
     "load_trained_model",
 ]
 
@@ -85,23 +86,33 @@ def centered_fvu(
 
 
 @torch.no_grad()
-def evaluate_shared_code(
+def evaluate_shared_code_modes(
     model: BlockCrosscoder,
     batches: Iterable[torch.Tensor],
     *,
     device: str | torch.device = "cpu",
     max_tokens: int | None = None,
-    selection_mode: str = "threshold",
-) -> dict:
-    """Evaluate endpoints valid for every implemented encoder topology.
+    selection_modes: tuple[str, ...] = ("topk", "threshold"),
+) -> dict[str, dict]:
+    """Evaluate one or more selector endpoints over one shared view pass.
 
     Site-only and leave-one-site-out views are operational re-encodings through
     the model, so biases, nonlinear scores, source-only fusion, and
     dense scaffolds retain their actual semantics. No direct ``model.E`` access
-    is used.
+    is used. Encoding, scoring, target statistics, decoder geometry, and the
+    pre-selection dependence profile are selector-independent and therefore
+    computed once. Reconstruction and every selector-dependent reduction remain
+    isolated by mode.
     """
-    if selection_mode not in {"topk", "threshold"}:
-        raise ValueError("selection_mode must be 'topk' or 'threshold'")
+    if (
+        not selection_modes
+        or len(set(selection_modes)) != len(selection_modes)
+        or any(mode not in {"topk", "threshold"} for mode in selection_modes)
+    ):
+        raise ValueError(
+            "selection_modes must be a nonempty unique tuple drawn from "
+            "{'topk', 'threshold'}"
+        )
     model = model.to(device).eval()
     cfg = model.cfg
     S, G, b = cfg.n_sites, cfg.n_blocks, cfg.block_dim
@@ -110,34 +121,44 @@ def evaluate_shared_code(
 
     target_sum = torch.zeros(S, cfg.d_model, dtype=torch.float64, device=device)
     target_sumsq = torch.zeros_like(target_sum)
-    full_sse = torch.zeros(S, dtype=torch.float64, device=device)
-    site_sse = torch.zeros(S, S, dtype=torch.float64, device=device)
-    loo_sse = torch.zeros(S, S, dtype=torch.float64, device=device)
-    support_intersection = torch.zeros(S, dtype=torch.float64, device=device)
-    support_union = torch.zeros(S, dtype=torch.float64, device=device)
-    loo_intersection = torch.zeros(S, dtype=torch.float64, device=device)
-    loo_union = torch.zeros(S, dtype=torch.float64, device=device)
-    site_intersection_count = torch.zeros(S, G, dtype=torch.float64, device=device)
-    site_full_count = torch.zeros_like(site_intersection_count)
-    site_concordance_numerator = torch.zeros(S, G, dtype=torch.float64, device=device)
-    site_concordance_denominator = torch.zeros_like(site_concordance_numerator)
-    site_full_code_sum = torch.zeros(S, G, b, dtype=torch.float64, device=device)
-    site_partial_code_sum = torch.zeros_like(site_full_code_sum)
-    site_intersection_full_energy = torch.zeros_like(site_concordance_numerator)
-    site_full_energy = torch.zeros_like(site_concordance_numerator)
-    loo_intersection_count = torch.zeros(S, G, dtype=torch.float64, device=device)
-    loo_full_count = torch.zeros_like(loo_intersection_count)
-    loo_concordance_numerator = torch.zeros(S, G, dtype=torch.float64, device=device)
-    loo_concordance_denominator = torch.zeros_like(loo_concordance_numerator)
-    loo_full_code_sum = torch.zeros(S, G, b, dtype=torch.float64, device=device)
-    loo_partial_code_sum = torch.zeros_like(loo_full_code_sum)
-    loo_intersection_full_energy = torch.zeros_like(loo_concordance_numerator)
-    loo_full_energy = torch.zeros_like(loo_concordance_numerator)
     pre_selection_loo_delta_sq = torch.zeros(S, G, dtype=torch.float64, device=device)
-    post_selection_loo_delta_sq = torch.zeros_like(pre_selection_loo_delta_sq)
-    fire = torch.zeros(G, dtype=torch.float64, device=device)
-    zsum = torch.zeros(G, b, dtype=torch.float64, device=device)
-    zz = torch.zeros(G, b, b, dtype=torch.float64, device=device)
+
+    def new_mode_state() -> dict[str, torch.Tensor]:
+        site_block = torch.zeros(S, G, dtype=torch.float64, device=device)
+        site_block_code = torch.zeros(S, G, b, dtype=torch.float64, device=device)
+        return {
+            "full_sse": torch.zeros(S, dtype=torch.float64, device=device),
+            "site_sse": torch.zeros(S, S, dtype=torch.float64, device=device),
+            "loo_sse": torch.zeros(S, S, dtype=torch.float64, device=device),
+            "support_intersection": torch.zeros(
+                S, dtype=torch.float64, device=device
+            ),
+            "support_union": torch.zeros(S, dtype=torch.float64, device=device),
+            "loo_intersection": torch.zeros(S, dtype=torch.float64, device=device),
+            "loo_union": torch.zeros(S, dtype=torch.float64, device=device),
+            "site_intersection_count": site_block.clone(),
+            "site_full_count": site_block.clone(),
+            "site_concordance_numerator": site_block.clone(),
+            "site_concordance_denominator": site_block.clone(),
+            "site_full_code_sum": site_block_code.clone(),
+            "site_partial_code_sum": site_block_code.clone(),
+            "site_intersection_full_energy": site_block.clone(),
+            "site_full_energy": site_block.clone(),
+            "loo_intersection_count": site_block.clone(),
+            "loo_full_count": site_block.clone(),
+            "loo_concordance_numerator": site_block.clone(),
+            "loo_concordance_denominator": site_block.clone(),
+            "loo_full_code_sum": site_block_code.clone(),
+            "loo_partial_code_sum": site_block_code.clone(),
+            "loo_intersection_full_energy": site_block.clone(),
+            "loo_full_energy": site_block.clone(),
+            "post_selection_loo_delta_sq": site_block.clone(),
+            "fire": torch.zeros(G, dtype=torch.float64, device=device),
+            "zsum": torch.zeros(G, b, dtype=torch.float64, device=device),
+            "zz": torch.zeros(G, b, b, dtype=torch.float64, device=device),
+        }
+
+    states = {mode: new_mode_state() for mode in selection_modes}
     materialized_decoder = model.decoder_tensor()
     materialized_encoder = (
         materialized_decoder * model.log_gamma.exp()
@@ -201,6 +222,8 @@ def evaluate_shared_code(
         full,
         index: int,
         *,
+        full_mask_count64: torch.Tensor,
+        all_full_energy64: torch.Tensor,
         intersection_count: torch.Tensor,
         full_count: torch.Tensor,
         concordance_numerator: torch.Tensor,
@@ -258,6 +281,47 @@ def evaluate_shared_code(
             partial_code_sum[index, block_slice] += partial_intersection.sum(dim=0)
             intersection_full_energy[index, block_slice] += full_q.sum(dim=0)
 
+    primary_mode = selection_modes[0]
+
+    def outputs_for_view(
+        value: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+        encoder_sites=None,
+    ) -> dict[str, BSCOutput]:
+        selection, _, _ = model.select_with_materialized(
+            value,
+            mode=primary_mode,
+            observed=observed,
+            validate_observed=validate_observed,
+            _decoder=materialized_decoder,
+            _encoder=materialized_encoder,
+            _score_geometry=score_geometry,
+            _encoder_sites=encoder_sites,
+        )
+        result: dict[str, BSCOutput] = {}
+        for mode in selection_modes:
+            if mode == primary_mode:
+                mask = selection.mask
+                selected = selection.z_selected
+            else:
+                mask = model._select_scores(
+                    selection.scores,
+                    mode=mode,
+                    z=selection.z,
+                )
+                selected = selection.z * mask.unsqueeze(-1)
+            prediction = model.decode(selected, _decoder=materialized_decoder)
+            result[mode] = BSCOutput(
+                prediction,
+                selection.z,
+                selected,
+                selection.scores,
+                mask,
+            )
+        return result
+
     for raw in batches:
         if max_tokens is not None and n_tokens >= max_tokens:
             break
@@ -267,174 +331,192 @@ def evaluate_shared_code(
         if not x.numel():
             break
         encoder_sites = model._frozen_encoder_sites(x, materialized_encoder)
-        full, _, _ = model.forward_with_materialized(
-            x,
-            mode=selection_mode,
-            _decoder=materialized_decoder,
-            _encoder=materialized_encoder,
-            _score_geometry=score_geometry,
-            _encoder_sites=encoder_sites,
-        )
+        full_outputs = outputs_for_view(x, encoder_sites=encoder_sites)
         accumulate_target_statistics(x)
-        full_sse += squared_error_by_site(x, full.xhat)
-        full_mask_count64 = full.mask.sum(dim=0).double()
-        all_full_energy64 = torch.zeros(G, dtype=torch.float64, device=device)
-        fire += full_mask_count64
-        for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-            stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-            block_slice = slice(start, stop)
-            selected = full.z_selected[:, block_slice].double()
-            gram = all_site_decoder_gram[block_slice]
-            if b == 1:
-                selected_energy = (
-                    selected[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
-                )
-            else:
-                selected_energy = torch.einsum(
-                    "ngb,gbc,ngc->ng",
-                    selected,
-                    gram,
-                    selected,
-                )
-            all_full_energy64[block_slice] = selected_energy.sum(dim=0)
-            zsum[block_slice] += selected.sum(dim=0)
-            zz[block_slice] += torch.einsum(
-                "ngb,ngc->gbc", selected, selected
+        full_mask_counts: dict[str, torch.Tensor] = {}
+        full_energies: dict[str, torch.Tensor] = {}
+        for mode, full in full_outputs.items():
+            state = states[mode]
+            state["full_sse"] += squared_error_by_site(x, full.xhat)
+            full_mask_count64 = full.mask.sum(dim=0).double()
+            all_full_energy64 = torch.zeros(
+                G, dtype=torch.float64, device=device
             )
+            state["fire"] += full_mask_count64
+            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+                block_slice = slice(start, stop)
+                selected = full.z_selected[:, block_slice].double()
+                gram = all_site_decoder_gram[block_slice]
+                if b == 1:
+                    selected_energy = (
+                        selected[..., 0].square() * gram[:, 0, 0].unsqueeze(0)
+                    )
+                else:
+                    selected_energy = torch.einsum(
+                        "ngb,gbc,ngc->ng",
+                        selected,
+                        gram,
+                        selected,
+                    )
+                all_full_energy64[block_slice] = selected_energy.sum(dim=0)
+                state["zsum"][block_slice] += selected.sum(dim=0)
+                state["zz"][block_slice] += torch.einsum(
+                    "ngb,ngc->gbc", selected, selected
+                )
+            full_mask_counts[mode] = full_mask_count64
+            full_energies[mode] = all_full_energy64
         del selected, selected_energy, gram
+
         observed_all = torch.ones(x.shape[0], S, dtype=torch.bool, device=x.device)
         zero_x: torch.Tensor | None = None
-        null_output = None
+        null_outputs: dict[str, BSCOutput] | None = None
 
         def run_view(
             view_observed: torch.Tensor,
             *,
             source_missing: bool,
             empty: bool,
-        ):
-            """Run a partial view, using a zero-information null encoding.
-
-            Source-only fusion cannot encode a view which omits its declared
-            source, and the one-site LOO view has no observed site at all.
-            In those cases a zero input with one synthetic observation bit is
-            the operational null: it preserves learned encoder/decoder biases
-            without leaking any held-out activation.
-            """
+            frozen_encoder_sites,
+        ) -> dict[str, BSCOutput]:
+            """Run one mode-independent partial encoding and both selectors."""
             if source_missing or empty:
-                nonlocal zero_x, null_output
-                if null_output is not None:
-                    return null_output
+                nonlocal zero_x, null_outputs
+                if null_outputs is not None:
+                    return null_outputs
                 if zero_x is None:
                     zero_x = torch.zeros_like(x)
                 null_observed = torch.zeros_like(view_observed)
                 fallback = cfg.source_site if cfg.encoder_fusion == "source" else 0
                 null_observed[:, fallback] = True
-                null_output = model.forward_with_materialized(
+                null_outputs = outputs_for_view(
                     zero_x,
-                    mode=selection_mode,
                     observed=null_observed,
                     validate_observed=False,
-                    _decoder=materialized_decoder,
-                    _encoder=materialized_encoder,
-                    _score_geometry=score_geometry,
-                )[0]
-                return null_output
+                )
+                return null_outputs
             if cfg.encoder_fusion == "source" or S == 1:
-                return full
-            return model.forward_with_materialized(
+                return full_outputs
+            return outputs_for_view(
                 x,
-                mode=selection_mode,
                 observed=view_observed,
                 validate_observed=False,
-                _decoder=materialized_decoder,
-                _encoder=materialized_encoder,
-                _score_geometry=score_geometry,
-                _encoder_sites=encoder_sites,
-            )[0]
+                encoder_sites=frozen_encoder_sites,
+            )
 
         for source in range(S):
             only_observed = torch.zeros_like(observed_all)
             only_observed[:, source] = True
-            only = run_view(
+            only_outputs = run_view(
                 only_observed,
                 source_missing=(
                     cfg.encoder_fusion == "source" and source != cfg.source_site
                 ),
                 empty=False,
+                frozen_encoder_sites=encoder_sites,
             )
-            site_sse[source] += squared_error_by_site(x, only.xhat)
-            support_intersection[source] += (only.mask & full.mask).sum()
-            support_union[source] += (only.mask | full.mask).sum()
-            accumulate_coordinate_concordance(
-                only,
-                full,
-                source,
-                intersection_count=site_intersection_count,
-                full_count=site_full_count,
-                concordance_numerator=site_concordance_numerator,
-                concordance_denominator=site_concordance_denominator,
-                full_code_sum=site_full_code_sum,
-                partial_code_sum=site_partial_code_sum,
-                intersection_full_energy=site_intersection_full_energy,
-                full_energy=site_full_energy,
-            )
-            del only
+            for mode, only in only_outputs.items():
+                full = full_outputs[mode]
+                state = states[mode]
+                state["site_sse"][source] += squared_error_by_site(x, only.xhat)
+                state["support_intersection"][source] += (
+                    only.mask & full.mask
+                ).sum()
+                state["support_union"][source] += (only.mask | full.mask).sum()
+                accumulate_coordinate_concordance(
+                    only,
+                    full,
+                    source,
+                    full_mask_count64=full_mask_counts[mode],
+                    all_full_energy64=full_energies[mode],
+                    intersection_count=state["site_intersection_count"],
+                    full_count=state["site_full_count"],
+                    concordance_numerator=state["site_concordance_numerator"],
+                    concordance_denominator=state["site_concordance_denominator"],
+                    full_code_sum=state["site_full_code_sum"],
+                    partial_code_sum=state["site_partial_code_sum"],
+                    intersection_full_energy=state[
+                        "site_intersection_full_energy"
+                    ],
+                    full_energy=state["site_full_energy"],
+                )
+            del only, full, state, only_outputs
 
             missing_observed = observed_all.clone()
             missing_observed[:, source] = False
-            missing = run_view(
+            missing_outputs = run_view(
                 missing_observed,
                 source_missing=(
                     cfg.encoder_fusion == "source" and source == cfg.source_site
                 ),
                 empty=S == 1,
+                frozen_encoder_sites=encoder_sites,
             )
-            loo_sse[source] += squared_error_by_site(x, missing.xhat)
-            loo_intersection[source] += (missing.mask & full.mask).sum()
-            loo_union[source] += (missing.mask | full.mask).sum()
-            accumulate_coordinate_concordance(
-                missing,
-                full,
-                source,
-                intersection_count=loo_intersection_count,
-                full_count=loo_full_count,
-                concordance_numerator=loo_concordance_numerator,
-                concordance_denominator=loo_concordance_denominator,
-                full_code_sum=loo_full_code_sum,
-                partial_code_sum=loo_partial_code_sum,
-                intersection_full_energy=loo_intersection_full_energy,
-                full_energy=loo_full_energy,
-            )
+            primary_missing = missing_outputs[primary_mode]
+            primary_full = full_outputs[primary_mode]
             for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
                 stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
                 block_slice = slice(start, stop)
                 pre_selection_loo_delta_sq[source, block_slice] += (
                     (
-                        missing.z[:, block_slice].double()
-                        - full.z[:, block_slice].double()
+                        primary_missing.z[:, block_slice].double()
+                        - primary_full.z[:, block_slice].double()
                     )
                     .square()
                     .sum(dim=(0, 2))
                 )
-                post_selection_loo_delta_sq[source, block_slice] += (
-                    (
-                        missing.z_selected[:, block_slice].double()
-                        - full.z_selected[:, block_slice].double()
-                    )
-                    .square()
-                    .sum(dim=(0, 2))
+            for mode, missing in missing_outputs.items():
+                full = full_outputs[mode]
+                state = states[mode]
+                state["loo_sse"][source] += squared_error_by_site(x, missing.xhat)
+                state["loo_intersection"][source] += (
+                    missing.mask & full.mask
+                ).sum()
+                state["loo_union"][source] += (missing.mask | full.mask).sum()
+                accumulate_coordinate_concordance(
+                    missing,
+                    full,
+                    source,
+                    full_mask_count64=full_mask_counts[mode],
+                    all_full_energy64=full_energies[mode],
+                    intersection_count=state["loo_intersection_count"],
+                    full_count=state["loo_full_count"],
+                    concordance_numerator=state["loo_concordance_numerator"],
+                    concordance_denominator=state["loo_concordance_denominator"],
+                    full_code_sum=state["loo_full_code_sum"],
+                    partial_code_sum=state["loo_partial_code_sum"],
+                    intersection_full_energy=state[
+                        "loo_intersection_full_energy"
+                    ],
+                    full_energy=state["loo_full_energy"],
                 )
-            del missing
-        del encoder_sites, null_output
+                for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
+                    stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
+                    block_slice = slice(start, stop)
+                    state["post_selection_loo_delta_sq"][source, block_slice] += (
+                        (
+                            missing.z_selected[:, block_slice].double()
+                            - full.z_selected[:, block_slice].double()
+                        )
+                        .square()
+                        .sum(dim=(0, 2))
+                    )
+            del missing, full, state, primary_missing, primary_full, missing_outputs
+        del (
+            encoder_sites,
+            null_outputs,
+            full_outputs,
+            full_mask_counts,
+            full_energies,
+            full_mask_count64,
+            all_full_energy64,
+        )
         n_tokens += x.shape[0]
 
     if n_tokens == 0:
         raise ValueError("evaluation stream produced no tokens")
     centered_ss = target_sumsq - target_sum.square() / n_tokens
     denominator = centered_ss.sum(dim=1).clamp_min(1e-30)
-    full_fvu = full_sse / denominator
-    site_matrix = site_sse / denominator.unsqueeze(0)
-    loo_matrix = loo_sse / denominator.unsqueeze(0)
 
     # Functional-dependence profiles are descriptive block endpoints. For
     # each omitted site and block, delta is the RMS Euclidean code change over
@@ -444,7 +526,6 @@ def evaluate_shared_code(
     # more sites; it is not a universal quality ordering (local features and
     # broad cross-layer features can both be scientifically meaningful).
     pre_delta = (pre_selection_loo_delta_sq / n_tokens).clamp_min(0).sqrt()
-    post_delta = (post_selection_loo_delta_sq / n_tokens).clamp_min(0).sqrt()
 
     def normalized_profile(
         delta: torch.Tensor,
@@ -459,7 +540,6 @@ def evaluate_shared_code(
         return profile, profile.sum(dim=0), defined
 
     pre_profile, pre_coherence, pre_defined = normalized_profile(pre_delta)
-    post_profile, post_coherence, post_defined = normalized_profile(post_delta)
 
     def concordance_payload(
         numerator: torch.Tensor,
@@ -629,106 +709,152 @@ def evaluate_shared_code(
             },
         }
 
-    site_coordinate = concordance_payload(
-        site_concordance_numerator,
-        site_concordance_denominator,
-        site_full_code_sum,
-        site_partial_code_sum,
-        site_intersection_count,
-        site_full_count,
-        site_intersection_full_energy,
-        site_full_energy,
-    )
-    loo_coordinate = concordance_payload(
-        loo_concordance_numerator,
-        loo_concordance_denominator,
-        loo_full_code_sum,
-        loo_partial_code_sum,
-        loo_intersection_count,
-        loo_full_count,
-        loo_intersection_full_energy,
-        loo_full_energy,
-    )
+    def finalize_mode(
+        selection_mode: str,
+        state: dict[str, torch.Tensor],
+    ) -> dict:
+        full_fvu = state["full_sse"] / denominator
+        site_matrix = state["site_sse"] / denominator.unsqueeze(0)
+        loo_matrix = state["loo_sse"] / denominator.unsqueeze(0)
+        post_delta = (
+            state["post_selection_loo_delta_sq"] / n_tokens
+        ).clamp_min(0).sqrt()
+        post_profile, post_coherence, post_defined = normalized_profile(post_delta)
 
-    # Used dimension is estimated from the *centered conditional covariance*
-    # of active codes and each effective site decoder Gram.  Centering keeps a
-    # constant nonzero code from masquerading as a varying used direction.
-    # The algebra is batched in bounded chunks; a Python loop over S*G is
-    # prohibitive for Phase-3 scalar dictionaries.
-    used_eigenvalues = torch.zeros(S, G, b, dtype=torch.float64, device=device)
-    chunk_size = 4096
-    for start in range(0, G, chunk_size):
-        stop = min(start + chunk_size, G)
-        denominator_g = fire[start:stop].clamp_min(1.0)
-        mean_z = zsum[start:stop] / denominator_g.unsqueeze(-1)
-        covariance = zz[start:stop] / denominator_g[:, None, None] - torch.einsum(
-            "gi,gj->gij", mean_z, mean_z
+        site_coordinate = concordance_payload(
+            state["site_concordance_numerator"],
+            state["site_concordance_denominator"],
+            state["site_full_code_sum"],
+            state["site_partial_code_sum"],
+            state["site_intersection_count"],
+            state["site_full_count"],
+            state["site_intersection_full_energy"],
+            state["site_full_energy"],
         )
-        covariance = (covariance + covariance.transpose(-1, -2)) * 0.5
-        if b == 1:
-            used_eigenvalues[:, start:stop, 0] = (
-                covariance[:, 0, 0].clamp_min(0).unsqueeze(0)
-                * decoder_gram[:, start:stop, 0, 0]
+        loo_coordinate = concordance_payload(
+            state["loo_concordance_numerator"],
+            state["loo_concordance_denominator"],
+            state["loo_full_code_sum"],
+            state["loo_partial_code_sum"],
+            state["loo_intersection_count"],
+            state["loo_full_count"],
+            state["loo_intersection_full_energy"],
+            state["loo_full_energy"],
+        )
+
+        # Used dimension is estimated from the *centered conditional
+        # covariance* of active codes and each effective site decoder Gram.
+        # Centering keeps a constant nonzero code from masquerading as a
+        # varying used direction. The algebra is batched in bounded chunks; a
+        # Python loop over S*G is prohibitive for Phase-3 scalar dictionaries.
+        used_eigenvalues = torch.zeros(
+            S, G, b, dtype=torch.float64, device=device
+        )
+        chunk_size = 4096
+        for start in range(0, G, chunk_size):
+            stop = min(start + chunk_size, G)
+            denominator_g = state["fire"][start:stop].clamp_min(1.0)
+            mean_z = state["zsum"][start:stop] / denominator_g.unsqueeze(-1)
+            covariance = state["zz"][start:stop] / denominator_g[
+                :, None, None
+            ] - torch.einsum("gi,gj->gij", mean_z, mean_z)
+            covariance = (covariance + covariance.transpose(-1, -2)) * 0.5
+            if b == 1:
+                used_eigenvalues[:, start:stop, 0] = (
+                    covariance[:, 0, 0].clamp_min(0).unsqueeze(0)
+                    * decoder_gram[:, start:stop, 0, 0]
+                )
+                continue
+            root_eval, root_vec = torch.linalg.eigh(covariance)
+            root = torch.matmul(
+                root_vec * root_eval.clamp_min(0).sqrt().unsqueeze(-2),
+                root_vec.transpose(-1, -2),
             )
-            continue
-        root_eval, root_vec = torch.linalg.eigh(covariance)
-        root = torch.matmul(
-            root_vec * root_eval.clamp_min(0).sqrt().unsqueeze(-2),
-            root_vec.transpose(-1, -2),
-        )
-        contribution = torch.matmul(
-            torch.matmul(root.unsqueeze(0), decoder_gram[:, start:stop]),
-            root.unsqueeze(0),
-        )
-        used_eigenvalues[:, start:stop] = torch.linalg.eigvalsh(contribution).flip(-1)
+            contribution = torch.matmul(
+                torch.matmul(root.unsqueeze(0), decoder_gram[:, start:stop]),
+                root.unsqueeze(0),
+            )
+            used_eigenvalues[:, start:stop] = torch.linalg.eigvalsh(
+                contribution
+            ).flip(-1)
 
-    payload = {
-        "schema_version": 5,
-        "selection_mode": selection_mode,
-        "n_tokens": n_tokens,
-        "model_cfg": asdict(cfg),
-        "full_fvu_per_site": full_fvu.tolist(),
-        "full_fvu_pooled": float(full_sse.sum() / denominator.sum()),
-        "site_only_fvu": site_matrix.tolist(),
-        "leave_one_site_out_fvu": loo_matrix.tolist(),
-        "site_only_support_iou": (
-            support_intersection / support_union.clamp_min(1)
-        ).tolist(),
-        "leave_one_site_out_support_iou": (
-            loo_intersection / loo_union.clamp_min(1)
-        ).tolist(),
-        "partial_view_coordinate_concordance": {
-            "definition": (
-                "lin_decoder_gram_concordance_covariance_over_variance_plus_mean_offset"
+        payload = {
+            "schema_version": 5,
+            "selection_mode": selection_mode,
+            "n_tokens": n_tokens,
+            "model_cfg": asdict(cfg),
+            "full_fvu_per_site": full_fvu.tolist(),
+            "full_fvu_pooled": float(
+                state["full_sse"].sum() / denominator.sum()
             ),
-            "decoder_gram": "sum_all_sites_D_g_s_D_g_s_transpose",
-            "support_contract": "all_view_partial_view_support_intersection",
-            "site_only": site_coordinate,
-            "leave_one_site_out": loo_coordinate,
-        },
-        "functional_dependence": {
-            "delta_definition": ("rms_l2_code_change_when_site_is_omitted_over_tokens"),
-            "profile_normalization": "divide_each_block_by_its_max_site_delta",
-            "coherence_definition": "sum_site_delta_divided_by_max_site_delta",
-            "interpretation": (
-                "descriptive_only; larger_coherence_is_not_universally_better"
-            ),
-            "pre_selection": {
-                "delta_by_site_block": pre_delta.cpu().tolist(),
-                "normalized_profile_by_site_block": pre_profile.cpu().tolist(),
-                "coherence_per_block": pre_coherence.cpu().tolist(),
-                "defined_per_block": pre_defined.cpu().tolist(),
+            "site_only_fvu": site_matrix.tolist(),
+            "leave_one_site_out_fvu": loo_matrix.tolist(),
+            "site_only_support_iou": (
+                state["support_intersection"]
+                / state["support_union"].clamp_min(1)
+            ).tolist(),
+            "leave_one_site_out_support_iou": (
+                state["loo_intersection"] / state["loo_union"].clamp_min(1)
+            ).tolist(),
+            "partial_view_coordinate_concordance": {
+                "definition": (
+                    "lin_decoder_gram_concordance_covariance_over_variance_plus_mean_offset"
+                ),
+                "decoder_gram": "sum_all_sites_D_g_s_D_g_s_transpose",
+                "support_contract": "all_view_partial_view_support_intersection",
+                "site_only": site_coordinate,
+                "leave_one_site_out": loo_coordinate,
             },
-            "post_selection": {
-                "delta_by_site_block": post_delta.cpu().tolist(),
-                "normalized_profile_by_site_block": post_profile.cpu().tolist(),
-                "coherence_per_block": post_coherence.cpu().tolist(),
-                "defined_per_block": post_defined.cpu().tolist(),
+            "functional_dependence": {
+                "delta_definition": (
+                    "rms_l2_code_change_when_site_is_omitted_over_tokens"
+                ),
+                "profile_normalization": "divide_each_block_by_its_max_site_delta",
+                "coherence_definition": "sum_site_delta_divided_by_max_site_delta",
+                "interpretation": (
+                    "descriptive_only; larger_coherence_is_not_universally_better"
+                ),
+                "pre_selection": {
+                    "delta_by_site_block": pre_delta.cpu().tolist(),
+                    "normalized_profile_by_site_block": pre_profile.cpu().tolist(),
+                    "coherence_per_block": pre_coherence.cpu().tolist(),
+                    "defined_per_block": pre_defined.cpu().tolist(),
+                },
+                "post_selection": {
+                    "delta_by_site_block": post_delta.cpu().tolist(),
+                    "normalized_profile_by_site_block": post_profile.cpu().tolist(),
+                    "coherence_per_block": post_coherence.cpu().tolist(),
+                    "defined_per_block": post_defined.cpu().tolist(),
+                },
             },
-        },
-        "fire_count": fire.cpu().tolist(),
-        "used_contribution_eigenvalues": used_eigenvalues.cpu().tolist(),
+            "fire_count": state["fire"].cpu().tolist(),
+            "used_contribution_eigenvalues": used_eigenvalues.cpu().tolist(),
+        }
+        # JSON round-trip is a cheap schema guard against accidental
+        # tensors/NaNs.
+        json.dumps(payload, allow_nan=False)
+        return payload
+
+    return {
+        mode: finalize_mode(mode, states[mode])
+        for mode in selection_modes
     }
-    # JSON round-trip is a cheap schema guard against accidental tensors/NaNs.
-    json.dumps(payload, allow_nan=False)
-    return payload
+
+
+@torch.no_grad()
+def evaluate_shared_code(
+    model: BlockCrosscoder,
+    batches: Iterable[torch.Tensor],
+    *,
+    device: str | torch.device = "cpu",
+    max_tokens: int | None = None,
+    selection_mode: str = "threshold",
+) -> dict:
+    """Evaluate one selector endpoint through the shared evaluator."""
+    return evaluate_shared_code_modes(
+        model,
+        batches,
+        device=device,
+        max_tokens=max_tokens,
+        selection_modes=(selection_mode,),
+    )[selection_mode]

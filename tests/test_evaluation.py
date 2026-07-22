@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 
 import block_crosscoder_experiment.evaluation as evaluation_module
-from block_crosscoder_experiment.evaluation import centered_fvu, evaluate_shared_code
+from block_crosscoder_experiment.evaluation import (
+    centered_fvu,
+    evaluate_shared_code,
+    evaluate_shared_code_modes,
+)
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 
 
@@ -77,6 +83,155 @@ def test_shared_code_builds_frozen_score_geometry_once(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
+    "config",
+    (
+        BSCConfig(
+            n_blocks=7,
+            block_dim=2,
+            n_sites=3,
+            d_model=5,
+            k=2,
+            encoder_fusion="availability_rescaled_sum",
+            selection_score="isolated_loss_decrease",
+            decoder_constraint="free",
+            decoder_bias=False,
+        ),
+        BSCConfig(
+            n_blocks=6,
+            block_dim=1,
+            n_sites=3,
+            d_model=4,
+            k=2,
+            encoder_fusion="source",
+            source_site=1,
+        ),
+        BSCConfig(
+            n_blocks=6,
+            block_dim=2,
+            n_sites=1,
+            d_model=5,
+            k=2,
+            encoder_mode="untied",
+            decoder_constraint="free",
+        ),
+    ),
+)
+def test_shared_code_modes_exactly_matches_independent_mode_evaluations(
+    config,
+) -> None:
+    model = BlockCrosscoder(config)
+    x = torch.randn(
+        29,
+        config.n_sites,
+        config.d_model,
+        generator=torch.Generator().manual_seed(991),
+    )
+    model.fit_threshold_([x], target_avg_blocks=2)
+    # Make the selectors observably different without changing the threshold
+    # endpoint contract: top-k retains k events while the deployed threshold
+    # intentionally retains none.
+    model.theta.fill_(1e30)
+    batches = [x[:11], x[11:]]
+    topk = evaluate_shared_code(model, batches, selection_mode="topk")
+    threshold = evaluate_shared_code(model, batches, selection_mode="threshold")
+    fused = evaluate_shared_code_modes(
+        model,
+        batches,
+        selection_modes=("topk", "threshold"),
+    )
+
+    assert fused == {"topk": topk, "threshold": threshold}
+    assert (
+        fused["topk"]["functional_dependence"]["pre_selection"]
+        == fused["threshold"]["functional_dependence"]["pre_selection"]
+    )
+    assert fused["topk"]["fire_count"] != fused["threshold"]["fire_count"]
+
+
+def test_shared_code_modes_shares_view_encoding_but_not_mode_decoding(
+    monkeypatch,
+) -> None:
+    config = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=3,
+        d_model=6,
+        k=2,
+        encoder_fusion="availability_rescaled_sum",
+    )
+    model = BlockCrosscoder(config)
+    x = torch.randn(17, config.n_sites, config.d_model)
+    model.fit_threshold_([x], target_avg_blocks=2)
+    encoder_calls = 0
+    score_calls = 0
+    decode_calls = 0
+    original_encoder = model._frozen_encoder_sites
+    original_scores = model.scores
+    original_decode = model.decode
+
+    def counted_encoder(*args, **kwargs):
+        nonlocal encoder_calls
+        encoder_calls += 1
+        return original_encoder(*args, **kwargs)
+
+    def counted_scores(*args, **kwargs):
+        nonlocal score_calls
+        score_calls += 1
+        return original_scores(*args, **kwargs)
+
+    def counted_decode(*args, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_frozen_encoder_sites", counted_encoder)
+    monkeypatch.setattr(model, "scores", counted_scores)
+    monkeypatch.setattr(model, "decode", counted_decode)
+    result = evaluate_shared_code_modes(model, [x])
+
+    assert result.keys() == {"topk", "threshold"}
+    # One full view plus S site-only and S leave-one-out views. Both selectors
+    # consume each shared score tensor, while reconstruction stays per-mode.
+    assert encoder_calls == 1
+    assert score_calls == 1 + 2 * config.n_sites
+    assert decode_calls == 2 * (1 + 2 * config.n_sites)
+
+
+def test_shared_code_modes_releases_partial_outputs_between_views(
+    monkeypatch,
+) -> None:
+    config = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=3,
+        d_model=6,
+        k=2,
+        encoder_fusion="availability_rescaled_sum",
+    )
+    model = BlockCrosscoder(config)
+    x = torch.randn(34, config.n_sites, config.d_model)
+    model.fit_threshold_([x], target_avg_blocks=2)
+    live: list[weakref.ReferenceType[torch.Tensor]] = []
+    peak = 0
+    original_decode = model.decode
+
+    def tracked_decode(*args, **kwargs):
+        nonlocal live, peak
+        prediction = original_decode(*args, **kwargs)
+        live = [reference for reference in live if reference() is not None]
+        live.append(weakref.ref(prediction))
+        peak = max(peak, len(live))
+        return prediction
+
+    monkeypatch.setattr(model, "decode", tracked_decode)
+    evaluate_shared_code_modes(model, [x[:17], x[17:]])
+
+    # Two selector-specific full outputs and two outputs for the current
+    # partial view coexist; prior views and batches must be gone.
+    assert peak == 4
+
+
+@pytest.mark.parametrize(
     ("config", "expected_bmm_calls"),
     (
         (BSCConfig(8, 2, 3, 6, 2, encoder_fusion="sum"), 1),
@@ -123,15 +278,15 @@ def test_shared_code_cached_views_preserve_complete_payload_exactly(
     x = torch.randn(23, 3, 5, generator=torch.Generator().manual_seed(844))
     if selection_mode == "threshold":
         model.fit_threshold_([x], target_avg_blocks=2)
-    original = model.forward_with_materialized
+    original = model.select_with_materialized
 
     def uncached(*args, **kwargs):
         kwargs.pop("_encoder_sites", None)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(model, "forward_with_materialized", uncached)
+    monkeypatch.setattr(model, "select_with_materialized", uncached)
     reference = evaluate_shared_code(model, [x], selection_mode=selection_mode)
-    monkeypatch.setattr(model, "forward_with_materialized", original)
+    monkeypatch.setattr(model, "select_with_materialized", original)
     cached = evaluate_shared_code(model, [x], selection_mode=selection_mode)
     assert cached == reference
 
