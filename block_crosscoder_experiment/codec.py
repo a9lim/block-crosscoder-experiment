@@ -54,8 +54,10 @@ import math
 import hashlib
 import json
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
+from typing import Protocol
 
 import torch
 
@@ -178,6 +180,53 @@ class _PacketEvents:
     block_ids: torch.Tensor  # [events] compact IDs, int32 CPU
     original_ids: torch.Tensor  # [events] dictionary IDs on model device
     canonical_codes: torch.Tensor  # [events,b] on model device
+
+
+@dataclass(frozen=True)
+class _RDEvaluationInput:
+    """One transformed R-D batch plus executor-owned paired context.
+
+    Public :func:`evaluate_rd` callers retain the historical tensor or
+    ``(tensor, row_ids)`` surface.  The cell executor can instead wrap the
+    transformed input in this private carrier and attach its paired raw-space
+    tensors without teaching the codec how normalization is serialized.
+    """
+
+    transformed: torch.Tensor
+    row_ids: torch.Tensor | None = None
+    context: object | None = None
+
+
+@dataclass(frozen=True)
+class _RDEvaluationBatch:
+    """Trusted batch state shared with an optional joint endpoint observer."""
+
+    transformed: torch.Tensor
+    sequence_ids: torch.Tensor  # [tokens] int64 CPU
+    row_ids: torch.Tensor | None
+    packet_events: _PacketEvents
+    context: object | None
+    decoder: torch.Tensor | None
+    decoder_matrix: torch.Tensor | None
+
+
+class _RDEvaluationObserver(Protocol):
+    """Executor hook for consuming the codec's one trusted packet traversal.
+
+    Implementations must consume decoded tensors synchronously.  The q-chunk
+    mapping and all prediction aliases are released as soon as
+    ``consume_decoded_chunk`` returns.
+    """
+
+    def begin_batch(self, batch: _RDEvaluationBatch) -> None: ...
+
+    def consume_decoded_chunk(
+        self,
+        batch: _RDEvaluationBatch,
+        decoded_chunk: Mapping[int, torch.Tensor],
+    ) -> None: ...
+
+    def end_batch(self, batch: _RDEvaluationBatch) -> None: ...
 
 
 @dataclass
@@ -1414,21 +1463,29 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
 
 
 @torch.no_grad()
-def evaluate_rd(
+def _evaluate_rd_stream(
     model,
     codec: Codec,
     batches,
     *,
     row_len: int | None = None,
     device: str = "cpu",
+    observer: _RDEvaluationObserver | None = None,
 ) -> dict:
-    """Eval pass: per-q distortion through quantized codes + rates, with
-    per-sequence accumulators and a sequence bootstrap.
+    """Traverse threshold packets once for transformed and observed endpoints.
 
     Real-data callers must yield ``(x, row_ids)`` pairs from the sequential
     store reader; column zero is the immutable sequence ID.  Tensor-only
     batches require ``row_len`` and are labelled as the fixed-length
-    synthetic/test fallback.  Mixing the two contracts is rejected.
+    synthetic/test fallback.  ``_RDEvaluationInput`` additionally lets the
+    executor attach paired raw-space state.  Mixing stored-ID and fallback
+    contracts is rejected.
+
+    The codec remains the sole owner of threshold selection, trusted packet
+    events, q-chunk decoding, rate arithmetic, transformed SSE, sequence
+    grouping, and bootstrap order.  An observer can synchronously consume the
+    very same event stream and decoded chunks for raw-space endpoints without
+    another encode/decode traversal.
     """
     spec = codec.spec
     b = model.cfg.block_dim
@@ -1493,22 +1550,31 @@ def evaluate_rd(
         )
     )
     for item in batches:
-        if isinstance(item, tuple):
+        observer_context: object | None = None
+        source_row_ids: torch.Tensor | None = None
+        if isinstance(item, _RDEvaluationInput):
+            x = item.transformed
+            source_row_ids = item.row_ids
+            observer_context = item.context
+        elif isinstance(item, tuple):
             if len(item) != 2:
                 raise ValueError("R-D batches must be x or (x, row_ids)")
-            x, row_ids = item
+            x, source_row_ids = item
+        else:
+            x = item
+
+        if source_row_ids is not None:
             if sequence_mode == "fixed_length_fallback":
                 raise ValueError("cannot mix stored IDs and fixed-length fallback")
             sequence_mode = "stored_sequence_ids"
             if (
-                row_ids.ndim != 2
-                or row_ids.shape[0] != x.shape[0]
-                or row_ids.shape[1] < 1
+                source_row_ids.ndim != 2
+                or source_row_ids.shape[0] != x.shape[0]
+                or source_row_ids.shape[1] < 1
             ):
                 raise ValueError("row_ids must have shape [tokens, >=1]")
-            sequence_ids = row_ids[:, 0].to(device="cpu", dtype=torch.int64)
+            sequence_ids = source_row_ids[:, 0].to(device="cpu", dtype=torch.int64)
         else:
-            x = item
             if sequence_mode == "stored_sequence_ids":
                 raise ValueError("cannot mix stored IDs and fixed-length fallback")
             sequence_mode = "fixed_length_fallback"
@@ -1561,6 +1627,17 @@ def evaluate_rd(
 
         packet_events = _packet_events_from_output(model, codec, out)
         del out, raw_mask, mask
+        batch = _RDEvaluationBatch(
+            transformed=x,
+            sequence_ids=sequence_ids,
+            row_ids=source_row_ids,
+            packet_events=packet_events,
+            context=observer_context,
+            decoder=materialized_decoder,
+            decoder_matrix=materialized_decoder_matrix,
+        )
+        if observer is not None:
+            observer.begin_batch(batch)
         err_site = {}
         for decoded_chunk in _decode_trusted_packet_events_q_chunks(
             model,
@@ -1574,6 +1651,8 @@ def evaluate_rd(
                 # Distortion uses the exact integer packet a saved artifact
                 # will decode. Only redundant validation is elided here.
                 err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
+            if observer is not None:
+                observer.consume_decoded_chunk(batch, decoded_chunk)
             del xhat, decoded_chunk
         tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
 
@@ -1605,6 +1684,8 @@ def evaluate_rd(
             pend["cnt"] += float(counts[sl].sum())
             pend["n"] += run_count
             start += run_count
+        if observer is not None:
+            observer.end_batch(batch)
     if current_sequence is not None:
         close_row()
 
@@ -1695,3 +1776,28 @@ def evaluate_rd(
             "rate_bits_bernoulli": results["bernoulli_bits_per_token"] + amp_bits,
         }
     return results
+
+
+@torch.no_grad()
+def evaluate_rd(
+    model,
+    codec: Codec,
+    batches,
+    *,
+    row_len: int | None = None,
+    device: str = "cpu",
+) -> dict:
+    """Evaluate transformed-space packet rate and distortion.
+
+    This public compatibility surface intentionally exposes no observer.  The
+    executor uses :func:`_evaluate_rd_stream` when it also needs paired
+    raw-space endpoints from the identical trusted traversal.
+    """
+
+    return _evaluate_rd_stream(
+        model,
+        codec,
+        batches,
+        row_len=row_len,
+        device=device,
+    )

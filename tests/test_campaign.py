@@ -644,6 +644,7 @@ def evaluation_payload(
     }
     return {
         "schema": EVALUATION_SCHEMA,
+        "evaluation_execution_implementation": ("joint_transformed_raw_packet_v1"),
         "cell_id": cell_id,
         "inputs": inputs,
         "validation": validation,
@@ -3396,7 +3397,10 @@ for kind in stage_kinds[a.stage]:
         validation = {"fvu": 0.1, "rate_distortion": 0.8}
         selection_metrics = {"validation": validation}
         payload = {
-            "schema": "bsc-evaluation-v1",
+            "schema": "bsc-evaluation-v2",
+            "evaluation_execution_implementation": (
+                "joint_transformed_raw_packet_v1"
+            ),
             "cell_id": cell["cell_id"],
             "inputs": {name: refs[name]["sha256"] for name in (
                 "checkpoint", "calibration", "deployment_codec",

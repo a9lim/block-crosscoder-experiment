@@ -848,7 +848,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v12-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v13-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -857,7 +857,7 @@ store is not assumed resident in host memory.
 Site-axis factorization reduces trainable parameters, optimizer state, and
 checkpoint bytes. Canonical factorized execution contracts the site basis and
 rank core directly and does not materialize full encoder or decoder site
-tensors. Estimator v12 nevertheless retains the previous unfactorized FLOP and
+tensors. Estimator v13 nevertheless retains the previous unfactorized FLOP and
 operational-workspace prices: the measured speed and memory reduction are not
 planning credit until a separately audited estimator version prices every
 direct-rank lifetime.
@@ -1032,10 +1032,47 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v12-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v13-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
+
+Rate-distortion evaluation serializes
+`evaluation_execution_implementation=joint_transformed_raw_packet_v1` under
+evaluation schema v2 and executor schema v4. One paired evaluation stream now
+owns threshold selection, the q-independent packet events, and exactly
+`ceil(number_of_quantizers / 2)` trusted sparse decodes per batch. The codec
+accumulator preserves transformed-space rate arithmetic, sequence grouping,
+bootstrap draw order, and its public `evaluate_rd` payload; a synchronous raw
+observer consumes those same decoded chunks, applies the deployment inverse,
+and accumulates paired raw-space endpoints and schedule-cache errors. The first
+packet event stream is also reused for the independent public source-free
+roundtrip. The executor no longer rereads or re-encodes the first batch.
+
+Phase 3 prefetches the one raw bf16 view, transfers it once, and applies the
+serialized normalization on CUDA. Phase 2 prefetches paired raw and persisted
+bf16 views, verifies row identity, reconstructs the actual encoder input from
+deployment bytes on CUDA, and releases the persisted view after an independent
+comparison. Large CUDA comparisons use one dynamic compiled reduction for
+maximum absolute and normalized allclose error; CPU and small tensors remain
+eager. Identity, diagonal, whitening, LayerNorm oracle, synthetic, zero-event,
+bias, padding, unusual quantizer order, chunk-tail, row-order, persisted-view
+mismatch, and public-packet corruption cases are release fixtures. Evaluation
+and campaign validators fail closed on a missing or superseded joint identity.
+
+At `B=4096`, four width-768 sites, 2,048 groups, block width four, six
+quantizers, and approximately 32 events/token on the RTX 4090, five warmups and
+31 synchronized wall-clock samples measure `40.939 ms` median / `41.062 ms`
+p95 for the former separate transformed/raw traversals and `25.707 ms` /
+`25.748 ms` for the joint traversal: a `37.21%` median reduction (`1.593x`),
+`1.595x` at p95, and `244.8 MiB` lower incremental peak. Repeated sparse
+execution gives maximum transformed-FVU relative disagreement `4.99e-11` and
+raw aggregate disagreement `1.25e-11`. On the same activation shape, compiled
+persisted-view validation measures `0.326 ms` versus `0.695 ms` eager (`2.13x`)
+and saves `96.0 MiB` peak. Estimator v13 explicitly prices paired raw and
+transformed targets, both metric lifetimes, all-q raw errors, cached forward and
+inverse normalization operators, and the persisted-validation peak; it grants
+no speculative memory credit for the removed second traversal.
 
 Decoded energy remains the scientific score. Its serialized
 `implementation.decoded_energy_implementation` field selects either the exact
@@ -1086,7 +1123,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v12 conservatively credits only four fp32
+Estimator v13 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse

@@ -9,11 +9,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import block_crosscoder_experiment.codec as codec_module
 from block_crosscoder_experiment.codec import (
+    Codec,
     CodecSpec,
+    _RDEvaluationInput,
     _artifact_digest,
     _decode_trusted_packet_events_q_chunks,
     _encode_batch_all_q_events,
+    _evaluate_rd_stream,
     _packet_from_output,
     _rotate_multi_q_events,
     decode_batch,
@@ -756,3 +760,179 @@ def test_codec_device_cache_refreshes_after_tensor_mutation():
     codec.lo.add_(1.0)
     second = codec._tensor_on("lo", "cpu", dtype=torch.float64)
     assert torch.equal(second, first + 1.0)
+
+
+class _RecordingRDEvaluationObserver:
+    def __init__(self) -> None:
+        self.batch_contexts: list[object | None] = []
+        self.packet_events: list[object] = []
+        self.chunk_qs: list[tuple[int, ...]] = []
+        self.predictions: dict[int, list[torch.Tensor]] = {}
+        self.ended = 0
+
+    def begin_batch(self, batch) -> None:
+        self.batch_contexts.append(batch.context)
+        self.packet_events.append(batch.packet_events)
+        assert batch.sequence_ids.device.type == "cpu"
+        assert batch.sequence_ids.dtype == torch.int64
+
+    def consume_decoded_chunk(self, batch, decoded_chunk) -> None:
+        assert batch.packet_events is self.packet_events[-1]
+        self.chunk_qs.append(tuple(decoded_chunk))
+        for q, prediction in decoded_chunk.items():
+            self.predictions.setdefault(q, []).append(prediction.detach().cpu().clone())
+
+    def end_batch(self, batch) -> None:
+        assert batch.packet_events is self.packet_events[-1]
+        self.ended += 1
+
+
+def _joint_rd_fixture(
+    *,
+    qs: tuple[int, ...],
+    decoder_bias: bool = True,
+    site_dims: tuple[int, ...] | None = None,
+) -> tuple[BlockCrosscoder, Codec, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(811)
+    model = make_model(
+        seed=812,
+        b=2,
+        g=10,
+        k=3.0,
+        decoder_bias=decoder_bias,
+        site_dims=site_dims,
+    )
+    calibration = torch.randn(96, S, D, generator=generator)
+    if site_dims is not None:
+        calibration = calibration * model.coordinate_mask[:, 0, 0].cpu()
+    calibrated(model, calibration)
+    if decoder_bias:
+        with torch.no_grad():
+            model.c.copy_(
+                torch.randn(model.c.shape, generator=generator)
+                * model.coordinate_mask[:, 0, 0].cpu()
+            )
+    codec = fit_codec(
+        model,
+        list(calibration.split(24)),
+        CodecSpec(qs=qs, floor=1, n_bootstrap=8),
+    )
+    evaluation = torch.randn(19, S, D, generator=generator)
+    if site_dims is not None:
+        evaluation = evaluation * model.coordinate_mask[:, 0, 0].cpu()
+    sequence_ids = torch.tensor([3] * 4 + [8] * 7 + [19] * 8)
+    row_ids = torch.stack((sequence_ids, torch.arange(len(sequence_ids))), dim=1)
+    return model, codec, evaluation, row_ids
+
+
+def test_joint_rd_stream_preserves_public_payload_and_reuses_one_packet_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qs = (8, 2, 12, 4, 6)
+    model, codec, evaluation, row_ids = _joint_rd_fixture(qs=qs)
+    slices = (slice(0, 5), slice(5, 13), slice(13, 19))
+    public_batches = [(evaluation[sl], row_ids[sl]) for sl in slices]
+    expected = evaluate_rd(model, codec, public_batches)
+
+    observer = _RecordingRDEvaluationObserver()
+    contexts = [object() for _ in slices]
+    joint_batches = [
+        _RDEvaluationInput(evaluation[sl], row_ids[sl], context)
+        for sl, context in zip(slices, contexts, strict=True)
+    ]
+    threshold_calls = 0
+    decode_calls = 0
+    original_threshold = codec_module._threshold_select
+    original_decode = codec_module._decode_trusted_packet_events_q_chunks
+
+    def counted_threshold(*args, **kwargs):
+        nonlocal threshold_calls
+        threshold_calls += 1
+        return original_threshold(*args, **kwargs)
+
+    def counted_decode(*args, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
+        yield from original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(codec_module, "_threshold_select", counted_threshold)
+    monkeypatch.setattr(
+        codec_module,
+        "_decode_trusted_packet_events_q_chunks",
+        counted_decode,
+    )
+    actual = _evaluate_rd_stream(model, codec, joint_batches, observer=observer)
+
+    assert actual == expected
+    assert threshold_calls == len(slices)
+    assert decode_calls == len(slices)
+    assert observer.batch_contexts == contexts
+    assert observer.ended == len(slices)
+    assert observer.chunk_qs == [
+        chunk for _ in slices for chunk in ((8, 2), (12, 4), (6,))
+    ]
+    assert tuple(observer.predictions) == qs
+    assert all(len(observer.predictions[q]) == len(slices) for q in qs)
+    for events, sl in zip(observer.packet_events, slices, strict=True):
+        assert events.n_tokens == len(evaluation[sl])
+        assert int(events.counts.sum()) == len(events.block_ids)
+
+
+@pytest.mark.parametrize("decoder_bias", (False, True))
+@pytest.mark.parametrize("padded", (False, True))
+@pytest.mark.parametrize("zero_support", (False, True))
+def test_joint_rd_stream_matches_public_for_bias_padding_and_zero_support(
+    decoder_bias: bool,
+    padded: bool,
+    zero_support: bool,
+) -> None:
+    qs = (2, 4, 6)
+    site_dims = (D, D - 3, D - 7) if padded else None
+    model, codec, evaluation, row_ids = _joint_rd_fixture(
+        qs=qs,
+        decoder_bias=decoder_bias,
+        site_dims=site_dims,
+    )
+    if zero_support:
+        codec = replace(
+            codec,
+            included=torch.zeros_like(codec.included),
+            rank_to_block=torch.empty(0, dtype=torch.long),
+            count_log2p=torch.zeros(1, dtype=torch.float64),
+        )
+    slices = (slice(0, 6), slice(6, 14), slice(14, 19))
+    expected = evaluate_rd(
+        model,
+        codec,
+        [(evaluation[sl], row_ids[sl]) for sl in slices],
+    )
+    observer = _RecordingRDEvaluationObserver()
+    actual = _evaluate_rd_stream(
+        model,
+        codec,
+        [
+            _RDEvaluationInput(
+                evaluation[sl],
+                row_ids[sl],
+                {"raw": evaluation[sl]},
+            )
+            for sl in slices
+        ],
+        observer=observer,
+    )
+
+    assert actual == expected
+    assert observer.ended == len(slices)
+    assert observer.chunk_qs == [chunk for _ in slices for chunk in ((2, 4), (6,))]
+    if zero_support:
+        assert actual["avg_count"] == 0.0
+        assert actual["support_bits_per_token"] == 0.0
+        assert all(int(events.counts.sum()) == 0 for events in observer.packet_events)
+    if padded:
+        coordinate_mask = model.coordinate_mask[:, 0, 0].cpu()
+        for predictions in observer.predictions.values():
+            for prediction in predictions:
+                assert torch.equal(
+                    prediction * ~coordinate_mask,
+                    torch.zeros_like(prediction),
+                )

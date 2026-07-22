@@ -17,7 +17,6 @@ from block_crosscoder_experiment.runtime_limits import (
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
-    DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
@@ -1508,7 +1507,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v12"
+        "dense-linear-memory-v13"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1563,10 +1562,12 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         estimate_cell(larger_window).storage_bytes - estimate_cell(sasa).storage_bytes
         == expected_sparse_delta
     )
+    # The explicitly priced joint transformed/raw evaluator is the peak for
+    # this tiny smoke cell, so increasing training-only tracker residency does
+    # not change the nonconcurrent maximum.
     assert (
         estimate_cell(larger_window).peak_vram_bytes
-        - estimate_cell(sasa).peak_vram_bytes
-        == expected_sparse_delta
+        == estimate_cell(sasa).peak_vram_bytes
     )
     batch_sasa = _replace_decision(sasa, "model.selector", "block_batchtopk")
     dense_sasa = _replace_decision(sasa, "model.selector", "learned_group_threshold")
@@ -1700,7 +1701,7 @@ def test_decoder_retraction_estimator_admits_only_bound_carriers(
             estimate_cell(changed)
 
 
-def test_v12_estimator_prices_cholesky_qr1_training_workspace(
+def test_v13_estimator_prices_cholesky_qr1_training_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cholesky = next(
@@ -1822,7 +1823,7 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_v12_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v13_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -1836,18 +1837,17 @@ def test_v12_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast_estimate = estimate_cell(fast)
     exact_estimate = estimate_cell(exact_control)
     values = fast.decision_map
-    expected_training_credit = (
-        DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
-        * int(values["optimizer.batch_tokens"])
-        * int(values["model.groups"])
-        * int(values["model.block_width"])
-        * 4
-    )
     assert fast_estimate.estimator == ESTIMATOR_VERSION
     assert exact_estimate.estimator == ESTIMATOR_VERSION
+    expected_evaluation_credit = (
+        int(values["model.groups"]) * int(values["model.block_width"]) ** 2 * 4
+    )
+    # Joint R-D evaluation is the peak for this smoke geometry. The specialized
+    # score still removes its exact evaluator Gram without conflating the
+    # nonconcurrent training and evaluation lifetimes.
     assert (
         exact_estimate.peak_vram_bytes - fast_estimate.peak_vram_bytes
-        == expected_training_credit
+        == expected_evaluation_credit
     )
 
     workspace = {
@@ -1932,7 +1932,7 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
     )
 
 
-def test_v12_estimator_prices_mapped_isolated_loss_training_and_geometry(
+def test_v13_estimator_prices_mapped_isolated_loss_training_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped = _isolated_loss_estimator_cell(
@@ -2033,8 +2033,10 @@ def test_mapped_isolated_loss_estimator_refuses_invalid_carriers(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
-    groups = 16 * EVALUATION_CONCORDANCE_BLOCK_CHUNK
+def test_evaluation_workspace_prices_dense_support_and_all_q_raw_errors():
+    # Keep shared-code analysis below the joint R-D branch so the all-q raw
+    # endpoint residency is directly observable in this fixture.
+    groups = 1
     common = {
         "batch_tokens": 128,
         "groups": groups,
@@ -2056,7 +2058,7 @@ def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():
     )
     assert one_q > 0
     assert saturated >= one_q
-    assert extra_qs == saturated
+    assert extra_qs - saturated == 3 * common["batch_tokens"] * common["sites"] * 8
     by_score = {
         score: _evaluation_workspace_bytes(
             quantizer_count=TRUSTED_DECODE_Q_CHUNK,
@@ -2104,6 +2106,14 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + batch_tokens * total_dim * 4
         + decoder_elements * 4
     )
+    joint_targets = 2 * batch_tokens * total_dim * 4
+    joint_metrics = (
+        batch_tokens * total_dim * (4 + 4 * 8)
+        + batch_tokens * sites * 3 * 8
+        + total_dim * (4 + 8)
+    )
+    normalization_operators = 2 * sites * 4
+    joint_rd = trusted_decode + joint_targets + joint_metrics + normalization_operators
     output = 4 * batch_tokens * (total_dim * 4 + latents * 8 + groups * 5)
     concordance_groups = min(groups, EVALUATION_CONCORDANCE_BLOCK_CHUNK)
     concordance = batch_tokens * concordance_groups * (8 * block_width + 4) * 8
@@ -2138,7 +2148,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + 2 * one_site_tensor
         + sparse_native_decode
     )
-    assert shared_code > trusted_decode
+    assert shared_code > joint_rd
     assert actual == shared_code
 
 

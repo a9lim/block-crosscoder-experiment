@@ -402,7 +402,7 @@ distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
-`dense-linear-memory-v12-q2-c512-t256-s32`. Its guarded
+`dense-linear-memory-v13-q2-c512-t256-s32`. Its guarded
 `stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
 not a paper result or a different scientific score. It uses the algebraic
 decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel
@@ -417,8 +417,16 @@ materialized site tensor is retained only under the explicit
 `materialized_site_tensor_reference_v1` oracle identity. Direct rank-space
 contraction is a project execution optimization, not an FMX procedure claim or
 a new experimental arm. The cell, checkpoint, run binding, and deployable
-codec bind this identity, while estimator v12 conservatively retains the prior
+codec bind this identity, while estimator v13 conservatively retains the prior
 operational compute and workspace price.
+
+Deployment evaluation binds the engineering identity
+`joint_transformed_raw_packet_v1`: transformed-space packet diagnostics and
+paired raw-space selection endpoints consume one threshold/event/decode
+traversal, while the public codec result, raw evidence contract, and independent
+source-free packet validation remain unchanged. This is not a paper-method
+adaptation or experimental condition. Evaluation schema v2, executor schema v4,
+the campaign gate, and estimator v13 bind and price the joint implementation.
 
 QR versus symmetric-polar retraction remains a scientific architecture choice.
 Canonical QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar

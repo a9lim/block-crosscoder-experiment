@@ -46,7 +46,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v12"
+    "dense-linear-memory-v13"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3785,8 +3785,11 @@ def _evaluation_workspace_bytes(
     latents = groups * block_width
 
     # The q-independent event stream remains live with every int32 packet.
-    # The chunk decoder additionally holds float symbols/canonical codes,
-    # rotated codes, CSR columns/rows, and q_chunk reconstructed activations.
+    # The joint transformed/raw evaluator additionally holds float symbols,
+    # canonical and rotated codes, CSR columns/rows, and q_chunk reconstructed
+    # activations.  One traversal owns both metric spaces and the first packet
+    # round trip; it does not receive a memory credit merely because the former
+    # second traversal was removed.
     retained_packet_bytes = batch_tokens * 4 + events * (32 + 12 * block_width)
     trusted_decode_bytes = (
         retained_packet_bytes
@@ -3795,6 +3798,26 @@ def _evaluation_workspace_bytes(
         + (q_chunk * batch_tokens + 1) * 8
         + q_chunk * batch_tokens * total_dim * 4
         + operational_decoder_elements * 4
+    )
+    joint_target_bytes = 2 * batch_tokens * total_dim * 4
+    joint_metric_bytes = (
+        # One raw inverse prediction and conservative fp64 transformed/raw
+        # residual plus square lifetimes.
+        batch_tokens * total_dim * (4 + 4 * 8)
+        # Raw/transformed token denominators and all-q raw endpoint errors.
+        + batch_tokens * sites * (2 + quantizer_count) * 8
+        # Calibration means in both spaces.
+        + total_dim * (4 + 8)
+    )
+    # A dense whitening carrier caches forward and inverse operators; diagonal
+    # modes use less.  Price the worst admitted real normalization regardless
+    # of the current mode so no artifact-dependent branch can exceed preflight.
+    normalization_operator_bytes = 2 * sites * site_dim**2 * 4
+    joint_rd_bytes = (
+        trusted_decode_bytes
+        + joint_target_bytes
+        + joint_metric_bytes
+        + normalization_operator_bytes
     )
 
     # Fused native/deployed sharing evaluation retains the full and one
@@ -3865,7 +3888,7 @@ def _evaluation_workspace_bytes(
         score_geometry_bytes = groups * 4
     else:
         score_geometry_bytes = 0
-    return max(trusted_decode_bytes, shared_code_bytes) + score_geometry_bytes
+    return max(joint_rd_bytes, shared_code_bytes) + score_geometry_bytes
 
 
 def _decoded_energy_code_norm_eligible_values(
@@ -4423,9 +4446,9 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
     """Conservative dense-linear training and on-disk resource estimate.
 
     FLOPs use six operations per operational dense weight element per token
-    (forward plus backward).  This intentionally does not grant factorized
-    models compute savings while the implementation materializes dense site
-    tensors. Storage includes one activation store, a conservative 16 bytes
+    (forward plus backward). This intentionally does not grant factorized
+    models compute savings until the direct-rank schedule receives a separate
+    planner audit. Storage includes one activation store, a conservative 16 bytes
     per trainable parameter for checkpoint and optimizer state, and the exact
     maximum persisted deadness-tracker representation.
     """

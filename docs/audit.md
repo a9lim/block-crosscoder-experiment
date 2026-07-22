@@ -85,6 +85,16 @@ exit is not evidence by itself.
   the prediction, SSE, and repeated-SpMM bounds in `design.md`. The estimator
   version content-binds the density denominator and exactly prices the capped
   live tensors and one released-per-site output.
+- Rate-distortion artifacts bind `joint_transformed_raw_packet_v1` under
+  evaluation schema v2 and executor schema v4. One paired stream, one threshold
+  selection, one packet-event construction, and `ceil(Q/2)` trusted decodes
+  must produce both transformed and raw endpoints; the first event stream must
+  also feed the independent public packet roundtrip. Codec payload equality,
+  sequence/bootstrap order, row and persisted-view mismatch refusal,
+  normalization modes, zero support, q order/tails, padding/bias, packet
+  corruption, and CUDA drift use the gates and benchmark in `design.md`.
+  Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
+  Estimator v13 prices the complete joint lifetime without a traversal credit.
 - Decoded energy has an explicit serialized implementation identity. The
   bounded code-norm kernel is admitted only for decoded-energy scoring on an
   unfactorized Gram/QR Stiefel decoder, a hard token- or batch-TopK selector,
@@ -100,7 +110,7 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v12 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v13 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
@@ -133,7 +143,7 @@ exit is not evidence by itself.
   carrier-incompatible identities refuse in cells, checkpoints, run bindings,
   and codecs. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
-  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v12
+  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v13
   grants no runtime credit for this optimization.
 - Phase-1 masking has a preceding scale-control panel: literal sum at `p=0`,
   nonpromotable literal sum at `p=.10`, and availability-rescaled sum at
@@ -431,7 +441,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v12-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v13-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks. Cholesky-QR1 reserves

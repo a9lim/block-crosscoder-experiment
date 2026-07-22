@@ -38,6 +38,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _matching_pathologies,
     _model_config,
     _normalization_record,
+    _persisted_view_validation,
     _production_precision_preflight,
     _resolve_real_store,
     _selection_validation_metrics,
@@ -113,6 +114,23 @@ def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
     assert source.count("_prefetched_evaluation_batches(") == 1
     assert "evaluate_selector_and_shared_code_modes(" in source
     assert "_evaluate_native_selector(" not in source
+    assert source.count("_evaluate_rate_distortion_and_raw_space(") == 1
+    assert "evaluate_rd(" not in source
+    assert "encode_batch(" not in source
+
+
+def test_persisted_view_validation_matches_allclose_contract() -> None:
+    expected = torch.tensor([1.0, -2.0, 0.0], dtype=torch.bfloat16)
+    actual = expected.float() + torch.tensor([0.01, -0.02, 0.011])
+    maximum, agrees = _persisted_view_validation(actual, expected)
+    assert maximum == pytest.approx(0.02)
+    assert agrees is True
+
+    refused = actual.clone()
+    refused[2] = 0.013
+    maximum, agrees = _persisted_view_validation(refused, expected)
+    assert maximum == pytest.approx(0.02)
+    assert agrees is False
 
 
 def test_subspace_overlap_is_bound_to_the_support_selected_group() -> None:

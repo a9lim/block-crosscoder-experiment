@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import hashlib
 import importlib.metadata
 import itertools
@@ -38,17 +39,19 @@ from block_crosscoder_experiment.campaign import (
     CAMPAIGN_SCHEMA,
     Campaign,
     CampaignError,
+    EVALUATION_EXECUTION_IMPLEMENTATION,
+    EVALUATION_SCHEMA,
     QUALIFICATION_SCHEMA,
 )
 from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
-    _decode_trusted_packet_events_q_chunks,
-    _encode_batch_events,
+    _RDEvaluationBatch,
+    _RDEvaluationInput,
+    _evaluate_rd_stream,
+    _packet_from_events,
     decode_batch,
-    encode_batch,
     estimate_calibration_peak_bytes,
-    evaluate_rd,
     fit_codec,
 )
 from block_crosscoder_experiment.evaluation import (
@@ -111,10 +114,9 @@ from block_crosscoder_experiment.trainer import (
 )
 
 
-EVALUATION_SCHEMA = "bsc-evaluation-v1"
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v3"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v4"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -3594,38 +3596,12 @@ def _evaluation_batches(
             yield _apply_prepared_transform(batch, preparation, transform)
 
 
-def _rd_evaluation_batches(
-    ctx: _Context,
-    preparation: Mapping[str, Any],
-) -> Iterator[torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
-    """Use true stored sequence IDs for every real-model R-D bootstrap."""
-
-    batch_size = int(ctx.values["optimizer.batch_tokens"])
-    if preparation["data"]["kind"] == "synthetic":
-        yield from _evaluation_batches(ctx, preparation, "evaluation")
-        return
-    reader = _store_reader(preparation, "evaluation")
-    transform = _prepared_transform(preparation)
-    for batch, row_ids in reader.sequential_batches_with_ids(batch_size):
-        yield _apply_prepared_transform(batch, preparation, transform), row_ids
-
-
 def _prefetched_evaluation_batches(
     ctx: _Context,
     preparation: Mapping[str, Any],
     role: str = "evaluation",
 ) -> Iterator[torch.Tensor]:
     batches: Iterator[torch.Tensor] = _evaluation_batches(ctx, preparation, role)
-    if _device(ctx).type == "cuda":
-        batches = prefetch_batches(batches, depth=2, pin_memory=True)
-    return batches
-
-
-def _prefetched_rd_evaluation_batches(
-    ctx: _Context,
-    preparation: Mapping[str, Any],
-) -> Iterator[torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
-    batches = _rd_evaluation_batches(ctx, preparation)
     if _device(ctx).type == "cuda":
         batches = prefetch_batches(batches, depth=2, pin_memory=True)
     return batches
@@ -5595,6 +5571,40 @@ def _apply_saved_real_normalization(
     return torch.einsum("sde,nse->nsd", operator, centered)
 
 
+def _persisted_view_validation_kernel(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> torch.Tensor:
+    """Return max absolute and allclose-normalized differences."""
+
+    expected_fp32 = expected.float()
+    difference = (actual - expected_fp32).abs()
+    tolerance = 0.012 + 0.012 * expected_fp32.abs()
+    return torch.stack((difference.amax(), (difference / tolerance).amax()))
+
+
+@functools.lru_cache(maxsize=1)
+def _compiled_cuda_persisted_view_validation():
+    return torch.compile(
+        _persisted_view_validation_kernel,
+        fullgraph=True,
+        dynamic=True,
+    )
+
+
+def _persisted_view_validation(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> tuple[float, bool]:
+    kernel = (
+        _compiled_cuda_persisted_view_validation()
+        if actual.device.type == "cuda" and actual.numel() >= 65_536
+        else _persisted_view_validation_kernel
+    )
+    maximum, normalized_maximum = kernel(actual, expected).cpu().tolist()
+    return float(maximum), float(normalized_maximum) <= 1.0
+
+
 def _invert_saved_real_normalization(
     normalized: torch.Tensor,
     raw_source: torch.Tensor,
@@ -6041,7 +6051,7 @@ class _RawEndpointErrorCache:
 
 
 @torch.no_grad()
-def _evaluate_raw_space(
+def _evaluate_rate_distortion_and_raw_space(
     ctx: _Context,
     preparation: Mapping[str, Any],
     model: BlockCrosscoder,
@@ -6049,24 +6059,18 @@ def _evaluate_raw_space(
     deployment: Mapping[str, Any],
     *,
     retain_endpoint_errors: bool = False,
-) -> tuple[dict[str, Any], _RawEndpointErrorCache | None]:
-    """Evaluate the serialized quantized codec in paired source coordinates."""
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    _RawEndpointErrorCache | None,
+    dict[str, Any],
+]:
+    """Evaluate transformed and paired raw codec endpoints in one traversal."""
 
     data = preparation["data"]
     batch_size = int(ctx.values["optimizer.batch_tokens"])
     device = _device(ctx)
     model = model.to(device).eval()
-    materialized_decoder = model.decoder_tensor()
-    materialized_encoder = (
-        materialized_decoder * model.log_gamma.exp()
-        if model.cfg.encoder_mode == "tied"
-        else model.encoder_tensor()
-    )
-    materialized_score_geometry = model._frozen_score_geometry(materialized_decoder)
-    materialized_decoder_matrix = materialized_decoder.permute(1, 2, 0, 3).reshape(
-        model.cfg.n_latents,
-        model.cfg.n_sites * model.cfg.d_model,
-    )
     sites, width = model.cfg.n_sites, model.cfg.d_model
     coordinate_mask = (
         model.coordinate_mask[:, 0, 0].to(device).double()
@@ -6086,8 +6090,7 @@ def _evaluate_raw_space(
     inverse_W: torch.Tensor | None = None
     saved_mean_device: torch.Tensor | None = None
     saved_diagonal_device: torch.Tensor | None = None
-    saved_mean_cpu: torch.Tensor | None = None
-    saved_operator_cpu: torch.Tensor | None = None
+    saved_forward_device: torch.Tensor | None = None
     synthetic_normalization: Mapping[str, Any] | None = None
     synthetic_mean_device: torch.Tensor | None = None
     synthetic_scale_device: torch.Tensor | None = None
@@ -6157,34 +6160,29 @@ def _evaluate_raw_space(
             and saved_mode == "layer"
         )
         if saved_normalization.get("kind") == "frozen_transform":
-            saved_mean_cpu = saved_normalization["mean"].to(dtype=torch.float32)
-            saved_mean_device = saved_mean_cpu.to(device=device)
+            saved_mean_device = saved_normalization["mean"].to(
+                device=device,
+                dtype=torch.float32,
+            )
             saved_W_cpu = saved_normalization["W"].to(dtype=torch.float32)
             if saved_mode in {"none", "scalar_rms", "sqrt_d"}:
-                saved_operator_cpu = torch.diagonal(saved_W_cpu, dim1=-2, dim2=-1)
-                saved_diagonal_device = saved_operator_cpu.to(device=device)
+                saved_diagonal_device = torch.diagonal(
+                    saved_W_cpu,
+                    dim1=-2,
+                    dim2=-1,
+                ).to(device=device)
+                saved_forward_device = saved_diagonal_device
             elif saved_mode == "whiten":
-                saved_operator_cpu = saved_W_cpu
+                saved_forward_device = saved_W_cpu.to(device=device)
                 inverse_W = torch.linalg.inv(saved_W_cpu.double()).float().to(device)
             elif saved_mode != "layer":
-                saved_operator_cpu = saved_W_cpu
+                saved_forward_device = saved_W_cpu.to(device=device)
 
-        def paired_stream() -> Iterator[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ]:
-            nonlocal serialized_forward_verified
-            nonlocal persisted_view_max_abs_difference
+        def paired_stream() -> Iterator[tuple[torch.Tensor, ...]]:
             raw_stream = raw.sequential_batches_with_ids(batch_size)
             if on_the_fly:
                 for x_raw, raw_ids in raw_stream:
-                    encoder_input = _apply_saved_real_normalization(
-                        x_raw,
-                        saved_normalization,
-                        mean=saved_mean_cpu,
-                        operator=saved_operator_cpu,
-                    )
-                    serialized_forward_verified = True
-                    yield (encoder_input, x_raw.float(), raw_ids)
+                    yield (x_raw, raw_ids)
                 return
             assert normalized is not None
             normalized_stream = normalized.sequential_batches_with_ids(batch_size)
@@ -6202,33 +6200,7 @@ def _evaluate_raw_space(
                     raise CellExecutionError(
                         "normalized/raw evaluation row identities diverged"
                     )
-                # The evaluated encoder input is always reconstructed from the
-                # transform bytes inside the priced deployment artifact.  A
-                # persisted Phase-2 view remains useful as an independent
-                # materialization check, but is never a shortcut around the
-                # actual consumer preprocessing path.
-                encoder_input = _apply_saved_real_normalization(
-                    x_raw,
-                    saved_normalization,
-                    mean=saved_mean_cpu,
-                    operator=saved_operator_cpu,
-                )
-                difference = float((encoder_input - x_normalized.float()).abs().max())
-                persisted_view_max_abs_difference = max(
-                    persisted_view_max_abs_difference, difference
-                )
-                if not torch.allclose(
-                    encoder_input,
-                    x_normalized.float(),
-                    rtol=0.012,
-                    atol=0.012,
-                ):
-                    raise CellExecutionError(
-                        "serialized deployment normalization does not reproduce "
-                        "the bound persisted evaluation view"
-                    )
-                serialized_forward_verified = True
-                yield (encoder_input, x_raw.float(), raw_ids)
+                yield (x_normalized, x_raw, raw_ids)
 
     calibration_tokens = int(deployment["raw_calibration_mean_fit_tokens"])
     calibration_mean = deployment["raw_calibration_mean"].to(
@@ -6240,7 +6212,6 @@ def _evaluate_raw_space(
     row_sequences: list[int] = []
     row_denominators: list[float] = []
     row_errors: dict[int, list[float]] = {q: [] for q in codec.spec.qs}
-    tokens = 0
     evaluation_stream: Iterator = paired_stream()
     if device.type == "cuda":
         evaluation_stream = prefetch_batches(
@@ -6248,102 +6219,156 @@ def _evaluate_raw_space(
             depth=2,
             pin_memory=True,
         )
-    try:
-        evaluation_iterator = iter(evaluation_stream)
-        for x_normalized, x_raw, row_ids in evaluation_iterator:
-            x_normalized = x_normalized.to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
-            x_raw = x_raw.to(device=device, dtype=torch.float32, non_blocking=True)
-            row_ids = row_ids.to(device=device, non_blocking=True)
+
+    class _RawObserver:
+        def __init__(self) -> None:
+            self.tokens = 0
+            self.roundtrip: dict[str, Any] | None = None
+            self._raw: torch.Tensor | None = None
+            self._token_denominator: torch.Tensor | None = None
+            self._token_errors: dict[int, torch.Tensor] = {}
+
+        def begin_batch(self, batch: _RDEvaluationBatch) -> None:
+            if self._raw is not None or not torch.is_tensor(batch.context):
+                raise CellExecutionError("joint R-D observer batch state is invalid")
+            x_raw = batch.context
+            if x_raw.shape != batch.transformed.shape or x_raw.device != device:
+                raise CellExecutionError("joint R-D paired raw tensor is misbound")
             centered = x_raw.double() - calibration_mean
             if coordinate_mask is not None:
                 centered = centered * coordinate_mask
             token_denominator = centered.square().sum(dim=2)
-            denominator += token_denominator.sum(dim=0)
-            threshold_output, packet_events = _encode_batch_events(
-                model,
-                codec,
-                x_normalized,
-                _decoder=materialized_decoder,
-                _encoder=materialized_encoder,
-                _score_geometry=materialized_score_geometry,
-            )
-            del threshold_output
-            token_errors: dict[int, torch.Tensor] = {}
-            for decoded_chunk in _decode_trusted_packet_events_q_chunks(
-                model,
-                codec,
-                packet_events,
-                qs=codec.spec.qs,
-                _decoder=materialized_decoder,
-                _decoder_matrix=materialized_decoder_matrix,
-            ):
-                for q, normalized_prediction in decoded_chunk.items():
-                    if data["kind"] == "synthetic":
-                        assert synthetic_normalization is not None
-                        if synthetic_normalization["kind"] == "token_layer_norm":
-                            raw_prediction = torch.zeros_like(normalized_prediction)
-                            for site, dim in enumerate(model.cfg.site_dims):
-                                values = x_raw[:, site, :dim]
-                                mean = values.mean(dim=-1, keepdim=True)
-                                variance = values.var(
-                                    dim=-1, correction=0, keepdim=True
-                                )
-                                raw_prediction[:, site, :dim] = (
-                                    normalized_prediction[:, site, :dim]
-                                    * (variance + 1e-5).sqrt()
-                                    + mean
-                                )
-                        else:
-                            assert synthetic_mean_device is not None
-                            assert synthetic_scale_device is not None
-                            raw_prediction = (
-                                normalized_prediction / synthetic_scale_device
-                                + synthetic_mean_device.unsqueeze(0)
+            denominator.add_(token_denominator.sum(dim=0))
+            self._raw = x_raw
+            self._token_denominator = token_denominator
+            self._token_errors = {}
+
+            if self.roundtrip is None:
+                q = max(codec.spec.qs)
+                packet = _packet_from_events(codec, batch.packet_events, q)
+                decoded = decode_batch(
+                    model,
+                    codec,
+                    packet,
+                    _decoder=batch.decoder,
+                    _decoder_matrix=batch.decoder_matrix,
+                )
+                packet_error = (
+                    (decoded.float() - batch.transformed.float())
+                    .double()
+                    .square()
+                    .sum()
+                )
+                packet_centered = (
+                    (
+                        batch.transformed.float()
+                        - codec.calib_mean.to(
+                            device=batch.transformed.device,
+                            dtype=torch.float32,
+                        ).unsqueeze(0)
+                    )
+                    .double()
+                    .square()
+                    .sum()
+                    .clamp_min(1e-30)
+                )
+                self.roundtrip = {
+                    "source_free_decode": True,
+                    "tokens": packet.n_tokens,
+                    "events": int(packet.counts.sum()),
+                    "finite": bool(torch.isfinite(decoded).all()),
+                    "shape_matches": list(decoded.shape)
+                    == list(batch.transformed.shape),
+                    "quantizer_bits": q,
+                    "fvu_pooled": float(packet_error / packet_centered),
+                }
+
+        def consume_decoded_chunk(
+            self,
+            batch: _RDEvaluationBatch,
+            decoded_chunk: Mapping[int, torch.Tensor],
+        ) -> None:
+            del batch
+            x_raw = self._raw
+            if x_raw is None:
+                raise CellExecutionError("joint R-D observer consumed before begin")
+            for q, normalized_prediction in decoded_chunk.items():
+                if data["kind"] == "synthetic":
+                    assert synthetic_normalization is not None
+                    if synthetic_normalization["kind"] == "token_layer_norm":
+                        raw_prediction = torch.zeros_like(normalized_prediction)
+                        for site, dim in enumerate(model.cfg.site_dims):
+                            values = x_raw[:, site, :dim]
+                            mean = values.mean(dim=-1, keepdim=True)
+                            variance = values.var(
+                                dim=-1,
+                                correction=0,
+                                keepdim=True,
+                            )
+                            raw_prediction[:, site, :dim] = (
+                                normalized_prediction[:, site, :dim]
+                                * (variance + 1e-5).sqrt()
+                                + mean
                             )
                     else:
-                        raw_prediction = _invert_saved_real_normalization(
-                            normalized_prediction,
-                            x_raw,
-                            saved_normalization,
-                            inverse_W=inverse_W,
-                            mean=saved_mean_device,
-                            diagonal=saved_diagonal_device,
+                        assert synthetic_mean_device is not None
+                        assert synthetic_scale_device is not None
+                        raw_prediction = (
+                            normalized_prediction / synthetic_scale_device
+                            + synthetic_mean_device.unsqueeze(0)
                         )
-                    residual = (x_raw - raw_prediction).double()
-                    if coordinate_mask is not None:
-                        residual = residual * coordinate_mask
-                    token_error = residual.square().sum(dim=2)
-                    token_errors[q] = token_error
-                    errors[q] += token_error.sum(dim=0)
-                del normalized_prediction, raw_prediction, residual, token_error
-                del decoded_chunk
+                else:
+                    raw_prediction = _invert_saved_real_normalization(
+                        normalized_prediction,
+                        x_raw,
+                        saved_normalization,
+                        inverse_W=inverse_W,
+                        mean=saved_mean_device,
+                        diagonal=saved_diagonal_device,
+                    )
+                residual = (x_raw - raw_prediction).double()
+                if coordinate_mask is not None:
+                    residual = residual * coordinate_mask
+                token_error = residual.square().sum(dim=2)
+                self._token_errors[q] = token_error
+                errors[q].add_(token_error.sum(dim=0))
+
+        def end_batch(self, batch: _RDEvaluationBatch) -> None:
+            x_raw = self._raw
+            token_denominator = self._token_denominator
+            if x_raw is None or token_denominator is None:
+                raise CellExecutionError("joint R-D observer ended before begin")
+            if set(self._token_errors) != set(codec.spec.qs):
+                raise CellExecutionError("joint R-D observer missed a quantizer")
             if retain_endpoint_errors:
                 endpoint_error_chunks.append(
                     torch.stack(
                         (
                             token_denominator.sum(dim=1),
-                            *(token_errors[q].sum(dim=1) for q in codec.spec.qs),
+                            *(self._token_errors[q].sum(dim=1) for q in codec.spec.qs),
                         ),
                         dim=0,
                     ).cpu()
                 )
 
-            sequences = row_ids[:, 0].to(dtype=torch.int64)
             unique_sequences, inverse = torch.unique_consecutive(
-                sequences, return_inverse=True
+                batch.sequence_ids,
+                return_inverse=True,
             )
+            inverse = inverse.to(device=device, non_blocking=True)
             grouped_denominator = torch.zeros(
-                len(unique_sequences), sites, dtype=torch.float64, device=device
+                len(unique_sequences),
+                sites,
+                dtype=torch.float64,
+                device=device,
             )
             grouped_denominator.index_add_(0, inverse, token_denominator)
             grouped_errors: dict[int, torch.Tensor] = {}
             for q in codec.spec.qs:
                 grouped = torch.zeros_like(grouped_denominator)
-                grouped.index_add_(0, inverse, token_errors[q])
+                grouped.index_add_(0, inverse, self._token_errors[q])
                 grouped_errors[q] = grouped
-            sequence_values = unique_sequences.cpu().tolist()
+            sequence_values = unique_sequences.tolist()
             denominator_values = grouped_denominator.sum(dim=1).cpu().tolist()
             error_values = {
                 q: grouped_errors[q].sum(dim=1).cpu().tolist() for q in codec.spec.qs
@@ -6360,13 +6385,103 @@ def _evaluate_raw_space(
                     row_denominators.append(den_value)
                     for q in codec.spec.qs:
                         row_errors[q].append(err_values[q])
-            tokens += len(x_raw)
+            self.tokens += len(x_raw)
+            self._raw = None
+            self._token_denominator = None
+            self._token_errors = {}
+
+    observer = _RawObserver()
+
+    def joint_inputs() -> Iterator[_RDEvaluationInput]:
+        nonlocal persisted_view_max_abs_difference
+        nonlocal serialized_forward_verified
+        for item in evaluation_stream:
+            if data["kind"] == "synthetic":
+                x_normalized, x_raw, row_ids = item
+                x_raw_device = x_raw.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                encoder_input = x_normalized.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+            elif on_the_fly:
+                x_raw, row_ids = item
+                x_raw_device = x_raw.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                encoder_input = _apply_saved_real_normalization(
+                    x_raw_device,
+                    saved_normalization,
+                    mean=saved_mean_device,
+                    operator=saved_forward_device,
+                )
+                serialized_forward_verified = True
+            else:
+                x_persisted, x_raw, row_ids = item
+                x_raw_device = x_raw.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                persisted_device = x_persisted.to(
+                    device=device,
+                    non_blocking=True,
+                )
+                # Always reconstruct the encoder input from the priced
+                # deployment bytes. The persisted Phase-2 view is only an
+                # independent, bounded materialization check.
+                encoder_input = _apply_saved_real_normalization(
+                    x_raw_device,
+                    saved_normalization,
+                    mean=saved_mean_device,
+                    operator=saved_forward_device,
+                )
+                difference, agrees = _persisted_view_validation(
+                    encoder_input,
+                    persisted_device,
+                )
+                persisted_view_max_abs_difference = max(
+                    persisted_view_max_abs_difference,
+                    difference,
+                )
+                if not agrees:
+                    raise CellExecutionError(
+                        "serialized deployment normalization does not reproduce "
+                        "the bound persisted evaluation view"
+                    )
+                serialized_forward_verified = True
+                del persisted_device
+            yield _RDEvaluationInput(
+                transformed=encoder_input,
+                row_ids=row_ids,
+                context=x_raw_device,
+            )
+            del encoder_input, x_raw_device
+
+    try:
+        rd = _evaluate_rd_stream(
+            model,
+            codec,
+            joint_inputs(),
+            row_len=1 if data["kind"] == "synthetic" else None,
+            device=str(device),
+            observer=observer,
+        )
     finally:
         close_evaluation = getattr(evaluation_stream, "close", None)
         if close_evaluation is not None:
             close_evaluation()
+    tokens = observer.tokens
     if tokens == 0:
         raise CellExecutionError("raw-space evaluation stream is empty")
+    if observer.roundtrip is None:
+        raise CellExecutionError("joint R-D evaluation omitted packet roundtrip")
     denominator = denominator.clamp_min(1e-30)
     row_denominator_tensor = torch.tensor(row_denominators, dtype=torch.float64)
 
@@ -6449,7 +6564,7 @@ def _evaluate_raw_space(
         if retain_endpoint_errors
         else None
     )
-    return payload, cache
+    return rd, payload, cache, observer.roundtrip
 
 
 @torch.no_grad()
@@ -7172,34 +7287,6 @@ def _evaluate(
     deployed = mode_endpoints.selector["threshold"]
     shared_native = mode_endpoints.shared_code["topk"]
     shared_deployed = mode_endpoints.shared_code["threshold"]
-    rd = evaluate_rd(
-        model,
-        codec,
-        _prefetched_rd_evaluation_batches(ctx, preparation),
-        row_len=1 if preparation["data"]["kind"] == "synthetic" else None,
-        device=str(device),
-    )
-    first_batch = next(_evaluation_batches(ctx, preparation, "evaluation"))
-    roundtrip_q = max(codec.spec.qs)
-    packet = encode_batch(model, codec, first_batch, q=roundtrip_q)
-    decoded = decode_batch(model, codec, packet)
-    packet_error = (decoded.cpu().float() - first_batch.float()).double().square().sum()
-    packet_centered = (
-        (first_batch.float() - codec.calib_mean.float().unsqueeze(0))
-        .double()
-        .square()
-        .sum()
-        .clamp_min(1e-30)
-    )
-    roundtrip = {
-        "source_free_decode": True,
-        "tokens": packet.n_tokens,
-        "events": int(packet.counts.sum()),
-        "finite": bool(torch.isfinite(decoded).all()),
-        "shape_matches": list(decoded.shape) == list(first_batch.shape),
-        "quantizer_bits": roundtrip_q,
-        "fvu_pooled": float(packet_error / packet_centered),
-    }
 
     recovery: dict[str, Any] | None = None
     identification: dict[str, Any] | None = None
@@ -7243,13 +7330,15 @@ def _evaluate(
             )
             for endpoint in ("native", "deployed")
         }
-    raw_space, raw_endpoint_cache = _evaluate_raw_space(
-        ctx,
-        preparation,
-        model,
-        codec,
-        deployment,
-        retain_endpoint_errors=True,
+    rd, raw_space, raw_endpoint_cache, roundtrip = (
+        _evaluate_rate_distortion_and_raw_space(
+            ctx,
+            preparation,
+            model,
+            codec,
+            deployment,
+            retain_endpoint_errors=True,
+        )
     )
     assert raw_endpoint_cache is not None
     schedule_plans = _selected_time_sharing_plans(
@@ -7421,6 +7510,7 @@ def _evaluate(
     ).hexdigest()
     payload = {
         "schema": EVALUATION_SCHEMA,
+        "evaluation_execution_implementation": (EVALUATION_EXECUTION_IMPLEMENTATION),
         "cell_id": ctx.cell.cell_id,
         "inputs": {
             "checkpoint": checkpoint_hash,
@@ -7469,8 +7559,12 @@ def _qualify(
     evaluation = _read_object(
         prerequisites["evaluation"][0], label="evaluation artifact"
     )
-    if evaluation.get("schema") != EVALUATION_SCHEMA:
-        raise CellExecutionError("evaluation artifact has the wrong schema")
+    if (
+        evaluation.get("schema") != EVALUATION_SCHEMA
+        or evaluation.get("evaluation_execution_implementation")
+        != EVALUATION_EXECUTION_IMPLEMENTATION
+    ):
+        raise CellExecutionError("evaluation artifact has the wrong implementation")
     input_hashes = {
         kind: prerequisites[kind][1]
         for kind in (

@@ -84,7 +84,8 @@ from .studies import (
 CAMPAIGN_SCHEMA = "bsc-campaign-v1"
 ARTIFACT_SCHEMA = "bsc-stage-artifacts-v1"
 QUALIFICATION_SCHEMA = "bsc-qualification-v1"
-EVALUATION_SCHEMA = "bsc-evaluation-v1"
+EVALUATION_SCHEMA = "bsc-evaluation-v2"
+EVALUATION_EXECUTION_IMPLEMENTATION = "joint_transformed_raw_packet_v1"
 PROMOTION_SCHEMA = "bsc-promotion-v1"
 SELECTION_SCHEMA = "bsc-stage-selection-v2"
 FAMILY_NOMINATION_SCHEMA = "bsc-family-revisit-nomination-v3"
@@ -4421,6 +4422,8 @@ class Campaign:
         }
         if (
             evaluation.get("schema") != EVALUATION_SCHEMA
+            or evaluation.get("evaluation_execution_implementation")
+            != EVALUATION_EXECUTION_IMPLEMENTATION
             or evaluation.get("cell_id") != cell_id
             or evaluation.get("inputs") != expected_evaluation_inputs
         ):
