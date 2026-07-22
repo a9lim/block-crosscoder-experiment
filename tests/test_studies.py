@@ -12,6 +12,9 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
@@ -1505,7 +1508,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v11"
+        "dense-linear-memory-v12"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1622,6 +1625,13 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
         ] == _expected_retraction_implementation(
             str(cell.decision_map["model.decoder"])
         )
+        assert cell.decision_map[
+            "implementation.factorized_execution_implementation"
+        ] == (
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            if cell.decision_map["model.site_rank"] is not None
+            else FACTORIZED_EXECUTION_NOT_APPLICABLE
+        )
 
     blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
     plan = build_phase1_plan(seeds=(0,), smoke=True)
@@ -1690,7 +1700,7 @@ def test_decoder_retraction_estimator_admits_only_bound_carriers(
             estimate_cell(changed)
 
 
-def test_v11_estimator_prices_cholesky_qr1_training_workspace(
+def test_v12_estimator_prices_cholesky_qr1_training_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cholesky = next(
@@ -1812,7 +1822,7 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_v11_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v12_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -1922,7 +1932,7 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
     )
 
 
-def test_v11_estimator_prices_mapped_isolated_loss_training_and_geometry(
+def test_v12_estimator_prices_mapped_isolated_loss_training_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped = _isolated_loss_estimator_cell(
@@ -2142,11 +2152,51 @@ def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():
         cell.decision_map["model.site_rank"]: estimate_cell(cell)
         for cell in stage.cells
     }
+    assert {
+        cell.decision_map["model.site_rank"]: cell.decision_map[
+            "implementation.factorized_execution_implementation"
+        ]
+        for cell in stage.cells
+    } == {
+        None: FACTORIZED_EXECUTION_NOT_APPLICABLE,
+        1: FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        2: FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        4: FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    }
     assert (
         estimates[1].parameters < estimates[2].parameters < estimates[None].parameters
     )
     assert estimates[4].parameters > estimates[None].parameters
     assert len({item.compute_flops for item in estimates.values()}) == 1
+
+    rank_one = next(
+        cell for cell in stage.cells if cell.decision_map["model.site_rank"] == 1
+    )
+    reference = _replace_decision(
+        rank_one,
+        "implementation.factorized_execution_implementation",
+        FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    )
+    assert estimate_cell(reference).peak_vram_bytes == estimates[1].peak_vram_bytes
+    for cell, value in (
+        (rank_one, FACTORIZED_EXECUTION_NOT_APPLICABLE),
+        (
+            next(
+                cell
+                for cell in stage.cells
+                if cell.decision_map["model.site_rank"] is None
+            ),
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        ),
+    ):
+        with pytest.raises(StudyError, match="violates its carrier predicate"):
+            estimate_cell(
+                _replace_decision(
+                    cell,
+                    "implementation.factorized_execution_implementation",
+                    value,
+                )
+            )
 
 
 def test_phase_alias_seed_and_merge_validation():

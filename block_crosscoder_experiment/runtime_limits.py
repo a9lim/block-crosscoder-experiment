@@ -21,7 +21,7 @@ DECODED_ENERGY_IMPLEMENTATIONS = (
 DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX = 1.0e-4
 DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX = 2.0e-3
 
-# The v11 planner removes only this conservative subset of the measured score
+# The v12 planner removes only this conservative subset of the measured score
 # graph residency.  Four fp32 [tokens, groups, block_width] buffers are less
 # than the observed Phase-2/3 peak reduction and so do not over-credit VRAM.
 DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS = 4
@@ -53,6 +53,23 @@ DECODER_RETRACTION_IMPLEMENTATIONS = (
     DECODER_RETRACTION_NOT_APPLICABLE,
 )
 
+# Site-axis factorization is either absent, evaluated directly in its compact
+# rank carrier, or executed through the full materialized tensor only as a
+# release oracle.  The direct CUDA contraction deliberately changes bf16
+# reduction order and therefore remains an explicit serialized identity.
+FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION = (
+    "direct_rank_space_bmm_bounded_v1"
+)
+FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION = (
+    "materialized_site_tensor_reference_v1"
+)
+FACTORIZED_EXECUTION_NOT_APPLICABLE = "not_applicable_v1"
+FACTORIZED_EXECUTION_IMPLEMENTATIONS = (
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
+)
+
 # Cholesky-QR1 squares the input condition number.  The admitted fp32 carrier
 # is deliberately narrow enough that the post-retraction Gram remains inside
 # the existing decoded-energy master bound.  Any bound change requires a new
@@ -65,6 +82,7 @@ MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
     "decoded_energy_implementation",
     "isolated_loss_decrease_implementation",
     "decoder_retraction_implementation",
+    "factorized_execution_implementation",
 )
 
 

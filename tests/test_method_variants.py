@@ -647,7 +647,15 @@ def test_site_axis_factorization_full_rank_reconstructs_the_full_control():
         encoder_init="independent",
     )
     full = BlockCrosscoder(full_cfg)
-    factorized = BlockCrosscoder(_model_cfg(**{**asdict(full_cfg), "site_rank": 3}))
+    factorized = BlockCrosscoder(
+        _model_cfg(
+            **{
+                **asdict(full_cfg),
+                "site_rank": 3,
+                "factorized_execution_implementation": None,
+            }
+        )
+    )
 
     assert factorized.D is None and factorized.E is None
     assert factorized.D_site is not None and factorized.D_core is not None

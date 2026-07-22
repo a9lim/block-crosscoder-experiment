@@ -6,10 +6,11 @@ token-LayerNorm, or whitened. Inputs are batches x: [B, S, d].
 
 Unfactorized parameter stacks are [S, G, b, d].  A declared novel arm may
 instead use a low-rank site-axis factorization
-``W[s,g,b,d] = sum_r A[s,r] B[r,g,b,d]`` for both encoder and decoder.  Every
-consumer still receives the materialized tensor through ``encoder_tensor`` or
-``decoder_tensor``; parameters are fp32 masters, and the bf16 forward copy is
-the trainer's job.
+``W[s,g,b,d] = sum_r A[s,r] B[r,g,b,d]`` for both encoder and decoder.  Its
+canonical forward contracts that factorization directly in rank space;
+``encoder_tensor`` and ``decoder_tensor`` remain explicit materialized-oracle
+surfaces.  Parameters are fp32 masters, and the bf16 forward copy is the
+trainer's job.
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ from .runtime_limits import (
     DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_IMPLEMENTATIONS,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_IMPLEMENTATIONS,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
@@ -291,6 +295,10 @@ class BSCConfig:
     # full unfactorized control. The factorized arm is deliberately narrow;
     # see the validation below.
     site_rank: int | None = None
+    # The canonical factorized forward remains compact through encode, score,
+    # and decode.  The materialized implementation is an explicit release
+    # oracle, never an ambient device-dependent fallback.
+    factorized_execution_implementation: str | None = None
 
     def __post_init__(self) -> None:
         if self.selection not in {"batch_topk", "token_topk", "threshold", "dense"}:
@@ -535,7 +543,34 @@ class BSCConfig:
                 "mapped isolated-loss decrease requires "
                 "isolated_loss_decrease scoring and a free decoder"
             )
-        if self.site_rank is not None:
+        if self.factorized_execution_implementation is None:
+            self.factorized_execution_implementation = (
+                FACTORIZED_EXECUTION_NOT_APPLICABLE
+                if self.site_rank is None
+                else FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            )
+        if (
+            self.factorized_execution_implementation
+            not in FACTORIZED_EXECUTION_IMPLEMENTATIONS
+        ):
+            raise ValueError("unknown factorized_execution_implementation")
+        if self.site_rank is None:
+            if (
+                self.factorized_execution_implementation
+                != FACTORIZED_EXECUTION_NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "unfactorized model requires not-applicable factorized execution"
+                )
+        else:
+            if (
+                self.factorized_execution_implementation
+                == FACTORIZED_EXECUTION_NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "site-axis factorization requires a factorized execution "
+                    "implementation"
+                )
             if (
                 isinstance(self.site_rank, bool)
                 or int(self.site_rank) != self.site_rank
@@ -914,7 +949,7 @@ class BlockCrosscoder(nn.Module):
     # -- core ops ---------------------------------------------------------
 
     def decoder_tensor(self) -> torch.Tensor:
-        """Structured decoder used by every forward/objective path."""
+        """Materialize the structured decoder for an explicit oracle/objective."""
         if self.cfg.site_rank is None:
             assert self.D is not None
             decoder = self.D
@@ -930,6 +965,14 @@ class BlockCrosscoder(nn.Module):
         return (
             self.cfg.decoded_energy_implementation
             == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        )
+
+    @property
+    def uses_direct_factorized_execution(self) -> bool:
+        return (
+            self.cfg.site_rank is not None
+            and self.cfg.factorized_execution_implementation
+            == FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
         )
 
     @property
@@ -995,6 +1038,18 @@ class BlockCrosscoder(nn.Module):
         if self._has_padded_coordinates:
             return encoder * self.coordinate_mask
         return encoder
+
+    def _factorized_core_with_coordinate_mask(
+        self,
+        core: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the common factorized-site padding mask without building S."""
+
+        if not self._has_padded_coordinates:
+            return core
+        # BSCConfig requires equal site widths for this parameterization, so
+        # every site has the same coordinate mask and it belongs on the core.
+        return core * self.coordinate_mask[0].to(core.dtype)
 
     def _site_observation_mask(
         self,
@@ -1166,6 +1221,43 @@ class BlockCrosscoder(nn.Module):
         z = x.reshape(x.shape[0], cfg.n_sites * cfg.d_model) @ W
         return self._finish_encoded_sum(z, keep), keep
 
+    def _encode_factorized_direct(
+        self,
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Encode through ``[S,R]`` and ``[R,G,b,d]`` without building SGBD."""
+
+        cfg = self.cfg
+        assert self.E_site is not None and self.E_core is not None
+        assert cfg.site_rank is not None
+        x = self._prepare_encoder_input(x)
+        # The materialized encoder masks after optional bias centering.  Repeat
+        # that structural mask here before site-to-rank contraction.
+        if self._has_padded_coordinates:
+            x = x * self.coordinate_mask[:, 0, 0].to(x.dtype)
+        if observed is None and cfg.encoder_fusion == "sum":
+            keep = None
+        else:
+            keep = self._site_observation_mask(
+                x,
+                observed,
+                validate=validate_observed,
+            )
+            x = x * keep
+        # [N,d,S] @ [S,R] -> [N,d,R], followed by one flattened rank-core
+        # GEMM.  Peak structured weight storage is R*G*b*d rather than S*G*b*d.
+        rank_input = torch.matmul(x.transpose(1, 2), self.E_site).transpose(1, 2)
+        core = self._factorized_core_with_coordinate_mask(self.E_core)
+        core_map = core.permute(0, 3, 1, 2).reshape(
+            cfg.site_rank * cfg.d_model,
+            cfg.n_latents,
+        )
+        z = rank_input.reshape(x.shape[0], -1) @ core_map
+        return self._finish_encoded_sum(z, keep), keep
+
     def _frozen_encoder_sites(
         self,
         x: torch.Tensor,
@@ -1241,7 +1333,14 @@ class BlockCrosscoder(nn.Module):
         observed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x: [B, S, d] -> z: [B, G, b]."""
-        z, _ = self._encode_with_tensor(x, self.encoder_tensor(), observed=observed)
+        if self.uses_direct_factorized_execution:
+            z, _ = self._encode_factorized_direct(x, observed=observed)
+        else:
+            z, _ = self._encode_with_tensor(
+                x,
+                self.encoder_tensor(),
+                observed=observed,
+            )
         return z
 
     @staticmethod
@@ -1404,6 +1503,90 @@ class BlockCrosscoder(nn.Module):
             score.sub_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
         return score
 
+    def _factorized_decoder_weight(self) -> torch.Tensor:
+        """Per-block decoder norm from the rank carrier in fp32."""
+
+        assert self.D_site is not None and self.D_core is not None
+        site = self.D_site.float()
+        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+        core_gram = torch.einsum("rgbd,tgbd->grt", core, core)
+        norm_sq = torch.einsum("sr,grt,st->sg", site, core_gram, site)
+        per_site = norm_sq.clamp_min(0).sqrt()
+        if self.cfg.decoder_norm_geometry == "sum_l2":
+            return per_site.sum(dim=0)
+        return per_site.square().sum(dim=0).sqrt()
+
+    def _factorized_decoder_gram(self) -> torch.Tensor:
+        """All-site ``[G,b,b]`` Gram without a ``[S,G,b,d]`` decoder."""
+
+        assert self.D_site is not None and self.D_core is not None
+        site_metric = self.D_site.float().transpose(0, 1) @ self.D_site.float()
+        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+        return torch.einsum("rt,rgbd,tgcd->gbc", site_metric, core, core)
+
+    def _factorized_isolated_loss_decrease_scores(
+        self,
+        code: torch.Tensor,
+        residual: torch.Tensor,
+        keep: torch.Tensor,
+        *,
+        all_sites_observed: bool,
+    ) -> torch.Tensor:
+        """Signed isolated-loss score entirely in the decoder rank carrier."""
+
+        cfg = self.cfg
+        assert cfg.site_rank is not None
+        assert self.D_site is not None and self.D_core is not None
+        site = self.D_site.float()
+        core = self._factorized_core_with_coordinate_mask(self.D_core).float()
+
+        # Linear term: observed residual sites -> rank coordinates -> blocks.
+        rank_residual = torch.matmul(
+            residual.transpose(1, 2),
+            site,
+        ).transpose(1, 2)
+        core_map = core.permute(0, 3, 1, 2).reshape(
+            cfg.site_rank * cfg.d_model,
+            cfg.n_latents,
+        )
+        projected = (
+            rank_residual.reshape(residual.shape[0], -1) @ core_map
+        ).reshape_as(code)
+
+        if all_sites_observed:
+            gram = torch.einsum(
+                "rt,rgbd,tgcd->gbc",
+                site.transpose(0, 1) @ site,
+                core,
+                core,
+            )
+            energy_sq = torch.einsum("ngb,gbc,ngc->ng", code, gram, code)
+        else:
+            energy_sq = torch.zeros(
+                code.shape[:2],
+                dtype=torch.float32,
+                device=code.device,
+            )
+            for site_index in range(cfg.n_sites):
+                coefficients = site[site_index]
+                site_gram = torch.einsum(
+                    "r,t,rgbd,tgcd->gbc",
+                    coefficients,
+                    coefficients,
+                    core,
+                    core,
+                )
+                site_energy = torch.einsum(
+                    "ngb,gbc,ngc->ng",
+                    code,
+                    site_gram,
+                    code,
+                )
+                energy_sq.add_(
+                    keep[:, site_index, 0].float().unsqueeze(1) * site_energy
+                )
+        return 2.0 * (projected * code).sum(dim=-1) - energy_sq
+
     def scores(
         self,
         z: torch.Tensor,
@@ -1422,9 +1605,18 @@ class BlockCrosscoder(nn.Module):
         """
         decoder = _decoder
         fast_decoded_energy = self.uses_stiefel_code_norm_decoded_energy
-        if decoder is None and (
-            _score_geometry is not None
-            or (self.cfg.selection_score != "code_norm" and not fast_decoded_energy)
+        direct_factorized = (
+            self.uses_direct_factorized_execution
+            and decoder is None
+            and _score_geometry is None
+        )
+        if (
+            decoder is None
+            and (
+                _score_geometry is not None
+                or (self.cfg.selection_score != "code_norm" and not fast_decoded_energy)
+            )
+            and not direct_factorized
         ):
             decoder = self.decoder_tensor()
         if _score_geometry is not None:
@@ -1439,13 +1631,16 @@ class BlockCrosscoder(nn.Module):
             score = z.norm(dim=-1)
         if self.cfg.selection_score == "decoder_weighted":
             if _score_geometry is None:
-                assert decoder is not None
-                D = decoder.float()
-                per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
-                if self.cfg.decoder_norm_geometry == "sum_l2":
-                    site_norms = per_site.sum(dim=0)
+                if direct_factorized:
+                    site_norms = self._factorized_decoder_weight()
                 else:
-                    site_norms = per_site.pow(2).sum(dim=0).sqrt()
+                    assert decoder is not None
+                    D = decoder.float()
+                    per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
+                    if self.cfg.decoder_norm_geometry == "sum_l2":
+                        site_norms = per_site.sum(dim=0)
+                    else:
+                        site_norms = per_site.pow(2).sum(dim=0).sqrt()
             else:
                 assert _score_geometry.decoder_weight is not None
                 site_norms = _score_geometry.decoder_weight
@@ -1460,9 +1655,12 @@ class BlockCrosscoder(nn.Module):
                 # the exact Gram quadratic is explicitly release-bounded.
                 pass
             elif _score_geometry is None:
-                assert decoder is not None
-                D = decoder.float()
-                gram = torch.einsum("sgbd,sgcd->gbc", D, D)
+                if direct_factorized:
+                    gram = self._factorized_decoder_gram()
+                else:
+                    assert decoder is not None
+                    D = decoder.float()
+                    gram = torch.einsum("sgbd,sgcd->gbc", D, D)
             else:
                 assert _score_geometry.decoder_gram is not None
                 gram = _score_geometry.decoder_gram
@@ -1494,27 +1692,36 @@ class BlockCrosscoder(nn.Module):
             )
             coordinate_mask = self.coordinate_mask[:, 0, 0].to(x.dtype)
             residual = x * keep * coordinate_mask
-            assert decoder is not None
-            decoder = decoder.float()
             code = z.float()
             residual = residual.float()
-            if self.uses_mapped_isolated_loss_decrease:
+            if direct_factorized:
+                score = self._factorized_isolated_loss_decrease_scores(
+                    code,
+                    residual,
+                    keep,
+                    all_sites_observed=(
+                        observed is None and self.cfg.encoder_fusion != "source"
+                    ),
+                )
+            elif self.uses_mapped_isolated_loss_decrease:
+                assert decoder is not None
                 score = self._mapped_isolated_loss_decrease_scores(
                     code,
                     residual,
                     keep,
-                    decoder,
+                    decoder.float(),
                     _score_geometry,
                     all_sites_observed=(
                         observed is None and self.cfg.encoder_fusion != "source"
                     ),
                 )
             else:
+                assert decoder is not None
                 score = self._exact_isolated_loss_decrease_scores(
                     code,
                     residual,
                     keep,
-                    decoder,
+                    decoder.float(),
                     _score_geometry,
                 )
             score = score.to(z.dtype)
@@ -1596,14 +1803,35 @@ class BlockCrosscoder(nn.Module):
         """z_selected: [B, G, b] -> xhat: [B, S, d]. AuxK residual
         reconstruction decodes without the bias (add_bias=False)."""
         cfg = self.cfg
-        decoder = self.decoder_tensor() if _decoder is None else _decoder
-        Wd = decoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
         flat = z_selected.reshape(-1, cfg.n_latents)
-        # [B, G*b] @ [S, G*b, d] broadcasts to [S, B, d].
-        xhat = torch.matmul(flat, Wd)
-        if add_bias and cfg.decoder_bias:
-            xhat = xhat + self.c.unsqueeze(1)
-        xhat = xhat.transpose(0, 1)
+        if _decoder is None and self.uses_direct_factorized_execution:
+            assert cfg.site_rank is not None
+            assert self.D_site is not None and self.D_core is not None
+            core = self._factorized_core_with_coordinate_mask(self.D_core)
+            core_map = core.permute(1, 2, 0, 3).reshape(
+                cfg.n_latents,
+                cfg.site_rank * cfg.d_model,
+            )
+            rank_output = (flat @ core_map).reshape(
+                z_selected.shape[0],
+                cfg.site_rank,
+                cfg.d_model,
+            )
+            # [B,d,R] @ [R,S] -> [B,d,S].
+            xhat = torch.matmul(
+                rank_output.transpose(1, 2),
+                self.D_site.transpose(0, 1),
+            ).transpose(1, 2)
+            if add_bias and cfg.decoder_bias:
+                xhat = xhat + self.c.unsqueeze(0)
+        else:
+            decoder = self.decoder_tensor() if _decoder is None else _decoder
+            Wd = decoder.reshape(cfg.n_sites, cfg.n_latents, cfg.d_model)
+            # [B, G*b] @ [S, G*b, d] broadcasts to [S, B, d].
+            xhat = torch.matmul(flat, Wd)
+            if add_bias and cfg.decoder_bias:
+                xhat = xhat + self.c.unsqueeze(1)
+            xhat = xhat.transpose(0, 1)
         if self._has_padded_coordinates:
             xhat = xhat * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
         return xhat
@@ -1633,12 +1861,13 @@ class BlockCrosscoder(nn.Module):
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
         _encoder_sites: _FrozenEncoderSites | None = None,
-    ) -> tuple[BSCOutput, torch.Tensor, torch.Tensor]:
-        """Forward plus the exact structured weights used by that pass.
+    ) -> tuple[BSCOutput, torch.Tensor | None, torch.Tensor | None]:
+        """Forward plus any materialized structured weights used by that pass.
 
-        The trainer consumes these tensors for regularizers, avoiding another
-        full site-axis materialization.  Public callers can continue to use
-        :meth:`forward` and receive the unchanged ``BSCOutput`` contract.
+        The direct factorized implementation returns ``None`` for both weights;
+        regularizers may then materialize explicitly if their objective needs
+        the full tensors. Public callers continue to receive the unchanged
+        :class:`BSCOutput` contract from :meth:`forward`.
         """
         selection, decoder, encoder = self.select_with_materialized(
             x,
@@ -1664,7 +1893,7 @@ class BlockCrosscoder(nn.Module):
         _encoder: torch.Tensor | None = None,
         _score_geometry: _ScoreGeometry | None = None,
         _encoder_sites: _FrozenEncoderSites | None = None,
-    ) -> tuple[BSCSelection, torch.Tensor, torch.Tensor]:
+    ) -> tuple[BSCSelection, torch.Tensor | None, torch.Tensor | None]:
         """Encode and select without paying for an unused dense decode.
 
         Frozen calibration and codec paths consume only code, score, and
@@ -1672,6 +1901,29 @@ class BlockCrosscoder(nn.Module):
         :meth:`forward_with_materialized` avoids materializing ``[B,S,d]``
         reconstructions while preserving the public forward result exactly.
         """
+        direct_factorized = (
+            self.uses_direct_factorized_execution
+            and _decoder is None
+            and _encoder is None
+            and _score_geometry is None
+            and _encoder_sites is None
+        )
+        if direct_factorized:
+            z, keep = self._encode_factorized_direct(
+                x,
+                observed=observed,
+                validate_observed=validate_observed,
+            )
+            scores = self.scores(
+                z,
+                x=x,
+                observed=observed,
+                _observation_keep=keep,
+            )
+            mask = self._select_scores(scores, mode=mode, z=z)
+            z_selected = z * mask.unsqueeze(-1)
+            return BSCSelection(z, z_selected, scores, mask), None, None
+
         decoder = self.decoder_tensor() if _decoder is None else _decoder
         if _encoder is None:
             if self.cfg.encoder_mode == "tied":

@@ -65,6 +65,9 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
@@ -525,6 +528,9 @@ def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
         "model.selection_score": "decoded_energy",
         "objective.encoder_site_mask_probability": 0.10,
         "implementation.decoder_retraction_implementation": "not_applicable_v1",
+        "implementation.factorized_execution_implementation": (
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+        ),
     }
     cell = replace(
         base,
@@ -538,8 +544,36 @@ def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
     )
     model_cfg, train_cfg = validate_cell_config(cell)
     assert model_cfg.site_rank == 2
+    assert model_cfg.factorized_execution_implementation == (
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+    )
     assert model_cfg.selection_score == "decoded_energy"
     assert train_cfg.encoder_site_mask_probability == 0.10
+
+    def with_factorized_implementation(value: str) -> CellSpec:
+        return replace(
+            cell,
+            decisions=tuple(
+                replace(decision, value=value)
+                if decision.name == "implementation.factorized_execution_implementation"
+                else decision
+                for decision in cell.decisions
+            ),
+        )
+
+    assert _model_config(
+        with_factorized_implementation(
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+        )
+    ).factorized_execution_implementation == (
+        FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+    )
+    for value, message in (
+        (FACTORIZED_EXECUTION_NOT_APPLICABLE, "violates its carrier predicate"),
+        ("ambient_cuda_default", "unknown factorized-execution"),
+    ):
+        with pytest.raises(CellExecutionError, match=message):
+            _model_config(with_factorized_implementation(value))
 
     campaign = _campaign(tmp_path, cell)
     summary = _runner(campaign).run(limit=1)
@@ -601,6 +635,10 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         ]
         == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
     )
+    assert (
+        checkpoint_payload["model_cfg"]["factorized_execution_implementation"]
+        == FACTORIZED_EXECUTION_NOT_APPLICABLE
+    )
     mismatched_checkpoint = copy.deepcopy(checkpoint_payload)
     mismatched_checkpoint["model_cfg"]["decoded_energy_implementation"] = (
         DECODED_ENERGY_EXACT_IMPLEMENTATION
@@ -627,6 +665,22 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         _validate_final_checkpoint(
             missing_retraction_path,
             missing_retraction_identity["run_binding"],
+        )
+
+    missing_factorized_identity = copy.deepcopy(checkpoint_payload)
+    missing_factorized_identity["model_cfg"].pop("factorized_execution_implementation")
+    missing_factorized_identity["run_binding"]["model_cfg"].pop(
+        "factorized_execution_implementation"
+    )
+    missing_factorized_path = tmp_path / "missing-factorized-identity.pt"
+    torch.save(missing_factorized_identity, missing_factorized_path)
+    with pytest.raises(
+        CellExecutionError,
+        match="lacks factorized_execution_implementation",
+    ):
+        _validate_final_checkpoint(
+            missing_factorized_path,
+            missing_factorized_identity["run_binding"],
         )
 
     forged_optimizer = copy.deepcopy(checkpoint_payload)

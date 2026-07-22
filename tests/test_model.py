@@ -27,6 +27,9 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
 )
 
 CFG = BSCConfig(n_blocks=16, block_dim=4, n_sites=4, d_model=32, k=3, seed=0)
@@ -38,6 +41,11 @@ def make_model(device, **overrides):
         and "decoder_retraction_implementation" not in overrides
     ):
         overrides["decoder_retraction_implementation"] = None
+    if (
+        "site_rank" in overrides
+        and "factorized_execution_implementation" not in overrides
+    ):
+        overrides["factorized_execution_implementation"] = None
     cfg = BSCConfig(**{**CFG.__dict__, **overrides})
     return BlockCrosscoder(cfg).to(device)
 
@@ -147,6 +155,58 @@ def test_decoder_retraction_identity_pairs_fail_closed(
             k=2,
             decoder_constraint=constraint,
             decoder_retraction_implementation=implementation,
+        )
+
+
+def test_factorized_execution_identity_resolves_and_fails_closed():
+    common = dict(
+        n_blocks=4,
+        block_dim=2,
+        n_sites=4,
+        d_model=6,
+        k=2,
+        decoder_constraint="free",
+    )
+    unfactorized = BSCConfig(**common)
+    direct = BSCConfig(**common, site_rank=2)
+    reference = BSCConfig(
+        **common,
+        site_rank=2,
+        factorized_execution_implementation=(
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+        ),
+    )
+    assert (
+        unfactorized.factorized_execution_implementation
+        == FACTORIZED_EXECUTION_NOT_APPLICABLE
+    )
+    assert (
+        direct.factorized_execution_implementation
+        == FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+    )
+    assert (
+        reference.factorized_execution_implementation
+        == FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+    )
+
+    with pytest.raises(ValueError, match="unknown factorized"):
+        BSCConfig(
+            **common,
+            site_rank=2,
+            factorized_execution_implementation="ambient_cuda_default",
+        )
+    with pytest.raises(ValueError, match="not-applicable"):
+        BSCConfig(
+            **common,
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            ),
+        )
+    with pytest.raises(ValueError, match="requires a factorized execution"):
+        BSCConfig(
+            **common,
+            site_rank=2,
+            factorized_execution_implementation=FACTORIZED_EXECUTION_NOT_APPLICABLE,
         )
 
 
@@ -774,6 +834,9 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
         decoder_constraint="free",
         decoder_init_preconditioning="none",
         decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+        factorized_execution_implementation=(
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+        ),
     )
     x = whitened_batch(device, n=8)
     expected = model(x)
@@ -802,6 +865,288 @@ def test_pre_materialized_structured_weights_preserve_forward(device):
         actual.xhat,
         model.decode(selected.z_selected, _decoder=selected_decoder),
     )
+
+
+_FACTORIZED_EXECUTION_ORACLE_CASES = (
+    pytest.param(
+        "sum",
+        "batch_topk",
+        "code_norm",
+        "signed",
+        True,
+        False,
+        id="sum-batch-code-norm-bias-full",
+    ),
+    pytest.param(
+        "mean",
+        "token_topk",
+        "decoder_weighted",
+        "relu",
+        True,
+        True,
+        id="mean-token-decoder-weighted-bias-padded",
+    ),
+    pytest.param(
+        "availability_rescaled_sum",
+        "threshold",
+        "decoded_energy",
+        "signed",
+        True,
+        True,
+        id="rescaled-threshold-decoded-energy-bias-padded",
+    ),
+    pytest.param(
+        "source",
+        "dense",
+        "isolated_loss_decrease",
+        "group_soft_threshold",
+        False,
+        False,
+        id="source-dense-isolated-loss-bias-free",
+    ),
+)
+
+
+@pytest.mark.parametrize("site_rank", (1, 2, 4))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize(
+    (
+        "fusion",
+        "selection",
+        "selection_score",
+        "activation",
+        "decoder_bias",
+        "padded",
+    ),
+    _FACTORIZED_EXECUTION_ORACLE_CASES,
+)
+def test_direct_factorized_execution_tracks_materialized_oracle_forward_backward(
+    device,
+    site_rank,
+    dtype,
+    fusion,
+    selection,
+    selection_score,
+    activation,
+    decoder_bias,
+    padded,
+):
+    """Release bounds across every factor rank, selector, score, and fusion."""
+
+    config = dict(
+        n_blocks=12,
+        block_dim=3,
+        n_sites=4,
+        d_model=9,
+        site_dims=(7, 7, 7, 7) if padded else (9, 9, 9, 9),
+        k=3,
+        seed=1201,
+        selection=selection,
+        encoder_mode="untied",
+        encoder_bias=True,
+        code_activation=activation,
+        selection_score=selection_score,
+        decoder_constraint="free",
+        encoder_constraint="none",
+        encoder_fusion=fusion,
+        source_site=1,
+        decoder_bias=decoder_bias,
+        apply_decoder_bias_to_input=decoder_bias,
+        site_rank=site_rank,
+    )
+    direct = BlockCrosscoder(BSCConfig(**config)).to(device=device, dtype=dtype)
+    reference = BlockCrosscoder(
+        BSCConfig(
+            **config,
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+            ),
+        )
+    ).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        assert direct.a is not None
+        direct.a.copy_(
+            torch.linspace(
+                -0.07,
+                0.11,
+                direct.a.numel(),
+                device=device,
+                dtype=dtype,
+            ).reshape_as(direct.a)
+        )
+        if decoder_bias:
+            direct.c.copy_(
+                torch.linspace(
+                    -0.19,
+                    0.23,
+                    direct.c.numel(),
+                    device=device,
+                    dtype=dtype,
+                ).reshape_as(direct.c)
+            )
+        direct.theta.fill_(0.4)
+        reference.load_state_dict(direct.state_dict())
+
+    generator = torch.Generator(device="cpu").manual_seed(1202)
+    x = torch.randn(37, 4, 9, generator=generator).to(device=device, dtype=dtype)
+    observed = None
+    if fusion != "sum":
+        observed = torch.ones(37, 4, dtype=torch.bool, device=device)
+        observed[::2, 0] = False
+        observed[1::3, 2] = False
+        # The source carrier must remain available for every token.
+        observed[:, 1] = True
+
+    actual, actual_decoder, actual_encoder = direct.forward_with_materialized(
+        x,
+        observed=observed,
+    )
+    expected, expected_decoder, expected_encoder = reference.forward_with_materialized(
+        x,
+        observed=observed,
+    )
+    assert actual_decoder is None and actual_encoder is None
+    assert expected_decoder is not None and expected_encoder is not None
+
+    output_drifts = {
+        "code": _relative_l2(actual.z, expected.z),
+        "score": _relative_l2(actual.scores, expected.scores),
+        "selected_code": _relative_l2(actual.z_selected, expected.z_selected),
+        "reconstruction": _relative_l2(actual.xhat, expected.xhat),
+    }
+    mask_disagreement = float((actual.mask != expected.mask).float().mean())
+    intersection = int((actual.mask & expected.mask).sum())
+    union = int((actual.mask | expected.mask).sum())
+    support_iou = intersection / max(union, 1)
+
+    actual_loss = (
+        bsc_loss(
+            actual,
+            x,
+            direct,
+            observation_mask=observed,
+            decoder=actual_decoder,
+            encoder=actual_encoder,
+        )["total"]
+        + 1e-4 * actual.scores.float().square().mean()
+    )
+    expected_loss = (
+        bsc_loss(
+            expected,
+            x,
+            reference,
+            observation_mask=observed,
+            decoder=expected_decoder,
+            encoder=expected_encoder,
+        )["total"]
+        + 1e-4 * expected.scores.float().square().mean()
+    )
+    actual_loss.backward()
+    expected_loss.backward()
+    loss_drift = abs(float((actual_loss - expected_loss).detach())) / max(
+        abs(float(expected_loss.detach())),
+        1e-12,
+    )
+    expected_parameters = dict(reference.named_parameters())
+    factor_gradient_drifts = {}
+    for name in ("D_site", "D_core", "E_site", "E_core"):
+        actual_gradient = dict(direct.named_parameters())[name].grad
+        expected_gradient = expected_parameters[name].grad
+        assert actual_gradient is not None and expected_gradient is not None
+        factor_gradient_drifts[name] = _relative_l2(
+            actual_gradient,
+            expected_gradient,
+        )
+
+    evidence = {
+        **output_drifts,
+        "mask_disagreement": mask_disagreement,
+        "support_iou": support_iou,
+        "loss": loss_drift,
+        "factor_gradients": factor_gradient_drifts,
+    }
+    if dtype == torch.float32:
+        assert max(output_drifts.values()) <= 3e-6, evidence
+        assert mask_disagreement == 0.0, evidence
+        assert loss_drift <= 3e-6, evidence
+        assert max(factor_gradient_drifts.values()) <= 1e-5, evidence
+    else:
+        assert output_drifts["code"] <= 8e-3, evidence
+        assert output_drifts["score"] <= 8e-3, evidence
+        assert output_drifts["selected_code"] <= 0.20, evidence
+        assert output_drifts["reconstruction"] <= 0.20, evidence
+        assert mask_disagreement <= 0.02, evidence
+        assert support_iou >= 0.95, evidence
+        assert loss_drift <= 5e-3, evidence
+        assert max(factor_gradient_drifts.values()) <= 0.30, evidence
+
+
+@pytest.mark.parametrize(
+    "selection_score",
+    ("code_norm", "decoder_weighted", "decoded_energy", "isolated_loss_decrease"),
+)
+def test_direct_factorized_dispatch_never_materializes_structured_weights(
+    monkeypatch,
+    device,
+    selection_score,
+):
+    config = dict(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=4,
+        d_model=7,
+        site_dims=(5, 5, 5, 5),
+        k=2,
+        selection="token_topk",
+        code_activation="relu" if selection_score == "decoder_weighted" else "signed",
+        selection_score=selection_score,
+        decoder_constraint="free",
+        decoder_bias=selection_score != "isolated_loss_decrease",
+        site_rank=2,
+    )
+    model = BlockCrosscoder(BSCConfig(**config)).to(device)
+    x = torch.randn(19, 4, 7, generator=torch.Generator().manual_seed(1301)).to(device)
+
+    def refuse_materialization():
+        raise AssertionError("canonical direct factorized execution materialized SGBD")
+
+    monkeypatch.setattr(model, "decoder_tensor", refuse_materialization)
+    monkeypatch.setattr(model, "encoder_tensor", refuse_materialization)
+    out, decoder, encoder = model.forward_with_materialized(x)
+    assert out.xhat.shape == x.shape
+    assert decoder is None and encoder is None
+
+
+def test_materialized_reference_identity_dispatches_through_oracle(monkeypatch, device):
+    model = make_model(
+        device,
+        site_rank=2,
+        decoder_constraint="free",
+        factorized_execution_implementation=(
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+        ),
+    )
+    decoder_calls = 0
+    encoder_calls = 0
+    materialize_decoder = model.decoder_tensor
+    materialize_encoder = model.encoder_tensor
+
+    def counted_decoder():
+        nonlocal decoder_calls
+        decoder_calls += 1
+        return materialize_decoder()
+
+    def counted_encoder():
+        nonlocal encoder_calls
+        encoder_calls += 1
+        return materialize_encoder()
+
+    monkeypatch.setattr(model, "decoder_tensor", counted_decoder)
+    monkeypatch.setattr(model, "encoder_tensor", counted_encoder)
+    _, decoder, encoder = model.forward_with_materialized(whitened_batch(device, n=7))
+    assert decoder is not None and encoder is not None
+    assert decoder_calls == 1
+    assert encoder_calls == 1
 
 
 @pytest.mark.parametrize(

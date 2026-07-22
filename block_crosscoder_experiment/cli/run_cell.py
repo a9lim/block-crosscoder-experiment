@@ -74,6 +74,9 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
@@ -111,7 +114,7 @@ from block_crosscoder_experiment.trainer import (
 EVALUATION_SCHEMA = "bsc-evaluation-v1"
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v2"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v3"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -2604,6 +2607,28 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     site_rank = (
         None if values["model.site_rank"] is None else int(values["model.site_rank"])
     )
+    factorized_execution_implementation = str(
+        values["implementation.factorized_execution_implementation"]
+    )
+    known_factorized_implementations = {
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_NOT_APPLICABLE,
+    }
+    if factorized_execution_implementation not in known_factorized_implementations:
+        raise CellExecutionError("unknown factorized-execution implementation identity")
+    allowed_factorized_implementations = (
+        {
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+        }
+        if site_rank is not None
+        else {FACTORIZED_EXECUTION_NOT_APPLICABLE}
+    )
+    if factorized_execution_implementation not in allowed_factorized_implementations:
+        raise CellExecutionError(
+            "factorized-execution implementation violates its carrier predicate"
+        )
     selection_score = str(values["model.selection_score"])
     decoded_energy_implementation = str(
         values["implementation.decoded_energy_implementation"]
@@ -2694,6 +2719,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         decoded_energy_implementation=decoded_energy_implementation,
         isolated_loss_decrease_implementation=isolated_loss_implementation,
         decoder_retraction_implementation=decoder_retraction_implementation,
+        factorized_execution_implementation=factorized_execution_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
         site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),

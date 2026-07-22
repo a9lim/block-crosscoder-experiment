@@ -282,8 +282,10 @@ directly to one all-site Gram and performs one map.  Partial and source-only
 views retain one mapped quadratic per site and weight it by the exact observed-
 site mask.  Padding is applied before the projection, hidden clean targets are
 excluded from both terms, negative gains are retained, and neither route
-materializes `[batch, groups, sites, d_model]`.  Materialized factorized free
-decoders use the same path and retain gradients to both site and core factors.
+materializes `[batch, groups, sites, d_model]`.  The materialized factorized
+reference uses the same path and retains gradients to both site and core
+factors.  The canonical factorized implementation below instead evaluates the
+quadratic directly in its rank carrier.
 
 Release fixtures compare reference and mapped implementations from identical
 state across all, partial, source-only, padded, factorized, exact-threshold, and
@@ -846,17 +848,49 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v11-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v12-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
 calibration-event materialization, and explicit runtime headroom; the activation
 store is not assumed resident in host memory.
 Site-axis factorization reduces trainable parameters, optimizer state, and
-checkpoint bytes, but the current transparent kernel materializes full site
-tensors before the encoder/decoder matmuls. Its FLOP estimate therefore remains
-the unfactorized operational-tensor cost; parameter savings are not counted as
-free compute savings.
+checkpoint bytes. Canonical factorized execution contracts the site basis and
+rank core directly and does not materialize full encoder or decoder site
+tensors. Estimator v12 nevertheless retains the previous unfactorized FLOP and
+operational-workspace prices: the measured speed and memory reduction are not
+planning credit until a separately audited estimator version prices every
+direct-rank lifetime.
+
+Every cell serializes `factorized_execution_implementation`. Unfactorized
+carriers derive `not_applicable_v1`; site-rank carriers derive
+`direct_rank_space_bmm_bounded_v1`. The explicit
+`materialized_site_tensor_reference_v1` identity is an oracle only. Unknown or
+carrier-incompatible identities refuse, and root, smoke, and child
+materialization rederive the canonical identity after each effective delta.
+The direct path contracts `[batch,d_model,sites]` with the site basis, applies
+one flattened rank-core encoder map, evaluates decoder weight and Gram scores
+in rank space, and decodes rank coordinates through the site basis. Padding,
+bias centering, all four fusion rules, every hard selector, and code-norm,
+decoder-weighted, decoded-energy, and signed isolated-loss-decrease scoring are
+covered without an `[sites,groups,block_width,d_model]` runtime weight.
+
+Release oracles cover ranks `1/2/4`, fp32/bf16, full and partial observation,
+source-only fusion, padding, bias, activation, selector, score, forward loss,
+and all factor gradients. The bf16 bounds are code/score relative L2 at most
+`.008`, selected-code/reconstruction drift at most `.20`, mask disagreement at
+most `.02`, support IoU at least `.95`, loss drift at most `.005`, and maximum
+factor-gradient drift at most `.30`; fp32 bounds are respectively `3e-6`, exact
+support, `3e-6`, and `1e-5`. On the Phase-2 rank-one stress shape
+(`B=4096`, four width-768 sites, 2,048 groups, block width four, 32 active
+blocks, bf16 forward, fused AdamW), five warmups and 31 CUDA-event samples of a
+complete Trainer step measure `10.482 ms` median / `11.360 ms` p95 for the
+materialized oracle and `4.198 ms` / `4.514 ms` for direct rank space: a
+`59.95%` median reduction (`2.497x`) and `130.0 MiB` lower incremental peak.
+Across 24 paired steps, maximum loss drift is `6.91e-6`, terminal loss drift is
+`5.14e-6`, support disagreement is `4.19e-4`, and support IoU is `.97353`.
+This bounded kernel-order change is engineering evidence, not a new scientific
+factorization arm.
 
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M
@@ -998,7 +1032,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v11-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v12-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -1052,7 +1086,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v11 conservatively credits only four fp32
+Estimator v12 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse

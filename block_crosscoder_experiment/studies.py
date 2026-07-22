@@ -27,6 +27,9 @@ from .runtime_limits import (
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
@@ -43,7 +46,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v11"
+    "dense-linear-memory-v12"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -585,6 +588,7 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "inference.threshold_source",
         "implementation.decoded_energy_implementation",
         "implementation.decoder_retraction_implementation",
+        "implementation.factorized_execution_implementation",
         "implementation.isolated_loss_decrease_implementation",
         "qualification.profile",
         "qualification.phase1_identification_thresholds",
@@ -3905,6 +3909,69 @@ def _decoder_constraint_from_values(
     }.get(str(values["model.decoder"]), "other")
 
 
+def _derived_factorized_execution_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    return (
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+        if values["model.site_rank"] is not None
+        else FACTORIZED_EXECUTION_NOT_APPLICABLE
+    )
+
+
+def _bind_derived_factorized_execution_implementation(
+    decisions: Sequence[Decision],
+) -> tuple[Decision, ...]:
+    """Bind site-axis factorization to one explicit contraction schedule."""
+
+    values = {decision.name: decision.value for decision in decisions}
+    filtered = tuple(
+        decision
+        for decision in decisions
+        if decision.name != "implementation.factorized_execution_implementation"
+    )
+    return merge_decisions(
+        filtered,
+        (
+            engineering(
+                "implementation.factorized_execution_implementation",
+                _derived_factorized_execution_implementation(values),
+                rationale=(
+                    "execute site-rank arms directly in rank space without full "
+                    "site-tensor materialization; nonfactorized arms declare no "
+                    "factorized execution"
+                ),
+            ),
+        ),
+    )
+
+
+def _resolved_factorized_execution_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    declared = str(values["implementation.factorized_execution_implementation"])
+    factorized = values["model.site_rank"] is not None
+    allowed = (
+        {
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+            FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+        }
+        if factorized
+        else {FACTORIZED_EXECUTION_NOT_APPLICABLE}
+    )
+    if declared not in {
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_NOT_APPLICABLE,
+    }:
+        raise StudyError("unknown factorized-execution implementation identity")
+    if declared not in allowed:
+        raise StudyError(
+            "factorized-execution implementation violates its carrier predicate"
+        )
+    return declared
+
+
 def _derived_decoder_retraction_implementation(
     values: Mapping[str, DecisionValue],
 ) -> str:
@@ -4011,7 +4078,8 @@ def _bind_derived_score_implementations(
 ) -> tuple[Decision, ...]:
     """Recompute implementation identities after every effective cell delta."""
 
-    bound = _bind_derived_decoder_retraction_implementation(decisions)
+    bound = _bind_derived_factorized_execution_implementation(decisions)
+    bound = _bind_derived_decoder_retraction_implementation(bound)
     bound = _bind_derived_decoded_energy_implementation(bound)
     values = {decision.name: decision.value for decision in bound}
     filtered = tuple(
@@ -4193,6 +4261,7 @@ def _estimate_components(
     decoder_retraction_implementation = _resolved_decoder_retraction_implementation(
         values
     )
+    _resolved_factorized_execution_implementation(values)
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the
