@@ -1442,8 +1442,9 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
                 f"{spec.max_calibration_event_bytes} bytes"
             )
         ev_codes.append(z_sel[nz[:, 0], nz[:, 1]].float().cpu())
-        ev_ids.append(nz[:, 1].to(torch.int32).cpu())
-        ev_tokens.append((nz[:, 0] + n_tokens).to(torch.int32).cpu())
+        event_indices = nz.to(torch.int32).cpu()
+        ev_ids.append(event_indices[:, 1])
+        ev_tokens.append(event_indices[:, 0] + n_tokens)
         block_events += mask.sum(dim=0)
         mean_acc += torch.sum(raw_x, dim=0, dtype=torch.float64).cpu()
         n_tokens += x.shape[0]
