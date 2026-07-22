@@ -212,6 +212,10 @@ every durable shard. If capture stops, repeat the identical command with
 allocation order, independent of `--split` argument order; changed code,
 dependencies, sources, profile, role sizes, resulting binding, or shard
 geometry are refused.
+The completed `capture.json` embeds the full binding. Verification recomputes
+its canonical digest and cross-checks implementation, allocation, geometry,
+and the complete profile role set; an empty directory or a digest-shaped string
+without matching content is not a successful verification.
 
 Phase 2 capture and materialized views:
 
@@ -303,8 +307,13 @@ Matrix estimates label whether they price the current conditional prefix or a
 complete frozen panel. Planning computes an incremental storage requirement:
 configured `BSC_VIEW_ROOT`, `BSC_ACTIVATION_STORE`, `BSC_RAW_STORE_ROOT`, and
 `BSC_TRANSFORM_ROOT` inputs receive credit only after their manifests and
-content hashes verify; already materialized campaign checkpoints receive only
-their verified physical-byte credit. The full scientific estimate remains
+content hashes verify **and** their source/allocation/view contract matches the
+materialized plan. Phase 1 receives no activation-store credit. Already
+materialized recorded campaign artifacts receive only their verified
+physical-byte credit. `matrix run` repeats this live check immediately before
+execution; the planning-only insufficient-storage override cannot bypass it.
+If any selected cell fails, the command exits nonzero even though it still
+prints the complete run summary. The full scientific estimate remains
 unchanged.
 
 The 1 TB `/data` volume should not be assumed to hold both campaigns. After the

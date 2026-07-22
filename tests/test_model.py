@@ -1918,6 +1918,45 @@ def test_anthropic_crosscoder_l1_sums_per_site_decoder_norms(device):
     assert not torch.allclose(observed, negative_control)
 
 
+def test_crosscoder_l1_decoder_weighted_selection_does_not_square_decoder_cost(
+    device,
+):
+    model = make_model(
+        device,
+        n_blocks=2,
+        block_dim=1,
+        n_sites=2,
+        d_model=2,
+        site_dims=(2, 2),
+        k=2,
+        code_activation="relu",
+        selection="dense",
+        selection_score="decoder_weighted",
+        regularizer="crosscoder_l1",
+        lambda_regularizer=1e-4,
+        encoder_bias=True,
+        decoder_constraint="free",
+        decoder_norm_geometry="sum_l2",
+        decoder_init_preconditioning="none",
+        decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+    )
+    with torch.no_grad():
+        model.E.fill_(0.5)
+        model.a.fill_(0.25)
+        model.D.zero_()
+        model.D[0, 0, 0, 0] = 3.0
+        model.D[1, 0, 0, 0] = 4.0
+        model.D[0, 1, 0, 0] = 5.0
+        model.D[1, 1, 0, 0] = 12.0
+    out = model(torch.ones(3, 2, 2, device=device))
+    site_cost = torch.tensor((7.0, 17.0), device=device)
+    observed = bsc_loss(out, torch.zeros_like(out.xhat), model)["regularizer"]
+    expected = (out.z.squeeze(-1).float() * site_cost).sum(dim=1).mean()
+    squared_cost_bug = (out.scores.float() * site_cost).sum(dim=1).mean()
+    assert torch.allclose(observed, expected)
+    assert not torch.allclose(observed, squared_cost_bug)
+
+
 def test_decoder_weighted_batchtopk_score_matches_minder(device):
     model = make_model(
         device,

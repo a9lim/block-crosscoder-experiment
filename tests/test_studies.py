@@ -1524,20 +1524,41 @@ def test_manifests_are_deterministic_round_trip_and_tamper_evident():
         CellSpec.from_manifest(bad)
 
 
+def test_legacy_v1_manifests_fail_with_explicit_migration_guidance():
+    plan = build_phase1_plan(seeds=(0,), smoke=True)
+    legacy_plan = plan.to_manifest()
+    legacy_plan["schema"] = "bsc-study-v1"
+    with pytest.raises(StudyError, match="legacy bsc-study-v1.*fresh plan"):
+        StudyPlan.from_manifest(legacy_plan)
+
+    legacy_cell = plan.cells[0].to_manifest()
+    legacy_cell["schema"] = "bsc-study-v1"
+    with pytest.raises(StudyError, match="legacy bsc-study-v1.*fresh plan"):
+        CellSpec.from_manifest(legacy_cell)
+
+    legacy_blueprint = build_phase1_blueprint((0,), smoke=True).to_manifest()
+    legacy_blueprint["schema"] = "bsc-blueprint-v3"
+    with pytest.raises(StudyError, match="legacy bsc-blueprint-v3.*fresh"):
+        Phase1Blueprint.from_manifest(legacy_blueprint)
+
+
 def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v16"
+        "dense-linear-memory-v17"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
         f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
     )
-    assert phase1_estimate.storage_bytes == phase1_estimate.parameters * 16
+    assert phase1_estimate.storage_bytes == (
+        phase1_estimate.parameters * 16
+        + studies_module._persisted_cell_artifact_overhead(phase1_cell)
+    )
     assert phase1_estimate.checkpoint_write_count == 2
     assert phase1_estimate.cumulative_checkpoint_write_bytes == (
-        phase1_estimate.checkpoint_write_count * phase1_estimate.storage_bytes
+        phase1_estimate.checkpoint_write_count * phase1_estimate.parameters * 16
     )
     assert phase1_estimate.peak_vram_bytes > phase1_estimate.parameters * 28
     assert phase1_estimate.peak_host_ram_bytes >= 8 * 1024**3
@@ -1556,10 +1577,14 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     plan_store = estimate.storage_bytes - sum(
         estimate_cell(cell).parameters * 16 for cell in phase2.cells
     )
+    artifact_overhead = sum(
+        studies_module._persisted_cell_artifact_overhead(cell) for cell in phase2.cells
+    )
     assert 0 < plan_store < per_cell_store
     one_derived_view = (
         estimate_cell(phase2.cells[0]).storage_bytes
         - estimate_cell(phase2.cells[0]).parameters * 16
+        - studies_module._persisted_cell_artifact_overhead(phase2.cells[0])
     )
     sasa = next(
         cell
@@ -1571,7 +1596,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         * sasa.decision_map["model.active_blocks"]
         * 4
     )
-    assert plan_store == 2 * one_derived_view + sasa_tracker_bytes
+    assert plan_store == artifact_overhead + 2 * one_derived_view + sasa_tracker_bytes
     Budget(max_training_tokens=estimate.training_tokens).enforce(estimate)
     with pytest.raises(BudgetExceeded, match="training_tokens"):
         Budget(max_training_tokens=estimate.training_tokens - 1).enforce(estimate)
@@ -1787,7 +1812,7 @@ def test_decoder_retraction_estimator_admits_only_bound_carriers(
             estimate_cell(changed)
 
 
-def test_v14_estimator_prices_cholesky_qr1_training_workspace(
+def test_v17_estimator_prices_cholesky_qr1_training_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cholesky = next(
@@ -1932,7 +1957,7 @@ def test_code_norm_estimator_refuses_unknown_implementation_identity() -> None:
         )
 
 
-def test_v14_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v17_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -2041,7 +2066,7 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
     )
 
 
-def test_v14_estimator_prices_mapped_isolated_loss_training_and_geometry(
+def test_v17_estimator_prices_mapped_isolated_loss_training_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped = _isolated_loss_estimator_cell(

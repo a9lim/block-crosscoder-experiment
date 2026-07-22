@@ -402,7 +402,7 @@ distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
-`dense-linear-memory-v14-q2-c512-t256-s32`. Its guarded
+`dense-linear-memory-v17-q2-c512-t256-s32`. Its guarded
 `stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
 not a paper result or a different scientific score. It uses the algebraic
 decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel
@@ -431,7 +431,7 @@ changes only the fp32 site-summation schedule of the same SASA objective and
 falls back wholesale around low-rank or ill-conditioned boundaries; the
 former site-reduced einsum remains its oracle rather than a scientific
 comparator.
-Estimator v14 conservatively retains the prior operational compute and
+Estimator v17 conservatively retains the prior operational compute and
 workspace price.
 
 Deployment evaluation binds the engineering identity
@@ -443,7 +443,7 @@ packet validation remain unchanged. The deployable carrier canonically
 resolves formerly distinct factorized, mapped-score, and persisted-view full
 paths; this is an execution-identity change, not a paper-method adaptation or
 experimental condition. Evaluation schema v2, the campaign gate, and estimator
-v16 bind and price the fused implementation.
+v17 bind and price the fused implementation.
 Executor v6 overlaps one ordered device transfer with the current CUDA batch
 and applies the same explicitly closed pipeline to all calibration traversals;
 this does not alter the data stream or scientific method.

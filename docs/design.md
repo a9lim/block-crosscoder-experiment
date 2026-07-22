@@ -114,8 +114,11 @@ executable matrix.
   free site decoders, squared reconstruction, and activation weighted by the
   **sum of the per-site L2 decoder norms**, not the L2 norm of a concatenated
   decoder. Its undisclosed training configuration makes
-  it an architecture bridge. The exact dense-ReLU/L1 training rule is retained
-  as a comparator family, and the calibration stage sparsifies it before
+  it an architecture bridge. The L1 term is computed from the unscaled ReLU
+  activation and decoder norms directly; selector scores never enter the
+  regularizer, so a decoder-weighted selector cannot square the decoder cost.
+  The exact dense-ReLU/L1 training rule is retained as a comparator family, and
+  the calibration stage sparsifies it before
   operational packet evaluation. It cannot become the selected sparse
   finalist, but it must receive the same independent Phase-2 calibration as
   every other Phase-3 comparator.
@@ -134,7 +137,8 @@ executable matrix.
 Every hard TopK recipe uses one universal engineering tie rule: rank by score
 descending and, only at an exact cutoff tie, retain the lowest declared
 candidate indices. The candidate index is the block index within a token for
-token-TopK and row-major `(token, block)` index for BatchTopK. Threshold
+token-TopK, row-major `(block, coordinate)` index within each token for scalar
+AuxK, and row-major `(token, block)` index for BatchTopK. Threshold
 selectors use strict greater-than and dense selectors retain strictly positive
 codes. This is content-bound behavior, not an installed-PyTorch default or a
 matrix axis.
@@ -446,6 +450,12 @@ vocabulary hash, and ordered tokenizer-file hash, and passes that tokenizer
 explicitly to TransformerLens. The capture artifact separately binds the exact
 source contract, ordered whole-sequence allocation, capture/store source-code
 hashes, Python and dependency versions, site dimensions, and shard geometry.
+The final manifest embeds that complete capture binding and its canonical
+SHA-256; consumers recompute the digest, require the exact binding field set,
+check every duplicated source/allocation/implementation field, and match the
+producer implementation against the currently reviewed capture code. A
+well-shaped digest string is not authentication. Scientific capture additionally
+requires a recorded CUDA device request.
 Physical store schema v3 requires `int64` row identities in the manifest,
 every shard record, metadata header, and tensor payload. It records an
 incomplete self-hashed manifest after each durable shard; resume reconstructs
@@ -467,6 +477,9 @@ estimate are bound into capture state.
 The content-bound Phase-2 name is
 `activation-store-v3-derived-views`; Phase 3 uses the distinct
 `activation-store-v3-single-view` contract. No v2 alias is accepted.
+Transform-only artifacts use the same durable publication discipline as store
+manifests: temporary write, file fsync, atomic replacement, and parent-directory
+fsync.
 
 The raw capture contains whole-sequence-disjoint roles:
 
@@ -856,19 +869,24 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v14-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v17-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
 calibration-event materialization, and explicit runtime headroom; the activation
-store is not assumed resident in host memory. Estimator v14 additionally
+store is not assumed resident in host memory. Activation stores use the exact
+whole-sequence-rounded split allocation and physical max-width site padding.
+The 16-byte parameter price is explicitly checkpoint model plus Adam moments
+plus the separately persisted deployment model; a schema-derived per-cell
+envelope prices codec tensors, reports, manifests, nontrainable buffers, and
+container metadata. Estimator v17 additionally
 prices the one-batch CUDA copy-stream lookahead at each phase's exact input
 precision and paired-stream topology; the existing host-prefetch queues remain
 inside the separately declared streamed-host headroom.
 Site-axis factorization reduces trainable parameters, optimizer state, and
 checkpoint bytes. Canonical factorized execution contracts the site basis and
 rank core directly and does not materialize full encoder or decoder site
-tensors. Estimator v14 nevertheless retains the previous unfactorized FLOP and
+tensors. Estimator v17 nevertheless retains the previous unfactorized FLOP and
 operational-workspace prices: the measured speed and memory reduction are not
 planning credit until a separately audited estimator version prices every
 direct-rank lifetime.
@@ -1003,7 +1021,7 @@ map nuclear rank one `11.043` to `5.716 ms` (`1.932x`, `623.7 MiB` lower peak),
 map rank two `13.258` to `8.583 ms` (`1.545x`, `527.0 MiB` lower), decoder
 nuclear rank one `7.214` to `3.938 ms` (`1.832x`, `311.9 MiB` lower), and
 decoder rank two `8.227` to `6.993 ms` (`1.176x`, `71.0 MiB` lower). Estimator
-v14 retains its conservative materialization allowance.
+v17 retains its conservative materialization allowance.
 
 The full unfactorized map-nuclear carrier separately serializes
 `batched_site_gram_reference_guard_d1e-3_e1e-4_v1`: it forms each site's fp32
@@ -1096,6 +1114,17 @@ Normalization is a scientific factor:
 - `whiten`: fitted shrinkage whitening with frozen eigensystem;
 - `layer`: per-token LayerNorm diagnostic.
 
+Token LayerNorm is also structurally ineligible for the linear planted-factor
+subspace, isolated-input reconstruction, and aligned-code identification
+conjunction. Phase-1 reports that conjunction as `applicable=false` with a
+named reason and null margin/pass fields; support diagnostics remain visible.
+Metric ineligibility is never encoded as a large negative scientific margin or
+as a failed scientific outcome. The qualification records the exact reason in
+`scientific_outcome.inapplicable_checks`; detached replay permits that neutral
+check only for a resolved `data.normalization=layer` cell. Other promotion
+constraints, including nondeployable inverse side information and the cell's
+declared promotability, remain independent.
+
 Dataset statistics use fp64 accumulation and fp32 transforms. Raw capture and
 store payloads are never fp16. Any inverse requiring source-token information
 must serialize and price that information or declare raw evaluation
@@ -1106,6 +1135,23 @@ content-addressed codec binding the cell, checkpoint, store, transform,
 threshold, included-block table, rotations, clipping bounds, quantizers, and
 side-information contract. Evaluation reloads both artifacts and performs a
 source-free round trip.
+
+Codec orientation is `second_moment_ordered_event_frame_v2`. Calibration orders
+active-code second-moment spectral clusters by descending eigenvalue. Separated
+one-dimensional clusters retain their principal axes; repeated or near-repeated
+clusters (adjacent relative eigengap at most `1e-6`) use a gauge-equivariant
+projected two-pass Gram--Schmidt frame over the active mean followed by active
+codes in immutable calibration-stream order. Non-null directions that those
+vectors cannot identify fail closed. A direction at or below `512` times fp64
+epsilon times the block's largest eigenvalue is calibration-null: its arbitrary
+orthonormal storage completion is harmless only because calibration forces its
+clip interval to exact `[0,0]`, so it contributes identically zero in every
+gauge. The codec serializes and revalidates both tolerances, minimum relative
+eigengap, near-degenerate block IDs/count, null block IDs/per-block dimensions,
+null-coordinate count, and maximum cluster/null dimensions. Gauge-rotated
+exact-isotropic, near-degenerate, and rank-deficient release fixtures must
+produce matching rate--distortion points; generic random simple-spectrum
+coverage is insufficient.
 
 The multi-quantizer CUDA decoder gathers each selected event's inverse
 canonical rotation once per batch and applies every bounded quantizer chunk as
@@ -1311,7 +1357,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v14-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v17-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -1363,7 +1409,7 @@ selector/shared plus R-D traversals and `116.156 ms` for the fused traversal:
 `1.0059x`, saving `0.680 ms` per batch before counting the eliminated second
 store read. Peak CUDA allocation rose from `4,795,438,080` to
 `4,896,102,400` bytes (`+96.001 MiB`) because endpoint reducers now remain
-resident during packet decodes; estimator v16 prices this overlap. Direct
+resident during packet decodes; estimator v17 prices this overlap. Direct
 packet-event comparison proved counts, block IDs, original IDs, and canonical
 codes bit-identical when gathering raw `z` at the selected positions.
 The executor composes ordered pinned-host prefetch with a one-batch-ahead
@@ -1412,7 +1458,7 @@ p95 for the former separate transformed/raw traversals and `25.707 ms` /
 execution gives maximum transformed-FVU relative disagreement `4.99e-11` and
 raw aggregate disagreement `1.25e-11`. On the same activation shape, compiled
 persisted-view validation measures `0.326 ms` versus `0.695 ms` eager (`2.13x`)
-and saves `96.0 MiB` peak. Estimator v14 explicitly prices paired raw and
+and saves `96.0 MiB` peak. Estimator v17 explicitly prices paired raw and
 transformed targets, both metric lifetimes, all-q raw errors, cached forward and
 inverse normalization operators, and the persisted-validation peak; it grants
 no speculative memory credit for the removed second traversal.
@@ -1466,7 +1512,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v14 conservatively credits only four fp32
+Estimator v17 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse
@@ -1532,6 +1578,24 @@ The qualification artifact separately records:
   `smoke_protocol_only`, or `none`, internally consistent with the resolved
   cell and promotion decision;
 - `selection_metrics`: the hash-bound metrics consumed by the frozen policy.
+
+Study manifests use `bsc-study-v2`, blueprints use `bsc-blueprint-v4`,
+preparations use `bsc-preparation-v2`, and qualifications use
+`bsc-qualification-v2`. The v2 qualification binds the preparation plus every
+downstream input hash and repeats the preparation's complete implementation
+identity. Detached Phase-1 and Phase-2 decision replay reruns the same semantic
+qualification contract, including outcome/eligibility consistency, rather than
+accepting a self-consistent rehash. Every seed admitted to one campaign
+selection must have the same implementation-identity digest. Non-smoke cells
+also require a clean committed source tree at preparation. Legacy study-v1 and
+blueprint-v3 roots are preserved but refused with a purpose-built incompatibility
+error; they are never silently defaulted or rewritten.
+
+Operational status excludes `running` cells from default runnable work and
+reports them separately as resume-required. `matrix run` repeats the live
+plan-bound storage preflight immediately before execution, ignores unrelated
+stores (and all stores for stateless Phase 1), credits only hash-verified inputs
+and recorded campaign artifacts, and exits nonzero if any selected cell fails.
 
 A smoke reduction preserves the underlying `qualification.promotable` intent
 of its full cell so selectable methods and declared controls remain

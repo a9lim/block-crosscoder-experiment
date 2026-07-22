@@ -383,6 +383,181 @@ def test_gauge_rotation_invariance():
     assert abs(r1["support_bits_per_token"] - r2["support_bits_per_token"]) < 1e-6
 
 
+def test_exactly_degenerate_codec_frame_is_gauge_equivariant():
+    """An isotropic +/- axis calibration distribution has no unique eigh
+    basis. Immutable event order must resolve its O(2) frame instead."""
+
+    cfg = BSCConfig(
+        n_blocks=1,
+        block_dim=2,
+        n_sites=1,
+        d_model=2,
+        k=1,
+        selection="threshold",
+        decoder_constraint="free",
+        decoder_init_preconditioning="none",
+        decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+    )
+    original = BlockCrosscoder(cfg)
+    rotated = BlockCrosscoder(cfg)
+    angle = torch.tensor(torch.pi / 4)
+    gauge = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle)],
+            [torch.sin(angle), torch.cos(angle)],
+        ]
+    )
+    with torch.no_grad():
+        for model, frame in ((original, torch.eye(2)), (rotated, gauge)):
+            model.E.zero_()
+            model.D.zero_()
+            # The full encoder parameter is packed as [S*d, G*b].
+            model.E.copy_(frame.T)
+            model.D[0, 0].copy_(frame)
+            model.c.zero_()
+            model.theta.fill_(0.5)
+
+    axes = torch.tensor(
+        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+    )
+    calibration = axes.repeat(64, 1).view(-1, 1, 2)
+    evaluation = axes.repeat(32, 1).view(-1, 1, 2)
+    with torch.no_grad():
+        assert torch.allclose(
+            original(evaluation, mode="threshold").xhat,
+            rotated(evaluation, mode="threshold").xhat,
+            atol=6e-8,
+        )
+
+    spec = CodecSpec(qs=(2, 4, 8), floor=1, n_bootstrap=8)
+    first = fit_codec(original, [calibration], spec)
+    second = fit_codec(rotated, [calibration], spec)
+    assert torch.allclose(second.rotation[0] @ gauge, first.rotation[0], atol=2e-6)
+    assert first.meta["canonical_near_degenerate_groups"] == 1
+    assert first.meta["canonical_max_eigenspace_cluster"] == 2
+    assert first.meta["canonical_min_relative_eigengap"] == pytest.approx(0.0)
+
+    result_first = evaluate_rd(original, first, [evaluation], row_len=4)
+    result_second = evaluate_rd(rotated, second, [evaluation], row_len=4)
+    for q in spec.qs:
+        assert result_first["points"][str(q)]["fvu_pooled"] == pytest.approx(
+            result_second["points"][str(q)]["fvu_pooled"],
+            abs=1e-7,
+        )
+
+
+def test_near_degenerate_second_moment_uses_ordered_event_frame():
+    delta = 5e-7
+    scale = (1.0 + delta) ** 0.5
+    codes = torch.tensor(
+        [[scale, 0.0], [-scale, 0.0], [0.0, 1.0], [0.0, -1.0]],
+        dtype=torch.float64,
+    )
+    ids = torch.zeros(4, dtype=torch.long)
+    moment = torch.einsum("ni,nj->ij", codes, codes).unsqueeze(0) / len(codes)
+    mean = codes.mean(dim=0, keepdim=True)
+    included = torch.ones(1, dtype=torch.bool)
+    first, first_null, first_meta = codec_module._canonical_second_moment_frames(
+        moment,
+        mean,
+        codes.float(),
+        ids,
+        included,
+    )
+    angle = torch.tensor(0.713, dtype=torch.float64)
+    gauge = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle)],
+            [torch.sin(angle), torch.cos(angle)],
+        ],
+        dtype=torch.float64,
+    )
+    rotated_codes = torch.einsum("ij,nj->ni", gauge, codes)
+    rotated_moment = torch.einsum(
+        "ij,gjk,lk->gil", gauge, moment, gauge
+    )
+    second, second_null, second_meta = codec_module._canonical_second_moment_frames(
+        rotated_moment,
+        torch.einsum("ij,gj->gi", gauge, mean),
+        rotated_codes.float(),
+        ids,
+        included,
+    )
+    assert first_meta["canonical_near_degenerate_groups"] == 1
+    assert second_meta["canonical_near_degenerate_groups"] == 1
+    assert not first_null.any()
+    assert not second_null.any()
+    assert torch.allclose(second[0] @ gauge, first[0], atol=2e-7)
+
+
+def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
+    cfg = BSCConfig(
+        n_blocks=1,
+        block_dim=2,
+        n_sites=1,
+        d_model=2,
+        k=1,
+        selection="threshold",
+        decoder_constraint="free",
+        decoder_init_preconditioning="none",
+        decoder_init_operation_order="gaussian_mask_rescale_then_declared_constraint",
+    )
+    original = BlockCrosscoder(cfg)
+    rotated = BlockCrosscoder(cfg)
+    angle = torch.tensor(0.611)
+    gauge = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle)],
+            [torch.sin(angle), torch.cos(angle)],
+        ]
+    )
+    with torch.no_grad():
+        for model, frame in ((original, torch.eye(2)), (rotated, gauge)):
+            model.E.zero_()
+            model.D.zero_()
+            model.E.copy_(frame.T)
+            model.D[0, 0].copy_(frame)
+            model.c.zero_()
+            model.theta.fill_(0.5)
+
+    # Calibration spans only e1, so its orthogonal coordinate cannot acquire
+    # a data-defined frame. Evaluation deliberately exercises that direction.
+    calibration = torch.tensor([[1.0, 0.0], [-1.0, 0.0]]).repeat(64, 1)
+    calibration = calibration.view(-1, 1, 2)
+    evaluation = torch.tensor(
+        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+    ).repeat(32, 1).view(-1, 1, 2)
+    spec = CodecSpec(qs=(2, 4), floor=1, n_bootstrap=8)
+    first = fit_codec(original, [calibration], spec)
+    second = fit_codec(rotated, [calibration], spec)
+    for fitted in (first, second):
+        assert fitted.meta["canonical_null_coordinate_count"] == 1
+        assert fitted.meta["canonical_null_block_ids"] == [0]
+        assert fitted.meta["canonical_null_dimensions"] == [1]
+        assert fitted.lo[0, -1].item() == 0.0
+        assert fitted.hi[0, -1].item() == 0.0
+        # Serialized validation binds the exact drop contract.
+        Codec.from_payload(fitted.to_payload())
+
+    forged = copy.deepcopy(first.to_payload())
+    forged["lo"][0, -1] = 1.0
+    forged["hi"][0, -1] = 1.0
+    unsigned = {
+        key: value for key, value in forged.items() if key != "artifact_sha256"
+    }
+    forged["artifact_sha256"] = _artifact_digest(unsigned)
+    with pytest.raises(ValueError, match="null-space clip bounds"):
+        Codec.from_payload(forged)
+
+    result_first = evaluate_rd(original, first, [evaluation], row_len=4)
+    result_second = evaluate_rd(rotated, second, [evaluation], row_len=4)
+    for q in spec.qs:
+        assert result_first["points"][str(q)]["fvu_pooled"] == pytest.approx(
+            result_second["points"][str(q)]["fvu_pooled"],
+            abs=1e-7,
+        )
+
+
 def test_floor_exclusion_reported_and_enforced():
     torch.manual_seed(4)
     m = calibrated(make_model(), torch.randn(2048, S, D))

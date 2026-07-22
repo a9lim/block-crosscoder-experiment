@@ -13,7 +13,7 @@ import platform
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import torch
 
@@ -250,6 +250,7 @@ def _dependency_versions() -> dict[str, str]:
         "block-crosscoder-experiment",
         "datasets",
         "huggingface-hub",
+        "numpy",
         "sae-lens",
         "safetensors",
         "torch",
@@ -277,6 +278,223 @@ def capture_implementation_contract() -> dict[str, object]:
         "data_module_sha256": _file_sha256(Path(__file__)),
         "store_module_sha256": _file_sha256(Path(store.__file__)),
     }
+
+
+def expected_capture_source_contract(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Materialize the capture source contract declared by a resolved cell.
+
+    This intentionally lives beside the capture producer so planning, capture,
+    preflight, and cell execution can share one canonical map from immutable
+    study decisions to the JSON capture contract.
+    """
+
+    def sequence(name: str) -> tuple[Any, ...]:
+        value = values[name]
+        if not isinstance(value, (tuple, list)):
+            raise ValueError(f"{name} must be a sequence")
+        return tuple(value)
+
+    hooks = tuple(str(item) for item in sequence("data.store_sites"))
+    if not hooks:
+        raise ValueError("data.store_sites cannot be empty")
+
+    def per_site(name: str) -> tuple[str, ...]:
+        items = tuple(str(item) for item in sequence(name))
+        if len(items) == 1:
+            return items * len(hooks)
+        if len(items) != len(hooks):
+            raise ValueError(f"{name} must contain one value or one per store site")
+        return items
+
+    def singleton(name: str) -> str:
+        items = sequence(name)
+        if len(items) != 1:
+            raise ValueError(f"{name} must contain exactly one value")
+        return str(items[0])
+
+    drop_policy = str(values["data.context_drop_policy"])
+    if drop_policy == "none":
+        drop_positions = 0
+    elif drop_policy == "drop_bos_position_0":
+        drop_positions = 1
+    else:
+        raise ValueError(f"unsupported data.context_drop_policy {drop_policy!r}")
+    models = per_site("data.source_models")
+    revisions = per_site("data.source_model_revisions")
+    base: dict[str, Any] = {
+        "sources": [
+            {"model": model, "revision": revision, "hook": hook}
+            for model, revision, hook in zip(models, revisions, hooks)
+        ],
+        "corpus": singleton("data.corpus"),
+        "corpus_config": singleton("data.corpus_config"),
+        "corpus_revision": singleton("data.corpus_revision"),
+        "corpus_split": singleton("data.corpus_split"),
+        "context": int(values["data.context_length"]),
+        "drop_positions": drop_positions,
+        "tokenizer_hashes": [str(item) for item in sequence("data.tokenizer_hashes")],
+        "tokenizer_contract": str(values["data.tokenizer_contract"]),
+        "store_contract_version": str(values["data.store_contract_version"]),
+        "alignment_version": str(values["data.alignment_version"]),
+        "alignment_audit": str(values["data.alignment_audit"]),
+    }
+    capture_pairs = sequence("data.capture_contract")
+    capture: dict[str, Any] = {}
+    for item in capture_pairs:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("data.capture_contract entries must be key/value pairs")
+        key, value = item
+        if not isinstance(key, str) or not key or key in capture:
+            raise ValueError("data.capture_contract has an invalid or duplicate key")
+        capture[key] = list(value) if isinstance(value, (tuple, list)) else value
+    overlap = set(base).intersection(capture)
+    if overlap:
+        raise ValueError(
+            "data.capture_contract duplicates resolved fields: "
+            + ", ".join(sorted(overlap))
+        )
+    return {**base, **capture}
+
+
+def expected_capture_allocation(
+    values: Mapping[str, Any],
+) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
+    """Rebuild the canonical whole-sequence allocation for a resolved cell."""
+
+    declared = values["data.split_sizes"]
+    if not isinstance(declared, (tuple, list)) or not declared:
+        raise ValueError("data.split_sizes must be a nonempty sequence")
+    drop_policy = str(values["data.context_drop_policy"])
+    if drop_policy == "none":
+        drop_positions = 0
+    elif drop_policy == "drop_bos_position_0":
+        drop_positions = 1
+    else:
+        raise ValueError(f"unsupported data.context_drop_policy {drop_policy!r}")
+    tokens_per_sequence = int(values["data.context_length"]) - drop_positions
+    if tokens_per_sequence <= 0:
+        raise ValueError("capture tokens per sequence must be positive")
+    split_sizes: dict[str, int] = {}
+    for item in declared:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("data.split_sizes entries must be name/count pairs")
+        name, count = str(item[0]), int(item[1])
+        if not name or name in split_sizes or count <= 0:
+            raise ValueError("data.split_sizes has an invalid or duplicate entry")
+        split_sizes[name] = count
+    return tuple(split_sizes), whole_sequence_split_plan(
+        split_sizes, tokens_per_sequence
+    )
+
+
+def validate_capture_manifest(capture: Mapping[str, Any]) -> dict[str, Any]:
+    """Authenticate an embedded capture binding and its duplicated fields."""
+
+    if capture.get("schema") != "bsc-capture-manifest-v1":
+        raise ValueError("capture manifest has an unknown schema")
+    source = capture.get("source")
+    if not isinstance(source, dict) or capture.get("source_hash") != _canonical_hash(
+        source
+    ):
+        raise ValueError("capture manifest source hash mismatch")
+    binding = capture.get("capture_binding")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema") != "bsc-capture-binding-v1"
+    ):
+        raise ValueError("capture manifest lacks its canonical embedded binding")
+    required_binding_keys = {
+        "schema",
+        "campaign_profile",
+        "source_hash",
+        "split_order",
+        "split_plan",
+        "capture_implementation",
+        "sites",
+        "site_dims",
+        "d_model",
+        "physical_store_format_version",
+        "batch_rows",
+        "write_batch_tokens",
+        "tokens_per_shard",
+        "writer_pipeline",
+        "capture_transfer_pipeline",
+    }
+    if set(binding) != required_binding_keys:
+        raise ValueError("capture binding has missing or unexpected fields")
+    implementation = binding.get("capture_implementation")
+    if (
+        not isinstance(implementation, dict)
+        or implementation.get("schema") != "bsc-capture-implementation-v1"
+    ):
+        raise ValueError("capture implementation contract is malformed")
+    binding_sha256 = _canonical_hash(binding)
+    if capture.get("capture_binding_sha256") != binding_sha256:
+        raise ValueError("capture binding digest mismatch")
+    sites = binding.get("sites")
+    site_dims = binding.get("site_dims")
+    d_model = binding.get("d_model")
+    positive_integer_fields = (
+        binding.get("batch_rows"),
+        binding.get("write_batch_tokens"),
+        binding.get("tokens_per_shard"),
+    )
+    if (
+        not isinstance(sites, list)
+        or sites != list(range(len(sites)))
+        or not isinstance(site_dims, list)
+        or len(site_dims) != len(sites)
+        or not site_dims
+        or any(
+            not isinstance(width, int) or isinstance(width, bool) or width <= 0
+            for width in site_dims
+        )
+        or not isinstance(d_model, int)
+        or isinstance(d_model, bool)
+        or d_model != max(site_dims)
+        or binding.get("physical_store_format_version") != STORE_FORMAT_VERSION
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in positive_integer_fields
+        )
+        or not isinstance(binding.get("writer_pipeline"), dict)
+        or not isinstance(binding.get("capture_transfer_pipeline"), dict)
+    ):
+        raise ValueError("capture binding geometry or execution fields are malformed")
+    duplicated = {
+        "source_hash": capture.get("source_hash"),
+        "split_order": capture.get("split_order"),
+        "split_plan": capture.get("split_plan"),
+        "capture_implementation": capture.get("capture_implementation"),
+    }
+    mismatches = {
+        key: {"manifest": value, "binding": binding.get(key)}
+        for key, value in duplicated.items()
+        if value != binding.get(key)
+    }
+    if capture.get("splits") != capture.get("split_plan"):
+        mismatches["splits"] = {
+            "manifest": capture.get("splits"),
+            "binding": binding.get("split_plan"),
+        }
+    profile = binding.get("campaign_profile")
+    required_roles = CAPTURE_PROFILE_SPLITS.get(str(profile))
+    if (
+        required_roles is None
+        or capture.get("split_order") != list(required_roles)
+        or not isinstance(capture.get("split_plan"), dict)
+        or set(capture.get("split_plan", {})) != set(required_roles or ())
+    ):
+        mismatches["campaign_profile"] = {
+            "manifest": capture.get("split_order"),
+            "binding": profile,
+        }
+    if mismatches:
+        raise ValueError(
+            "capture manifest differs from its embedded binding: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return dict(binding)
 
 
 def load_pinned_tokenizer(model: str, revision: str, contract: str):
@@ -865,7 +1083,7 @@ def fit_transform_artifacts(
         encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         if manifest_path.exists() and manifest_path.read_text() != encoded:
             raise ValueError(f"existing transform manifest differs at {manifest_path}")
-        manifest_path.write_text(encoded)
+        _atomic_json(manifest_path, manifest)
         results[mode] = {
             **manifest,
             "path": str(transform_path),
@@ -911,6 +1129,64 @@ def verify_alignment(roots: Iterable[Path]) -> dict:
             "n_tokens": readers[0].n_tokens,
             "row_stream_sha256": readers[0].manifest["row_stream_sha256"],
         }
+    return result
+
+
+def verify_store_root(root: Path) -> dict[str, object]:
+    """Verify one raw capture root, including its complete declared role set."""
+
+    if not root.is_dir():
+        raise ValueError(f"activation-store root does not exist: {root}")
+    split_names = tuple(
+        path.name
+        for path in sorted(root.iterdir())
+        if path.is_dir() and (path / "split.json").is_file()
+    )
+    if not split_names:
+        raise ValueError("activation store exposes no splits")
+    capture_path = root / CAPTURE_MANIFEST_NAME
+    if not capture_path.is_file():
+        raise ValueError("single-store verification requires capture.json")
+    try:
+        capture_payload = json.loads(capture_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read capture manifest: {exc}") from exc
+    if not isinstance(capture_payload, dict):
+        raise ValueError("capture manifest must be a JSON object")
+    binding = validate_capture_manifest(capture_payload)
+    declared_order = tuple(str(item) for item in capture_payload["split_order"])
+    if split_names != tuple(sorted(declared_order)):
+        raise ValueError(
+            "activation store split set differs from the declared capture roles"
+        )
+    result: dict[str, object] = {}
+    for split in declared_order:
+        reader = StoreReader(root, split)
+        verification = reader.verify()
+        allocation = capture_payload["split_plan"][split]
+        meta = reader.manifest.get("meta", {})
+        expected_meta = {
+            "split_requested_tokens": allocation["requested_tokens"],
+            "split_actual_tokens": allocation["actual_tokens"],
+            "sequence_start": allocation["sequence_start"],
+            "sequence_stop_exclusive": allocation["sequence_stop_exclusive"],
+            "tokens_per_sequence": allocation["tokens_per_sequence"],
+            "ordered_split_allocation": list(declared_order),
+            "capture_binding_sha256": _canonical_hash(binding),
+        }
+        if any(meta.get(key) != value for key, value in expected_meta.items()):
+            raise ValueError(f"split {split!r} differs from its capture allocation")
+        if reader.n_tokens != int(allocation["actual_tokens"]):
+            raise ValueError(
+                f"split {split!r} row count differs from capture allocation"
+            )
+        if (
+            list(reader.sites) != binding["sites"]
+            or list(reader.site_dims) != binding["site_dims"]
+            or reader.d_model != binding["d_model"]
+        ):
+            raise ValueError(f"split {split!r} geometry differs from capture binding")
+        result[split] = verification
     return result
 
 
@@ -1517,6 +1793,7 @@ def capture(
         "split_plan": split_plan,
         "splits": capture_splits,
         "capture_implementation": implementation,
+        "capture_binding": binding,
         "capture_binding_sha256": binding_sha256,
     }
     _atomic_json(capture_path, capture_manifest)
@@ -1648,15 +1925,16 @@ def main(argv: Iterable[str] | None = None) -> None:
         )
         print(json.dumps(payload, indent=2))
     elif args.command == "verify":
-        if len(args.store) == 1:
-            root = args.store[0]
-            payload = {
-                split.name: StoreReader(root, split.name).verify()
-                for split in root.iterdir()
-                if split.is_dir() and (split / "split.json").exists()
-            }
-        else:
-            payload = verify_alignment(args.store)
+        try:
+            if len(args.store) == 1:
+                payload = verify_store_root(args.store[0])
+            else:
+                for root in args.store:
+                    if (root / CAPTURE_MANIFEST_NAME).is_file():
+                        verify_store_root(root)
+                payload = verify_alignment(args.store)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            parser.exit(2, f"error: {exc}\n")
         print(json.dumps(payload, indent=2))
     else:
         split_sizes = parse_split_sizes(args.split)

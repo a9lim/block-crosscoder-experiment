@@ -122,7 +122,7 @@ exit is not evidence by itself.
   normalization modes, zero support, q order/tails, padding/bias, packet
   corruption, and CUDA drift use the gates and benchmark in `design.md`.
   Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
-  Estimator v16 prices the complete fused lifetime and dedicated-stream device
+  Estimator v17 prices the complete fused lifetime and dedicated-stream device
   lookahead without a traversal credit. Training and ordinary metric iterators
   use the same ordered event-bound transfer pipeline. All three calibration
   traversals use separately closed instances of that host/CUDA prefetch
@@ -142,12 +142,14 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v14 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v17 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
-  lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
-  supported device and any undeclared tie policy is refused.
+  lowest row-major event index batch-wide. Scalar-coordinate AuxK uses row-major
+  `(block, coordinate)` order within each token. Zero/ReLU and BF16 cutoff-tie
+  fixtures pass on every supported device and any undeclared tie policy is
+  refused.
 - Code norm has a separate serialized execution identity. Large contiguous
   no-grad bf16 CUDA pools of block width four bind the exact `sqrt.rn` kernel;
   the identity binds both the 4,194,304-output admission threshold and the
@@ -209,7 +211,7 @@ exit is not evidence by itself.
   the fresh parameter shape before PyTorch may accept positional optimizer
   state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
-  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
+  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v17
   remains conservative and grants no runtime credit for this optimization.
   Unfactorized map-nuclear cells additionally bind
   `batched_site_gram_reference_guard_d1e-3_e1e-4_v1`; the old site-reducing
@@ -329,6 +331,11 @@ exit is not evidence by itself.
   length equals its explicit manifest count.
 - Every shard and split manifest binds content, row stream, source, transform,
   ordered sites, dimensions, dtype, count, and shard index.
+- `capture.json` embeds the exact producer binding. Verification recomputes its
+  canonical digest, rejects missing or extra binding fields, checks every
+  duplicated source/allocation/implementation field and physical geometry, and
+  requires every declared profile role. An empty store is a failed verification,
+  not an empty successful report.
 - The one-deep shard writer owns no more than one detached pending payload plus
   one producer staging payload; the exact padded bf16 activation and int64 row-ID
   residency estimate passes its pre-output refusal gate.
@@ -342,9 +349,17 @@ exit is not evidence by itself.
   and `activation-store-v3-single-view` in Phase 3 across cells, capture CLI,
   source manifests, and documentation; stale v2 aliases are refused.
 - Derived normalization views preserve the raw row-stream digest exactly.
+- Transform-only manifests are file-fsynced, atomically replaced, and followed
+  by a parent-directory fsync; crash injection never publishes partial JSON.
 - Normalization and encoder-scale statistics read only their declared fit split;
   codec thresholds/quantizers read calibration only.
 - Corrupt headers, shards, transforms, row order, or hashes fail closed.
+- Codec orientation uses the serialized
+  `second_moment_ordered_event_frame_v2` contract. Exact-isotropic and
+  near-degenerate gauge-rotation fixtures match at every priced quantizer.
+  Calibration-null directions are explicitly diagnosed and have exact zero
+  clip bounds; forged nonzero bounds are refused. Eigengap/cluster/null
+  diagnostics are present, and an unidentified non-null frame fails closed.
 
 ## 4. Checkpoint and campaign audit
 
@@ -365,8 +380,21 @@ exit is not evidence by itself.
   artifact fails verification.
 - Qualification rehashes every prerequisite rather than trusting an artifact
   manifest's claim about itself.
+- Study-v2/blueprint-v4 explicitly refuse legacy study-v1/blueprint-v3 campaign
+  roots with a preservation/migration error. Preparation-v2 and
+  qualification-v2 bind the complete implementation identity and all six
+  qualification inputs. Detached Phase-1/Phase-2 replay reruns the live
+  qualification semantics, and a selection refuses mixed implementation
+  identities across seeds. Every non-smoke phase requires clean committed
+  source before preparation.
 - Integrity qualification, scientific outcome, and promotion eligibility are
   separate and internally consistent.
+- Structurally inapplicable Phase-1 identification endpoints carry
+  `applicable=false`, a named reason, and null margin/pass fields. They remain
+  integrity-complete neutral diagnostics, are named under
+  `scientific_outcome.inapplicable_checks`, and are never rewritten as
+  catastrophic numeric or scientific-outcome failures. Detached replay rejects
+  the exemption for any cell not resolved to token LayerNorm.
 - Smoke cells preserve the full cell's `qualification.promotable` intent while
   `runtime.smoke` forces `promotion_eligible=false`. A uniformly smoke stage
   may select only through qualification mode `smoke_protocol_only`, without
@@ -378,6 +406,9 @@ exit is not evidence by itself.
   frozen metric by median, then worst seed, then candidate ID.
 - Selection freezes the entire eligible/ineligible universe and all metric and
   qualification hashes.
+- Status reports `running` cells as resume-required rather than default-runnable;
+  default run skips them, while `--resume` opts in explicitly. A matrix run with
+  any failed selected cell exits nonzero.
 - Phase-1 capacity, retraction, site-factorization, missing-site-fusion,
   site-masking, score, and selector stages are fixed-carrier capability panels.
   Every challenger is seed-complete and evidence-bearing but nonpromotable;
@@ -535,7 +566,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v14-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v17-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks. Cholesky-QR1 reserves
@@ -548,6 +579,11 @@ exit is not evidence by itself.
 - The planner refuses a declared budget violation before registration.
 - Local filesystem planning checks live free space unless explicitly overridden
   for planning only.
+- Launch repeats the live storage check without accepting the planning override.
+  Input credit is bound to the materialized plan's capture/allocation/view
+  contract; stateless Phase 1 receives zero input-store credit, unrelated stores
+  receive none, and only verified recorded campaign artifacts receive resume
+  credit.
 - Phase 3 remains within the frozen 4,002,097,152 optimizer-token
   (4B final plus eight short preflights), 400M-parameter,
   22GB peak-VRAM, 55GB peak-host-RAM, 850GB-storage, and one-week conservative

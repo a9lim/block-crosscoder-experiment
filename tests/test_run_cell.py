@@ -55,6 +55,8 @@ from block_crosscoder_experiment.cli.run_cell import (
     _normalize_model_only_consumer_state,
     _normalization_record,
     _persisted_view_validation,
+    _phase1_identification_evidence,
+    _phase1_identification_outcome,
     _production_precision_preflight,
     _resolve_real_store,
     _selection_validation_metrics,
@@ -79,7 +81,10 @@ from block_crosscoder_experiment.serialization import (
     MODEL_STATE_DIGEST_CONTRACT,
     model_state_digest,
 )
-from block_crosscoder_experiment.cli.data import fit_transform_artifacts
+from block_crosscoder_experiment.cli.data import (
+    capture_implementation_contract,
+    fit_transform_artifacts,
+)
 from block_crosscoder_experiment.codec import Codec
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
@@ -99,7 +104,11 @@ from block_crosscoder_experiment.runtime_limits import (
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
 )
-from block_crosscoder_experiment.store import ShardWriter, StoreReader
+from block_crosscoder_experiment.store import (
+    STORE_FORMAT_VERSION,
+    ShardWriter,
+    StoreReader,
+)
 from block_crosscoder_experiment.studies import (
     BSC_FACTOR_CONTESTS,
     CellSpec,
@@ -1208,12 +1217,27 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     assert qualification["inputs"] == {
         kind: refs[kind].sha256
         for kind in (
+            "preparation",
             "checkpoint",
             "calibration",
             "deployment_codec",
             "deployment_schedules",
             "evaluation",
         )
+    }
+    preparation = json.loads(refs["preparation"].resolve(campaign.root).read_text())
+    assert qualification["implementation_identity"] == preparation["implementation"]
+    assert qualification["implementation_identity_sha256"] == preparation[
+        "implementation_sha256"
+    ]
+    assert set(qualification["implementation_identity"]["dependencies"]) == {
+        "datasets",
+        "huggingface-hub",
+        "numpy",
+        "sae-lens",
+        "safetensors",
+        "torch",
+        "transformers",
     }
     evaluation = json.loads(refs["evaluation"].resolve(campaign.root).read_text())
     assert evaluation["synthetic_recovery"]["native"]["n_truth_factors"] > 0
@@ -1273,7 +1297,7 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     assert "model_state" in durable_deployment
     assert "codec_payload" in durable_deployment
     assert preparation["implementation"]["executor_schema"] == (
-        "bsc-cell-executor-v11"
+        "bsc-cell-executor-v12"
     )
     assert preparation["implementation"]["executor_process_model"] == (
         "persistent_exact_snapshot_lineage_v5"
@@ -2077,6 +2101,79 @@ def test_failed_scientific_outcome_still_yields_admissible_terminal_report(
     )
     assert qualification["promotion_eligible"] is False
     assert "scientific_outcome_failed" in qualification["promotion_ineligible_reasons"]
+
+
+def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
+    thresholds = _cell(seed=0).decision_map[
+        "qualification.phase1_identification_thresholds"
+    ]
+    recovery = {
+        "identification_metrics_eligible": False,
+        "identification_metrics_ineligible_reason": (
+            "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+        ),
+        "support_precision": 1.0,
+        "support_recall": 1.0,
+    }
+    native = _phase1_identification_evidence(recovery, thresholds)
+    deployed = _phase1_identification_evidence(recovery, thresholds)
+    assert native["applicable"] is False
+    assert native["passed"] is None
+    assert native["margin"] is None
+    assert native["ineligible_reason"] == (
+        "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+    )
+    assert native["aggregate"] == {
+        "support_precision_diagnostic": 1.0,
+        "support_recall_diagnostic": 1.0,
+    }
+    validation = _selection_validation_metrics(
+        Phase.PHASE1,
+        identification={"native": native, "deployed": deployed},
+        fixed_rate={},
+    )
+    assert validation == {
+        "phase1_identification_applicable": False,
+        "phase1_identification_conjunction": False,
+        "phase1_identification_margin": None,
+    }
+    passed, inapplicable = _phase1_identification_outcome(
+        Phase.PHASE1,
+        {"native": native, "deployed": deployed},
+        validation,
+    )
+    assert passed is True
+    assert inapplicable == {
+        "phase1_identification": (
+            "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+        )
+    }
+
+
+def test_scientific_prepare_requires_clean_committed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _cell()
+    cell = replace(
+        base,
+        decisions=tuple(
+            replace(decision, value=False)
+            if decision.name == "runtime.smoke"
+            else decision
+            for decision in base.decisions
+        ),
+    )
+    ctx = SimpleNamespace(
+        cell=cell,
+        values=cell.decision_map,
+        cell_path=tmp_path / "cell.json",
+        preparation=tmp_path / "preparation.json",
+    )
+    identity = run_cell_module._implementation_identity()
+    identity["git_dirty"] = True
+    monkeypatch.setattr(run_cell_module, "_implementation_identity", lambda: identity)
+    with pytest.raises(CellExecutionError, match="scientific cells require"):
+        run_cell_module._prepare(ctx)
 
 
 def test_final_training_artifacts_are_reused_not_mutated_on_resume(
@@ -3502,23 +3599,66 @@ def test_anthropic_anchor_maps_only_the_minimal_dense_l1_method() -> None:
     assert cell.decision_map["qualification.promotable"] is True
 
 
-def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
-    tmp_path: Path,
-) -> None:
-    values = _phase3_cell().decision_map
+def _bound_capture_manifest(
+    values: dict[str, object], *, profile: str
+) -> dict[str, object]:
     source = _expected_real_source_contract(values)
     source_hash = hashlib.sha256(canonical_json(source).encode("utf-8")).hexdigest()
     split_order, split_plan = _expected_capture_allocation(values)
-    payload = {
+    implementation = {
+        **capture_implementation_contract(),
+        "runtime": {
+            "requested_device": "cuda",
+            "torch_cuda_version": torch.version.cuda,
+            "cuda_device_name": "test-device",
+        },
+    }
+    store_site_count = len(values["data.store_sites"])
+    captured_width = max(int(item) for item in values["data.site_dims"])
+    binding = {
+        "schema": "bsc-capture-binding-v1",
+        "campaign_profile": profile,
+        "source_hash": source_hash,
+        "split_order": list(split_order),
+        "split_plan": split_plan,
+        "capture_implementation": implementation,
+        "sites": list(range(store_site_count)),
+        "site_dims": [captured_width] * store_site_count,
+        "d_model": captured_width,
+        "physical_store_format_version": STORE_FORMAT_VERSION,
+        "batch_rows": 1,
+        "write_batch_tokens": 1,
+        "tokens_per_shard": 128,
+        "writer_pipeline": {"contract": "test_fixture_v1"},
+        "capture_transfer_pipeline": {"contract": "test_fixture_v1"},
+    }
+    return {
         "schema": "bsc-capture-manifest-v1",
         "source": source,
         "source_hash": source_hash,
         "split_order": list(split_order),
         "split_plan": split_plan,
-        "splits": split_plan,
-        "capture_implementation": {"test_runtime": "exact"},
-        "capture_binding_sha256": hashlib.sha256(b"binding").hexdigest(),
+        "splits": copy.deepcopy(split_plan),
+        "capture_implementation": implementation,
+        "capture_binding": binding,
+        "capture_binding_sha256": hashlib.sha256(
+            canonical_json(binding).encode("utf-8")
+        ).hexdigest(),
     }
+
+
+def _rehash_capture_binding(payload: dict[str, object]) -> None:
+    payload["capture_binding_sha256"] = hashlib.sha256(
+        canonical_json(payload["capture_binding"]).encode("utf-8")
+    ).hexdigest()
+
+
+def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
+    tmp_path: Path,
+) -> None:
+    values = _phase3_cell().decision_map
+    split_order, split_plan = _expected_capture_allocation(values)
+    payload = _bound_capture_manifest(values, profile="phase3")
     tmp_path.mkdir(exist_ok=True)
     capture_path = tmp_path / "capture.json"
     capture_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -3531,8 +3671,12 @@ def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
         reordered["split_order"][1],
         reordered["split_order"][0],
     )
+    reordered["capture_binding"]["split_order"] = copy.deepcopy(
+        reordered["split_order"]
+    )
+    _rehash_capture_binding(reordered)
     capture_path.write_text(json.dumps(reordered, indent=2) + "\n")
-    with pytest.raises(CellExecutionError, match="split order"):
+    with pytest.raises(CellExecutionError, match="split order|embedded binding"):
         _load_capture_contract(tmp_path, values)
 
     reassigned = copy.deepcopy(payload)
@@ -3545,6 +3689,10 @@ def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
         reassigned["split_plan"][first]["sequence_start"],
     )
     reassigned["splits"] = copy.deepcopy(reassigned["split_plan"])
+    reassigned["capture_binding"]["split_plan"] = copy.deepcopy(
+        reassigned["split_plan"]
+    )
+    _rehash_capture_binding(reassigned)
     capture_path.write_text(json.dumps(reassigned, indent=2) + "\n")
     with pytest.raises(CellExecutionError, match="split allocation"):
         _load_capture_contract(tmp_path, values)
@@ -3556,33 +3704,14 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     cell = _phase3_cell()
     values = cell.decision_map
     raw_root = tmp_path / "raw"
-    source = _expected_real_source_contract(values)
-    source.update(
-        {
-            "format_version": 2,
-            "row_identity_columns": ["sequence", "position", "token_id"],
-            "capture_mode": "raw_once",
-        }
-    )
-    source_hash = hashlib.sha256(canonical_json(source).encode("utf-8")).hexdigest()
+    capture_manifest = _bound_capture_manifest(values, profile="phase3")
+    source = capture_manifest["source"]
+    source_hash = capture_manifest["source_hash"]
     split_order, split_plan = _expected_capture_allocation(values)
-    capture_binding_sha256 = hashlib.sha256(b"phase3-test-capture-binding").hexdigest()
+    capture_binding_sha256 = capture_manifest["capture_binding_sha256"]
     raw_root.mkdir()
     (raw_root / "capture.json").write_text(
-        json.dumps(
-            {
-                "schema": "bsc-capture-manifest-v1",
-                "source": source,
-                "source_hash": source_hash,
-                "split_order": list(split_order),
-                "split_plan": split_plan,
-                "splits": split_plan,
-                "capture_implementation": {"test_runtime": "exact"},
-                "capture_binding_sha256": capture_binding_sha256,
-            },
-            indent=2,
-        )
-        + "\n"
+        json.dumps(capture_manifest, indent=2) + "\n"
     )
     store_site_count = len(values["data.store_sites"])
     captured_width = max(int(item) for item in values["data.site_dims"])

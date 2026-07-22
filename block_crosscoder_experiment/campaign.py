@@ -56,6 +56,7 @@ from .studies import (
     FrozenPanelDecision,
     FrozenPanelEntry,
     FrozenSelection,
+    Phase,
     Phase1Blueprint,
     Phase2Blueprint,
     Phase3Blueprint,
@@ -88,7 +89,8 @@ from .studies import (
 
 CAMPAIGN_SCHEMA = "bsc-campaign-v1"
 ARTIFACT_SCHEMA = "bsc-stage-artifacts-v2"
-QUALIFICATION_SCHEMA = "bsc-qualification-v1"
+QUALIFICATION_SCHEMA = "bsc-qualification-v2"
+PREPARATION_SCHEMA = "bsc-preparation-v2"
 EVALUATION_SCHEMA = "bsc-evaluation-v2"
 EVALUATION_EXECUTION_IMPLEMENTATION = "fused_deployable_full_view_packet_v2"
 PROMOTION_SCHEMA = "bsc-promotion-v1"
@@ -109,6 +111,14 @@ REQUIRED_QUALIFICATION_CHECKS = frozenset(
         "scientific_endpoint_complete",
         "split_integrity",
     }
+)
+QUALIFICATION_INPUT_KINDS = (
+    "preparation",
+    "checkpoint",
+    "calibration",
+    "deployment_codec",
+    "deployment_schedules",
+    "evaluation",
 )
 
 
@@ -308,6 +318,258 @@ def _run_cell_json_sha256(payload: Mapping[str, Any]) -> str:
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _sha256_canonical_payload(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_qualification_payload(
+    payload: Mapping[str, Any],
+    *,
+    cell: CellSpec,
+    expected_artifact_hashes: Mapping[str, str] | None = None,
+    expected_implementation_identity: Mapping[str, Any] | None = None,
+    evaluation: Mapping[str, Any] | None = None,
+) -> str:
+    """Replay the complete qualification contract without filesystem access.
+
+    The returned value is the authenticated implementation-identity digest.
+    Live campaign gates supply exact artifact hashes, the preparation identity,
+    and the evaluation payload.  Detached decision parsers supply every piece
+    embedded in their evidence envelope and therefore exercise the same
+    semantic checks rather than treating a self-consistent rehash as approval.
+    """
+
+    cell_id = cell.cell_id
+    if payload.get("schema") != QUALIFICATION_SCHEMA:
+        raise ArtifactError("qualification artifact has the wrong schema")
+    if payload.get("cell_id") != cell_id or payload.get("qualified") is not True:
+        raise ArtifactError("qualification artifact does not approve this cell")
+    checks = payload.get("checks")
+    if not isinstance(checks, Mapping):
+        raise ArtifactError("qualification checks must be an object")
+    missing_checks = REQUIRED_QUALIFICATION_CHECKS.difference(checks)
+    if missing_checks:
+        raise ArtifactError(
+            f"qualification lacks required checks {sorted(missing_checks)}"
+        )
+    if not all(value is True for value in checks.values()):
+        raise ArtifactError("qualification checks must all be true")
+
+    scientific_outcome = payload.get("scientific_outcome")
+    if not isinstance(scientific_outcome, Mapping):
+        raise ArtifactError("qualification must report scientific_outcome")
+    outcome_checks = scientific_outcome.get("checks")
+    if not isinstance(outcome_checks, Mapping) or not outcome_checks:
+        raise ArtifactError("scientific_outcome checks must be a nonempty object")
+    if not all(isinstance(value, bool) for value in outcome_checks.values()):
+        raise ArtifactError("scientific_outcome checks must be boolean")
+    outcome_passed = scientific_outcome.get("passed")
+    if not isinstance(outcome_passed, bool):
+        raise ArtifactError("scientific_outcome must decide passed")
+    if outcome_passed is not all(outcome_checks.values()):
+        raise ArtifactError("scientific_outcome passed disagrees with its checks")
+    inapplicable_checks = scientific_outcome.get("inapplicable_checks", {})
+    if (
+        not isinstance(inapplicable_checks, Mapping)
+        or any(
+            check not in outcome_checks
+            or outcome_checks[check] is not True
+            or not isinstance(reason, str)
+            or not reason
+            for check, reason in inapplicable_checks.items()
+        )
+    ):
+        raise ArtifactError("scientific_outcome inapplicable checks are malformed")
+    expected_inapplicable_checks = (
+        {
+            "phase1_identification": (
+                "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+            )
+        }
+        if cell.phase is Phase.PHASE1
+        and cell.decision_map.get("data.normalization") == "layer"
+        else {}
+    )
+    if dict(inapplicable_checks) != expected_inapplicable_checks:
+        raise ArtifactError(
+            "scientific_outcome inapplicability disagrees with the resolved cell"
+        )
+    margins = scientific_outcome.get("margins")
+    if not isinstance(margins, Mapping) or any(
+        value is not None
+        and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math_isfinite(value)
+        )
+        for value in margins.values()
+    ):
+        raise ArtifactError(
+            "scientific_outcome margins must be finite numbers or null"
+        )
+
+    promotion_eligible = payload.get("promotion_eligible")
+    if not isinstance(promotion_eligible, bool):
+        raise ArtifactError("qualification must decide promotion_eligible")
+    reasons = payload.get("promotion_ineligible_reasons")
+    if promotion_eligible:
+        if reasons != []:
+            raise ArtifactError(
+                "a promotion-eligible qualification cannot name ineligible reasons"
+            )
+    elif (
+        not isinstance(reasons, list)
+        or not reasons
+        or not all(isinstance(item, str) and item for item in reasons)
+    ):
+        raise ArtifactError(
+            "a diagnostic qualification must name promotion-ineligible reasons"
+        )
+    protocol_eligible = payload.get("selection_eligible_for_protocol_test")
+    eligibility_mode = payload.get("selection_eligibility_mode")
+    if not isinstance(protocol_eligible, bool) or eligibility_mode not in {
+        "scientific_promotion",
+        "smoke_protocol_only",
+        "none",
+    }:
+        raise ArtifactError(
+            "qualification must bind its scientific/protocol selection mode"
+        )
+    is_smoke = cell.decision_map.get("runtime.smoke") is True
+    resolved_promotable = cell.decision_map.get("qualification.promotable") is True
+    expected_mode = (
+        "scientific_promotion"
+        if promotion_eligible
+        else "smoke_protocol_only"
+        if protocol_eligible
+        else "none"
+    )
+    if eligibility_mode != expected_mode:
+        raise ArtifactError("qualification selection mode disagrees with eligibility")
+    if promotion_eligible and not resolved_promotable:
+        raise ArtifactError(
+            "qualification cannot override the cell's immutable nonpromotable recipe"
+        )
+    if promotion_eligible and not outcome_passed:
+        raise ArtifactError(
+            "a scientifically failed qualification cannot be promotion eligible"
+        )
+    if promotion_eligible and is_smoke:
+        raise ArtifactError("a smoke qualification cannot be promotion eligible")
+    if protocol_eligible and (
+        promotion_eligible or not is_smoke or not resolved_promotable
+    ):
+        raise ArtifactError(
+            "smoke protocol eligibility is inconsistent with the resolved cell"
+        )
+
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, Mapping) or set(inputs) != set(QUALIFICATION_INPUT_KINDS):
+        raise ArtifactError(
+            "qualification artifact must bind its exact input-hash set"
+        )
+    if not all(_is_sha256_hex(value) for value in inputs.values()):
+        raise ArtifactError(
+            "qualification input hashes must be 64 lowercase hex characters"
+        )
+    if expected_artifact_hashes is not None:
+        expected = {
+            kind: expected_artifact_hashes[kind] for kind in QUALIFICATION_INPUT_KINDS
+        }
+        if dict(inputs) != expected:
+            raise ArtifactError(
+                "qualification input binding mismatch: "
+                + canonical_json({"expected": expected, "actual": inputs})
+            )
+
+    implementation_identity = payload.get("implementation_identity")
+    implementation_identity_sha256 = payload.get("implementation_identity_sha256")
+    if not isinstance(implementation_identity, Mapping) or not _is_sha256_hex(
+        implementation_identity_sha256
+    ):
+        raise ArtifactError(
+            "qualification must bind its complete implementation identity"
+        )
+    observed_implementation_sha256 = _sha256_canonical_payload(
+        implementation_identity
+    )
+    if implementation_identity_sha256 != observed_implementation_sha256:
+        raise ArtifactError("qualification implementation-identity hash mismatch")
+    if (
+        expected_implementation_identity is not None
+        and dict(implementation_identity) != dict(expected_implementation_identity)
+    ):
+        raise ArtifactError(
+            "qualification implementation identity differs from preparation"
+        )
+
+    selection_metrics = payload.get("selection_metrics")
+    selection_metrics_sha256 = payload.get("selection_metrics_sha256")
+    if not isinstance(selection_metrics, Mapping) or not _is_sha256_hex(
+        selection_metrics_sha256
+    ):
+        raise ArtifactError("qualification must bind its selection metrics")
+    if selection_metrics_sha256 != _sha256_canonical_payload(selection_metrics):
+        raise ArtifactError("qualification selection-metrics hash mismatch")
+    if payload.get("selection_metrics_evaluation_sha256") != inputs["evaluation"]:
+        raise ArtifactError(
+            "selection metrics are not bound to the evaluation artifact"
+        )
+    if payload.get("validation") != selection_metrics.get("validation"):
+        raise ArtifactError(
+            "qualification validation differs from bound selection metrics"
+        )
+
+    if evaluation is not None:
+        expected_evaluation_inputs = {
+            kind: inputs[kind]
+            for kind in (
+                "checkpoint",
+                "calibration",
+                "deployment_codec",
+                "deployment_schedules",
+            )
+        }
+        if (
+            evaluation.get("schema") != EVALUATION_SCHEMA
+            or evaluation.get("evaluation_execution_implementation")
+            != EVALUATION_EXECUTION_IMPLEMENTATION
+            or evaluation.get("cell_id") != cell_id
+            or evaluation.get("inputs") != expected_evaluation_inputs
+        ):
+            raise ArtifactError(
+                "evaluation artifact schema/cell/input binding mismatch"
+            )
+        evaluation_metrics = evaluation.get("selection_metrics")
+        evaluation_metrics_sha256 = evaluation.get("selection_metrics_sha256")
+        if not isinstance(evaluation_metrics, Mapping) or not _is_sha256_hex(
+            evaluation_metrics_sha256
+        ):
+            raise ArtifactError("evaluation lacks authenticated selection metrics")
+        if evaluation_metrics_sha256 != _sha256_canonical_payload(evaluation_metrics):
+            raise ArtifactError("evaluation selection-metrics hash mismatch")
+        if (
+            selection_metrics != evaluation_metrics
+            or selection_metrics_sha256 != evaluation_metrics_sha256
+        ):
+            raise ArtifactError(
+                "qualification selection metrics differ from the bound evaluation"
+            )
+        if evaluation.get("validation") != evaluation_metrics.get("validation"):
+            raise ArtifactError(
+                "evaluation validation differs from bound selection metrics"
+            )
+    return observed_implementation_sha256
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1099,6 +1361,7 @@ class Campaign:
         if not isinstance(cells, list) or len(cells) != len(plan.cells):
             raise CampaignError("Phase-1 decision has incomplete cell evidence")
         cells_by_id: dict[str, Mapping[str, Any]] = {}
+        implementation_sha256s: set[str] = set()
         plan_cells_by_id = {cell.cell_id: cell for cell in plan.cells}
         for evidence in cells:
             if not isinstance(evidence, Mapping):
@@ -1132,18 +1395,19 @@ class Campaign:
                 or _run_cell_json_sha256(qualification) != qualification_sha256
             ):
                 raise CampaignError("Phase-1 cell lacks bound qualification evidence")
-            selection_metrics = qualification.get("selection_metrics")
-            if (
-                not isinstance(selection_metrics, Mapping)
-                or qualification.get("selection_metrics_sha256")
-                != hashlib.sha256(
-                    canonical_json(selection_metrics).encode("utf-8")
-                ).hexdigest()
-            ):
-                raise CampaignError(
-                    "Phase-1 qualification metrics are not authenticated"
+            try:
+                implementation_sha256s.add(
+                    _validate_qualification_payload(qualification, cell=cell)
                 )
+            except ArtifactError as exc:
+                raise CampaignError(
+                    f"Phase-1 qualification semantic replay failed for {cell_id}: {exc}"
+                ) from exc
             cells_by_id[cell_id] = evidence
+        if len(implementation_sha256s) != 1:
+            raise CampaignError(
+                "Phase-1 campaign mixes qualification implementation identities"
+            )
 
         expected = canonical_prefix
         replayed_plan_ids = [expected.plan_id]
@@ -1671,6 +1935,7 @@ class Campaign:
         if len(cells_by_id) != len(cells):
             raise CampaignError("campaign manifest has malformed cell evidence")
         embedded_cells_by_id: dict[str, CellSpec] = {}
+        implementation_sha256s: set[str] = set()
         for cell_id, evidence in cells_by_id.items():
             try:
                 embedded_cell = CellSpec.from_manifest(evidence["cell"])
@@ -1685,34 +1950,45 @@ class Campaign:
             embedded_cells_by_id[cell_id] = embedded_cell
             qualification = evidence.get("qualification")
             artifacts = evidence.get("artifacts")
-            qualification_hashes = (
-                [
-                    "sha256:" + str(item.get("sha256"))
-                    for item in artifacts
-                    if isinstance(item, Mapping) and item.get("kind") == "qualification"
-                ]
-                if isinstance(artifacts, list)
-                else []
-            )
+            try:
+                artifact_refs = (
+                    [ArtifactRef.from_dict(item) for item in artifacts]
+                    if isinstance(artifacts, list)
+                    else []
+                )
+            except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+                raise CampaignError(
+                    f"campaign cell has malformed artifact evidence: {cell_id}: {exc}"
+                ) from exc
+            artifact_hashes = {ref.kind: ref.sha256 for ref in artifact_refs}
             if (
                 evidence.get("state")
                 not in {RunState.QUALIFIED.value, RunState.PROMOTED.value}
                 or not isinstance(qualification, Mapping)
                 or qualification.get("schema") != QUALIFICATION_SCHEMA
                 or qualification.get("cell_id") != cell_id
-                or len(qualification_hashes) != 1
-                or _run_cell_json_sha256(qualification) != qualification_hashes[0]
+                or len(artifact_hashes) != len(artifact_refs)
+                or "qualification" not in artifact_hashes
+                or _run_cell_json_sha256(qualification)
+                != "sha256:" + artifact_hashes["qualification"]
             ):
                 raise CampaignError("campaign cell lacks its qualification payload")
-            metrics = qualification.get("selection_metrics")
-            if (
-                not isinstance(metrics, Mapping)
-                or qualification.get("selection_metrics_sha256")
-                != hashlib.sha256(canonical_json(metrics).encode("utf-8")).hexdigest()
-            ):
-                raise CampaignError(
-                    "campaign qualification metrics are unauthenticated"
+            try:
+                implementation_sha256s.add(
+                    _validate_qualification_payload(
+                        qualification,
+                        cell=embedded_cell,
+                        expected_artifact_hashes=artifact_hashes,
+                    )
                 )
+            except (ArtifactError, KeyError) as exc:
+                raise CampaignError(
+                    f"Phase-2 qualification semantic replay failed for {cell_id}: {exc}"
+                ) from exc
+        if len(implementation_sha256s) != 1:
+            raise CampaignError(
+                "Phase-2 campaign mixes qualification implementation identities"
+            )
         phase2_seeds = tuple(
             sorted({cell.seed for cell in embedded_cells_by_id.values()})
         )
@@ -4384,10 +4660,64 @@ class Campaign:
             )
         for kind in required:
             self._verify_artifact(artifacts[kind])
-        if target is RunState.QUALIFIED:
+        if target is RunState.PREPARED:
+            self._validate_preparation_implementation(cell_id, artifacts)
+        elif target is RunState.QUALIFIED:
             self._validate_qualification(cell_id, artifacts)
         elif target is RunState.PROMOTED:
             self._validate_promotion(cell_id, artifacts)
+
+    def _validate_preparation_implementation(
+        self,
+        cell_id: str,
+        artifacts: Mapping[str, ArtifactRef],
+    ) -> None:
+        """Reject implementation drift as soon as a production cell prepares."""
+
+        payload = _read_json(artifacts["preparation"].resolve(self.root))
+        implementation = payload.get("implementation")
+        # Minimal state-machine fixtures and custom executors may not implement
+        # the production preparation contract.  They cannot later pass the v2
+        # qualification gate; when an identity is present, bind it immediately.
+        if implementation is None:
+            return
+        if (
+            payload.get("schema") != PREPARATION_SCHEMA
+            or payload.get("cell_id") != cell_id
+            or not isinstance(implementation, Mapping)
+            or payload.get("implementation_sha256")
+            != _sha256_canonical_payload(implementation)
+        ):
+            raise ArtifactError(
+                "preparation artifact lacks its schema/cell/implementation binding"
+            )
+        observed_digest = _sha256_canonical_payload(implementation)
+        for planned_cell in self.plan.cells:
+            record = self.record(planned_cell.cell_id)
+            if record.cell_id == cell_id:
+                continue
+            other_ref = record.artifact_map.get("preparation")
+            if other_ref is None:
+                continue
+            other_ref.verify(self.root)
+            other_payload = _read_json(other_ref.resolve(self.root))
+            other_implementation = other_payload.get("implementation")
+            if other_implementation is None:
+                continue
+            if not isinstance(other_implementation, Mapping):
+                raise ArtifactError(
+                    "prepared campaign cell has malformed implementation identity"
+                )
+            other_digest = _sha256_canonical_payload(other_implementation)
+            if other_digest != observed_digest:
+                raise ArtifactError(
+                    "preparation implementation identity differs from an already "
+                    f"prepared campaign cell {record.cell_id}"
+                )
+            # Every production preparation traverses this gate, so one prior
+            # bound identity is the campaign identity.  Avoid an O(cells^2)
+            # rescan of hundreds of immutable preparation files.
+            break
 
     def _validate_qualification(
         self,
@@ -4396,191 +4726,40 @@ class Campaign:
     ) -> None:
         """Validate a qualification decision, not merely a metrics report.
 
-        The qualification JSON must have schema ``bsc-qualification-v1``, the
+        The qualification JSON must have schema ``bsc-qualification-v2``, the
         matching cell ID, ``qualified: true``, the complete all-true evidence
         integrity check set, a separately reported scientific outcome, an
         explicit boolean promotion-eligibility decision, and an ``inputs``
-        mapping that exactly names the hashes of the checkpoint, calibration,
-        deployable codec, and evaluation artifacts.  A scientifically negative but complete
-        control is admissible evidence and therefore may qualify; it cannot be
-        selected or promoted.
+        mapping that exactly names the hashes of the preparation, checkpoint,
+        calibration, deployable codec, schedules, and evaluation artifacts.
+        The qualification also carries the exact preparation implementation
+        identity.  A scientifically negative but complete control is admissible
+        evidence and therefore may qualify; it cannot be selected or promoted.
         """
 
-        ref = artifacts["qualification"]
-        payload = _read_json(ref.resolve(self.root))
-        if payload.get("schema") != QUALIFICATION_SCHEMA:
-            raise ArtifactError("qualification artifact has the wrong schema")
-        if payload.get("cell_id") != cell_id or payload.get("qualified") is not True:
-            raise ArtifactError("qualification artifact does not approve this cell")
-        checks = payload.get("checks")
-        if not isinstance(checks, dict):
-            raise ArtifactError("qualification checks must be an object")
-        missing_checks = REQUIRED_QUALIFICATION_CHECKS.difference(checks)
-        if missing_checks:
-            raise ArtifactError(
-                f"qualification lacks required checks {sorted(missing_checks)}"
-            )
-        if not all(value is True for value in checks.values()):
-            raise ArtifactError("qualification checks must all be true")
-        scientific_outcome = payload.get("scientific_outcome")
-        if not isinstance(scientific_outcome, dict):
-            raise ArtifactError("qualification must report scientific_outcome")
-        outcome_checks = scientific_outcome.get("checks")
-        if not isinstance(outcome_checks, dict) or not outcome_checks:
-            raise ArtifactError("scientific_outcome checks must be a nonempty object")
-        if not all(isinstance(value, bool) for value in outcome_checks.values()):
-            raise ArtifactError("scientific_outcome checks must be boolean")
-        outcome_passed = scientific_outcome.get("passed")
-        if not isinstance(outcome_passed, bool):
-            raise ArtifactError("scientific_outcome must decide passed")
-        if outcome_passed is not all(outcome_checks.values()):
-            raise ArtifactError("scientific_outcome passed disagrees with its checks")
-        margins = scientific_outcome.get("margins")
-        if not isinstance(margins, dict) or any(
-            value is not None
-            and (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math_isfinite(value)
-            )
-            for value in margins.values()
-        ):
-            raise ArtifactError(
-                "scientific_outcome margins must be finite numbers or null"
-            )
-        if not isinstance(payload.get("promotion_eligible"), bool):
-            raise ArtifactError("qualification must decide promotion_eligible")
-        if payload["promotion_eligible"] is False:
-            reasons = payload.get("promotion_ineligible_reasons")
-            if (
-                not isinstance(reasons, list)
-                or not reasons
-                or not all(isinstance(item, str) and item for item in reasons)
-            ):
-                raise ArtifactError(
-                    "a diagnostic qualification must name promotion-ineligible reasons"
-                )
-        protocol_eligible = payload.get("selection_eligible_for_protocol_test")
-        eligibility_mode = payload.get("selection_eligibility_mode")
-        if not isinstance(protocol_eligible, bool) or eligibility_mode not in {
-            "scientific_promotion",
-            "smoke_protocol_only",
-            "none",
-        }:
-            raise ArtifactError(
-                "qualification must bind its scientific/protocol selection mode"
-            )
         cell = self._require_cell(cell_id)
-        is_smoke = cell.decision_map.get("runtime.smoke") is True
-        resolved_promotable = cell.decision_map.get("qualification.promotable") is True
-        expected_mode = (
-            "scientific_promotion"
-            if payload["promotion_eligible"] is True
-            else "smoke_protocol_only"
-            if protocol_eligible
-            else "none"
-        )
-        if eligibility_mode != expected_mode:
-            raise ArtifactError(
-                "qualification selection mode disagrees with eligibility"
-            )
-        if payload["promotion_eligible"] is True and not resolved_promotable:
-            raise ArtifactError(
-                "qualification cannot override the cell's immutable nonpromotable recipe"
-            )
-        if payload["promotion_eligible"] is True and not outcome_passed:
-            raise ArtifactError(
-                "a scientifically failed qualification cannot be promotion eligible"
-            )
-        if payload["promotion_eligible"] is True and is_smoke:
-            raise ArtifactError("a smoke qualification cannot be promotion eligible")
-        if protocol_eligible and (
-            payload["promotion_eligible"] is True
-            or not is_smoke
-            or not resolved_promotable
+        payload = _read_json(artifacts["qualification"].resolve(self.root))
+        preparation = _read_json(artifacts["preparation"].resolve(self.root))
+        if (
+            preparation.get("schema") != PREPARATION_SCHEMA
+            or preparation.get("cell_id") != cell_id
+            or not isinstance(preparation.get("implementation"), Mapping)
+            or preparation.get("implementation_sha256")
+            != _sha256_canonical_payload(preparation["implementation"])
         ):
             raise ArtifactError(
-                "smoke protocol eligibility is inconsistent with the resolved cell"
-            )
-        if not protocol_eligible and eligibility_mode == "smoke_protocol_only":
-            raise ArtifactError("smoke protocol mode requires explicit eligibility")
-        inputs = payload.get("inputs")
-        if not isinstance(inputs, dict):
-            raise ArtifactError("qualification artifact must bind its input hashes")
-        expected = {
-            kind: artifacts[kind].sha256
-            for kind in (
-                "checkpoint",
-                "calibration",
-                "deployment_codec",
-                "deployment_schedules",
-                "evaluation",
-            )
-        }
-        if inputs != expected:
-            raise ArtifactError(
-                "qualification input binding mismatch: "
-                + canonical_json({"expected": expected, "actual": inputs})
+                "preparation artifact lacks its schema/cell/implementation binding"
             )
         evaluation = _read_json(artifacts["evaluation"].resolve(self.root))
-        expected_evaluation_inputs = {
-            kind: expected[kind]
-            for kind in (
-                "checkpoint",
-                "calibration",
-                "deployment_codec",
-                "deployment_schedules",
-            )
-        }
-        if (
-            evaluation.get("schema") != EVALUATION_SCHEMA
-            or evaluation.get("evaluation_execution_implementation")
-            != EVALUATION_EXECUTION_IMPLEMENTATION
-            or evaluation.get("cell_id") != cell_id
-            or evaluation.get("inputs") != expected_evaluation_inputs
-        ):
-            raise ArtifactError(
-                "evaluation artifact schema/cell/input binding mismatch"
-            )
-        selection_metrics = payload.get("selection_metrics")
-        selection_metrics_sha256 = payload.get("selection_metrics_sha256")
-        if not isinstance(selection_metrics, dict) or not isinstance(
-            selection_metrics_sha256, str
-        ):
-            raise ArtifactError("qualification must bind its selection metrics")
-        observed_metrics_sha256 = hashlib.sha256(
-            canonical_json(selection_metrics).encode("utf-8")
-        ).hexdigest()
-        if selection_metrics_sha256 != observed_metrics_sha256:
-            raise ArtifactError("qualification selection-metrics hash mismatch")
-        if payload.get("selection_metrics_evaluation_sha256") != expected["evaluation"]:
-            raise ArtifactError(
-                "selection metrics are not bound to the evaluation artifact"
-            )
-        evaluation_metrics = evaluation.get("selection_metrics")
-        evaluation_metrics_sha256 = evaluation.get("selection_metrics_sha256")
-        if not isinstance(evaluation_metrics, dict) or not isinstance(
-            evaluation_metrics_sha256, str
-        ):
-            raise ArtifactError("evaluation lacks authenticated selection metrics")
-        observed_evaluation_metrics_sha256 = hashlib.sha256(
-            canonical_json(evaluation_metrics).encode("utf-8")
-        ).hexdigest()
-        if evaluation_metrics_sha256 != observed_evaluation_metrics_sha256:
-            raise ArtifactError("evaluation selection-metrics hash mismatch")
-        if (
-            selection_metrics != evaluation_metrics
-            or selection_metrics_sha256 != evaluation_metrics_sha256
-        ):
-            raise ArtifactError(
-                "qualification selection metrics differ from the bound evaluation"
-            )
-        if evaluation.get("validation") != evaluation_metrics.get(
-            "validation"
-        ) or payload.get("validation") != evaluation_metrics.get("validation"):
-            raise ArtifactError(
-                "qualification/evaluation validation differs from bound selection metrics"
-            )
+        _validate_qualification_payload(
+            payload,
+            cell=cell,
+            expected_artifact_hashes={
+                kind: artifacts[kind].sha256 for kind in QUALIFICATION_INPUT_KINDS
+            },
+            expected_implementation_identity=preparation["implementation"],
+            evaluation=evaluation,
+        )
 
     def _validate_promotion(
         self,
@@ -8203,7 +8382,12 @@ class Campaign:
                 return False
         return True
 
-    def runnable_cell_ids(self, *, include_failed: bool = False) -> tuple[str, ...]:
+    def runnable_cell_ids(
+        self,
+        *,
+        include_failed: bool = False,
+        include_resume_required: bool = False,
+    ) -> tuple[str, ...]:
         runnable: list[str] = []
         for stage in self.plan.stages:
             if not self.stage_open(stage.name):
@@ -8213,6 +8397,8 @@ class Campaign:
                 if state in {RunState.QUALIFIED, RunState.PROMOTED}:
                     continue
                 if state is RunState.FAILED and not include_failed:
+                    continue
+                if state is RunState.RUNNING and not include_resume_required:
                     continue
                 runnable.append(cell.cell_id)
         return tuple(runnable)
@@ -8238,6 +8424,8 @@ class Campaign:
             "counts": {key: value for key, value in counts.items() if value},
             "stages": by_stage,
             "runnable": len(self.runnable_cell_ids()),
+            "resume_required": counts[RunState.RUNNING.value],
+            "failed_retry_required": counts[RunState.FAILED.value],
         }
 
     def reconcile_stale_locks(self, max_age_seconds: float) -> tuple[str, ...]:
@@ -8577,7 +8765,12 @@ class CampaignRunner:
         if stop_after is not None and stop_after not in STAGE_TARGETS:
             raise CampaignError(f"unknown stop stage {stop_after!r}")
         if cell_ids is None:
-            selected = list(self.campaign.runnable_cell_ids(include_failed=resume))
+            selected = list(
+                self.campaign.runnable_cell_ids(
+                    include_failed=resume,
+                    include_resume_required=resume,
+                )
+            )
         else:
             selected = list(cell_ids)
             for cell_id in selected:

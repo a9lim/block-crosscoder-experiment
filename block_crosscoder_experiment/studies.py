@@ -52,16 +52,18 @@ from .runtime_limits import (
     isolated_loss_mapped_eligible,
 )
 
-SCHEMA_VERSION = "bsc-study-v1"
+SCHEMA_VERSION = "bsc-study-v2"
+LEGACY_STUDY_SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v16"
+    "dense-linear-memory-v17"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
     f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
 )
-CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v1"
-BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v3"
+CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v2"
+BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v4"
+LEGACY_BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v3"
 PHASE3_PROVISIONED_STORAGE_BYTES = 1_000_000_000_000
 PHASE3_STORAGE_CEILING_BYTES = int(PHASE3_PROVISIONED_STORAGE_BYTES * 0.85)
 PHASE3_PRODUCTION_STABILITY_TOKENS = 262_144
@@ -1448,6 +1450,13 @@ class CellSpec:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "CellSpec":
+        if payload.get("schema") == LEGACY_STUDY_SCHEMA_VERSION:
+            raise StudyError(
+                "legacy bsc-study-v1 cell manifests predate the complete "
+                "implementation contract and cannot be resumed under bsc-study-v2; "
+                "preserve the old campaign root and create a fresh plan or use an "
+                "explicitly reviewed content-bound migration"
+            )
         if payload.get("schema") != SCHEMA_VERSION:
             raise StudyError(f"unsupported cell schema {payload.get('schema')!r}")
         cell = cls(
@@ -2297,6 +2306,13 @@ class StudyPlan:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "StudyPlan":
+        if payload.get("schema") == LEGACY_STUDY_SCHEMA_VERSION:
+            raise StudyError(
+                "legacy bsc-study-v1 plans predate the complete implementation "
+                "contract and cannot be resumed under bsc-study-v2; preserve the "
+                "old campaign root and create a fresh plan or use an explicitly "
+                "reviewed content-bound migration"
+            )
         if payload.get("schema") != SCHEMA_VERSION:
             raise StudyError(f"unsupported plan schema {payload.get('schema')!r}")
         plan = cls(
@@ -3359,6 +3375,11 @@ class Phase2Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase2Blueprint":
+        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
+            raise StudyError(
+                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
+                "old campaign and build a fresh bsc-blueprint-v4 plan"
+            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError("unsupported Phase-2 blueprint schema")
         blueprint = cls(
@@ -3465,6 +3486,11 @@ class Phase1Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase1Blueprint":
+        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
+            raise StudyError(
+                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
+                "old campaign and build a fresh bsc-blueprint-v4 plan"
+            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError("unsupported Phase-1 blueprint schema")
         blueprint = cls(
@@ -3661,6 +3687,11 @@ class Phase3Blueprint:
 
     @classmethod
     def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase3Blueprint":
+        if payload.get("schema") == LEGACY_BLUEPRINT_SCHEMA_VERSION:
+            raise StudyError(
+                "legacy bsc-blueprint-v3 embeds pre-v2 study cells; preserve the "
+                "old campaign and build a fresh bsc-blueprint-v4 plan"
+            )
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError("unsupported Phase-3 blueprint schema")
         blueprint = cls(
@@ -4402,8 +4433,21 @@ def _estimate_components(
     split_sizes_value = values["data.split_sizes"]
     if not isinstance(split_sizes_value, tuple) or not split_sizes_value:
         raise StudyError("data.split_sizes must be a nonempty tuple")
+    drop_policy = values["data.context_drop_policy"]
+    if drop_policy == "none":
+        dropped_positions = 0
+    elif drop_policy == "drop_bos_position_0":
+        dropped_positions = 1
+    else:
+        raise StudyError(f"unknown data.context_drop_policy {drop_policy!r}")
+    tokens_per_sequence = (
+        _positive_int(values["data.context_length"], "data.context_length")
+        - dropped_positions
+    )
+    if tokens_per_sequence <= 0:
+        raise StudyError("data context leaves no stored positions per sequence")
     try:
-        stored_rows = sum(
+        requested_rows = tuple(
             _positive_int(item[1], f"data.split_sizes[{item[0]}]")
             for item in split_sizes_value
         )
@@ -4411,6 +4455,10 @@ def _estimate_components(
         raise StudyError(
             "data.split_sizes entries must be (name, positive count)"
         ) from exc
+    stored_rows = sum(
+        math.ceil(requested / tokens_per_sequence) * tokens_per_sequence
+        for requested in requested_rows
+    )
     row_id_width = _positive_int(values["data.row_id_width"], "data.row_id_width")
     row_id_bytes = _positive_int(values["data.row_id_bytes"], "data.row_id_bytes")
     activation_storage = (
@@ -4423,7 +4471,7 @@ def _estimate_components(
         operational_decoder_elements + operational_encoder_elements
     )
     # Factorization reduces learned parameters, checkpoint size, and optimizer
-    # state. Direct-rank kernels also reduce measured execution work, but v14
+    # state. Direct-rank kernels also reduce measured execution work, but v17
     # conservatively retains the unfactorized FLOP price until every direct
     # lifetime has a separately audited accounting model.
     compute_flops = train_tokens * operational_weight_elements * 6
@@ -4619,15 +4667,40 @@ def _estimate_components(
     )
 
 
+def _persisted_cell_artifact_overhead(cell: CellSpec) -> int:
+    """Conservative envelope for durable non-parameter cell artifacts.
+
+    The 16-byte parameter price in ``estimate_cell`` has explicit ownership:
+    fp32 checkpoint model (4), fp32 Adam moments (8), and the separately saved
+    fp32 deployment model (4). This envelope prices the remaining duplicated
+    codec tensors, nontrainable buffers, RNG/container metadata, and JSON
+    evaluation/qualification/manifests.
+    """
+
+    values = cell.decision_map
+    groups = _positive_int(values["model.groups"], "model.groups")
+    block_dim = _positive_int(values["model.block_width"], "model.block_width")
+    sites = len(values["data.store_sites"])
+    quantizers = len(values["codec.quantizer_bits"])
+    duplicated_codec_tensors = 2 * (
+        8 * groups * block_dim * block_dim
+        + 64 * groups * block_dim
+        + 128 * groups
+    )
+    diagnostic_payload = 1024 * groups * max(1, sites) + 4096 * max(1, quantizers)
+    return 16 * 1024**2 + duplicated_codec_tensors + diagnostic_payload
+
+
 def estimate_cell(cell: CellSpec) -> ResourceEstimate:
     """Conservative dense-linear training and on-disk resource estimate.
 
     FLOPs use six operations per operational dense weight element per token
     (forward plus backward). This intentionally does not grant factorized
     models compute savings until the direct-rank schedule receives a separate
-    planner audit. Storage includes one activation store, a conservative 16 bytes
-    per trainable parameter for checkpoint and optimizer state, and the exact
-    maximum persisted deadness-tracker representation.
+    planner audit. Storage includes one activation store, 16 bytes per trainable
+    parameter explicitly split across the checkpoint model, Adam moments, and
+    deployment model, the exact maximum persisted deadness tracker, and a
+    schema-derived envelope for remaining codec/report/container artifacts.
     """
 
     (
@@ -4642,7 +4715,11 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
         _,
     ) = _estimate_components(cell)
     checkpoint_storage = parameters * 16 + tracker_checkpoint_bytes
-    storage_bytes = activation_storage + checkpoint_storage
+    storage_bytes = (
+        activation_storage
+        + checkpoint_storage
+        + _persisted_cell_artifact_overhead(cell)
+    )
     return ResourceEstimate(
         training_tokens=train_tokens,
         parameters=parameters,
@@ -4678,6 +4755,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
             sum(stores.values())
             + sum(raw_stores.values())
             + sum(item[1] * 16 + item[6] for item in components)
+            + sum(_persisted_cell_artifact_overhead(cell) for cell in plan.cells)
         ),
         checkpoint_write_count=sum(item[7] for item in components),
         cumulative_checkpoint_write_bytes=sum(

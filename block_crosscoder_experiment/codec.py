@@ -17,12 +17,14 @@ Pipeline, per model:
    counting, paying no bits — identically in both arms; exclusions and their
    calibration/evaluation usage shares are reported openly, with split size
    and floor bound in every cell rather than inherited from a campaign default.
-3. **Canonical orientation**: per block, rotate the code space to
-   diagonalize the calib active-code second moment (descending); sign
-   fixed so the active-mean projection is nonnegative. Exploits the
-   residual O(b) gauge; frozen thereafter. Without it, an arbitrary
-   gauge rotation changes componentwise clipping while the model is
-   unchanged (tested: gauge-rotated models produce matching R-D points).
+3. **Canonical orientation**: per block, order the calib active-code
+   second-moment spectral subspaces descending. Separated one-dimensional
+   subspaces retain their principal axes; repeated or near-repeated clusters
+   use projected Gram--Schmidt on active-code observations in immutable
+   stream order. This construction is equivariant under the residual O(b)
+   gauge; frozen thereafter. Without it, an arbitrary gauge rotation changes
+   componentwise clipping while the model is unchanged (tested, including an
+   exactly repeated two-dimensional eigenspace).
 4. **Quantizer**: per canonical coordinate, clip to the calib
    0.1%/99.9% quantiles, then 2^q uniform levels spanning the range
    (endpoints included: xhat = lo + round(t*(2^q-1)) * (hi-lo)/(2^q-1));
@@ -104,6 +106,17 @@ _CALIBRATION_MOMENT_CHUNK = 262_144
 # bounding the NaN-padded workspace to 32 MiB of fp32 values. A single unusually
 # frequent group may exceed this cap only by its own unavoidable event payload.
 _CALIBRATION_QUANTILE_PAD_MAX_ELEMENTS = 8 << 20
+# Eigenvectors are not an identified frame inside a repeated eigenspace.  A
+# relative cluster tolerance also keeps an almost-degenerate frame from being
+# chosen by backend-level roundoff.  The complete value is recorded in every
+# codec artifact.
+_CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE = 1e-6
+# A covariance-null direction has no data-defined frame.  Eigh roundoff can
+# lift an exact null eigenvalue by O(eps * lambda_max), so this narrow bound
+# distinguishes numerical nullity from merely low-variance active content.
+_CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE = 512.0 * torch.finfo(
+    torch.float64
+).eps
 
 
 def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int:
@@ -116,6 +129,189 @@ def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int
     return selected_events * (32 + 24 * block_dim) + moment_events * (
         8 * block_dim * block_dim + 8 * block_dim
     )
+
+
+def _canonical_second_moment_frames(
+    moment: torch.Tensor,
+    mean_code: torch.Tensor,
+    codes: torch.Tensor,
+    ids: torch.Tensor,
+    included: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+    """Return gauge-equivariant descending second-moment frames.
+
+    A simple ``eigh`` orientation is not defined when eigenvalues repeat:
+    different but functionally identical O(b) gauges may receive unrelated
+    bases inside the repeated eigenspace.  We retain the second-moment
+    spectral cluster subspaces, but choose the basis *within* each cluster by
+    projected modified Gram--Schmidt over ``mean, event_0, event_1, ...``.
+    Event order is the immutable calibration stream order and is independent
+    of the code coordinates.  Every candidate and every spectral projector
+    transforms covariantly, hence a gauge ``O`` gives
+    ``frame' = frame @ O.T``.
+
+    A covariance-null subspace has no data-defined frame.  Any orthonormal
+    completion is harmless only if those coordinates are dropped exactly at
+    quantization; the returned null mask therefore requires clip bounds
+    ``lo == hi == 0``.  Non-null directions must still be identified from
+    active content or calibration fails closed.
+    """
+
+    if moment.ndim != 3 or moment.shape[-1] != moment.shape[-2]:
+        raise ValueError("codec second moments must be square per block")
+    groups, block_dim, _ = moment.shape
+    if mean_code.shape != (groups, block_dim):
+        raise ValueError("codec active-code means disagree with second moments")
+    if codes.ndim != 2 or codes.shape[1] != block_dim or ids.shape != (len(codes),):
+        raise ValueError("codec event codes and block IDs disagree")
+    if included.shape != (groups,):
+        raise ValueError("codec inclusion mask disagrees with second moments")
+
+    eye = torch.eye(block_dim, dtype=torch.float64)
+    safe_moment = torch.where(
+        included.view(-1, 1, 1),
+        moment,
+        eye.expand(groups, block_dim, block_dim),
+    )
+    eigenvalues, eigenvectors = torch.linalg.eigh(safe_moment)
+    eigenvalues = eigenvalues.flip(-1)
+    eigenvectors = eigenvectors.flip(-1)  # descending, columns
+
+    # Stable sorting groups the observations without changing their immutable
+    # order inside a block.  That order is the tie-break used to identify a
+    # symmetric (+/- pair) active-code distribution.
+    event_order = torch.argsort(ids, stable=True)
+    boundaries = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long),
+            torch.bincount(ids, minlength=groups).cumsum(0),
+        )
+    )
+
+    frames = eye.expand(groups, block_dim, block_dim).clone()
+    null_coordinates = torch.zeros(groups, block_dim, dtype=torch.bool)
+    relative_gaps: list[float] = []
+    near_degenerate_groups = 0
+    near_degenerate_block_ids: list[int] = []
+    null_block_ids: list[int] = []
+    null_dimensions = [0] * groups
+    null_coordinate_count = 0
+    max_null_dimension = 0
+    max_cluster = 1
+    eps = torch.finfo(torch.float64).eps
+
+    for group in included.nonzero(as_tuple=False).flatten().tolist():
+        values = eigenvalues[group]
+        if block_dim > 1:
+            scales = torch.maximum(values[:-1].abs(), values[1:].abs()).clamp_min(
+                torch.finfo(torch.float64).tiny
+            )
+            gaps = ((values[:-1] - values[1:]).abs() / scales).tolist()
+            relative_gaps.extend(float(gap) for gap in gaps)
+        else:
+            gaps = []
+
+        clusters: list[tuple[int, int]] = []
+        start = 0
+        for index, gap in enumerate(gaps):
+            if gap > _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE:
+                clusters.append((start, index + 1))
+                start = index + 1
+        clusters.append((start, block_dim))
+        group_max_cluster = max(stop - start for start, stop in clusters)
+        max_cluster = max(max_cluster, group_max_cluster)
+        near_degenerate_groups += int(group_max_cluster > 1)
+        if group_max_cluster > 1:
+            near_degenerate_block_ids.append(group)
+
+        first = int(boundaries[group])
+        last = int(boundaries[group + 1])
+        group_codes = codes[event_order[first:last]]
+        group_mean = mean_code[group].double()
+        canonical_columns: list[torch.Tensor] = []
+        for cluster_start, cluster_stop in clusters:
+            dimension = cluster_stop - cluster_start
+            spectral_basis = eigenvectors[
+                group, :, cluster_start:cluster_stop
+            ]
+            largest_eigenvalue = values[0].abs()
+            null_threshold = (
+                largest_eigenvalue
+                * _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
+            ).clamp_min(torch.finfo(torch.float64).tiny)
+            cluster_is_null = bool(
+                values[cluster_start:cluster_stop].abs().max() <= null_threshold
+            )
+            if cluster_is_null:
+                # No calibration observation distinguishes orientations in
+                # this subspace.  Keep eigh's orthonormal completion solely as
+                # a storage carrier; exact zero clip bounds below make its
+                # decoded contribution identically zero in every gauge.
+                canonical_columns.extend(spectral_basis.unbind(dim=1))
+                null_coordinates[group, cluster_start:cluster_stop] = True
+                null_coordinate_count += dimension
+                null_dimensions[group] += dimension
+                max_null_dimension = max(max_null_dimension, dimension)
+                if not null_block_ids or null_block_ids[-1] != group:
+                    null_block_ids.append(group)
+                continue
+            projector = spectral_basis @ spectral_basis.T
+            cluster_columns: list[torch.Tensor] = []
+            for candidate_index in range(len(group_codes) + 1):
+                candidate = (
+                    group_mean
+                    if candidate_index == 0
+                    else group_codes[candidate_index - 1].double()
+                )
+                candidate_norm = candidate.norm()
+                if not bool(candidate_norm > 0):
+                    continue
+                vector = projector @ candidate
+                # Two MGS passes keep the serialized fp32 frame orthonormal
+                # even for a near-degenerate multi-axis cluster.
+                for _ in range(2):
+                    for previous in cluster_columns:
+                        vector = vector - previous * torch.dot(previous, vector)
+                norm = vector.norm()
+                if bool(norm > (256.0 * eps * candidate_norm)):
+                    cluster_columns.append(vector / norm)
+                    if len(cluster_columns) == dimension:
+                        break
+            if len(cluster_columns) != dimension:
+                raise ValueError(
+                    "codec canonical frame is not identifiable from active "
+                    f"calibration codes for included block {group}: "
+                    f"eigenspace dimension {dimension}, identified "
+                    f"{len(cluster_columns)}"
+                )
+            canonical_columns.extend(cluster_columns)
+
+        basis = torch.stack(canonical_columns, dim=1)
+        gram = basis.T @ basis
+        if not torch.allclose(gram, eye, rtol=1e-9, atol=1e-9):
+            raise RuntimeError("codec canonical-frame construction lost orthogonality")
+        frames[group] = basis.T
+
+    diagnostics: dict[str, object] = {
+        "canonical_orientation": "second_moment_ordered_event_frame_v2",
+        "canonical_eigenspace_relative_tolerance": (
+            _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE
+        ),
+        "canonical_near_degenerate_groups": near_degenerate_groups,
+        "canonical_near_degenerate_block_ids": near_degenerate_block_ids,
+        "canonical_null_eigenvalue_relative_tolerance": (
+            _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
+        ),
+        "canonical_null_coordinate_count": null_coordinate_count,
+        "canonical_null_block_ids": null_block_ids,
+        "canonical_null_dimensions": null_dimensions,
+        "canonical_max_null_dimension": max_null_dimension,
+        "canonical_max_eigenspace_cluster": max_cluster,
+        "canonical_min_relative_eigengap": (
+            min(relative_gaps) if relative_gaps else 1.0
+        ),
+    }
+    return frames, null_coordinates, diagnostics
 
 
 def _grouped_coordinate_quantiles(
@@ -484,6 +680,17 @@ class Codec:
             "excluded_calib_event_share",
             "theta",
             "model_cfg",
+            "canonical_orientation",
+            "canonical_eigenspace_relative_tolerance",
+            "canonical_near_degenerate_groups",
+            "canonical_near_degenerate_block_ids",
+            "canonical_null_eigenvalue_relative_tolerance",
+            "canonical_null_coordinate_count",
+            "canonical_null_block_ids",
+            "canonical_null_dimensions",
+            "canonical_max_null_dimension",
+            "canonical_max_eigenspace_cluster",
+            "canonical_min_relative_eigengap",
         }
         missing_meta = sorted(required_meta - set(self.meta))
         if missing_meta:
@@ -520,6 +727,101 @@ class Codec:
             abs_tol=1e-9,
         ):
             raise ValueError("codec excluded-event share disagrees with its counts")
+        if (
+            self.meta["canonical_orientation"]
+            != "second_moment_ordered_event_frame_v2"
+            or self.meta["canonical_eigenspace_relative_tolerance"]
+            != _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE
+            or not isinstance(self.meta["canonical_near_degenerate_groups"], int)
+            or isinstance(self.meta["canonical_near_degenerate_groups"], bool)
+            or not 0
+            <= self.meta["canonical_near_degenerate_groups"]
+            <= self.n_included
+            or not isinstance(
+                self.meta["canonical_near_degenerate_block_ids"], list
+            )
+            or self.meta["canonical_null_eigenvalue_relative_tolerance"]
+            != _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
+            or not isinstance(self.meta["canonical_null_coordinate_count"], int)
+            or isinstance(self.meta["canonical_null_coordinate_count"], bool)
+            or not 0
+            <= self.meta["canonical_null_coordinate_count"]
+            <= self.n_included * block
+            or not isinstance(self.meta["canonical_null_block_ids"], list)
+            or not isinstance(self.meta["canonical_null_dimensions"], list)
+            or not isinstance(self.meta["canonical_max_null_dimension"], int)
+            or isinstance(self.meta["canonical_max_null_dimension"], bool)
+            or not 0 <= self.meta["canonical_max_null_dimension"] <= block
+            or not isinstance(self.meta["canonical_max_eigenspace_cluster"], int)
+            or isinstance(self.meta["canonical_max_eigenspace_cluster"], bool)
+            or not 1 <= self.meta["canonical_max_eigenspace_cluster"] <= block
+            or not isinstance(
+                self.meta["canonical_min_relative_eigengap"], (int, float)
+            )
+            or isinstance(self.meta["canonical_min_relative_eigengap"], bool)
+            or not math.isfinite(
+                float(self.meta["canonical_min_relative_eigengap"])
+            )
+            or float(self.meta["canonical_min_relative_eigengap"]) < 0
+        ):
+            raise ValueError("codec canonical-orientation metadata is invalid")
+        near_degenerate_ids = self.meta["canonical_near_degenerate_block_ids"]
+        if (
+            len(near_degenerate_ids)
+            != self.meta["canonical_near_degenerate_groups"]
+            or any(
+                not isinstance(block_id, int)
+                or isinstance(block_id, bool)
+                or block_id < 0
+                or block_id >= groups
+                or not bool(self.included[block_id])
+                for block_id in near_degenerate_ids
+            )
+            or near_degenerate_ids != sorted(set(near_degenerate_ids))
+        ):
+            raise ValueError("codec near-degenerate block IDs are invalid")
+        null_block_ids = self.meta["canonical_null_block_ids"]
+        null_dimensions = self.meta["canonical_null_dimensions"]
+        if (
+            any(
+                not isinstance(block_id, int)
+                or isinstance(block_id, bool)
+                or block_id < 0
+                or block_id >= groups
+                or not bool(self.included[block_id])
+                for block_id in null_block_ids
+            )
+            or null_block_ids != sorted(set(null_block_ids))
+            or len(null_dimensions) != groups
+            or any(
+                not isinstance(dimension, int)
+                or isinstance(dimension, bool)
+                or dimension < 0
+                or dimension > block
+                for dimension in null_dimensions
+            )
+            or [
+                block_id
+                for block_id, dimension in enumerate(null_dimensions)
+                if dimension
+            ]
+            != null_block_ids
+            or sum(null_dimensions)
+            != self.meta["canonical_null_coordinate_count"]
+            or max(null_dimensions, default=0)
+            != self.meta["canonical_max_null_dimension"]
+            or bool(null_block_ids)
+            != bool(self.meta["canonical_null_coordinate_count"])
+            or bool(null_block_ids)
+            != bool(self.meta["canonical_max_null_dimension"])
+        ):
+            raise ValueError("codec null-space block IDs are invalid")
+        for block_id, null_dimension in enumerate(null_dimensions):
+            if null_dimension and (
+                bool(self.lo[block_id, block - null_dimension :].count_nonzero())
+                or bool(self.hi[block_id, block - null_dimension :].count_nonzero())
+            ):
+                raise ValueError("codec null-space clip bounds must be exactly zero")
 
     @property
     def n_included(self) -> int:
@@ -1493,8 +1795,9 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
         count_hist = torch.tensor([n_tokens], dtype=torch.long)
     del included_counts, token_ids
 
-    # Canonical orientation: batched second moments via index_add, eigh
-    # descending, sign so the active-mean projection is >= 0.
+    # Canonical orientation: batched second moments via index_add, with a
+    # gauge-equivariant ordered-event frame inside repeated/near-repeated
+    # eigenspaces.
     M = torch.zeros(G, b, b, dtype=torch.float64)
     mean_code = torch.zeros(G, b, dtype=torch.float64)
     for start in range(0, len(codes), _CALIBRATION_MOMENT_CHUNK):
@@ -1510,14 +1813,15 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     denom = block_events.clamp_min(1).double()
     M /= denom.view(-1, 1, 1)
     mean_code /= denom.view(-1, 1)
-    eye = torch.eye(b, dtype=torch.float64)
-    safe_M = torch.where(included.view(-1, 1, 1), M, eye.expand(G, b, b))
-    _, evecs = torch.linalg.eigh(safe_M)  # ascending
-    evecs = evecs.flip(-1)  # descending eigenvalue order, columns
-    R = evecs.transpose(1, 2)  # rows: z_can = R @ z
-    sign = torch.sign(torch.einsum("gij,gj->gi", R, mean_code))
-    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-    R = R * sign.unsqueeze(-1)
+    R, canonical_null_coordinates, canonical_diagnostics = (
+        _canonical_second_moment_frames(
+            M,
+            mean_code,
+            codes,
+            ids,
+            included,
+        )
+    )
 
     # Clip quantiles per canonical coordinate.
     codes_can = torch.einsum("nij,nj->ni", R[ids].float(), codes)
@@ -1537,6 +1841,11 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     )
     lo[quantile_groups] = grouped_quantiles[0]
     hi[quantile_groups] = grouped_quantiles[1]
+    # A null-space basis is mathematically unidentifiable, but also carries no
+    # calibration signal.  Exact zero ranges make its packet symbols and
+    # arbitrary orthonormal completion decode to the same zero contribution.
+    lo[canonical_null_coordinates] = 0.0
+    hi[canonical_null_coordinates] = 0.0
     # Count model: add-one smoothing over the *entire legal alphabet*
     # [0, G_included].  Tail clamping is not a code: an unseen but legal
     # count must still have a distinct decodable symbol.
@@ -1586,6 +1895,7 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
             "excluded_calib_event_share": float(
                 block_events[~included].sum() / max(1, block_events.sum())
             ),
+            **canonical_diagnostics,
         },
     )
 

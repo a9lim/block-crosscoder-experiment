@@ -26,6 +26,8 @@ from block_crosscoder_experiment.cli.data import (
     parse_split_sizes,
     tokenizer_contract_hash,
     transformer_lens_model_name,
+    validate_capture_manifest,
+    verify_store_root,
     verify_alignment,
     whole_sequence_split_plan,
 )
@@ -44,6 +46,7 @@ from block_crosscoder_experiment.studies import (
     StudyError,
     build_phase2_blueprint,
     build_phase2_plan,
+    build_phase1_plan,
     resolved_candidate_execution_signature,
 )
 
@@ -99,7 +102,7 @@ def test_capture_cli_requires_profile_and_complete_profile_roles(tmp_path):
         data_module.main([*common, "--profile", "phase2"])
 
 
-def _raw_store(root, *, offset=0.0):
+def _raw_store(root, *, offset=0.0, authenticated_profile=None):
     root.mkdir(parents=True, exist_ok=True)
     source = {
         "store_contract_version": "activation-store-v3-single-view",
@@ -108,25 +111,63 @@ def _raw_store(root, *, offset=0.0):
     source_hash = hashlib.sha256(
         json.dumps(source, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    split_sizes = {
-        "normalization_fit": 64,
-        "calibration": 48,
-        "eval": 32,
-        "train": 80,
-    }
+    split_sizes = (
+        {
+            "normalization_fit": 2,
+            "calibration": 2,
+            "development": 2,
+            "confirmation": 2,
+            "train": 2,
+        }
+        if authenticated_profile == "phase2"
+        else {
+            "normalization_fit": 64,
+            "calibration": 48,
+            "eval": 32,
+            "train": 80,
+        }
+    )
     split_plan = whole_sequence_split_plan(split_sizes, 1)
-    (root / "capture.json").write_text(
-        json.dumps(
+    capture_payload = {
+        "source": source,
+        "source_hash": source_hash,
+        "split_order": list(split_sizes),
+        "split_plan": split_plan,
+        "splits": split_plan,
+    }
+    if authenticated_profile is not None:
+        implementation = {
+            "schema": "bsc-capture-implementation-v1",
+            "test": "unrelated",
+        }
+        binding = {
+            "schema": "bsc-capture-binding-v1",
+            "campaign_profile": authenticated_profile,
+            "source_hash": source_hash,
+            "split_order": list(split_sizes),
+            "split_plan": split_plan,
+            "capture_implementation": implementation,
+            "sites": [0, 1],
+            "site_dims": [5, 5],
+            "d_model": 5,
+            "physical_store_format_version": data_module.STORE_FORMAT_VERSION,
+            "batch_rows": 1,
+            "write_batch_tokens": 1,
+            "tokens_per_shard": 17,
+            "writer_pipeline": {"contract": "test"},
+            "capture_transfer_pipeline": {"contract": "test"},
+        }
+        capture_payload.update(
             {
-                "source": source,
-                "source_hash": source_hash,
-                "split_order": list(split_sizes),
-                "split_plan": split_plan,
-                "splits": split_plan,
+                "schema": "bsc-capture-manifest-v1",
+                "capture_implementation": implementation,
+                "capture_binding": binding,
+                "capture_binding_sha256": hashlib.sha256(
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
             }
         )
-        + "\n"
-    )
+    (root / "capture.json").write_text(json.dumps(capture_payload) + "\n")
     gen = torch.Generator().manual_seed(4)
     for split, n in split_sizes.items():
         writer = ShardWriter(
@@ -167,15 +208,27 @@ def test_derive_views_preserves_row_identity(tmp_path):
     )
 
 
-def test_fit_transform_artifact_binds_capture_and_fit_stream_without_shards(tmp_path):
+def test_fit_transform_artifact_binds_capture_and_fit_stream_without_shards(
+    tmp_path, monkeypatch
+):
     raw = tmp_path / "raw"
     _raw_store(raw)
     out = tmp_path / "transforms"
+    fsync_calls = []
+    real_fsync = data_module.os.fsync
+
+    def tracked_fsync(descriptor):
+        fsync_calls.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(data_module.os, "fsync", tracked_fsync)
     result = fit_transform_artifacts(raw, out, ("scalar_rms",), batch_size=13)
     record = result["scalar_rms"]
     artifact_root = out / "scalar_rms" / record["transform_hash"]
     assert (artifact_root / "whitener.pt").is_file()
     assert (artifact_root / "transform.json").is_file()
+    assert len(fsync_calls) >= 2  # manifest file and containing directory
+    assert not (artifact_root / "transform.json.tmp").exists()
     assert not any(path.name == "split.json" for path in artifact_root.rglob("*"))
     assert (
         record["source_fit_row_stream_sha256"]
@@ -606,6 +659,33 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
         "train",
     ]
     assert uninterrupted["capture_implementation"]["test_runtime"] == "exact"
+    assert (
+        uninterrupted["capture_binding"]["capture_implementation"]
+        == uninterrupted["capture_implementation"]
+    )
+    validate_capture_manifest(uninterrupted)
+    tampered_capture = json.loads(json.dumps(uninterrupted))
+    tampered_capture["capture_binding"]["capture_implementation"]["test_runtime"] = (
+        "forged"
+    )
+    with pytest.raises(ValueError, match="binding digest mismatch"):
+        validate_capture_manifest(tampered_capture)
+    zero_digest_capture = json.loads(json.dumps(uninterrupted))
+    zero_digest_capture["capture_binding_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="binding digest mismatch"):
+        validate_capture_manifest(zero_digest_capture)
+    arbitrary_implementation = json.loads(json.dumps(uninterrupted))
+    arbitrary_implementation["capture_implementation"] = {
+        "schema": "evil-arbitrary-code-v1"
+    }
+    arbitrary_implementation["capture_binding"]["capture_implementation"] = {
+        "schema": "evil-arbitrary-code-v1"
+    }
+    arbitrary_implementation["capture_binding_sha256"] = data_module._canonical_hash(
+        arbitrary_implementation["capture_binding"]
+    )
+    with pytest.raises(ValueError, match="implementation contract is malformed"):
+        validate_capture_manifest(arbitrary_implementation)
     assert uninterrupted["source"]["transformer_lens_model_names"] == ["gpt2"]
     assert loader_calls[0][0] == "gpt2"
     assert loader_calls[0][1]["revision"] == expected_source["sources"][0]["revision"]
@@ -652,7 +732,7 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
     assert partial.verify() == 64
     resumed = capture(make_args(resumed_root, resume=True))
     assert resumed == uninterrupted
-
+    validate_capture_manifest(resumed)
     for split in uninterrupted["split_order"]:
         left = StoreReader(uninterrupted_root, split)
         right = StoreReader(resumed_root, split)
@@ -662,6 +742,32 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
             right_acts, right_ids = right._shard_payload(shard, verify=True)
             assert torch.equal(left_acts, right_acts)
             assert torch.equal(left_ids, right_ids)
+
+
+def test_data_verify_rejects_empty_and_incomplete_capture_role_sets(
+    tmp_path, monkeypatch
+):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit) as exc_info:
+        data_module.main(["verify", "--store", str(empty)])
+    assert exc_info.value.code == 2
+
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+    root = tmp_path / "capture"
+    capture(make_args(root))
+    assert set(verify_store_root(root)) == {
+        "normalization_fit",
+        "calibration",
+        "development",
+        "confirmation",
+        "train",
+    }
+    extra = root / "undeclared"
+    extra.mkdir()
+    (extra / "split.json").write_text("{}\n")
+    with pytest.raises(ValueError, match="split set differs"):
+        verify_store_root(root)
 
 
 def test_capture_refuses_pipeline_residency_before_creating_output(
@@ -734,12 +840,15 @@ def test_cuda_capture_copy_overlap_holds_only_two_pinned_destinations(monkeypatc
 
     def source():
         for index in range(6):
-            yield torch.full(
-                (4, 2, 8),
-                index,
-                dtype=torch.bfloat16,
-                device="cuda",
-            ), identities
+            yield (
+                torch.full(
+                    (4, 2, 8),
+                    index,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+                identities,
+            )
 
     stream = _overlap_cuda_capture_copies(source())
     expected_value = 0
@@ -940,6 +1049,77 @@ def test_incremental_storage_preflight_credits_only_verified_inputs(
     shard.write_bytes(corrupted)
     with pytest.raises(StudyError, match="checksum"):
         _verified_existing_input_storage()
+
+
+def test_storage_credit_is_plan_bound_and_phase1_is_always_zero(tmp_path, monkeypatch):
+    raw = tmp_path / "unrelated"
+    _raw_store(raw, authenticated_profile="phase2")
+    monkeypatch.setenv("BSC_RAW_STORE_ROOT", str(raw))
+    phase1 = build_phase1_plan((0,), smoke=True)
+    phase1_credit = _verified_existing_input_storage(plan=phase1)
+    assert phase1_credit["verified_existing_input_bytes"] == 0
+    assert phase1_credit["inputs"] == []
+
+    # The capture is internally authenticated but belongs to a different
+    # source and split allocation, so it cannot buy credit for Phase 2.
+    phase2 = build_phase2_plan((0,), smoke=True)
+    phase2_credit = _verified_existing_input_storage(plan=phase2)
+    assert phase2_credit["verified_existing_input_bytes"] == 0
+    assert phase2_credit["inputs"][0]["eligible_for_plan"] is False
+
+    _, _, make_args = _mock_capture_runtime(monkeypatch)
+    matching = tmp_path / "matching"
+    matching_args = make_args(matching)
+    matching_args.split = [
+        f"{role}=64" for role in data_module.CAPTURE_PROFILE_SPLITS["phase2"]
+    ]
+    capture(matching_args)
+    monkeypatch.setenv("BSC_RAW_STORE_ROOT", str(matching))
+    matching_credit = _verified_existing_input_storage(plan=phase2)
+    assert matching_credit["verified_existing_input_bytes"] > 0
+    assert matching_credit["inputs"][0]["eligible_for_plan"] is True
+
+
+def test_matrix_run_rechecks_storage_and_exits_nonzero_after_cell_failure(
+    tmp_path, monkeypatch, capsys
+):
+    plan = build_phase1_plan((0,), smoke=True)
+
+    class FakeCampaign:
+        def __init__(self):
+            self.plan = plan
+
+        def status(self):
+            return {"plan_id": plan.plan_id}
+
+    campaign = FakeCampaign()
+    monkeypatch.setattr(matrix_module, "Campaign", lambda root: campaign)
+    preflight_calls = []
+
+    def checked(root, estimate, *, allow_insufficient, plan):
+        preflight_calls.append((root, allow_insufficient, plan))
+        return {"sufficient": True}
+
+    monkeypatch.setattr(matrix_module, "_checked_storage_extension", checked)
+    monkeypatch.setattr(
+        matrix_module,
+        "_run_with_optional_view_dispatch",
+        lambda campaign, args: SimpleNamespace(
+            failed_cells=1,
+            to_dict=lambda: {
+                "selected_cells": 1,
+                "completed_cells": 0,
+                "failed_cells": 1,
+                "skipped_cells": 0,
+            },
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        matrix_main(["run", "--root", str(tmp_path)])
+    assert exc_info.value.code == 1
+    assert preflight_calls == [(tmp_path, False, plan)]
+    output = json.loads(capsys.readouterr().out)
+    assert output["run"]["failed_cells"] == 1
 
 
 def test_phase2_view_dispatch_is_per_cell_and_fails_closed_on_manifests(

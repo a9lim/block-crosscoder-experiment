@@ -12,7 +12,7 @@ import block_crosscoder_experiment.gram as gram_module
 import block_crosscoder_experiment.model as model_module
 import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
-from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig, BSCOutput
 from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
@@ -271,7 +271,7 @@ def test_trainer_detaches_unconsumed_score_graph_without_changing_trajectory(
     _assert_nested_exact(optimized.opt.state_dict(), reference.opt.state_dict())
 
 
-def test_trainer_retains_score_graph_for_positive_crosscoder_l1(monkeypatch):
+def test_trainer_detaches_score_graph_for_positive_crosscoder_l1(monkeypatch):
     cfg = BSCConfig(
         n_blocks=8,
         block_dim=1,
@@ -296,7 +296,7 @@ def test_trainer_retains_score_graph_for_positive_crosscoder_l1(monkeypatch):
 
     monkeypatch.setattr(trainer.fwd, "scores", observed_scores)
     trainer.step(torch.randn(24, 2, 6), materialize_record=False)
-    assert observed_requires_grad == [True]
+    assert observed_requires_grad == [False]
 
 
 def test_optimizer_numerics_are_explicitly_frozen():
@@ -1118,6 +1118,113 @@ def test_decoder_weighted_token_horizon_uses_scaled_rank_and_unscaled_values(dev
     denominator = (flattened - flattened.mean(dim=0)).pow(2).sum(dim=1).mean()
     expected = (numerator / denominator).nan_to_num(0.0)
     assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("fel", "sasa", "long_horizon", "decoder_weighted_token_horizon"),
+)
+def test_block_auxk_cutoff_ties_choose_lowest_block_indices(
+    device,
+    monkeypatch,
+    variant,
+):
+    cfg = BSCConfig(
+        n_blocks=4,
+        block_dim=1,
+        n_sites=1,
+        d_model=4,
+        k=1,
+        code_activation=(
+            "relu" if variant == "decoder_weighted_token_horizon" else "signed"
+        ),
+        selection_score=(
+            "decoder_weighted"
+            if variant == "decoder_weighted_token_horizon"
+            else "code_norm"
+        ),
+        decoder_constraint="free",
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    x = torch.zeros(2, 1, 4, device=device)
+    z = torch.arange(1, 9, dtype=torch.float32, device=device).view(2, 4, 1)
+    scores = torch.ones(2, 4, device=device)
+    selected = torch.zeros(2, 4, dtype=torch.bool, device=device)
+    if variant == "fel":
+        selected[:, 0] = True
+    out = BSCOutput(
+        torch.zeros_like(x),
+        z,
+        z * selected.unsqueeze(-1),
+        scores,
+        selected,
+    )
+    captured: list[torch.Tensor] = []
+
+    def capture_decode(code, *, add_bias=True, _decoder=None):
+        captured.append(code.detach().clone())
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(model, "decode", capture_decode)
+    if variant in {"sasa", "long_horizon"}:
+        monkeypatch.setattr(model, "encode", lambda *args, **kwargs: z)
+        monkeypatch.setattr(
+            model,
+            "scores",
+            lambda *args, **kwargs: torch.ones(2, 4, device=device),
+        )
+    dead = (
+        None
+        if variant == "fel"
+        else torch.ones(4, dtype=torch.bool, device=device)
+    )
+    assert aux_loss(model, x, out, variant, dead, s_aux=2) is not None
+    support = captured[-1].squeeze(-1) != 0
+    expected = torch.tensor(
+        [[False, True, True, False]] * 2
+        if variant == "fel"
+        else [[True, True, False, False]] * 2,
+        device=device,
+    )
+    assert torch.equal(support, expected)
+
+
+def test_sasa_release_auxk_cutoff_ties_use_row_major_scalar_coordinate_order(
+    device,
+    monkeypatch,
+):
+    cfg = BSCConfig(
+        n_blocks=3,
+        block_dim=2,
+        n_sites=1,
+        d_model=4,
+        k=1,
+        decoder_constraint="free",
+    )
+    model = BlockCrosscoder(cfg).to(device)
+    x = torch.zeros(2, 1, 4, device=device)
+    z = torch.ones(2, 3, 2, device=device)
+    out = BSCOutput(
+        torch.zeros_like(x),
+        z,
+        torch.zeros_like(z),
+        torch.ones(2, 3, device=device),
+        torch.zeros(2, 3, dtype=torch.bool, device=device),
+    )
+    captured: list[torch.Tensor] = []
+
+    def capture_decode(code, *, add_bias=True, _decoder=None):
+        captured.append(code.detach().clone())
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(model, "decode", capture_decode)
+    dead = torch.ones(3, 2, dtype=torch.bool, device=device)
+    assert aux_loss(model, x, out, "sasa_release", dead, s_aux=2) is not None
+    expected = torch.tensor(
+        [[[True, True], [False, False], [False, False]]] * 2,
+        device=device,
+    )
+    assert torch.equal(captured[-1] != 0, expected)
 
 
 @pytest.mark.parametrize(

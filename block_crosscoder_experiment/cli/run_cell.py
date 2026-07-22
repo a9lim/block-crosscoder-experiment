@@ -37,6 +37,13 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import torch
 import numpy as np
 
+from block_crosscoder_experiment.cli.data import (
+    capture_implementation_contract,
+    expected_capture_allocation,
+    expected_capture_source_contract,
+    validate_capture_manifest,
+)
+
 from block_crosscoder_experiment.campaign import (
     ARTIFACT_SCHEMA,
     CAMPAIGN_SCHEMA,
@@ -44,6 +51,7 @@ from block_crosscoder_experiment.campaign import (
     CampaignError,
     EVALUATION_EXECUTION_IMPLEMENTATION,
     EVALUATION_SCHEMA,
+    PREPARATION_SCHEMA,
     QUALIFICATION_SCHEMA,
 )
 from block_crosscoder_experiment.codec import (
@@ -134,9 +142,8 @@ from block_crosscoder_experiment.trainer import (
 
 
 _NATIVE_TORCH_SAVE = torch.save
-PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v11"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v12"
 EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
@@ -1174,7 +1181,15 @@ def _implementation_identity() -> dict[str, Any]:
     except (OSError, subprocess.CalledProcessError):
         pass
     dependencies: dict[str, str | None] = {}
-    for distribution in ("numpy", "safetensors", "torch"):
+    for distribution in (
+        "datasets",
+        "huggingface-hub",
+        "numpy",
+        "sae-lens",
+        "safetensors",
+        "torch",
+        "transformers",
+    ):
         try:
             dependencies[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
@@ -1191,6 +1206,10 @@ def _implementation_identity() -> dict[str, Any]:
         "torch_cuda_build": torch.version.cuda,
         "dependencies": dependencies,
     }
+
+
+def _implementation_identity_sha256(identity: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(dict(identity)).encode("utf-8")).hexdigest()
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -1707,30 +1726,6 @@ def _intervals_are_disjoint(intervals: Mapping[str, Mapping[str, Any]]) -> bool:
     return all(left[1][0] < right[0][0] for left, right in zip(ordered, ordered[1:]))
 
 
-def _single_source_value(values: Mapping[str, Any], name: str) -> str:
-    resolved = tuple(str(item) for item in values[name])
-    if len(resolved) != 1:
-        raise CellExecutionError(
-            f"{name} must contain exactly one value for this capture contract, "
-            f"got {resolved!r}"
-        )
-    return resolved[0]
-
-
-def _per_site_source_values(
-    values: Mapping[str, Any], name: str, *, n_sites: int
-) -> tuple[str, ...]:
-    resolved = tuple(str(item) for item in values[name])
-    if len(resolved) == 1:
-        return resolved * n_sites
-    if len(resolved) != n_sites:
-        raise CellExecutionError(
-            f"{name} must have one shared value or one value per captured site; "
-            f"got {len(resolved)} for {n_sites} sites"
-        )
-    return resolved
-
-
 def _resolved_capture_contract(values: Mapping[str, Any]) -> dict[str, Any]:
     """Decode the cell's immutable capture decisions into their JSON shape.
 
@@ -1767,47 +1762,12 @@ def _resolved_capture_contract(values: Mapping[str, Any]) -> dict[str, Any]:
 def _expected_real_source_contract(values: Mapping[str, Any]) -> dict[str, Any]:
     """Materialize the exact scientific capture contract from cell decisions."""
 
-    hooks = tuple(str(item) for item in values["data.store_sites"])
-    if not hooks:
-        raise CellExecutionError("data.store_sites cannot be empty")
-    models = _per_site_source_values(values, "data.source_models", n_sites=len(hooks))
-    revisions = _per_site_source_values(
-        values, "data.source_model_revisions", n_sites=len(hooks)
-    )
-    drop_policy = str(values["data.context_drop_policy"])
-    if drop_policy == "none":
-        drop_positions = 0
-    elif drop_policy == "drop_bos_position_0":
-        drop_positions = 1
-    else:
+    try:
+        return expected_capture_source_contract(values)
+    except (KeyError, TypeError, ValueError) as exc:
         raise CellExecutionError(
-            f"unsupported data.context_drop_policy {drop_policy!r}"
-        )
-    base = {
-        "sources": [
-            {"model": model, "revision": revision, "hook": hook}
-            for model, revision, hook in zip(models, revisions, hooks)
-        ],
-        "corpus": _single_source_value(values, "data.corpus"),
-        "corpus_config": _single_source_value(values, "data.corpus_config"),
-        "corpus_revision": _single_source_value(values, "data.corpus_revision"),
-        "corpus_split": _single_source_value(values, "data.corpus_split"),
-        "context": int(values["data.context_length"]),
-        "drop_positions": drop_positions,
-        "tokenizer_hashes": list(str(item) for item in values["data.tokenizer_hashes"]),
-        "tokenizer_contract": str(values["data.tokenizer_contract"]),
-        "store_contract_version": str(values["data.store_contract_version"]),
-        "alignment_version": str(values["data.alignment_version"]),
-        "alignment_audit": str(values["data.alignment_audit"]),
-    }
-    capture = _resolved_capture_contract(values)
-    overlap = set(base).intersection(capture)
-    if overlap:
-        raise CellExecutionError(
-            "data.capture_contract duplicates separately resolved source fields: "
-            + ", ".join(sorted(overlap))
-        )
-    return {**base, **capture}
+            f"invalid resolved capture source contract: {exc}"
+        ) from exc
 
 
 def _verify_real_source_contract(
@@ -1835,36 +1795,10 @@ def _expected_capture_allocation(
 ) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
     """Rebuild the canonical whole-sequence allocation from cell decisions."""
 
-    declared_items = tuple(values["data.split_sizes"])
-    split_order = tuple(str(name) for name, _ in declared_items)
-    drop_policy = str(values["data.context_drop_policy"])
-    if drop_policy == "none":
-        drop_positions = 0
-    elif drop_policy == "drop_bos_position_0":
-        drop_positions = 1
-    else:
-        raise CellExecutionError(
-            f"unsupported data.context_drop_policy {drop_policy!r}"
-        )
-    tokens_per_sequence = int(values["data.context_length"]) - drop_positions
-    if tokens_per_sequence <= 0:
-        raise CellExecutionError("capture tokens per sequence must be positive")
-    next_sequence = 0
-    plan: dict[str, dict[str, int]] = {}
-    for name, requested in declared_items:
-        name = str(name)
-        requested = int(requested)
-        n_sequences = math.ceil(requested / tokens_per_sequence)
-        sequence_stop = next_sequence + n_sequences
-        plan[name] = {
-            "requested_tokens": requested,
-            "actual_tokens": n_sequences * tokens_per_sequence,
-            "sequence_start": next_sequence,
-            "sequence_stop_exclusive": sequence_stop,
-            "tokens_per_sequence": tokens_per_sequence,
-        }
-        next_sequence = sequence_stop
-    return split_order, plan
+    try:
+        return expected_capture_allocation(values)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CellExecutionError(f"invalid resolved capture split allocation: {exc}") from exc
 
 
 def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[str, Any]:
@@ -1874,6 +1808,10 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
             f"raw activation store lacks immutable source contract {capture_path}"
         )
     capture = _read_object(capture_path, label="capture source contract")
+    try:
+        capture_binding = validate_capture_manifest(capture)
+    except ValueError as exc:
+        raise CellExecutionError(f"capture source contract is unauthenticated: {exc}") from exc
     source = capture.get("source")
     source_hash = capture.get("source_hash")
     if not isinstance(source, dict) or not isinstance(source_hash, str):
@@ -1884,6 +1822,32 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
     if computed_source_hash != source_hash:
         raise CellExecutionError("capture source contract hash mismatch")
     declared = _verify_real_source_contract(source, values)
+    capture_implementation = capture.get("capture_implementation")
+    expected_implementation = capture_implementation_contract()
+    if not isinstance(capture_implementation, dict):
+        raise CellExecutionError("capture implementation contract is malformed")
+    observed_core = {
+        key: capture_implementation.get(key) for key in expected_implementation
+    }
+    if observed_core != expected_implementation:
+        raise CellExecutionError(
+            "capture implementation differs from the current reviewed producer: "
+            + canonical_json(
+                {"expected": expected_implementation, "observed": observed_core}
+            )
+        )
+    runtime = capture_implementation.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or set(runtime)
+        != {"requested_device", "torch_cuda_version", "cuda_device_name"}
+        or not isinstance(runtime.get("requested_device"), str)
+    ):
+        raise CellExecutionError("capture runtime provenance is malformed")
+    if values["runtime.smoke"] is False and not runtime["requested_device"].startswith(
+        "cuda"
+    ):
+        raise CellExecutionError("scientific activation capture must run on CUDA")
     split_order, split_plan = _expected_capture_allocation(values)
     if capture.get("schema") != "bsc-capture-manifest-v1":
         raise CellExecutionError("capture source contract has an unknown schema")
@@ -1907,6 +1871,8 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
         "split_order": split_order,
         "split_plan": split_plan,
         "capture_binding_sha256": capture_binding_sha256,
+        "capture_binding": capture_binding,
+        "capture_implementation": capture_implementation,
     }
 
 
@@ -2706,11 +2672,11 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
         )
     declared_device = _declared_device(values)
     implementation = _implementation_identity()
-    if ctx.cell.phase is Phase.PHASE3 and (
+    if values["runtime.smoke"] is False and (
         implementation["git_commit"] is None or implementation["git_dirty"] is not False
     ):
         raise CellExecutionError(
-            "Phase 3 requires a clean committed implementation; source identity "
+            "scientific cells require a clean committed implementation; source identity "
             f"is commit={implementation['git_commit']!r}, "
             f"dirty={implementation['git_dirty']!r}"
         )
@@ -2802,6 +2768,7 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
             "universe_sha256": values["selection.universe_sha256"],
         },
         "implementation": implementation,
+        "implementation_sha256": _implementation_identity_sha256(implementation),
     }
     _write_immutable_json(ctx.preparation, payload)
     return (("preparation", ctx.preparation),)
@@ -3303,6 +3270,10 @@ def _load_preparation(path: Path, cell_id: str) -> dict[str, Any]:
             "implementation changed after prepare; create a new content-addressed "
             "campaign cell before executing another stage"
         )
+    if payload.get("implementation_sha256") != _implementation_identity_sha256(
+        current_implementation
+    ):
+        raise CellExecutionError("preparation implementation digest mismatch")
     return payload
 
 
@@ -6308,6 +6279,12 @@ def _synthetic_recovery(
         "selection_mode": selection_mode,
         "shared_feature_claim_eligible": shared_feature_claim_eligible,
         "shared_feature_claim_reason": shared_feature_claim_reason,
+        "identification_metrics_eligible": subspace_eligible,
+        "identification_metrics_ineligible_reason": (
+            None
+            if subspace_eligible
+            else "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+        ),
         "n_factor_calibration_examples": matching_examples,
         "n_examples": evaluation_examples,
         "n_truth_factors": n_factors,
@@ -6375,6 +6352,26 @@ def _phase1_identification_evidence(
             "unknown Phase-1 identification threshold table: "
             + canonical_json(sorted(thresholds))
         )
+    if recovery.get("identification_metrics_eligible") is False:
+        reason = recovery.get("identification_metrics_ineligible_reason")
+        if not isinstance(reason, str) or not reason:
+            raise CellExecutionError(
+                "ineligible Phase-1 identification evidence lacks a reason"
+            )
+        return {
+            "applicable": False,
+            "ineligible_reason": reason,
+            "thresholds": thresholds,
+            "per_factor": [],
+            "aggregate": {
+                "support_precision_diagnostic": recovery.get("support_precision"),
+                "support_recall_diagnostic": recovery.get("support_recall"),
+            },
+            "checks": {},
+            "normalized_margins": {},
+            "margin": None,
+            "passed": None,
+        }
     matching = recovery.get("matching") or {}
     association = matching.get("best_support_association_f1")
     overlap = matching.get("matched_subspace_overlap")
@@ -6526,6 +6523,8 @@ def _phase1_identification_evidence(
     }
     margin = min(normalized_margins.values())
     return {
+        "applicable": True,
+        "ineligible_reason": None,
         "thresholds": thresholds,
         "per_factor": per_factor,
         "aggregate": aggregate,
@@ -8492,19 +8491,27 @@ def _selection_validation_metrics(
     *,
     identification: Mapping[str, Any] | None,
     fixed_rate: Mapping[str, Any],
-) -> dict[str, bool | float]:
+) -> dict[str, bool | float | None]:
     """Map executor endpoints into the schema consumed by live policies."""
 
     if phase is Phase.PHASE1:
+        applicable = bool(
+            identification is not None
+            and all(
+                identification.get(endpoint, {}).get("applicable") is True
+                for endpoint in ("native", "deployed")
+            )
+        )
         return {
+            "phase1_identification_applicable": applicable,
             "phase1_identification_conjunction": bool(
-                identification is not None
+                applicable
                 and identification["native"]["passed"]
                 and identification["deployed"]["passed"]
             ),
             "phase1_identification_margin": (
-                -1.0e9
-                if identification is None
+                None
+                if not applicable
                 else min(
                     float(identification["native"]["margin"]),
                     float(identification["deployed"]["margin"]),
@@ -8523,6 +8530,39 @@ def _selection_validation_metrics(
             "fixed-rate selection score must be finite or ineligible"
         )
     return {PHASE2_SELECTION_METRIC_KEY: float(selection_score)}
+
+
+def _phase1_identification_outcome(
+    phase: Phase,
+    identification: Mapping[str, Any] | None,
+    validation: Mapping[str, Any],
+) -> tuple[bool, dict[str, str]]:
+    """Evaluate or explicitly neutralize the Phase-1 identification check."""
+
+    if phase is not Phase.PHASE1:
+        return True, {}
+    if not isinstance(identification, Mapping):
+        return False, {}
+    endpoints = tuple(identification.get(name, {}) for name in ("native", "deployed"))
+    if all(endpoint.get("applicable") is False for endpoint in endpoints):
+        reasons = {endpoint.get("ineligible_reason") for endpoint in endpoints}
+        if len(reasons) == 1:
+            reason = next(iter(reasons))
+            if isinstance(reason, str) and reason:
+                return True, {"phase1_identification": reason}
+        return False, {}
+    passed = all(
+        endpoint.get("applicable") is True and endpoint.get("passed") is True
+        for endpoint in endpoints
+    )
+    return (
+        bool(
+            passed
+            and validation.get("phase1_identification_applicable") is True
+            and validation.get("phase1_identification_conjunction") is True
+        ),
+        {},
+    )
 
 
 def _evaluate(
@@ -8883,6 +8923,7 @@ def _qualify(
     input_hashes = {
         kind: prerequisites[kind][1]
         for kind in (
+            "preparation",
             "checkpoint",
             "calibration",
             "deployment_codec",
@@ -9361,9 +9402,22 @@ def _qualify(
         and all(
             isinstance(recovery.get(endpoint), dict)
             and isinstance(identification.get(endpoint), dict)
-            and isinstance(identification[endpoint].get("passed"), bool)
-            and finite_number(identification[endpoint].get("margin"))
-            and isinstance(identification[endpoint].get("checks"), dict)
+            and (
+                (
+                    identification[endpoint].get("applicable") is True
+                    and isinstance(identification[endpoint].get("passed"), bool)
+                    and finite_number(identification[endpoint].get("margin"))
+                    and isinstance(identification[endpoint].get("checks"), dict)
+                )
+                or (
+                    identification[endpoint].get("applicable") is False
+                    and identification[endpoint].get("passed") is None
+                    and identification[endpoint].get("margin") is None
+                    and isinstance(
+                        identification[endpoint].get("ineligible_reason"), str
+                    )
+                )
+            )
             for endpoint in ("native", "deployed")
         )
     )
@@ -9377,6 +9431,13 @@ def _qualify(
         )
         and phase1_ranges_ok
         and phase1_endpoint_complete
+    )
+    phase1_identification_passed, inapplicable_scientific_checks = (
+        _phase1_identification_outcome(
+            ctx.cell.phase,
+            identification,
+            evaluation.get("validation", {}),
+        )
     )
     scientific_outcome_checks = {
         "support_target_calibration": (
@@ -9394,20 +9455,7 @@ def _qualify(
             and float(evaluation_excluded)
             <= threshold_map["codec_excluded_evaluation_event_fraction_max"]
         ),
-        "phase1_identification": (
-            ctx.cell.phase is not Phase.PHASE1
-            or (
-                isinstance(identification, dict)
-                and all(
-                    identification.get(endpoint, {}).get("passed") is True
-                    for endpoint in ("native", "deployed")
-                )
-                and evaluation.get("validation", {}).get(
-                    "phase1_identification_conjunction"
-                )
-                is True
-            )
-        ),
+        "phase1_identification": phase1_identification_passed,
         "production_precision_finite": precision_finite_passed,
         "production_precision_reconstruction": (precision_reconstruction_passed),
         "production_precision_support": precision_support_passed,
@@ -9426,6 +9474,7 @@ def _qualify(
     scientific_outcome = {
         "passed": all(scientific_outcome_checks.values()),
         "checks": scientific_outcome_checks,
+        "inapplicable_checks": inapplicable_scientific_checks,
         "margins": {
             "support_target_abs_error": (
                 threshold_map["support_target_abs_error_max"]
@@ -9476,6 +9525,8 @@ def _qualify(
         == input_hashes["deployment_codec"]
         and isinstance(preparation.get("implementation"), dict)
         and preparation["implementation"].get("executor_schema") == EXECUTOR_SCHEMA
+        and preparation.get("implementation_sha256")
+        == _implementation_identity_sha256(preparation["implementation"])
     )
     expected_steps = math.ceil(
         int(ctx.values["data.train_tokens"]) / int(ctx.values["optimizer.batch_tokens"])
@@ -9632,6 +9683,8 @@ def _qualify(
         "checks": checks,
         "scientific_outcome": scientific_outcome,
         "inputs": input_hashes,
+        "implementation_identity": preparation["implementation"],
+        "implementation_identity_sha256": preparation["implementation_sha256"],
         "validation": evaluation["validation"],
         "qualification_profile": ctx.values["qualification.profile"],
         "thresholds_version": ctx.values["qualification.thresholds_version"],

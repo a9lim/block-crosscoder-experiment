@@ -16,6 +16,11 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
+from block_crosscoder_experiment.cli.data import (
+    expected_capture_allocation,
+    expected_capture_source_contract,
+    validate_capture_manifest,
+)
 from block_crosscoder_experiment.campaign import (
     Campaign,
     CampaignError,
@@ -209,6 +214,7 @@ def _configured_input_roots() -> tuple[Path, ...]:
 def _verified_existing_input_storage(
     *,
     verification_cache_root: Path | None = None,
+    plan=None,
 ) -> dict[str, object]:
     """Hash-verify configured immutable inputs and count their physical bytes.
 
@@ -216,6 +222,46 @@ def _verified_existing_input_storage(
     Merely pointing an environment variable at a directory never buys storage
     credit, and overlapping environment roots are deduplicated by resolved path.
     """
+
+    if plan is not None and plan.phase is Phase.PHASE1:
+        return {
+            "verified_existing_input_bytes": 0,
+            "inputs": [],
+            "plan_input_contract": "stateless_phase1_no_input_credit",
+        }
+
+    expected_source: dict[str, object] | None = None
+    expected_source_hash: str | None = None
+    expected_split_plan: dict[str, dict[str, int]] | None = None
+    expected_split_order: tuple[str, ...] | None = None
+    expected_normalizations: set[str] | None = None
+    if plan is not None:
+        cells = [cell for stage in plan.stages for cell in stage.cells]
+        if not cells:
+            raise StudyError("cannot price inputs for an empty materialized plan")
+        contracts = []
+        allocations = []
+        for cell in cells:
+            values = cell.decision_map
+            try:
+                contracts.append(expected_capture_source_contract(values))
+                allocations.append(expected_capture_allocation(values))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StudyError(
+                    f"cannot resolve plan-bound activation input for {cell.cell_id}: {exc}"
+                ) from exc
+        expected_source = contracts[0]
+        expected_split_order, expected_split_plan = allocations[0]
+        if any(contract != expected_source for contract in contracts[1:]) or any(
+            allocation != allocations[0] for allocation in allocations[1:]
+        ):
+            raise StudyError(
+                "materialized plan does not share one immutable capture contract"
+            )
+        expected_source_hash = _canonical_hash(expected_source)
+        expected_normalizations = {
+            str(cell.decision_map["data.normalization"]) for cell in cells
+        }
 
     counted_files: set[Path] = set()
     records: list[dict[str, object]] = []
@@ -227,6 +273,30 @@ def _verified_existing_input_storage(
         root_files: set[Path] = set()
         verified_splits: list[str] = []
         verified_transforms: list[str] = []
+        eligible_capture_files: set[Path] = set()
+        for capture_path in root.rglob("capture.json"):
+            try:
+                capture = json.loads(capture_path.read_text())
+                if not isinstance(capture, dict):
+                    raise ValueError("manifest must be an object")
+                if plan is None and "capture_binding" not in capture:
+                    source = capture.get("source")
+                    if not isinstance(source, dict) or capture.get(
+                        "source_hash"
+                    ) != _canonical_hash(source):
+                        raise ValueError("capture source hash mismatch")
+                else:
+                    validate_capture_manifest(capture)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise StudyError(
+                    f"invalid capture manifest {capture_path}: {exc}"
+                ) from exc
+            if expected_source is None or (
+                capture.get("source") == expected_source
+                and capture.get("split_order") == list(expected_split_order or ())
+                and capture.get("split_plan") == expected_split_plan
+            ):
+                eligible_capture_files.add(capture_path.resolve())
         for manifest_path in split_manifests:
             split_dir = manifest_path.parent
             try:
@@ -239,10 +309,31 @@ def _verified_existing_input_storage(
                 raise StudyError(
                     f"unverified activation split at {split_dir}: {exc}"
                 ) from exc
-            root_files.add(manifest_path.resolve())
-            for shard in reader.manifest["shards"]:
-                root_files.add((split_dir / shard["file"]).resolve())
-            verified_splits.append(str(split_dir.relative_to(root)))
+            meta = reader.manifest.get("meta", {})
+            eligible = expected_source is None
+            if expected_source is not None and expected_split_plan is not None:
+                allocation = expected_split_plan.get(split_dir.name)
+                source_matches = meta.get("source_hash") == expected_source_hash
+                if not source_matches and str(reader.whitener_hash) == (
+                    f"raw:{expected_source_hash}"
+                ):
+                    source_matches = True
+                eligible = bool(
+                    allocation is not None
+                    and source_matches
+                    and meta.get("split_requested_tokens")
+                    == allocation["requested_tokens"]
+                    and meta.get("split_actual_tokens") == allocation["actual_tokens"]
+                    and reader.n_tokens == allocation["actual_tokens"]
+                )
+                normalization = meta.get("normalization")
+                if meta.get("derived_view") is True:
+                    eligible = eligible and normalization in expected_normalizations
+            if eligible:
+                root_files.add(manifest_path.resolve())
+                for shard in reader.manifest["shards"]:
+                    root_files.add((split_dir / shard["file"]).resolve())
+                verified_splits.append(str(split_dir.relative_to(root)))
         for manifest_path in transform_manifests:
             try:
                 manifest = json.loads(manifest_path.read_text())
@@ -267,22 +358,19 @@ def _verified_existing_input_storage(
                 ) from exc
             if transform.hash != manifest.get("transform_hash"):
                 raise StudyError(f"transform hash mismatch at {manifest_path.parent}")
-            root_files.update((manifest_path.resolve(), transform_path.resolve()))
-            verified_transforms.append(str(manifest_path.parent.relative_to(root)))
-        for capture_path in root.rglob("capture.json"):
-            try:
-                capture = json.loads(capture_path.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                raise StudyError(
-                    f"invalid capture manifest {capture_path}: {exc}"
-                ) from exc
-            source = capture.get("source")
-            if not isinstance(source, dict) or capture.get(
-                "source_hash"
-            ) != _canonical_hash(source):
-                raise StudyError(f"capture source hash mismatch at {capture_path}")
-            root_files.add(capture_path.resolve())
-        if not verified_splits and not verified_transforms:
+            eligible = expected_source is None or (
+                manifest.get("source_hash") == expected_source_hash
+                and manifest.get("mode") in expected_normalizations
+                and manifest.get("source_fit_requested_tokens")
+                == (expected_split_plan or {})
+                .get("normalization_fit", {})
+                .get("requested_tokens")
+            )
+            if eligible:
+                root_files.update((manifest_path.resolve(), transform_path.resolve()))
+                verified_transforms.append(str(manifest_path.parent.relative_to(root)))
+        root_files.update(eligible_capture_files)
+        if expected_source is None and not verified_splits and not verified_transforms:
             raise StudyError(
                 f"configured input contains no verified split or transform artifact: {root}"
             )
@@ -295,6 +383,7 @@ def _verified_existing_input_storage(
                 "verified_bytes": byte_count,
                 "splits": verified_splits,
                 "transforms": verified_transforms,
+                "eligible_for_plan": bool(root_files),
             }
         )
     return {
@@ -305,29 +394,35 @@ def _verified_existing_input_storage(
     }
 
 
-def _storage_preflight(root: Path, estimated_storage_bytes: int) -> dict[str, object]:
+def _storage_preflight(
+    root: Path,
+    estimated_storage_bytes: int,
+    *,
+    plan=None,
+) -> dict[str, object]:
     existing = _verified_existing_input_storage(
-        verification_cache_root=root / ".store-verification"
+        verification_cache_root=root / ".store-verification",
+        plan=plan,
     )
-    checkpoint_files: set[Path] = set()
+    campaign_artifact_files: set[Path] = set()
     if (root / "plan.json").is_file():
         existing_campaign = Campaign(root)
         for record in existing_campaign.records():
-            checkpoint = record.artifact_map.get("checkpoint")
-            if checkpoint is None:
-                continue
-            checkpoint.verify(root)
-            checkpoint_files.add(checkpoint.resolve(root).resolve())
-    checkpoint_bytes = sum(path.stat().st_size for path in checkpoint_files)
+            for artifact in record.artifact_map.values():
+                artifact.verify(root)
+                campaign_artifact_files.add(artifact.resolve(root).resolve())
+    campaign_artifact_bytes = sum(
+        path.stat().st_size for path in campaign_artifact_files
+    )
     input_credit = min(
         estimated_storage_bytes,
         int(existing["verified_existing_input_bytes"]),
     )
-    checkpoint_credit = min(
+    campaign_artifact_credit = min(
         max(0, estimated_storage_bytes - input_credit),
-        checkpoint_bytes,
+        campaign_artifact_bytes,
     )
-    credited = input_credit + checkpoint_credit
+    credited = input_credit + campaign_artifact_credit
     additional = max(0, estimated_storage_bytes - credited)
     parent = _nearest_existing_parent(root)
     free = shutil.disk_usage(parent).free
@@ -335,9 +430,9 @@ def _storage_preflight(root: Path, estimated_storage_bytes: int) -> dict[str, ob
         "estimate_scope": "materialized_plan_prefix_or_frozen_panel",
         "estimated_storage_bytes": estimated_storage_bytes,
         **existing,
-        "verified_existing_campaign_checkpoint_bytes": checkpoint_bytes,
+        "verified_existing_campaign_artifact_bytes": campaign_artifact_bytes,
         "credited_existing_input_bytes": input_credit,
-        "credited_existing_campaign_checkpoint_bytes": checkpoint_credit,
+        "credited_existing_campaign_artifact_bytes": campaign_artifact_credit,
         "credited_existing_storage_bytes": credited,
         "additional_storage_bytes_required": additional,
         "free_bytes": free,
@@ -666,8 +761,9 @@ def _checked_storage_extension(
     estimate,
     *,
     allow_insufficient: bool,
+    plan=None,
 ) -> dict[str, object]:
-    preflight = _storage_preflight(root, estimate.storage_bytes)
+    preflight = _storage_preflight(root, estimate.storage_bytes, plan=plan)
     if not allow_insufficient and not preflight["sufficient"]:
         raise BudgetExceeded(
             f"storage_bytes: conservative cumulative estimate {estimate.storage_bytes}; "
@@ -676,7 +772,7 @@ def _checked_storage_extension(
             f"{preflight['free_bytes']} free bytes at "
             f"{preflight['filesystem_path']} after crediting "
             f"{preflight['credited_existing_storage_bytes']} bytes of hash-verified "
-            "configured inputs and existing campaign checkpoints; choose a larger "
+            "configured inputs and existing campaign artifacts; choose a larger "
             "filesystem or pass "
             "--allow-insufficient-local-storage for planning only"
         )
@@ -939,6 +1035,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.root,
                 estimate,
                 allow_insufficient=args.allow_insufficient_local_storage,
+                plan=plan,
             )
             campaign = Campaign(args.root)
             campaign.register(
@@ -964,8 +1061,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         campaign = Campaign(args.root)
         if args.command == "run":
+            estimate = estimate_plan(campaign.plan)
+            _checked_storage_extension(
+                args.root,
+                estimate,
+                allow_insufficient=False,
+                plan=campaign.plan,
+            )
             summary = _run_with_optional_view_dispatch(campaign, args)
             _print({"run": summary.to_dict(), "status": campaign.status()})
+            if summary.failed_cells:
+                raise SystemExit(1)
         elif args.command == "status":
             _print(campaign.status())
         elif args.command == "reconcile":
@@ -1002,6 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.root,
                 estimate,
                 allow_insufficient=args.allow_insufficient_local_storage,
+                plan=extended,
             )
             campaign.extend(
                 extended,
@@ -1038,6 +1145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.root,
                 estimate,
                 allow_insufficient=args.allow_insufficient_local_storage,
+                plan=extended,
             )
             campaign.extend_family(
                 extended,
@@ -1080,6 +1188,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.root,
                 estimate,
                 allow_insufficient=args.allow_insufficient_local_storage,
+                plan=extended,
             )
             campaign.extend_family_revisit(
                 extended,

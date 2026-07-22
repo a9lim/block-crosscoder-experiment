@@ -53,6 +53,7 @@ from .model import (
     BlockCrosscoder,
     BSCConfig,
     BSCOutput,
+    _token_topk_interior,
     bsc_loss,
     bsc_reconstruction_loss,
 )
@@ -1060,9 +1061,12 @@ def aux_loss(
             return None
         flat = out.z.reshape(B, -1)
         masked = flat.masked_fill(~dead_coordinates.view(1, -1), float("-inf"))
-        top = masked.topk(keep, dim=1, sorted=False).indices
-        aux_flat = torch.zeros_like(flat)
-        aux_flat.scatter_(1, top, masked.gather(1, top))
+        # Scalar-coordinate candidate order is the row-major flattening of
+        # [block, coordinate].  This is the same declared lowest-index cutoff
+        # rule as the main token selector, applied to the release's scalar
+        # rather than block candidates.
+        aux_mask = _token_topk_interior(masked, keep)
+        aux_flat = flat * aux_mask
         residual = (x - out.xhat).detach()
         rhat = model.decode(aux_flat.view_as(out.z), add_bias=True)
         return reconstruction(rhat - residual, residual)
@@ -1090,10 +1094,9 @@ def aux_loss(
         if keep <= 0:
             return None
         ranked = out.scores.masked_fill(~dead.view(1, -1), float("-inf")).detach()
-        top = ranked.topk(keep, dim=1, sorted=False).indices
+        aux_mask = _token_topk_interior(ranked, keep)
         flat = out.z.squeeze(-1)
-        aux_flat = torch.zeros_like(flat)
-        aux_flat.scatter_(1, top, flat.gather(1, top))
+        aux_flat = flat * aux_mask
         residual = (x - out.xhat).detach()
         rhat = model.decode(aux_flat.unsqueeze(-1), add_bias=False)
         value = reconstruction(rhat - residual, residual)
@@ -1115,9 +1118,7 @@ def aux_loss(
             observed=encoder_observed,
         ).masked_fill(~dead.view(1, -1), float("-inf"))
 
-    top = p.topk(keep, dim=1, sorted=False).indices
-    mask = torch.zeros(B, G, dtype=torch.bool, device=p.device)
-    mask.scatter_(1, top, True)
+    mask = _token_topk_interior(p, keep)
     rhat = model.decode(z_aux * mask.unsqueeze(-1), add_bias=False)
     return reconstruction(rhat - residual, residual)
 
@@ -1759,10 +1760,11 @@ class Trainer:
                 x,
                 observed=encoder_observed,
                 validate_observed=False,
-                _score_grad=(
-                    self.fwd.cfg.lambda_regularizer > 0
-                    and self.fwd.cfg.regularizer == "crosscoder_l1"
-                ),
+                # Hard-selection scores are not an objective carrier.  The
+                # crosscoder L1 bridge consumes the unscaled code and decoder
+                # norms directly, so retaining this graph would only preserve
+                # the former decoder-cost-squaring bug's extra graph.
+                _score_grad=False,
             )
             # The target mask is the true data-availability mask, not the
             # stochastic augmentation mask: hidden clean sites remain targets.

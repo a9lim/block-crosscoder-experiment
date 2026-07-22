@@ -2840,7 +2840,12 @@ def bsc_loss(
                 site_cost = per_site.sum(dim=0)
             else:
                 site_cost = per_site.pow(2).sum(dim=0).sqrt()
-            reg = (out.scores.float() * site_cost.unsqueeze(0)).sum(dim=1).mean()
+            # The objective is activation times decoder cost.  Selection
+            # scores are not the activation carrier: under the paper-faithful
+            # ``decoder_weighted`` bridge they already contain ``site_cost``
+            # and using them here would silently square the decoder penalty.
+            activation = out.z.float().norm(dim=-1)
+            reg = (activation * site_cost.unsqueeze(0)).sum(dim=1).mean()
         elif cfg.regularizer == "group_l21":
             # Fel Group-Lasso BSF: mean over examples of the sum of activated
             # block norms.  The learned group soft threshold lives in encode.
