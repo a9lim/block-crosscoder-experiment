@@ -69,6 +69,11 @@ from block_crosscoder_experiment.store import (
     Whitener,
     prefetch_batches,
 )
+from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    decoded_energy_code_norm_eligible,
+)
 from block_crosscoder_experiment.studies import (
     CellSpec,
     Phase,
@@ -87,7 +92,7 @@ from block_crosscoder_experiment.studies import (
     build_phase3_plan,
     canonical_json,
 )
-from block_crosscoder_experiment.trainer import TrainConfig, Trainer
+from block_crosscoder_experiment.trainer import TrainConfig, Trainer, validate_run_binding
 
 
 EVALUATION_SCHEMA = "bsc-evaluation-v1"
@@ -2582,6 +2587,33 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         raise CellExecutionError(
             f"unknown objective.regularizer_schedule {regularizer_schedule!r}"
         )
+    site_rank = (
+        None if values["model.site_rank"] is None else int(values["model.site_rank"])
+    )
+    selection_score = str(values["model.selection_score"])
+    decoded_energy_implementation = str(
+        values["implementation.decoded_energy_implementation"]
+    )
+    eligible_score_specialization = decoded_energy_code_norm_eligible(
+        selection_score=selection_score,
+        decoder_constraint=constraint,
+        training_selector=selection,
+        site_rank=site_rank,
+        retract_every=int(values["optimizer.retract_every_steps"]),
+    )
+    if decoded_energy_implementation not in {
+        DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    }:
+        raise CellExecutionError("unknown decoded-energy implementation identity")
+    if (
+        decoded_energy_implementation
+        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        and not eligible_score_specialization
+    ):
+        raise CellExecutionError(
+            "stiefel decoded-energy implementation violates its carrier predicate"
+        )
     return BSCConfig(
         n_blocks=total_groups,
         block_dim=int(values["model.block_width"]),
@@ -2602,13 +2634,10 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         encoder_scale_init=float(values["model.encoder_scale_init"]),
         source_site=int(values["model.source_site"]),
         code_activation=activation,
-        selection_score=str(values["model.selection_score"]),
+        selection_score=selection_score,
+        decoded_energy_implementation=decoded_energy_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
-        site_rank=(
-            None
-            if values["model.site_rank"] is None
-            else int(values["model.site_rank"])
-        ),
+        site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),
         decoder_constraint=constraint,
         group_threshold_scope=str(values["model.threshold_scope"]),
@@ -3176,6 +3205,8 @@ def _load_deployable_codec(
         state = payload["model_state"]
         if not isinstance(cfg_payload, dict) or not isinstance(state, dict):
             raise TypeError("model config/state must be mappings")
+        if "decoded_energy_implementation" not in cfg_payload:
+            raise ValueError("model config lacks decoded_energy_implementation")
         model = BlockCrosscoder(BSCConfig(**cfg_payload))
         if set(cfg_payload) != set(asdict(model.cfg)):
             raise ValueError("model config does not contain the exact resolved fields")
@@ -3196,10 +3227,19 @@ def _load_deployable_codec(
                 raise ValueError(f"model state tensor {name} is nonfinite")
         model.load_state_dict(state, strict=True)
         model = model.to(device).eval()
+        model.validate_decoded_energy_implementation()
         codec_payload = payload["codec_payload"]
         if not isinstance(codec_payload, dict):
             raise TypeError("nested codec payload must be a mapping")
         codec = Codec.from_payload(codec_payload, source=f"{path}:codec_payload")
+        nested_model_cfg = codec.meta.get("model_cfg")
+        if (
+            not isinstance(nested_model_cfg, dict)
+            or canonical_json(nested_model_cfg) != canonical_json(cfg_payload)
+        ):
+            raise ValueError(
+                "nested codec model config differs from the deployed model config"
+            )
         summary = payload["training_summary"]
         if not isinstance(summary, dict) or set(summary) != {
             "step_idx",
@@ -3876,6 +3916,51 @@ def _production_precision_preflight(
     }
 
 
+@torch.no_grad()
+def _decoded_energy_specialization_preflight(
+    model: BlockCrosscoder,
+    train_cfg: TrainConfig,
+) -> dict[str, Any]:
+    """Bind the score specialization's master and forward-copy geometry."""
+
+    master = model.validate_decoded_energy_implementation()
+    if not master["applicable"]:
+        return {
+            "schema": "bsc-decoded-energy-specialization-v1",
+            "applicable": False,
+            "implementation": model.cfg.decoded_energy_implementation,
+            "passed": True,
+        }
+    if not decoded_energy_code_norm_eligible(
+        selection_score=model.cfg.selection_score,
+        decoder_constraint=model.cfg.decoder_constraint,
+        training_selector=model.cfg.selection,
+        site_rank=model.cfg.site_rank,
+        retract_every=train_cfg.retract_every,
+    ):
+        raise CellExecutionError(
+            "decoded-energy specialization disagrees with resolved trainer cadence"
+        )
+    if train_cfg.forward_dtype == "bf16":
+        forward_model = copy.deepcopy(model).to(torch.bfloat16)
+        try:
+            forward = forward_model.validate_decoded_energy_implementation()
+        finally:
+            del forward_model
+    else:
+        forward = dict(master)
+    passed = bool(master["passed"] and forward["passed"])
+    return {
+        "schema": "bsc-decoded-energy-specialization-v1",
+        "applicable": True,
+        "implementation": model.cfg.decoded_energy_implementation,
+        "master": master,
+        "forward": forward,
+        "retract_every_steps": train_cfg.retract_every,
+        "passed": passed,
+    }
+
+
 def _binding(
     ctx: _Context,
     preparation: Mapping[str, Any],
@@ -3908,6 +3993,19 @@ def _validate_final_checkpoint(
         ) from exc
     if payload.get("run_binding") != binding:
         raise CellExecutionError("existing checkpoint has a different run binding")
+    try:
+        validate_run_binding(
+            payload.get("run_binding"),
+            {
+                "model_cfg": payload.get("model_cfg"),
+                "train_cfg": payload.get("train_cfg"),
+            },
+            keys=("model_cfg", "train_cfg"),
+        )
+    except ValueError as exc:
+        raise CellExecutionError(
+            "checkpoint top-level configuration disagrees with its run binding"
+        ) from exc
     data_cursor = payload.get("data_cursor")
     if not isinstance(data_cursor, dict):
         raise CellExecutionError("final checkpoint lacks exact data-cursor state")
@@ -3933,6 +4031,13 @@ def _validate_final_checkpoint(
     history = payload.get("history")
     previous_shares = payload.get("diagnostic_prev_shares")
     model_payload = payload.get("model_cfg")
+    if (
+        not isinstance(model_payload, dict)
+        or "decoded_energy_implementation" not in model_payload
+    ):
+        raise CellExecutionError(
+            "final checkpoint lacks decoded_energy_implementation identity"
+        )
     expected_share_shape = (
         (
             int(model_payload.get("n_sites", -1)),
@@ -3978,6 +4083,7 @@ def _training_report_payload(
         raise CellExecutionError("final checkpoint lacks initialization provenance")
     regularizer_calibration = initialization.get("regularizer_calibration")
     precision_preflight = initialization.get("precision_preflight")
+    decoded_energy_preflight = initialization.get("decoded_energy_specialization")
     if not isinstance(regularizer_calibration, Mapping):
         raise CellExecutionError(
             "final checkpoint lacks regularizer-calibration provenance"
@@ -3985,6 +4091,10 @@ def _training_report_payload(
     if not isinstance(precision_preflight, Mapping):
         raise CellExecutionError(
             "final checkpoint lacks precision-preflight provenance"
+        )
+    if not isinstance(decoded_energy_preflight, Mapping):
+        raise CellExecutionError(
+            "final checkpoint lacks decoded-energy specialization provenance"
         )
     return {
         "schema": TRAINING_REPORT_SCHEMA,
@@ -4001,6 +4111,7 @@ def _training_report_payload(
         "train_cfg": metadata["train_cfg"],
         "regularizer_calibration": dict(regularizer_calibration),
         "precision_preflight": dict(precision_preflight),
+        "decoded_energy_specialization": dict(decoded_energy_preflight),
     }
 
 
@@ -4043,6 +4154,15 @@ def _train(
     init_x_device = init_x.to(device=device, dtype=torch.float32)
     model.initialize_decoder_bias_(init_x_device)
     model.project_decoder_()
+    # Validate before any encoder/regularizer/precision calibration can invoke
+    # the specialized score path.
+    initialization["decoded_energy_specialization"] = (
+        _decoded_energy_specialization_preflight(model, train_cfg)
+    )
+    if initialization["decoded_energy_specialization"].get("passed") is not True:
+        raise CellExecutionError(
+            "decoded-energy specialization preflight failed before optimizer construction"
+        )
     initialization["encoder_scale_calibration"] = _apply_encoder_scale_calibration(
         ctx, preparation, model
     )
@@ -4124,6 +4244,12 @@ def _train(
             or canonical_json(report.get("precision_preflight"))
             != canonical_json(
                 metadata["run_binding"]["initialization"]["precision_preflight"]
+            )
+            or canonical_json(report.get("decoded_energy_specialization"))
+            != canonical_json(
+                metadata["run_binding"]["initialization"][
+                    "decoded_energy_specialization"
+                ]
             )
         ):
             raise CellExecutionError("training report/checkpoint binding mismatch")

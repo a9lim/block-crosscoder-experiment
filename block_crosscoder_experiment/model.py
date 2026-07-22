@@ -29,8 +29,17 @@ from .gram import (
     _qr_retract_count_tensor_,
     _retract_count_tensor_,
     decoder_nuclear_penalty,
+    gram_residual,
     init_decoder_stack,
     map_nuclear_penalty,
+)
+from .runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_IMPLEMENTATIONS,
+    DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX,
+    DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    decoded_energy_code_norm_eligible,
 )
 
 __all__ = [
@@ -218,6 +227,10 @@ class BSCConfig:
     selection_score: str = (
         "code_norm"  # plus decoder_weighted/decoded_energy/loss decrease
     )
+    # The scientific score name remains decoded_energy.  This separate,
+    # serialized implementation identity permits the Stiefel equality
+    # ||D_g^T z_g||_sites = ||z_g|| only under the guarded carrier below.
+    decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION
     decoder_constraint: str = "gram"  # plus QR, ball/equality Frobenius, row-unit, free
     encoder_constraint: str = "none"  # none | unit_latent
     regularizer: str | None = None  # plus map nuclear, crosscoder L1, group L21
@@ -280,6 +293,11 @@ class BSCConfig:
             raise ValueError(
                 "selection_score must be code_norm, decoder_weighted, or "
                 "decoded_energy, or isolated_loss_decrease"
+            )
+        if self.decoded_energy_implementation not in DECODED_ENERGY_IMPLEMENTATIONS:
+            raise ValueError(
+                "decoded_energy_implementation must be exact_decoder_gram_v1 "
+                "or stiefel_code_norm_bounded_v1"
             )
         if self.decoder_constraint not in {
             "gram",
@@ -453,6 +471,23 @@ class BSCConfig:
                 raise ValueError(
                     "site-axis factorization requires encoder_constraint='none'"
                 )
+        if (
+            self.decoded_energy_implementation
+            == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            and not decoded_energy_code_norm_eligible(
+                selection_score=self.selection_score,
+                decoder_constraint=self.decoder_constraint,
+                training_selector=self.selection,
+                site_rank=self.site_rank,
+                # BSCConfig does not own optimizer cadence.  Trainer repeats
+                # the complete check with its serialized TrainConfig.
+                retract_every=1,
+            )
+        ):
+            raise ValueError(
+                "stiefel code-norm decoded energy requires decoded_energy, "
+                "a Gram/QR unfactorized decoder, and a hard TopK selector"
+            )
 
     @property
     def n_latents(self) -> int:
@@ -792,6 +827,57 @@ class BlockCrosscoder(nn.Module):
             return decoder * self.coordinate_mask
         return decoder
 
+    @property
+    def uses_stiefel_code_norm_decoded_energy(self) -> bool:
+        return (
+            self.cfg.decoded_energy_implementation
+            == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        )
+
+    @torch.no_grad()
+    def validate_decoded_energy_implementation(self) -> dict[str, object]:
+        """Validate the effective decoder geometry used by the fast score.
+
+        This is intentionally called at initialization, diagnostics,
+        checkpoint boundaries, and trained-model load—not every step, where
+        rebuilding the Gram would erase the specialization's measured win.
+        """
+
+        if not self.uses_stiefel_code_norm_decoded_energy:
+            return {
+                "applicable": False,
+                "implementation": self.cfg.decoded_energy_implementation,
+                "passed": True,
+            }
+        if self.parameter_dtype not in {torch.float32, torch.bfloat16}:
+            raise RuntimeError(
+                "stiefel code-norm decoded energy requires fp32 master or "
+                "bf16 forward precision"
+            )
+        residual = float(gram_residual(self.decoder_tensor().float()).max())
+        postcast = self.parameter_dtype == torch.bfloat16
+        limit = (
+            DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX
+            if postcast
+            else DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX
+        )
+        passed = math.isfinite(residual) and residual <= limit
+        record: dict[str, object] = {
+            "applicable": True,
+            "implementation": self.cfg.decoded_energy_implementation,
+            "geometry": "effective_concatenated_decoder_gram",
+            "precision": "bf16_postcast" if postcast else "fp32_master",
+            "gram_residual_max": residual,
+            "gram_residual_maximum": limit,
+            "passed": passed,
+        }
+        if not passed:
+            raise RuntimeError(
+                "stiefel code-norm decoded-energy invariant failed: "
+                f"Gram residual {residual:.6g} exceeds {limit:.6g}"
+            )
+        return record
+
     def encoder_tensor(self) -> torch.Tensor:
         if self.cfg.site_rank is not None:
             assert self.E_site is not None and self.E_core is not None
@@ -1070,19 +1156,24 @@ class BlockCrosscoder(nn.Module):
 
         if torch.is_grad_enabled():
             raise RuntimeError("frozen score geometry requires no-grad execution")
-        D = decoder.float()
         decoder_weight = None
         decoder_gram = None
         site_decoder_gram = None
         if self.cfg.selection_score == "decoder_weighted":
+            D = decoder.float()
             per_site = D.pow(2).sum(dim=(2, 3)).sqrt()
             if self.cfg.decoder_norm_geometry == "sum_l2":
                 decoder_weight = per_site.sum(dim=0)
             else:
                 decoder_weight = per_site.pow(2).sum(dim=0).sqrt()
-        elif self.cfg.selection_score == "decoded_energy":
+        elif (
+            self.cfg.selection_score == "decoded_energy"
+            and not self.uses_stiefel_code_norm_decoded_energy
+        ):
+            D = decoder.float()
             decoder_gram = torch.einsum("sgbd,sgcd->gbc", D, D)
         elif self.cfg.selection_score == "isolated_loss_decrease":
+            D = decoder.float()
             # Preserve the original per-site contraction exactly rather than
             # relying on a different batched kernel to choose the same sums.
             site_decoder_gram = torch.stack(
@@ -1115,8 +1206,13 @@ class BlockCrosscoder(nn.Module):
         ReLU activation multiplied by the sum of its site decoder norms.
         """
         decoder = _decoder
+        fast_decoded_energy = self.uses_stiefel_code_norm_decoded_energy
         if decoder is None and (
-            _score_geometry is not None or self.cfg.selection_score != "code_norm"
+            _score_geometry is not None
+            or (
+                self.cfg.selection_score != "code_norm"
+                and not fast_decoded_energy
+            )
         ):
             decoder = self.decoder_tensor()
         if _score_geometry is not None:
@@ -1125,7 +1221,9 @@ class BlockCrosscoder(nn.Module):
             assert decoder is not None
             if _score_geometry.decoder_key != self._decoder_binding_key(decoder):
                 raise ValueError("score geometry is not bound to this decoder tensor")
-        if self.cfg.selection_score in {"code_norm", "decoder_weighted"}:
+        if self.cfg.selection_score in {"code_norm", "decoder_weighted"} or (
+            self.cfg.selection_score == "decoded_energy" and fast_decoded_energy
+        ):
             score = z.norm(dim=-1)
         if self.cfg.selection_score == "decoder_weighted":
             if _score_geometry is None:
@@ -1144,16 +1242,22 @@ class BlockCrosscoder(nn.Module):
             # Isolated decoded contribution energy. Unlike code_norm this is
             # invariant to reciprocal within-block encoder/decoder gauges, and
             # unlike decoder_weighted it preserves vector-coordinate geometry.
-            if _score_geometry is None:
+            if fast_decoded_energy:
+                # Under the effective concatenated Stiefel constraint this is
+                # decoded contribution energy.  The fp32/bf16 deviation from
+                # the exact Gram quadratic is explicitly release-bounded.
+                pass
+            elif _score_geometry is None:
                 assert decoder is not None
                 D = decoder.float()
                 gram = torch.einsum("sgbd,sgcd->gbc", D, D)
             else:
                 assert _score_geometry.decoder_gram is not None
                 gram = _score_geometry.decoder_gram
-            code = z.float()
-            energy_sq = torch.einsum("ngb,gbc,ngc->ng", code, gram, code)
-            score = energy_sq.clamp_min(0).sqrt().to(z.dtype)
+            if not fast_decoded_energy:
+                code = z.float()
+                energy_sq = torch.einsum("ngb,gbc,ngc->ng", code, gram, code)
+                score = energy_sq.clamp_min(0).sqrt().to(z.dtype)
         elif self.cfg.selection_score == "isolated_loss_decrease":
             if x is None:
                 raise ValueError(

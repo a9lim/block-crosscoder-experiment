@@ -805,7 +805,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v2` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v9-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -907,10 +907,65 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v8-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v9-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
+
+Decoded energy remains the scientific score. Its serialized
+`implementation.decoded_energy_implementation` field selects either the exact
+decoder-Gram quadratic or `stiefel_code_norm_bounded_v1`. The latter is derived
+only for an unfactorized Gram- or QR-constrained decoder, decoded-energy
+scoring, token-TopK or block-BatchTopK training selection, and decoder
+retraction after every optimizer update. Under that carrier it evaluates
+`||z_g||` directly and omits the selector's fp32 decoder Gram; every other
+configuration retains `exact_decoder_gram_v1`. The implementation identity is
+recomputed after every child-cell delta rather than inherited from its parent.
+
+The bounded implementation refuses fp32 master Gram residual above `1e-4` or
+bf16 forward-copy residual above `2e-3` at initialization before score-using
+calibration, periodic diagnostics, checkpoint save, exact resume, trained-model
+load, and deployable-codec load. Checkpoint, run-binding, outer deployable
+model, and nested codec model configurations must agree exactly. These boundary
+checks deliberately avoid rebuilding the Gram on every scored step; the
+required every-update retraction preserves the carrier between them. Release
+fixtures compare exact and specialized paths from identical state. In fp32
+they require score relative L2 drift at most `2e-6`, exact hard support, and
+output, loss, and parameter-gradient relative drift at most `2e-6`. In bf16
+they require score relative L2 drift at most `2e-3`, mask-element disagreement
+at most `1e-3`, support IoU at least `.99`, output relative L2 drift at most
+`.05`, loss relative drift at most `1e-4`, and maximum parameter-gradient
+relative drift at most `.06`. The 25-step trajectory gate additionally
+requires nested model/optimizer-state
+relative L2 drift at most `.05`, active-support disagreement at most `.02`, and
+support IoU at least `.95`. Calibration, threshold inference, codec selection,
+and partial-view selectors use the same centralized score branch. Publication
+evaluation still constructs its exact fp64 site and all-site decoder Grams for
+decoded-energy coverage and concordance; the specialization does not alter
+those endpoints.
+
+On the standardized bf16 CUDA fixture, explicitly casting the code to fp32
+before the norm produces bitwise-identical bf16 scores and support, while the
+Phase-2 score kernel is `2.681x` slower and adds `320 MiB` peak allocation
+instead of `32 MiB`. That non-improvement is excluded; the direct bf16 norm is
+the bound implementation.
+
+The fixed Phase-2 campaign-shape gate (`B=2048`, four sites of width 768,
+2,048 groups, block width four, eight active blocks, bf16 forward) measures the
+complete Trainer step, including every-update polar retraction. Across two
+idle-GPU runs the bounded implementation reduces median step time from
+`16.591 ms` to `12.698 ms` (`23.47%`) and peak allocation by `352.125 MiB`.
+Its identical-state one-step score/loss/maximum-gradient relative drifts are
+`4.39e-4`, `4.16e-7`, and `.03193`, with support IoU `.999390`. Across 25
+paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
+support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
+terminal fp32/bf16 Gram residuals remain within their declared gates.
+
+Estimator v9 conservatively credits only four fp32
+`[batch_tokens, groups, block_width]` selector work buffers plus the omitted
+fp32 score Gram when the explicit bounded identity and its full predicate both
+hold. An otherwise eligible exact implementation receives no credit. Sparse
+evaluation workspace and exact fp64 sharing-Gram residency are unchanged.
 
 The dominant all-observed, unpadded CUDA quadratic objective compiles the fp32
 cast, residual, square, scalar sum, and declared normalization division as one

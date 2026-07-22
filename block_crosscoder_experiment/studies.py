@@ -23,15 +23,19 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
     TRUSTED_DECODE_Q_CHUNK,
+    decoded_energy_code_norm_eligible,
 )
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v8"
+    "dense-linear-memory-v9"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3740,6 +3744,7 @@ def _evaluation_workspace_bytes(
     sites: int,
     site_dim: int,
     selection_score: str,
+    decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION,
 ) -> int:
     """Conservative peak for the fixed-shape CUDA evaluation kernels.
 
@@ -3820,7 +3825,11 @@ def _evaluation_workspace_bytes(
         + 2 * frozen_encoder_site_bytes
         + sparse_native_decode_bytes
     )
-    if selection_score == "decoded_energy":
+    if (
+        selection_score == "decoded_energy"
+        and decoded_energy_implementation
+        != DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    ):
         score_geometry_bytes = groups * block_width**2 * 4
     elif selection_score == "isolated_loss_decrease":
         score_geometry_bytes = sites * groups * block_width**2 * 4
@@ -3829,6 +3838,88 @@ def _evaluation_workspace_bytes(
     else:
         score_geometry_bytes = 0
     return max(trusted_decode_bytes, shared_code_bytes) + score_geometry_bytes
+
+
+def _decoded_energy_code_norm_eligible_values(
+    values: Mapping[str, DecisionValue],
+) -> bool:
+    """Apply the shared predicate to one resolved decision mapping."""
+
+    decoder_constraint = {
+        "per_block_stiefel": "qr",
+        "concatenated_stiefel": "qr",
+        "concatenated_stiefel_polar": "gram",
+    }.get(str(values["model.decoder"]), "other")
+    training_selector = {
+        "token_topk": "token_topk",
+        "block_batchtopk": "batch_topk",
+    }.get(str(values["model.selector"]), "other")
+    return decoded_energy_code_norm_eligible(
+        selection_score=str(values["model.selection_score"]),
+        decoder_constraint=decoder_constraint,
+        training_selector=training_selector,
+        site_rank=(
+            None
+            if values["model.site_rank"] is None
+            else int(values["model.site_rank"])
+        ),
+        retract_every=int(values["optimizer.retract_every_steps"]),
+    )
+
+
+def _derived_decoded_energy_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    return (
+        DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        if _decoded_energy_code_norm_eligible_values(values)
+        else DECODED_ENERGY_EXACT_IMPLEMENTATION
+    )
+
+
+def _bind_derived_decoded_energy_implementation(
+    decisions: Sequence[Decision],
+) -> tuple[Decision, ...]:
+    """Replace any inherited mode with the final resolved carrier identity."""
+
+    values = {decision.name: decision.value for decision in decisions}
+    filtered = tuple(
+        decision
+        for decision in decisions
+        if decision.name != "implementation.decoded_energy_implementation"
+    )
+    return merge_decisions(
+        filtered,
+        (
+            engineering(
+                "implementation.decoded_energy_implementation",
+                _derived_decoded_energy_implementation(values),
+                rationale=(
+                    "derive the bounded Stiefel code-norm kernel from the final "
+                    "score, selector, decoder, factorization, and cadence contract"
+                ),
+            ),
+        ),
+    )
+
+
+def _resolved_decoded_energy_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    """Validate the explicit score-kernel identity used by the planner."""
+
+    eligible = _decoded_energy_code_norm_eligible_values(values)
+    declared = str(values["implementation.decoded_energy_implementation"])
+    if declared not in {
+        DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    }:
+        raise StudyError("unknown decoded-energy implementation identity")
+    if declared == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION and not eligible:
+        raise StudyError(
+            "stiefel decoded-energy implementation violates its carrier predicate"
+        )
+    return declared
 
 
 def _estimate_components(
@@ -3921,14 +4012,23 @@ def _estimate_components(
     batch_tokens = _positive_int(
         values["optimizer.batch_tokens"], "optimizer.batch_tokens"
     )
+    decoded_energy_implementation = _resolved_decoded_energy_implementation(values)
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the
     # preflight.  Fixed evaluation chunk geometry is content-bound through the
     # estimator version and priced explicitly below.  A fixed 2 GiB covers
     # CUDA/PyTorch context and allocator slack.
+    latent_workspace_buffers = 6 - (
+        DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
+        if decoded_energy_implementation
+        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        else 0
+    )
     dense_workspace_values = batch_tokens * (
-        len(site_dims) * max(site_dims) + 6 * shared_coordinates + 2 * groups
+        len(site_dims) * max(site_dims)
+        + latent_workspace_buffers * shared_coordinates
+        + 2 * groups
     )
     quantizer_bits = values["codec.quantizer_bits"]
     if not isinstance(quantizer_bits, tuple) or not quantizer_bits:
@@ -3943,6 +4043,7 @@ def _estimate_components(
         sites=len(site_dims),
         site_dim=max(site_dims),
         selection_score=str(values["model.selection_score"]),
+        decoded_energy_implementation=decoded_energy_implementation,
     )
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0
@@ -7162,7 +7263,9 @@ def _resolved_cell_defaults(
             rationale="no unrecorded singular-value smoothing is permitted",
         ),
     )
-    return merge_decisions(decisions, additions)
+    return _bind_derived_decoded_energy_implementation(
+        merge_decisions(decisions, additions)
+    )
 
 
 def _smoke_overrides(
@@ -7497,6 +7600,7 @@ def _cell(
         decisions = merge_decisions(
             decisions, _smoke_overrides(recipe, phase, decisions)
         )
+    decisions = _bind_derived_decoded_energy_implementation(decisions)
     return CellSpec(
         name=f"{phase.value}.{stage}.{suffix}.s{seed}",
         phase=phase,
@@ -7687,6 +7791,7 @@ def derive_child_cell(
         )
     if smoke:
         decisions = merge_decisions(decisions, _derived_smoke_overrides(decisions))
+    decisions = _bind_derived_decoded_energy_implementation(decisions)
     derived_recipe_id = content_id(
         {
             "schema": BLUEPRINT_SCHEMA_VERSION,

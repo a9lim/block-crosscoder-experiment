@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+from dataclasses import asdict
+import math
 import weakref
 
 import pytest
@@ -11,9 +14,12 @@ from block_crosscoder_experiment.evaluation import (
     evaluate_selector_and_shared_code_modes,
     evaluate_shared_code,
     evaluate_shared_code_modes,
+    load_trained_model,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
 )
 
@@ -37,6 +43,134 @@ def test_centered_fvu_centers_each_coordinate_not_one_site_scalar() -> None:
     actual = centered_fvu(target, prediction)
     assert actual.shape == (1,)
     assert torch.allclose(actual[0], expected)
+
+
+def test_stiefel_score_specialization_preserves_exact_shared_view_payloads() -> None:
+    cfg_values = {
+        "n_blocks": 24,
+        "block_dim": 2,
+        "n_sites": 3,
+        "d_model": 7,
+        "site_dims": (7, 5, 3),
+        "k": 3,
+        "seed": 2501,
+        "selection": "token_topk",
+        "encoder_mode": "tied",
+        "encoder_fusion": "availability_rescaled_sum",
+        "decoder_constraint": "gram",
+        "selection_score": "decoded_energy",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        )
+    ).eval()
+    fast = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=(
+                DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            ),
+        )
+    ).eval()
+    fast.load_state_dict(exact.state_dict())
+    x = torch.randn(96, 3, 7, generator=torch.Generator().manual_seed(2502))
+    exact.fit_threshold_([x], target_avg_blocks=3, method="exact")
+    fast.fit_threshold_([x], target_avg_blocks=3, method="exact")
+
+    expected = evaluate_shared_code_modes(exact, [x])
+    actual = evaluate_shared_code_modes(fast, [x])
+    normalized_actual = copy.deepcopy(actual)
+    for mode in ("topk", "threshold"):
+        assert actual[mode]["model_cfg"]["decoded_energy_implementation"] == (
+            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        )
+        assert expected[mode]["model_cfg"]["decoded_energy_implementation"] == (
+            DECODED_ENERGY_EXACT_IMPLEMENTATION
+        )
+        normalized_actual[mode]["model_cfg"]["decoded_energy_implementation"] = (
+            DECODED_ENERGY_EXACT_IMPLEMENTATION
+        )
+
+    def assert_nested_close(left, right) -> None:
+        if isinstance(left, dict):
+            assert left.keys() == right.keys()
+            for key in left:
+                assert_nested_close(left[key], right[key])
+        elif isinstance(left, list):
+            assert len(left) == len(right)
+            for left_item, right_item in zip(left, right, strict=True):
+                assert_nested_close(left_item, right_item)
+        elif isinstance(left, float):
+            if math.isnan(left):
+                assert math.isnan(right)
+            else:
+                assert left == pytest.approx(right, rel=1e-10, abs=1e-12)
+        else:
+            assert left == right
+
+    assert_nested_close(normalized_actual, expected)
+
+
+def test_load_trained_model_refuses_specialization_binding_and_residual_mutation(
+    tmp_path,
+) -> None:
+    cfg = BSCConfig(
+        n_blocks=16,
+        block_dim=2,
+        n_sites=2,
+        d_model=6,
+        site_dims=(6, 4),
+        k=3,
+        selection="token_topk",
+        encoder_mode="tied",
+        decoder_constraint="gram",
+        selection_score="decoded_energy",
+        decoded_energy_implementation=(DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION),
+    )
+    model = BlockCrosscoder(cfg)
+    model_cfg = asdict(cfg)
+    train_cfg = {"retract_every": 1}
+    payload = {
+        "model_cfg": model_cfg,
+        "train_cfg": train_cfg,
+        "model": model.state_dict(),
+        "run_binding": {
+            "model_cfg": copy.deepcopy(model_cfg),
+            "train_cfg": copy.deepcopy(train_cfg),
+        },
+    }
+    valid_path = tmp_path / "valid.pt"
+    torch.save(payload, valid_path)
+    restored, metadata = load_trained_model(valid_path)
+    assert restored.uses_stiefel_code_norm_decoded_energy
+    assert metadata["model_cfg"]["decoded_energy_implementation"] == (
+        DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    )
+
+    rebound = copy.deepcopy(payload)
+    rebound["model_cfg"]["decoded_energy_implementation"] = (
+        DECODED_ENERGY_EXACT_IMPLEMENTATION
+    )
+    rebound_path = tmp_path / "rebound.pt"
+    torch.save(rebound, rebound_path)
+    with pytest.raises(ValueError, match="run binding mismatch"):
+        load_trained_model(rebound_path)
+
+    missing = copy.deepcopy(payload)
+    del missing["model_cfg"]["decoded_energy_implementation"]
+    missing_path = tmp_path / "missing.pt"
+    torch.save(missing, missing_path)
+    with pytest.raises(ValueError, match="lacks decoded_energy_implementation"):
+        load_trained_model(missing_path)
+
+    drifted = copy.deepcopy(payload)
+    drifted["model"]["D"].mul_(1.1)
+    drifted_path = tmp_path / "drifted.pt"
+    torch.save(drifted, drifted_path)
+    with pytest.raises(RuntimeError, match="invariant failed"):
+        load_trained_model(drifted_path)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

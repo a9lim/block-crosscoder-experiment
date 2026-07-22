@@ -50,6 +50,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .gram import _retract_count_tensor_, gram_residual, site_frobenius_shares
 from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
+from .runtime_limits import decoded_energy_code_norm_eligible
 
 __all__ = [
     "TrainConfig",
@@ -1313,6 +1314,19 @@ class Trainer:
         self.cfg = cfg
         self.run_binding = copy.deepcopy(run_binding)
         self.master = model  # fp32 masters
+        if model.uses_stiefel_code_norm_decoded_energy and not (
+            decoded_energy_code_norm_eligible(
+                selection_score=model.cfg.selection_score,
+                decoder_constraint=model.cfg.decoder_constraint,
+                training_selector=model.cfg.selection,
+                site_rank=model.cfg.site_rank,
+                retract_every=cfg.retract_every,
+            )
+        ):
+            raise ValueError(
+                "stiefel code-norm decoded energy requires decoder retraction "
+                "after every optimizer step"
+            )
         masking_enabled = (
             cfg.encoder_site_mask_mode != "bernoulli"
             or cfg.encoder_site_mask_probability > 0
@@ -1330,6 +1344,12 @@ class Trainer:
                 p.requires_grad_(False)
         else:
             self.fwd = model
+        # Fail before optimizer state exists when either the fp32 carrier or
+        # its regenerated bf16 forward copy lies outside the bound under which
+        # decoded energy is specialized to code norm.
+        self.master.validate_decoded_energy_implementation()
+        if self.fwd is not self.master:
+            self.fwd.validate_decoded_energy_implementation()
         self.opt, self.optimizer_kind = build_optimizer(self.master, cfg)
         self.sched = LambdaLR(self.opt, _lr_factor(cfg))
         tracker_selector: str | None = None
@@ -1747,13 +1767,34 @@ class Trainer:
             }
         else:
             d = {}
-        master_residual = _constraint_residual(self.master)
-        if master_residual is not None:
+        # Existing diagnostic synchronizations are the periodic runtime gate;
+        # reuse its one Gram scan for both the general constraint metric and
+        # the specialization metric.
+        if self.master.uses_stiefel_code_norm_decoded_energy:
+            master_score_geometry = (
+                self.master.validate_decoded_energy_implementation()
+            )
+            master_residual = float(master_score_geometry["gram_residual_max"])
             d["decoder_constraint_residual_master"] = master_residual
+            d["decoded_energy_master_gram_residual"] = master_residual
+        else:
+            master_residual = _constraint_residual(self.master)
+            if master_residual is not None:
+                d["decoder_constraint_residual_master"] = master_residual
         if self.fwd is not self.master:
-            postcast_residual = _constraint_residual(self.fwd)
-            if postcast_residual is not None:
+            if self.fwd.uses_stiefel_code_norm_decoded_energy:
+                forward_score_geometry = (
+                    self.fwd.validate_decoded_energy_implementation()
+                )
+                postcast_residual = float(
+                    forward_score_geometry["gram_residual_max"]
+                )
                 d["decoder_constraint_residual_postcast"] = postcast_residual
+                d["decoded_energy_postcast_gram_residual"] = postcast_residual
+            else:
+                postcast_residual = _constraint_residual(self.fwd)
+                if postcast_residual is not None:
+                    d["decoder_constraint_residual_postcast"] = postcast_residual
         shares = site_frobenius_shares(self.master.decoder_tensor()).detach()
         d["share_jump"] = float((shares - self._prev_shares).abs().max())
         self._prev_shares = shares.clone()
@@ -1778,6 +1819,11 @@ class Trainer:
     # -- checkpointing ------------------------------------------------------
 
     def save_checkpoint(self, path: str | Path) -> None:
+        # Checkpoint boundaries are hard refusal points: a model outside the
+        # declared score-geometry envelope must never become durable evidence.
+        self.master.validate_decoded_energy_implementation()
+        if self.fwd is not self.master:
+            self.fwd.validate_decoded_energy_implementation()
         np_state = np.random.get_state()
         payload = {
             "model": self.master.state_dict(),
@@ -1842,6 +1888,10 @@ class Trainer:
         expected_binding: dict | None = None,
     ) -> "Trainer":
         payload = torch.load(path, map_location=device, weights_only=True)
+        if "decoded_energy_implementation" not in payload.get("model_cfg", {}):
+            raise ValueError(
+                "checkpoint lacks decoded_energy_implementation identity"
+            )
         accepted_tokens = payload.get("accepted_tokens")
         if (
             not isinstance(accepted_tokens, int)

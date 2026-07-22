@@ -18,6 +18,10 @@ from block_crosscoder_experiment.model import (
     bsc_loss,
     token_topk_mask,
 )
+from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+)
 
 CFG = BSCConfig(n_blocks=16, block_dim=4, n_sites=4, d_model=32, k=3, seed=0)
 
@@ -1549,6 +1553,238 @@ def test_decoded_energy_reduces_to_code_norm_on_concatenated_stiefel_blocks():
     assert torch.allclose(
         decoded.scores(z), conventional.scores(z), rtol=2e-5, atol=2e-6
     )
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_stiefel_code_norm_score_specialization_preserves_partial_view_support(
+    device,
+    dtype,
+):
+    if dtype == torch.bfloat16 and device.type != "cuda":
+        pytest.skip("the bounded bf16 specialization is a CUDA forward path")
+    cfg_values = {
+        "n_blocks": 32,
+        "block_dim": 3,
+        "n_sites": 3,
+        "d_model": 32,
+        "site_dims": (32, 28, 24),
+        "k": 4,
+        "seed": 493,
+        "selection": "token_topk",
+        "encoder_mode": "tied",
+        "encoder_fusion": "availability_rescaled_sum",
+        "decoder_constraint": "gram",
+        "selection_score": "decoded_energy",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        )
+    ).to(device=device, dtype=dtype)
+    fast = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=(
+                DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            ),
+        )
+    ).to(device=device, dtype=dtype)
+    fast.load_state_dict(exact.state_dict())
+    fast.validate_decoded_energy_implementation()
+
+    generator = torch.Generator().manual_seed(494)
+    calibration = torch.randn(96, 3, 32, generator=generator).to(
+        device=device,
+        dtype=dtype,
+    )
+    exact.fit_threshold_([calibration], 4.0, method="exact")
+    fast.fit_threshold_([calibration], 4.0, method="exact")
+    threshold_scale = max(abs(float(exact.theta)), 1e-12)
+    threshold_rtol = 2e-5 if dtype == torch.float32 else 5e-3
+    assert abs(float(fast.theta - exact.theta)) / threshold_scale <= threshold_rtol
+
+    observations = (
+        None,
+        torch.tensor([[True, False, False]], device=device).expand(96, -1),
+        torch.tensor([[False, True, True]], device=device).expand(96, -1),
+    )
+    for observed in observations:
+        exact_z = exact.encode(calibration, observed=observed)
+        fast_z = fast.encode(calibration, observed=observed)
+        torch.testing.assert_close(fast_z, exact_z, rtol=0, atol=0)
+        exact_scores = exact.scores(exact_z)
+        fast_scores = fast.scores(fast_z)
+        score_drift = _relative_l2(fast_scores, exact_scores)
+        assert score_drift <= (2e-6 if dtype == torch.float32 else 2e-3)
+        for mode in ("topk", "threshold"):
+            exact_mask = exact._select_scores(exact_scores, mode=mode, z=exact_z)
+            fast_mask = fast._select_scores(fast_scores, mode=mode, z=fast_z)
+            if dtype == torch.float32:
+                assert torch.equal(fast_mask, exact_mask)
+            else:
+                disagreement = float((fast_mask != exact_mask).float().mean())
+                intersection = int((fast_mask & exact_mask).sum())
+                union = int((fast_mask | exact_mask).sum())
+                assert disagreement <= 1e-3
+                assert intersection / max(union, 1) >= 0.99
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_cuda_stiefel_score_specialization_bounds_forward_loss_and_gradients(
+    selection,
+    dtype,
+):
+    cfg_values = {
+        "n_blocks": 64,
+        "block_dim": 4,
+        "n_sites": 4,
+        "d_model": 128,
+        "site_dims": (128, 120, 112, 104),
+        "k": 8,
+        "seed": 495,
+        "selection": selection,
+        "encoder_mode": "tied",
+        "encoder_fusion": "availability_rescaled_sum",
+        "decoder_constraint": "gram",
+        "selection_score": "decoded_energy",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        ),
+        device="cuda",
+    ).to(dtype=dtype)
+    fast = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=(
+                DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            ),
+        ),
+        device="cuda",
+    ).to(dtype=dtype)
+    fast.load_state_dict(exact.state_dict())
+    fast.validate_decoded_energy_implementation()
+    x = torch.randn(
+        128,
+        4,
+        128,
+        generator=torch.Generator().manual_seed(496),
+        device="cpu",
+    ).to(device="cuda", dtype=dtype)
+
+    exact_out, exact_decoder, exact_encoder = exact.forward_with_materialized(x)
+    fast_out, fast_decoder, fast_encoder = fast.forward_with_materialized(x)
+    exact_loss = bsc_loss(
+        exact_out,
+        x,
+        exact,
+        decoder=exact_decoder,
+        encoder=exact_encoder,
+    )["total"]
+    fast_loss = bsc_loss(
+        fast_out,
+        x,
+        fast,
+        decoder=fast_decoder,
+        encoder=fast_encoder,
+    )["total"]
+    exact_loss.backward()
+    fast_loss.backward()
+
+    score_drift = _relative_l2(fast_out.scores, exact_out.scores)
+    output_drift = _relative_l2(fast_out.xhat, exact_out.xhat)
+    loss_drift = abs(float((fast_loss - exact_loss).detach())) / max(
+        abs(float(exact_loss.detach())), 1e-12
+    )
+    mask_disagreement = float((fast_out.mask != exact_out.mask).float().mean())
+    intersection = int((fast_out.mask & exact_out.mask).sum())
+    union = int((fast_out.mask | exact_out.mask).sum())
+    support_iou = intersection / max(union, 1)
+    exact_parameters = dict(exact.named_parameters())
+    gradient_drifts = {}
+    for name, parameter in fast.named_parameters():
+        actual_gradient = parameter.grad
+        expected_gradient = exact_parameters[name].grad
+        if actual_gradient is None or expected_gradient is None:
+            assert actual_gradient is None and expected_gradient is None, name
+            continue
+        gradient_drifts[name] = _relative_l2(actual_gradient, expected_gradient)
+
+    if dtype == torch.float32:
+        assert score_drift <= 2e-6
+        assert mask_disagreement == 0.0
+        assert output_drift <= 2e-6
+        assert loss_drift <= 2e-6
+        assert max(gradient_drifts.values()) <= 2e-6
+    else:
+        assert score_drift <= 2e-3
+        assert mask_disagreement <= 1e-3
+        assert support_iou >= 0.99
+        assert output_drift <= 0.05
+        assert loss_drift <= 1e-4
+        assert max(gradient_drifts.values()) <= 0.06
+
+
+def test_stiefel_code_norm_frozen_geometry_omits_decoder_gram_and_refuses_drift():
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=16,
+            block_dim=2,
+            n_sites=2,
+            d_model=6,
+            site_dims=(6, 4),
+            k=3,
+            selection="batch_topk",
+            encoder_mode="tied",
+            decoder_constraint="qr",
+            selection_score="decoded_energy",
+            decoded_energy_implementation=(
+                DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            ),
+        )
+    )
+    with torch.no_grad():
+        decoder = model.decoder_tensor()
+        geometry = model._frozen_score_geometry(decoder)
+        assert geometry.decoder_gram is None
+        assert geometry.decoder_weight is None
+        assert geometry.site_decoder_gram is None
+        model.D.mul_(1.1)
+    with pytest.raises(RuntimeError, match="invariant failed"):
+        model.validate_decoded_energy_implementation()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"selection_score": "code_norm"},
+        {"decoder_constraint": "free"},
+        {"selection": "threshold"},
+        {"site_rank": 1, "encoder_mode": "untied", "decoder_constraint": "free"},
+    ),
+)
+def test_stiefel_code_norm_config_fails_closed_outside_complete_carrier(overrides):
+    values = {
+        "n_blocks": 8,
+        "block_dim": 2,
+        "n_sites": 2,
+        "d_model": 5,
+        "k": 2,
+        "selection": "token_topk",
+        "decoder_constraint": "gram",
+        "selection_score": "decoded_energy",
+        "decoded_energy_implementation": (
+            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        ),
+        **overrides,
+    }
+    with pytest.raises(ValueError, match="stiefel code-norm decoded energy"):
+        BSCConfig(**values)
 
 
 def test_isolated_loss_decrease_matches_explicit_candidate_reconstructions():

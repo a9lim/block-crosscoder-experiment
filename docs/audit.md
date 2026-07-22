@@ -75,6 +75,24 @@ exit is not evidence by itself.
   the prediction, SSE, and repeated-SpMM bounds in `design.md`. The estimator
   version content-binds the density denominator and exactly prices the capped
   live tensors and one released-per-site output.
+- Decoded energy has an explicit serialized implementation identity. The
+  bounded code-norm kernel is admitted only for decoded-energy scoring on an
+  unfactorized Gram/QR Stiefel decoder, a hard token- or batch-TopK selector,
+  and retraction after every update; every other carrier uses the exact
+  decoder-Gram quadratic. Root, smoke, and child materialization recompute this
+  identity from their final decisions. The fast frozen-score geometry contains
+  no selector Gram, while exact fp64 sharing/concordance Grams remain present.
+- The bounded implementation is released only after the fp32/bf16 score,
+  support, loss, gradient, and 25-step state gates in `design.md`. Master and
+  forward-copy Gram residuals fail closed at initialization before any
+  score-consuming calibration, logged diagnostics, checkpoint save/resume,
+  trained-model load, and deployable-codec load. Checkpoint model/train configs
+  must match their run binding, and outer deployable and nested codec model
+  configs must match exactly. Finite off-manifold states, missing identities,
+  ineligible cadence/configuration, and rehashed configuration forgeries are
+  refusal fixtures. Estimator v9 credits only the four bounded selector buffers
+  and score Gram actually removed; explicit exact mode, sparse evaluation, and
+  fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.
@@ -376,7 +394,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v2` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v9-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks.

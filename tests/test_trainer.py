@@ -10,6 +10,10 @@ import block_crosscoder_experiment.model as model_module
 import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
+from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+)
 from block_crosscoder_experiment.trainer import (
     DeadTracker,
     TrainConfig,
@@ -1651,3 +1655,123 @@ def test_expected_binding_rejects_legacy_checkpoint(device, tmp_path):
         Trainer.load_checkpoint(
             path, device=device, expected_binding={"whitener_hash": "abc"}
         )
+
+
+def _fast_decoded_energy_cfg() -> BSCConfig:
+    return BSCConfig(
+        n_blocks=12,
+        block_dim=3,
+        n_sites=3,
+        d_model=16,
+        k=3,
+        seed=719,
+        selection="token_topk",
+        selection_score="decoded_energy",
+        decoded_energy_implementation=(
+            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        ),
+        decoder_constraint="gram",
+    )
+
+
+def test_stiefel_decoded_energy_trainer_requires_every_step_retraction(device):
+    with pytest.raises(ValueError, match="after every optimizer step"):
+        Trainer(
+            BlockCrosscoder(_fast_decoded_energy_cfg()).to(device),
+            train_cfg(total_steps=2, retract_every=2),
+        )
+
+
+def test_stiefel_decoded_energy_diagnostics_resume_and_save_refusal(
+    device,
+    tmp_path,
+):
+    cfg = _fast_decoded_energy_cfg()
+    train = train_cfg(total_steps=3, log_every=1, forward_dtype="fp32")
+    binding = {
+        "model_cfg": asdict(cfg),
+        "train_cfg": asdict(train),
+        "cell_id": "stiefel-fast-test",
+    }
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train,
+        run_binding=binding,
+    )
+    batch = torch.randn(
+        32,
+        cfg.n_sites,
+        cfg.d_model,
+        generator=torch.Generator().manual_seed(720),
+    ).to(device)
+    record = trainer.step(batch)
+    assert record["decoded_energy_master_gram_residual"] <= 1e-4
+    assert record["decoder_constraint_residual_master"] == record[
+        "decoded_energy_master_gram_residual"
+    ]
+
+    checkpoint = tmp_path / "stiefel-fast.pt"
+    trainer.save_checkpoint(checkpoint)
+    restored = Trainer.load_checkpoint(
+        checkpoint,
+        device=device,
+        expected_binding=binding,
+    )
+    _assert_nested_exact(restored.master.state_dict(), trainer.master.state_dict())
+    _assert_nested_exact(restored.opt.state_dict(), trainer.opt.state_dict())
+    assert (
+        restored.master.cfg.decoded_energy_implementation
+        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    )
+    next_batch = torch.randn(
+        32,
+        cfg.n_sites,
+        cfg.d_model,
+        generator=torch.Generator().manual_seed(721),
+    ).to(device)
+    continued = trainer.step(next_batch)
+    replayed = restored.step(next_batch)
+    _assert_nested_exact(replayed, continued)
+    _assert_nested_exact(restored.master.state_dict(), trainer.master.state_dict())
+    _assert_nested_exact(restored.opt.state_dict(), trainer.opt.state_dict())
+
+    with torch.no_grad():
+        assert trainer.master.D is not None
+        trainer.master.D[0, 0, 0, 0].add_(1.0)
+    refused = tmp_path / "off-manifold.pt"
+    with pytest.raises(RuntimeError, match="Gram residual"):
+        trainer.save_checkpoint(refused)
+    assert not refused.exists()
+
+
+def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
+    cfg = _fast_decoded_energy_cfg()
+    train = train_cfg(total_steps=1)
+    binding = {
+        "model_cfg": asdict(cfg),
+        "train_cfg": asdict(train),
+    }
+    trainer = Trainer(
+        BlockCrosscoder(cfg).to(device),
+        train,
+        run_binding=binding,
+    )
+    checkpoint = tmp_path / "bound-fast.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+
+    missing = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    missing["model_cfg"].pop("decoded_energy_implementation")
+    missing_path = tmp_path / "missing-fast-id.pt"
+    torch.save(missing, missing_path)
+    with pytest.raises(ValueError, match="lacks decoded_energy_implementation"):
+        Trainer.load_checkpoint(missing_path, device=device)
+
+    forged = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    forged["model_cfg"]["decoded_energy_implementation"] = (
+        DECODED_ENERGY_EXACT_IMPLEMENTATION
+    )
+    forged_path = tmp_path / "forged-fast-id.pt"
+    torch.save(forged, forged_path)
+    with pytest.raises(ValueError, match="run binding mismatch"):
+        Trainer.load_checkpoint(forged_path, device=device)

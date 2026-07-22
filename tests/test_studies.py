@@ -7,6 +7,9 @@ import pytest
 from block_crosscoder_experiment.campaign import Campaign
 from block_crosscoder_experiment.cli.run_cell import validate_cell_config
 from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
@@ -1453,7 +1456,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v8"
+        "dense-linear-memory-v9"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1543,6 +1546,147 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     )
     assert dense_aux_storage - token_aux_storage == (
         dense_tracker_bytes - sasa_tracker_bytes
+    )
+
+
+def test_decoded_energy_implementation_is_rederived_after_child_deltas() -> None:
+    blueprint = build_phase2_blueprint(seeds=(0,), smoke=True)
+    plan = build_phase2_plan(seeds=(0,), smoke=True)
+    parent = next(
+        cells
+        for cells in _eligible_groups(plan.stages[-1])
+        if cells[0].recipe_name == "phase1_contract_bsc"
+    )
+    assert {
+        cell.decision_map["implementation.decoded_energy_implementation"]
+        for cell in parent
+    } == {DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION}
+
+    plan = materialize_child_plan(
+        plan,
+        blueprint,
+        _freeze(plan.stages[-1], parent),
+    )
+    while plan.stages[-1].name != "site_factorization_4m":
+        plan = materialize_child_plan(
+            plan,
+            blueprint,
+            _freeze(plan.stages[-1]),
+        )
+
+    cells = plan.stages[-1].cells
+    carrier = next(
+        cell for cell in cells if cell.recipe_name.endswith("selected_parent_carrier")
+    )
+    assert carrier.decision_map["model.decoder"] == "concatenated_stiefel"
+    assert carrier.decision_map["model.site_rank"] is None
+    assert (
+        carrier.decision_map["implementation.decoded_energy_implementation"]
+        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    )
+    changed_carriers = tuple(cell for cell in cells if cell is not carrier)
+    assert changed_carriers
+    assert all(
+        cell.decision_map["model.decoder"] == "free_scale_controlled"
+        for cell in changed_carriers
+    )
+    assert {
+        cell.decision_map["implementation.decoded_energy_implementation"]
+        for cell in changed_carriers
+    } == {DECODED_ENERGY_EXACT_IMPLEMENTATION}
+
+
+@pytest.mark.parametrize(
+    ("decision_name", "decision_value", "message"),
+    (
+        (
+            "implementation.decoded_energy_implementation",
+            "ambient_cuda_default",
+            "unknown decoded-energy implementation identity",
+        ),
+        (
+            "optimizer.retract_every_steps",
+            20,
+            "violates its carrier predicate",
+        ),
+        (
+            "model.decoder",
+            "free_scale_controlled",
+            "violates its carrier predicate",
+        ),
+    ),
+)
+def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
+    decision_name: str,
+    decision_value,
+    message: str,
+) -> None:
+    cell = next(
+        cell
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
+        if cell.recipe_name == "phase1_contract_bsc"
+    )
+    with pytest.raises(StudyError, match=message):
+        estimate_cell(_replace_decision(cell, decision_name, decision_value))
+
+
+def test_v9_estimator_credits_only_the_explicit_fast_implementation() -> None:
+    fast = next(
+        cell
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
+        if cell.recipe_name == "phase1_contract_bsc"
+    )
+    exact_control = _replace_decision(
+        fast,
+        "implementation.decoded_energy_implementation",
+        DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    )
+    fast_estimate = estimate_cell(fast)
+    exact_estimate = estimate_cell(exact_control)
+    values = fast.decision_map
+    expected_training_credit = (
+        DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
+        * int(values["optimizer.batch_tokens"])
+        * int(values["model.groups"])
+        * int(values["model.block_width"])
+        * 4
+    )
+    assert fast_estimate.estimator == ESTIMATOR_VERSION
+    assert exact_estimate.estimator == ESTIMATOR_VERSION
+    assert (
+        exact_estimate.peak_vram_bytes - fast_estimate.peak_vram_bytes
+        == expected_training_credit
+    )
+
+    workspace = {
+        "batch_tokens": int(values["optimizer.batch_tokens"]),
+        "groups": int(values["model.groups"]),
+        "block_width": int(values["model.block_width"]),
+        "total_dim": sum(int(item) for item in values["data.site_dims"]),
+        "operational_decoder_elements": (
+            int(values["model.groups"])
+            * int(values["model.block_width"])
+            * sum(int(item) for item in values["data.site_dims"])
+        ),
+        "quantizer_count": len(values["codec.quantizer_bits"]),
+        "sites": len(values["data.site_dims"]),
+        "site_dim": max(int(item) for item in values["data.site_dims"]),
+        "selection_score": "decoded_energy",
+    }
+    exact_workspace = _evaluation_workspace_bytes(
+        **workspace,
+        decoded_energy_implementation=DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    )
+    fast_workspace = _evaluation_workspace_bytes(
+        **workspace,
+        decoded_energy_implementation=(
+            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        ),
+    )
+    assert exact_workspace - fast_workspace == (
+        int(values["model.groups"])
+        * int(values["model.block_width"]) ** 2
+        * 4
     )
 
 

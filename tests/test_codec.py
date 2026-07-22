@@ -25,6 +25,10 @@ from block_crosscoder_experiment.codec import (
     fit_codec,
 )
 from block_crosscoder_experiment.model import BSCOutput, BlockCrosscoder, BSCConfig
+from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+)
 
 G, B, S, D = 8, 4, 3, 16
 
@@ -90,6 +94,75 @@ def test_codec_fits_and_evaluates():
     assert res["zero_rate"]["fvu_pooled"] == 1.0
     assert p4["rate_bits_per_token"] >= p4["amplitude_bits_per_token"]
     assert len(p4["rate_bits_ci95"]) == 2
+
+
+def test_codec_threshold_packets_preserve_stiefel_score_mode_after_reload(tmp_path):
+    cfg_values = {
+        "n_blocks": 16,
+        "block_dim": 2,
+        "n_sites": 2,
+        "d_model": 6,
+        "site_dims": (6, 4),
+        "k": 3,
+        "seed": 509,
+        "selection": "token_topk",
+        "encoder_mode": "tied",
+        "encoder_fusion": "availability_rescaled_sum",
+        "decoder_constraint": "gram",
+        "selection_score": "decoded_energy",
+    }
+    exact = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=DECODED_ENERGY_EXACT_IMPLEMENTATION,
+        )
+    ).eval()
+    fast = BlockCrosscoder(
+        BSCConfig(
+            **cfg_values,
+            decoded_energy_implementation=(
+                DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            ),
+        )
+    ).eval()
+    fast.load_state_dict(exact.state_dict())
+    generator = torch.Generator().manual_seed(510)
+    calibration = torch.randn(256, 2, 6, generator=generator)
+    evaluation = torch.randn(64, 2, 6, generator=generator)
+    exact.fit_threshold_([calibration], 3.0, method="exact")
+    fast.fit_threshold_([calibration], 3.0, method="exact")
+    assert (
+        abs(float(fast.theta - exact.theta)) / max(abs(float(exact.theta)), 1e-12)
+        <= 2e-5
+    )
+
+    exact_selection = exact(evaluation, mode="threshold")
+    fast_selection = fast(evaluation, mode="threshold")
+    assert torch.equal(fast_selection.mask, exact_selection.mask)
+    codec = fit_codec(
+        fast,
+        list(calibration.split(64)),
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=2),
+    )
+    assert codec.meta["model_cfg"]["decoded_energy_implementation"] == (
+        DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    )
+    path = tmp_path / "specialized-codec.pt"
+    codec.save(path)
+    reloaded = type(codec).load(path)
+    restored = BlockCrosscoder(BSCConfig(**reloaded.meta["model_cfg"])).eval()
+    restored.load_state_dict(fast.state_dict())
+    restored.validate_decoded_energy_implementation()
+
+    exact_packet = encode_batch(exact, reloaded, evaluation, q=4)
+    fast_packet = encode_batch(fast, reloaded, evaluation, q=4)
+    restored_packet = encode_batch(restored, reloaded, evaluation, q=4)
+    for field in ("counts", "block_ids", "amplitude_symbols"):
+        assert torch.equal(getattr(fast_packet, field), getattr(exact_packet, field))
+        assert torch.equal(
+            getattr(restored_packet, field),
+            getattr(fast_packet, field),
+        )
 
 
 def test_codec_calibration_memory_ceiling_fails_without_sampling():

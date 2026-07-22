@@ -391,7 +391,16 @@ total bits/token. Those budgets are the exact fourfold transfer of the pilot
 distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
-The resource envelope uses estimator schema `dense-linear-memory-v2`.
+The resource envelope uses estimator schema
+`dense-linear-memory-v9-q2-c512-t256-s32`. Its guarded
+`stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
+not a paper result or a different scientific score. It uses the algebraic
+decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel
+decoder with hard TopK selection and every-update retraction, under the fixed
+fp32/bf16 residual and trajectory gates in `design.md`; all other cells retain
+the exact decoder-Gram implementation. The implementation identity and its
+residual thresholds are project engineering decisions and are content-bound in
+the cell, checkpoint, run binding, and deployable codec.
 
 ## 7. Fairness and compatibility
 

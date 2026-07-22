@@ -51,13 +51,19 @@ from block_crosscoder_experiment.cli.run_cell import (
     _transform_on_cuda,
     _training_batches,
     _train_config,
+    _validate_final_checkpoint,
     _verify_real_source_contract,
     _verify_store_reader_once,
     _write_deployment_schedule_bundle,
     validate_cell_config,
 )
 from block_crosscoder_experiment.cli.data import fit_transform_artifacts
+from block_crosscoder_experiment.codec import Codec
 from block_crosscoder_experiment.model import BlockCrosscoder
+from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+)
 from block_crosscoder_experiment.store import ShardWriter, StoreReader
 from block_crosscoder_experiment.studies import (
     BSC_FACTOR_CONTESTS,
@@ -130,6 +136,27 @@ def _cell(
         base,
         name=f"{phase.value}.test.executor{recipe_index}.s{seed}",
         stage="test",
+    )
+
+
+def _stiefel_decoded_energy_cell(*, seed: int = 0) -> CellSpec:
+    base = _cell(recipe_index=0, seed=seed)
+    overrides = {
+        "model.selection_score": "decoded_energy",
+        "implementation.decoded_energy_implementation": (
+            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        ),
+        "optimizer.retract_every_steps": 1,
+    }
+    return replace(
+        base,
+        name=f"phase1.test.stiefel_decoded_energy.s{seed}",
+        decisions=tuple(
+            replace(decision, value=overrides[decision.name])
+            if decision.name in overrides
+            else decision
+            for decision in base.decisions
+        ),
     )
 
 
@@ -498,7 +525,7 @@ def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
 def test_deployable_codec_is_the_complete_validated_consumer_artifact(
     tmp_path: Path,
 ) -> None:
-    cell = _cell(seed=37)
+    cell = _stiefel_decoded_energy_cell(seed=37)
     campaign = _campaign(tmp_path, cell)
     assert _runner(campaign).run(limit=1).failed_cells == 0
     refs = campaign.record(cell.cell_id).artifact_map
@@ -516,7 +543,76 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
     )
     assert loaded["schema"] == "bsc-deployable-codec-v2"
     assert model.cfg.n_blocks == codec.included.numel()
+    assert (
+        model.cfg.decoded_energy_implementation
+        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+    )
     assert summary["accepted_tokens"] > 0
+
+    checkpoint_payload = torch.load(
+        refs["checkpoint"].resolve(campaign.root),
+        map_location="cpu",
+        weights_only=True,
+    )
+    mismatched_checkpoint = copy.deepcopy(checkpoint_payload)
+    mismatched_checkpoint["model_cfg"]["decoded_energy_implementation"] = (
+        DECODED_ENERGY_EXACT_IMPLEMENTATION
+    )
+    checkpoint_path = tmp_path / "mismatched-checkpoint-config.pt"
+    torch.save(mismatched_checkpoint, checkpoint_path)
+    with pytest.raises(CellExecutionError, match="top-level configuration"):
+        _validate_final_checkpoint(
+            checkpoint_path,
+            checkpoint_payload["run_binding"],
+        )
+
+    nested_identity_mismatch = copy.deepcopy(payload)
+    nested_codec = Codec.from_payload(
+        nested_identity_mismatch["codec_payload"],
+        source="test nested codec",
+    )
+    nested_codec.meta["model_cfg"]["decoded_energy_implementation"] = (
+        DECODED_ENERGY_EXACT_IMPLEMENTATION
+    )
+    nested_identity_mismatch["codec_payload"] = nested_codec.to_payload()
+    unsigned = {
+        key: value
+        for key, value in nested_identity_mismatch.items()
+        if key != "artifact_sha256"
+    }
+    nested_identity_mismatch["artifact_sha256"] = _tensor_payload_digest(unsigned)
+    nested_identity_path = tmp_path / "nested-model-identity-mismatch.pt"
+    torch.save(nested_identity_mismatch, nested_identity_path)
+    with pytest.raises(CellExecutionError, match="model config|model-config"):
+        _load_deployable_codec(
+            nested_identity_path,
+            cell_id=cell.cell_id,
+            checkpoint_hash=refs["checkpoint"].sha256,
+            calibration_hash=refs["calibration"].sha256,
+            preparation_hash=preparation_hash,
+            device=torch.device("cpu"),
+        )
+
+    finite_off_manifold = copy.deepcopy(payload)
+    finite_off_manifold["model_state"]["D"].mul_(1.01)
+    assert torch.isfinite(finite_off_manifold["model_state"]["D"]).all()
+    unsigned = {
+        key: value
+        for key, value in finite_off_manifold.items()
+        if key != "artifact_sha256"
+    }
+    finite_off_manifold["artifact_sha256"] = _tensor_payload_digest(unsigned)
+    finite_gram_path = tmp_path / "finite-off-manifold-model.pt"
+    torch.save(finite_off_manifold, finite_gram_path)
+    with pytest.raises(CellExecutionError, match="decoded-energy invariant"):
+        _load_deployable_codec(
+            finite_gram_path,
+            cell_id=cell.cell_id,
+            checkpoint_hash=refs["checkpoint"].sha256,
+            calibration_hash=refs["calibration"].sha256,
+            preparation_hash=preparation_hash,
+            device=torch.device("cpu"),
+        )
 
     corrupt_tensor = copy.deepcopy(payload)
     state_name = next(iter(corrupt_tensor["model_state"]))
@@ -608,6 +704,86 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
             preparation_hash=preparation_hash,
             device=torch.device("cpu"),
         )
+
+
+@pytest.mark.parametrize(
+    ("decision_name", "decision_value", "message"),
+    (
+        (
+            "implementation.decoded_energy_implementation",
+            "ambient_cuda_default",
+            "unknown decoded-energy implementation identity",
+        ),
+        (
+            "optimizer.retract_every_steps",
+            20,
+            "violates its carrier predicate",
+        ),
+    ),
+)
+def test_runner_refuses_unknown_or_ineligible_decoded_energy_implementation(
+    decision_name: str,
+    decision_value,
+    message: str,
+) -> None:
+    cell = _stiefel_decoded_energy_cell()
+    changed = replace(
+        cell,
+        decisions=tuple(
+            replace(decision, value=decision_value)
+            if decision.name == decision_name
+            else decision
+            for decision in cell.decisions
+        ),
+    )
+    with pytest.raises(CellExecutionError, match=message):
+        _model_config(changed)
+
+
+def test_decoded_energy_preflight_precedes_every_score_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cell = _stiefel_decoded_energy_cell(seed=39)
+    campaign = _campaign(tmp_path, cell)
+    runner = _runner(campaign)
+    assert runner.run(stop_after="prepare").completed_cells == 1
+    campaign.transition(cell.cell_id, RunState.RUNNING)
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign.root))
+    ctx = _Context(
+        campaign.cell_manifest_path(cell.cell_id),
+        campaign.cell_dir(cell.cell_id) / "preflight-order-artifacts.json",
+        "train",
+    )
+    events: list[str] = []
+    original_validate = BlockCrosscoder.validate_decoded_energy_implementation
+
+    def track_validation(model):
+        record = original_validate(model)
+        if record["applicable"]:
+            events.append("validated")
+        return record
+
+    class FirstScoreSeen(RuntimeError):
+        pass
+
+    def stop_at_first_score(model, *args, **kwargs):
+        events.append("score")
+        raise FirstScoreSeen
+
+    with monkeypatch.context() as order:
+        order.setattr(
+            BlockCrosscoder,
+            "validate_decoded_energy_implementation",
+            track_validation,
+        )
+        order.setattr(BlockCrosscoder, "scores", stop_at_first_score)
+        with pytest.raises(FirstScoreSeen):
+            run_cell_module._train(ctx, ctx.prerequisites(), resume=False)
+    assert events
+    assert events[0] == "validated"
+    assert events[-1] == "score"
+    assert "validated" in events[: events.index("score")]
 
 
 def test_failed_scientific_outcome_still_yields_admissible_terminal_report(
