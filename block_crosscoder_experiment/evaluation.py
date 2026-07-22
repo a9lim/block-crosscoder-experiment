@@ -63,6 +63,14 @@ class _ModeConcordanceReductions(NamedTuple):
     intersection_full_energy: torch.Tensor
 
 
+class _ModeLooReductions(NamedTuple):
+    """Concordance plus both LOO deltas from one fp64 code pair."""
+
+    concordance: _ModeConcordanceReductions
+    pre_selection_delta_sq: torch.Tensor
+    post_selection_delta_sq: torch.Tensor
+
+
 @dataclass(slots=True)
 class _EvaluationViewOutput:
     """Lean evaluator state retained after one selector decode.
@@ -164,28 +172,17 @@ def _batched_mode_selected_moments(
     return _ModeSelectedMoments(decoded_energy, code_sum, code_outer)
 
 
-def _batched_mode_concordance(
-    full_code: torch.Tensor,
-    partial_code: torch.Tensor,
+def _batched_mode_concordance_from_fp64(
+    full64: torch.Tensor,
+    partial64: torch.Tensor,
     gram: torch.Tensor,
-    full_masks: torch.Tensor | None = None,
-    partial_masks: torch.Tensor | None = None,
-    *,
-    intersection: torch.Tensor | None = None,
+    intersection: torch.Tensor,
 ) -> _ModeConcordanceReductions:
-    """Reduce both selector modes from one raw fp64 concordance geometry."""
+    """Reduce both selector modes from an already-materialized fp64 pair."""
 
-    full64 = full_code.double()
-    partial64 = partial_code.double()
     full_q, partial_q, cross = _raw_quadratic_terms(full64, gram, partial64)
     assert partial_q is not None and cross is not None
-    if intersection is None:
-        if full_masks is None or partial_masks is None:
-            raise ValueError("need masks or a precomputed intersection")
-        intersection = full_masks & partial_masks
-    elif full_masks is not None or partial_masks is not None:
-        raise ValueError("pass masks or a precomputed intersection, not both")
-    zero = torch.zeros((), dtype=torch.float64, device=full_code.device)
+    zero = torch.zeros((), dtype=torch.float64, device=full64.device)
 
     # Materialize only one mode-expanded value family at a time.  This keeps
     # the peak below the existing 8*b+4 fp64 concordance workspace bound.
@@ -213,6 +210,31 @@ def _batched_mode_concordance(
     )
 
 
+def _batched_mode_concordance(
+    full_code: torch.Tensor,
+    partial_code: torch.Tensor,
+    gram: torch.Tensor,
+    full_masks: torch.Tensor | None = None,
+    partial_masks: torch.Tensor | None = None,
+    *,
+    intersection: torch.Tensor | None = None,
+) -> _ModeConcordanceReductions:
+    """Reduce both selector modes from one raw fp64 concordance geometry."""
+
+    if intersection is None:
+        if full_masks is None or partial_masks is None:
+            raise ValueError("need masks or a precomputed intersection")
+        intersection = full_masks & partial_masks
+    elif full_masks is not None or partial_masks is not None:
+        raise ValueError("pass masks or a precomputed intersection, not both")
+    return _batched_mode_concordance_from_fp64(
+        full_code.double(),
+        partial_code.double(),
+        gram,
+        intersection,
+    )
+
+
 def _batched_mode_selected_delta_sq(
     full_code: torch.Tensor,
     partial_code: torch.Tensor,
@@ -221,15 +243,31 @@ def _batched_mode_selected_delta_sq(
 ) -> torch.Tensor:
     """Mode-first selected-code squared deltas with exact mask suppression."""
 
-    zero = torch.zeros((), dtype=torch.float64, device=full_code.device)
+    return _batched_mode_selected_delta_sq_from_fp64(
+        full_code.double(),
+        partial_code.double(),
+        full_masks,
+        partial_masks,
+    )
+
+
+def _batched_mode_selected_delta_sq_from_fp64(
+    full64: torch.Tensor,
+    partial64: torch.Tensor,
+    full_masks: torch.Tensor,
+    partial_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Mode-first selected-code deltas from an already-materialized pair."""
+
+    zero = torch.zeros((), dtype=torch.float64, device=full64.device)
     full_selected = torch.where(
         full_masks.unsqueeze(-1),
-        full_code.double().unsqueeze(0),
+        full64.unsqueeze(0),
         zero,
     )
     partial_selected = torch.where(
         partial_masks.unsqueeze(-1),
-        partial_code.double().unsqueeze(0),
+        partial64.unsqueeze(0),
         zero,
     )
     # Preserve the per-mode CUDA reduction schedule.  The mode-first multi-axis
@@ -240,6 +278,38 @@ def _batched_mode_selected_delta_sq(
             (partial_selected[mode] - full_selected[mode]).square().sum(dim=(0, 2))
             for mode in range(full_masks.shape[0])
         )
+    )
+
+
+def _batched_mode_loo_reductions(
+    full_code: torch.Tensor,
+    partial_code: torch.Tensor,
+    gram: torch.Tensor,
+    full_masks: torch.Tensor,
+    partial_masks: torch.Tensor,
+    intersection: torch.Tensor,
+) -> _ModeLooReductions:
+    """Reuse one fp64 full/partial pair across all LOO reductions."""
+
+    full64 = full_code.double()
+    partial64 = partial_code.double()
+    concordance = _batched_mode_concordance_from_fp64(
+        full64,
+        partial64,
+        gram,
+        intersection,
+    )
+    pre_selection_delta_sq = (partial64 - full64).square().sum(dim=(0, 2))
+    post_selection_delta_sq = _batched_mode_selected_delta_sq_from_fp64(
+        full64,
+        partial64,
+        full_masks,
+        partial_masks,
+    )
+    return _ModeLooReductions(
+        concordance,
+        pre_selection_delta_sq,
+        post_selection_delta_sq,
     )
 
 
@@ -807,6 +877,7 @@ def _evaluate_code_modes(
             prefix: str,
             support_intersection_key: str,
             support_union_key: str,
+            include_loo_deltas: bool = False,
         ) -> torch.Tensor:
             """Accumulate every selector from one raw partial-view geometry."""
 
@@ -831,12 +902,31 @@ def _evaluate_code_modes(
                     full_mode_masks[:, :, block_slice]
                     & partial_mode_masks[:, :, block_slice]
                 )
-                reductions = _batched_mode_concordance(
-                    raw_full_code[:, block_slice],
-                    raw_partial_code[:, block_slice],
-                    all_site_decoder_gram[block_slice],
-                    intersection=intersection,
-                )
+                if include_loo_deltas:
+                    loo_reductions = _batched_mode_loo_reductions(
+                        raw_full_code[:, block_slice],
+                        raw_partial_code[:, block_slice],
+                        all_site_decoder_gram[block_slice],
+                        full_mode_masks[:, :, block_slice],
+                        partial_mode_masks[:, :, block_slice],
+                        intersection,
+                    )
+                    reductions = loo_reductions.concordance
+                    pre_selection_loo_delta_sq[index, block_slice] += (
+                        loo_reductions.pre_selection_delta_sq
+                    )
+                    for mode_index, state in enumerate(mode_states):
+                        state["post_selection_loo_delta_sq"][index, block_slice] += (
+                            loo_reductions.post_selection_delta_sq[mode_index]
+                        )
+                else:
+                    loo_reductions = None
+                    reductions = _batched_mode_concordance(
+                        raw_full_code[:, block_slice],
+                        raw_partial_code[:, block_slice],
+                        all_site_decoder_gram[block_slice],
+                        intersection=intersection,
+                    )
                 intersection_totals += reductions.intersection_count.sum(dim=1)
                 for mode_index, state in enumerate(mode_states):
                     state[f"{prefix}_intersection_count"][index, block_slice] += (
@@ -857,7 +947,7 @@ def _evaluate_code_modes(
                     state[f"{prefix}_intersection_full_energy"][index, block_slice] += (
                         reductions.intersection_full_energy[mode_index]
                     )
-                del intersection, reductions
+                del intersection, reductions, loo_reductions
             union_totals = (
                 full_support_total64 + partial_totals - intersection_totals
             )
@@ -906,19 +996,6 @@ def _evaluate_code_modes(
                 empty=S == 1,
                 frozen_encoder_sites=encoder_sites,
             )
-            primary_missing = missing_outputs[primary_mode]
-            primary_full = full_outputs[primary_mode]
-            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-                block_slice = slice(start, stop)
-                pre_selection_loo_delta_sq[source, block_slice] += (
-                    (
-                        primary_missing.z[:, block_slice].double()
-                        - primary_full.z[:, block_slice].double()
-                    )
-                    .square()
-                    .sum(dim=(0, 2))
-                )
             for mode, missing in missing_outputs.items():
                 state = states[mode]
                 if missing.sse is None:
@@ -932,30 +1009,13 @@ def _evaluate_code_modes(
                 prefix="loo",
                 support_intersection_key="loo_intersection",
                 support_union_key="loo_union",
+                include_loo_deltas=True,
             )
-            raw_missing_code = missing_outputs[primary_mode].z
-            for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
-                stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
-                block_slice = slice(start, stop)
-                selected_delta_sq = _batched_mode_selected_delta_sq(
-                    raw_full_code[:, block_slice],
-                    raw_missing_code[:, block_slice],
-                    full_mode_masks[:, :, block_slice],
-                    missing_mode_masks[:, :, block_slice],
-                )
-                for mode_index, state in enumerate(mode_states):
-                    state["post_selection_loo_delta_sq"][source, block_slice] += (
-                        selected_delta_sq[mode_index]
-                    )
-                del selected_delta_sq
             del (
                 missing,
                 state,
-                primary_missing,
-                primary_full,
                 missing_outputs,
                 missing_mode_masks,
-                raw_missing_code,
             )
         del (
             encoder_sites,
