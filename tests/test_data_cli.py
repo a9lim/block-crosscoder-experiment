@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import shutil
 import sys
 import types
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -711,6 +713,48 @@ def test_cuda_capture_copy_overlap_is_byte_exact_ordered_and_close_safe():
     next(stream)
     stream.close()
     assert closed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_capture_copy_overlap_holds_only_two_pinned_destinations(monkeypatch):
+    real_empty_like = torch.empty_like
+    destinations: list[weakref.ReferenceType[torch.Tensor]] = []
+    peak_live = 0
+
+    def tracked_empty_like(*args, **kwargs):
+        nonlocal peak_live
+        live_before = sum(reference() is not None for reference in destinations)
+        result = real_empty_like(*args, **kwargs)
+        destinations.append(weakref.ref(result))
+        peak_live = max(peak_live, live_before + 1)
+        return result
+
+    monkeypatch.setattr(data_module.torch, "empty_like", tracked_empty_like)
+    identities = torch.zeros(4, 3, dtype=torch.int64)
+
+    def source():
+        for index in range(6):
+            yield torch.full(
+                (4, 2, 8),
+                index,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ), identities
+
+    stream = _overlap_cuda_capture_copies(source())
+    expected_value = 0
+    while True:
+        try:
+            item = next(stream)
+        except StopIteration:
+            break
+        host, row_ids = item
+        assert bool((host == expected_value).all())
+        expected_value += 1
+        del item, host, row_ids
+        gc.collect()
+    assert expected_value == 6
+    assert peak_live == 2
 
 
 def test_capture_streams_slices_without_torch_cat(tmp_path, monkeypatch):

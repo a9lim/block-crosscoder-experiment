@@ -177,6 +177,11 @@ def _overlap_cuda_capture_copies(
             host, row_ids = pending.resolve()
             pending = following
             yield host, row_ids
+            # The consumer has requested another batch, so it has finished
+            # copying this transient pinned view into the writer staging
+            # buffer. Release the yielded aliases before allocating the next
+            # lookahead destination; otherwise three pinned batches coexist.
+            del host, row_ids
         host, row_ids = pending.resolve()
         pending = None
         yield host, row_ids
@@ -1413,6 +1418,12 @@ def capture(
         remaining = n_tokens
         while remaining:
             if pending_x is None or not pending_x.shape[0]:
+                # Drop the exhausted views before advancing the capture
+                # generator. RHS evaluation of ``next`` otherwise retains the
+                # prior pinned allocation while the lookahead allocates its
+                # following destination, violating the two-buffer bound.
+                pending_x = None
+                pending_ids = None
                 try:
                     pending_x, pending_ids = next(stream)
                 except StopIteration as exc:
