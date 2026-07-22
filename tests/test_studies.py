@@ -1452,7 +1452,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v6"
+        "dense-linear-memory-v7"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1474,7 +1474,17 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         estimate_cell(phase2.cells[0]).storage_bytes
         - estimate_cell(phase2.cells[0]).parameters * 16
     )
-    assert plan_store == 2 * one_derived_view  # immutable raw + scalar-RMS view
+    sasa = next(
+        cell
+        for cell in phase2.cells
+        if cell.decision_map["objective.auxiliary"] == "frequency_dead_residual"
+    )
+    sasa_tracker_bytes = (
+        sasa.decision_map["auxiliary.dead_window_tokens"]
+        * sasa.decision_map["model.active_blocks"]
+        * 4
+    )
+    assert plan_store == 2 * one_derived_view + sasa_tracker_bytes
     Budget(max_training_tokens=estimate.training_tokens).enforce(estimate)
     with pytest.raises(BudgetExceeded, match="training_tokens"):
         Budget(max_training_tokens=estimate.training_tokens - 1).enforce(estimate)
@@ -1484,6 +1494,51 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         Budget(max_peak_host_ram_bytes=estimate.peak_host_ram_bytes - 1).enforce(
             estimate
         )
+
+    larger_window = _replace_decision(
+        sasa,
+        "auxiliary.dead_window_tokens",
+        64,
+    )
+    active = sasa.decision_map["model.active_blocks"]
+    expected_sparse_delta = (64 - 32) * active * 4
+    assert (
+        estimate_cell(larger_window).storage_bytes
+        - estimate_cell(sasa).storage_bytes
+        == expected_sparse_delta
+    )
+    assert (
+        estimate_cell(larger_window).peak_vram_bytes
+        - estimate_cell(sasa).peak_vram_bytes
+        == expected_sparse_delta
+    )
+    batch_sasa = _replace_decision(sasa, "model.selector", "block_batchtopk")
+    dense_sasa = _replace_decision(sasa, "model.selector", "learned_group_threshold")
+    token_aux_storage = (
+        estimate_cell(sasa).storage_bytes - estimate_cell(sasa).parameters * 16
+    )
+    batch_aux_storage = (
+        estimate_cell(batch_sasa).storage_bytes
+        - estimate_cell(batch_sasa).parameters * 16
+    )
+    dense_aux_storage = (
+        estimate_cell(dense_sasa).storage_bytes
+        - estimate_cell(dense_sasa).parameters * 16
+    )
+    batch_tracker_bytes = (
+        sasa.decision_map["auxiliary.dead_window_tokens"]
+        + sasa.decision_map["optimizer.batch_tokens"]
+        - 1
+    ) * active * 4
+    dense_tracker_bytes = sasa.decision_map["auxiliary.dead_window_tokens"] * (
+        (sasa.decision_map["model.groups"] + 7) // 8
+    )
+    assert batch_aux_storage - token_aux_storage == (
+        batch_tracker_bytes - sasa_tracker_bytes
+    )
+    assert dense_aux_storage - token_aux_storage == (
+        dense_tracker_bytes - sasa_tracker_bytes
+    )
 
 
 def test_evaluation_workspace_prices_dense_support_and_saturates_q_chunks():

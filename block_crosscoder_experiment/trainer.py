@@ -236,8 +236,9 @@ class DeadTracker:
 
     Each scientific auxiliary owns a disjoint criterion, so a tracker retains
     and updates only that criterion's sufficient state. SASA keeps its exact
-    boolean token window; long-horizon rules keep one last-fire index per
-    block; release adapters keep only their declared age counters.
+    token window in selector-specific sparse or bitpacked form; long-horizon
+    rules keep one last-fire index per block; release adapters keep only their
+    declared age counters.
     """
 
     def __init__(
@@ -249,6 +250,8 @@ class DeadTracker:
         max_tokens: int | None = None,
         block_dim: int = 1,
         policy: str,
+        selector: str | None = None,
+        active_blocks: float | None = None,
     ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
@@ -269,13 +272,44 @@ class DeadTracker:
         if policy == "sasa":
             if max_tokens == 0:
                 raise ValueError("SASA dead tracking requires a nonzero token window")
+            if selector not in {
+                "token_topk",
+                "batch_topk",
+                "threshold",
+                "dense",
+            }:
+                raise ValueError("SASA dead tracking has an unknown selector")
+            if (
+                not isinstance(active_blocks, (int, float))
+                or isinstance(active_blocks, bool)
+                or not 0 < float(active_blocks) <= n_blocks
+            ):
+                raise ValueError("SASA active_blocks must be in (0, n_blocks]")
         elif max_tokens != 0:
             raise ValueError("non-SASA dead tracking requires max_tokens=0")
+        elif selector is not None or active_blocks is not None:
+            raise ValueError("selector metadata belongs only to SASA dead tracking")
         self.capacity = int(capacity)
         self.max_tokens = max_tokens
         self.device = torch.device(device)
         self.policy = policy
-        self.chunks: list[torch.Tensor] = []
+        self.selector = selector
+        self.active_blocks = active_blocks
+        self.representation = (
+            "fixed_token_indices"
+            if selector == "token_topk"
+            else (
+                "fixed_batch_indices"
+                if selector == "batch_topk"
+                else ("bitpacked_masks" if policy == "sasa" else None)
+            )
+        )
+        self._bit_shifts = (
+            torch.arange(8, dtype=torch.uint8, device=self.device)
+            if self.representation == "bitpacked_masks"
+            else None
+        )
+        self.chunks: list[dict[str, torch.Tensor | int]] = []
         self._history_tokens = 0
         self._history_count = (
             torch.zeros(n_blocks, dtype=torch.int64, device=self.device)
@@ -371,40 +405,184 @@ class DeadTracker:
 
         assert self.policy == "sasa"
         assert self._history_count is not None
+        chunk = self._selected_event_chunk(accepted)
+        dense_counts: torch.Tensor | None = None
+        if self.representation == "bitpacked_masks":
+            dense_counts = self._dense_mask_counts(accepted)
         if self.max_tokens != 0:
             if self.max_tokens is not None and len(accepted) >= self.max_tokens:
-                suffix = accepted[-self.max_tokens :].clone()
-                self.chunks = [suffix]
-                self._history_tokens = len(suffix)
-                self._history_count.copy_(suffix.sum(dim=0, dtype=torch.int64))
+                start = len(accepted) - self.max_tokens
+                if self.representation == "fixed_batch_indices":
+                    chunk["start_token"] = start
+                else:
+                    indices = chunk["indices"]
+                    assert torch.is_tensor(indices)
+                    chunk = {
+                        "indices": indices[start:].clone(),
+                        "n_tokens": self.max_tokens,
+                        "start_token": 0,
+                    }
+                self.chunks = [chunk]
+                self._history_tokens = self.max_tokens
+                self._history_count.copy_(
+                    self._dense_mask_counts(accepted[-self.max_tokens :])
+                    if dense_counts is not None
+                    else self._chunk_counts(chunk, dtype=torch.int64)
+                )
                 return
-            self.chunks.append(accepted.clone())
+            self.chunks.append(chunk)
             self._history_tokens += len(accepted)
-            self._history_count += accepted.sum(dim=0, dtype=torch.int64)
+            self._history_count += (
+                dense_counts
+                if dense_counts is not None
+                else self._chunk_counts(chunk, dtype=torch.int64)
+            )
             if self.max_tokens is None:
                 while len(self.chunks) > self.capacity:
                     removed = self.chunks.pop(0)
-                    self._history_tokens -= len(removed)
-                    self._history_count -= removed.sum(dim=0, dtype=torch.int64)
+                    retained = int(removed["n_tokens"]) - int(
+                        removed["start_token"]
+                    )
+                    self._history_tokens -= retained
+                    self._history_count -= self._chunk_counts(
+                        removed,
+                        dtype=torch.int64,
+                    )
             else:
                 excess = self.history_tokens - self.max_tokens
                 while excess > 0 and self.chunks:
                     oldest = self.chunks[0]
-                    if excess >= len(oldest):
-                        excess -= len(oldest)
+                    start = int(oldest["start_token"])
+                    retained = int(oldest["n_tokens"]) - start
+                    if excess >= retained:
+                        excess -= retained
                         removed = self.chunks.pop(0)
-                        self._history_tokens -= len(removed)
-                        self._history_count -= removed.sum(
-                            dim=0, dtype=torch.int64
+                        self._history_tokens -= retained
+                        self._history_count -= self._chunk_counts(
+                            removed,
+                            dtype=torch.int64,
                         )
                     else:
-                        removed = oldest[:excess]
-                        self.chunks[0] = oldest[excess:].clone()
-                        self._history_tokens -= len(removed)
-                        self._history_count -= removed.sum(
-                            dim=0, dtype=torch.int64
+                        self._history_count -= self._chunk_counts(
+                            oldest,
+                            dtype=torch.int64,
+                            row_start=start,
+                            row_stop=start + excess,
                         )
+                        new_start = start + excess
+                        if self.representation == "fixed_batch_indices":
+                            oldest["start_token"] = new_start
+                        else:
+                            indices = oldest["indices"]
+                            assert torch.is_tensor(indices)
+                            oldest["indices"] = indices[new_start:].clone()
+                            oldest["n_tokens"] = retained - excess
+                            oldest["start_token"] = 0
+                        self._history_tokens -= excess
                         excess = 0
+
+    def _selected_event_chunk(
+        self,
+        accepted: torch.Tensor,
+    ) -> dict[str, torch.Tensor | int]:
+        assert self.representation in {
+            "fixed_token_indices",
+            "fixed_batch_indices",
+            "bitpacked_masks",
+        }
+        assert self.active_blocks is not None
+        byte_mask = accepted.contiguous().view(torch.uint8)
+        if self.representation == "fixed_token_indices":
+            n_keep = int(round(self.active_blocks))
+            indices = byte_mask.topk(
+                n_keep,
+                dim=1,
+                largest=True,
+                sorted=False,
+            ).indices
+            indices = indices.sort(dim=1).values.to(torch.int32)
+        elif self.representation == "fixed_batch_indices":
+            if accepted.numel() > torch.iinfo(torch.int32).max:
+                raise ValueError("batch-topk tracker indices exceed int32 range")
+            n_keep = min(
+                max(int(round(len(accepted) * self.active_blocks)), 0),
+                accepted.numel(),
+            )
+            indices = byte_mask.reshape(-1).topk(
+                n_keep,
+                largest=True,
+                sorted=False,
+            ).indices
+            indices = indices.sort().values.to(torch.int32)
+        else:
+            indices = byte_mask[:, 0::8].clone()
+            for shift in range(1, 8):
+                source = byte_mask[:, shift::8]
+                if source.shape[1]:
+                    indices[:, : source.shape[1]].bitwise_or_(source << shift)
+        return {
+            "indices": indices,
+            "n_tokens": len(accepted),
+            "start_token": 0,
+        }
+
+    def _chunk_counts(
+        self,
+        chunk: dict[str, torch.Tensor | int],
+        *,
+        dtype: torch.dtype,
+        row_start: int | None = None,
+        row_stop: int | None = None,
+    ) -> torch.Tensor:
+        indices = chunk["indices"]
+        assert torch.is_tensor(indices)
+        n_tokens = int(chunk["n_tokens"])
+        start = int(chunk["start_token"]) if row_start is None else row_start
+        stop = n_tokens if row_stop is None else row_stop
+        counts = torch.zeros(self.n_blocks, dtype=dtype, device=self.device)
+        if self.representation == "fixed_token_indices":
+            blocks = indices[start:stop].reshape(-1).to(
+                device=self.device,
+                dtype=torch.int64,
+            )
+            weights = torch.ones(blocks.shape, dtype=dtype, device=self.device)
+        elif self.representation == "fixed_batch_indices":
+            flat = indices.to(device=self.device, dtype=torch.int64)
+            rows = torch.div(flat, self.n_blocks, rounding_mode="floor")
+            blocks = flat.remainder(self.n_blocks)
+            weights = ((rows >= start) & (rows < stop)).to(dtype)
+        else:
+            assert self._bit_shifts is not None
+            packed = indices[start:stop].to(device=self.device)
+            counts = torch.zeros(
+                self.n_blocks,
+                dtype=dtype,
+                device=self.device,
+            )
+            for rows in packed.split(512):
+                unpacked = torch.bitwise_right_shift(
+                    rows.unsqueeze(-1),
+                    self._bit_shifts,
+                ).bitwise_and_(1)
+                unpacked = unpacked.reshape(len(rows), -1)[:, : self.n_blocks]
+                counts.add_(unpacked.sum(dim=0, dtype=torch.int32))
+            return counts
+        counts.scatter_add_(
+            0,
+            blocks,
+            weights,
+        )
+        return counts
+
+    def _dense_mask_counts(self, mask: torch.Tensor) -> torch.Tensor:
+        counts = torch.zeros(
+            self.n_blocks,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        for rows in mask.split(512):
+            counts.add_(rows.sum(dim=0, dtype=torch.int32))
+        return counts
 
     @property
     def history_tokens(self) -> int:
@@ -413,8 +591,9 @@ class DeadTracker:
     def frequency(self, window_tokens: int) -> torch.Tensor:
         """Per-block frequency over the last ``window_tokens`` accepted tokens.
 
-        Stored boolean chunks are sliced at the exact token boundary, so batch
-        size and partial final batches do not change the criterion.
+        Sparse fixed-cardinality or bitpacked variable-support chunks are
+        sliced at the exact token boundary, so batch size and partial final
+        batches do not change the criterion.
         """
         if self.policy != "sasa":
             raise RuntimeError("frequency is available only for the SASA policy")
@@ -427,14 +606,25 @@ class DeadTracker:
             assert self._history_count is not None
             return self._history_count.float() / max(1, history_tokens)
         remaining = window_tokens
-        total = torch.zeros(self.n_blocks, device=self.device)
+        total = torch.zeros(
+            self.n_blocks,
+            dtype=torch.int64,
+            device=self.device,
+        )
         for chunk in reversed(self.chunks):
-            take = min(remaining, len(chunk))
-            total += chunk[-take:].sum(dim=0, dtype=torch.float32)
+            n_tokens = int(chunk["n_tokens"])
+            retained = n_tokens - int(chunk["start_token"])
+            take = min(remaining, retained)
+            total += self._chunk_counts(
+                chunk,
+                dtype=torch.int64,
+                row_start=n_tokens - take,
+                row_stop=n_tokens,
+            )
             remaining -= take
             if remaining == 0:
                 break
-        return total / window_tokens
+        return total.float() / window_tokens
 
     def dead(
         self,
@@ -510,6 +700,9 @@ class DeadTracker:
             "policy": self.policy,
         }
         if self.policy == "sasa":
+            state["selector"] = self.selector
+            state["active_blocks"] = self.active_blocks
+            state["representation"] = self.representation
             state["chunks"] = self.chunks
         elif self.policy == "long_horizon":
             state["tokens_seen"] = self.tokens_seen
@@ -524,15 +717,27 @@ class DeadTracker:
         return state
 
     def load_state_dict(self, state: dict) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("dead-tracker state must be a mapping")
         if state.get("policy") != self.policy:
             raise ValueError("dead-tracker policy changed across resume")
         expected_keys = set(self.state_dict())
         if set(state) != expected_keys:
             raise ValueError("dead-tracker state keys do not match its policy")
+        capacity = state["capacity"]
+        block_dim = state["block_dim"]
+        max_tokens = state["max_tokens"]
+        max_tokens_valid = (
+            max_tokens is None
+            if self.max_tokens is None
+            else type(max_tokens) is int and max_tokens == self.max_tokens
+        )
         if (
-            int(state["capacity"]) != self.capacity
-            or state["max_tokens"] != self.max_tokens
-            or int(state["block_dim"]) != self.block_dim
+            type(capacity) is not int
+            or capacity != self.capacity
+            or type(block_dim) is not int
+            or block_dim != self.block_dim
+            or not max_tokens_valid
         ):
             raise ValueError("dead-tracker configuration changed across resume")
 
@@ -553,21 +758,119 @@ class DeadTracker:
             return value
 
         if self.policy == "sasa":
+            if (
+                state["selector"] != self.selector
+                or type(state["active_blocks"]) is not type(self.active_blocks)
+                or state["active_blocks"] != self.active_blocks
+                or state["representation"] != self.representation
+            ):
+                raise ValueError("dead-tracker selector changed across resume")
+            assert self.representation in {
+                "fixed_token_indices",
+                "fixed_batch_indices",
+                "bitpacked_masks",
+            }
+            assert self.active_blocks is not None
             chunks = state["chunks"]
             if not isinstance(chunks, list):
                 raise ValueError("dead-tracker chunks must be a list")
             for chunk in chunks:
+                if not isinstance(chunk, dict) or set(chunk) != {
+                    "indices",
+                    "n_tokens",
+                    "start_token",
+                }:
+                    raise ValueError("dead-tracker chunk fields are malformed")
+                n_tokens = chunk["n_tokens"]
+                start_token = chunk["start_token"]
                 if (
-                    not torch.is_tensor(chunk)
-                    or chunk.ndim != 2
-                    or chunk.shape[0] <= 0
-                    or chunk.shape[1] != self.n_blocks
-                    or chunk.dtype != torch.bool
+                    not isinstance(n_tokens, int)
+                    or isinstance(n_tokens, bool)
+                    or n_tokens <= 0
+                    or not isinstance(start_token, int)
+                    or isinstance(start_token, bool)
+                    or not 0 <= start_token < n_tokens
+                ):
+                    raise ValueError("dead-tracker chunk token bounds are malformed")
+                if (
+                    self.representation != "fixed_batch_indices"
+                    and start_token != 0
                 ):
                     raise ValueError(
-                        "dead-tracker chunks must be nonempty bool [tokens, blocks]"
+                        "compact dead-tracker chunks cannot retain a stale prefix"
                     )
-            history_tokens = sum(len(chunk) for chunk in chunks)
+                indices = chunk["indices"]
+                if not torch.is_tensor(indices) or indices.layout != torch.strided:
+                    raise ValueError(
+                        "dead-tracker chunk indices must be dense strided tensors"
+                    )
+                if self.representation == "fixed_token_indices":
+                    if indices.dtype != torch.int32:
+                        raise ValueError("dead-tracker chunk indices must be int32")
+                    width = int(round(self.active_blocks))
+                    if indices.shape != (n_tokens, width):
+                        raise ValueError(
+                            "token-topk tracker indices have the wrong shape"
+                        )
+                    out_of_range = bool(
+                        ((indices < 0) | (indices >= self.n_blocks)).any()
+                    )
+                    unordered = width > 1 and bool(
+                        (indices[:, 1:] <= indices[:, :-1]).any()
+                    )
+                    if out_of_range or unordered:
+                        raise ValueError(
+                            "token-topk tracker indices are not canonical"
+                        )
+                elif self.representation == "fixed_batch_indices":
+                    if indices.dtype != torch.int32:
+                        raise ValueError("dead-tracker chunk indices must be int32")
+                    expected = min(
+                        max(int(round(n_tokens * self.active_blocks)), 0),
+                        n_tokens * self.n_blocks,
+                    )
+                    if indices.shape != (expected,):
+                        raise ValueError(
+                            "batch-topk tracker indices have the wrong shape"
+                        )
+                    out_of_range = bool(
+                        (
+                            (indices < 0)
+                            | (indices >= n_tokens * self.n_blocks)
+                        ).any()
+                    )
+                    unordered = len(indices) > 1 and bool(
+                        (indices[1:] <= indices[:-1]).any()
+                    )
+                    if out_of_range or unordered:
+                        raise ValueError(
+                            "batch-topk tracker indices are not canonical"
+                        )
+                else:
+                    packed_width = (self.n_blocks + 7) // 8
+                    if (
+                        indices.dtype != torch.uint8
+                        or indices.shape != (n_tokens, packed_width)
+                    ):
+                        raise ValueError(
+                            "bitpacked tracker masks have the wrong shape or dtype"
+                        )
+                    padding = -self.n_blocks % 8
+                    if padding and bool(
+                        (
+                            indices[:, -1]
+                            >> torch.tensor(
+                                8 - padding,
+                                dtype=torch.uint8,
+                                device=indices.device,
+                            )
+                        ).any()
+                    ):
+                        raise ValueError("bitpacked tracker padding is nonzero")
+            history_tokens = sum(
+                int(chunk["n_tokens"]) - int(chunk["start_token"])
+                for chunk in chunks
+            )
             if (
                 self.max_tokens is not None
                 and history_tokens > self.max_tokens
@@ -576,14 +879,21 @@ class DeadTracker:
             ):
                 raise ValueError("dead-tracker chunks exceed their retention bound")
             self.chunks = [
-                chunk.to(device=self.device, dtype=torch.bool).clone()
+                {
+                    "indices": chunk["indices"].to(device=self.device).clone(),
+                    "n_tokens": int(chunk["n_tokens"]),
+                    "start_token": int(chunk["start_token"]),
+                }
                 for chunk in chunks
             ]
             self._history_tokens = history_tokens
             assert self._history_count is not None
             self._history_count.zero_()
             for chunk in self.chunks:
-                self._history_count += chunk.sum(dim=0, dtype=torch.int64)
+                self._history_count += self._chunk_counts(
+                    chunk,
+                    dtype=torch.int64,
+                )
         elif self.policy == "long_horizon":
             tokens_seen = state["tokens_seen"]
             if (
@@ -995,6 +1305,11 @@ class Trainer:
             self.fwd = model
         self.opt, self.optimizer_kind = build_optimizer(self.master, cfg)
         self.sched = LambdaLR(self.opt, _lr_factor(cfg))
+        tracker_selector: str | None = None
+        tracker_active_blocks: float | None = None
+        if cfg.aux_variant == "sasa":
+            tracker_selector = model.cfg.selection
+            tracker_active_blocks = float(model.cfg.k)
         self.tracker = DeadTracker(
             model.cfg.n_blocks,
             capacity=128,
@@ -1006,6 +1321,8 @@ class Trainer:
                 if cfg.aux_variant not in {"none", "fel"}
                 else "disabled"
             ),
+            selector=tracker_selector,
+            active_blocks=tracker_active_blocks,
         )
         self.step_idx = 0
         self.accepted_tokens = 0

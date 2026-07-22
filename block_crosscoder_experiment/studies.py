@@ -30,7 +30,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v6"
+    "dense-linear-memory-v7"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3812,8 +3812,8 @@ def _evaluation_workspace_bytes(
 
 def _estimate_components(
     cell: CellSpec,
-) -> tuple[int, int, int, int, int, int, tuple[Any, ...]]:
-    """Return tokens, parameters, storage, FLOPs, peak memory, and store key."""
+) -> tuple[int, int, int, int, int, int, int, tuple[Any, ...]]:
+    """Return tokens, parameters, storage, FLOPs, memory, tracker, and key."""
 
     values = cell.decision_map
     site_dims_value = values["data.site_dims"]
@@ -3925,10 +3925,42 @@ def _estimate_components(
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0
     )
+    auxiliary = str(values["objective.auxiliary"])
+    if auxiliary == "frequency_dead_residual":
+        active_blocks = _positive_int(
+            values["model.active_blocks"],
+            "model.active_blocks",
+        )
+        dead_window_tokens = _positive_int(
+            values["auxiliary.dead_window_tokens"],
+            "auxiliary.dead_window_tokens",
+        )
+        if selector == "token_topk":
+            tracker_checkpoint_bytes = dead_window_tokens * active_blocks * 4
+        elif selector in {"block_batchtopk", "decoder_weighted_batchtopk"}:
+            tracker_checkpoint_bytes = (
+                dead_window_tokens + batch_tokens - 1
+            ) * active_blocks * 4
+        else:
+            tracker_checkpoint_bytes = dead_window_tokens * ((groups + 7) // 8)
+        tracker_residency_bytes = tracker_checkpoint_bytes + groups * 8
+    elif auxiliary in {
+        "dead_latent_residual",
+        "decoder_weighted_token_horizon_residual",
+    }:
+        tracker_checkpoint_bytes = groups * 8
+        tracker_residency_bytes = tracker_checkpoint_bytes
+    elif auxiliary == "sasa_release_coordinate":
+        tracker_checkpoint_bytes = shared_coordinates * 8
+        tracker_residency_bytes = tracker_checkpoint_bytes
+    else:
+        tracker_checkpoint_bytes = 0
+        tracker_residency_bytes = 0
     training_residency_bytes = (
         parameters * 28
         + dense_workspace_values * 4
         + factorized_materialization_bytes
+        + tracker_residency_bytes
     )
     # Evaluation runs after training state is released, so adding its complete
     # workspace to Adam residency would invent a peak that cannot occur.  Keep
@@ -3956,7 +3988,7 @@ def _estimate_components(
     # shard/prefetch/runtime headroom without pretending the store is resident.
     endpoint_error_cache_bytes = stored_rows * (len(quantizer_bits) + 1) * 8
     peak_host_ram_bytes = max(
-        8 * 1024**3 + parameters * 20,
+        8 * 1024**3 + parameters * 20 + tracker_checkpoint_bytes,
         8 * 1024**3 + calibration_ceiling,
         8 * 1024**3 + endpoint_error_cache_bytes,
     )
@@ -3992,6 +4024,7 @@ def _estimate_components(
         compute_flops,
         peak_vram_bytes,
         peak_host_ram_bytes,
+        tracker_checkpoint_bytes,
         store_key,
     )
 
@@ -4002,8 +4035,9 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
     FLOPs use six operations per operational dense weight element per token
     (forward plus backward).  This intentionally does not grant factorized
     models compute savings while the implementation materializes dense site
-    tensors.  Storage includes one activation store and a conservative 16
-    bytes per trainable parameter for checkpoint and optimizer state.
+    tensors. Storage includes one activation store, a conservative 16 bytes
+    per trainable parameter for checkpoint and optimizer state, and the exact
+    maximum persisted deadness-tracker representation.
     """
 
     (
@@ -4013,9 +4047,10 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
         compute_flops,
         peak_vram_bytes,
         peak_host_ram_bytes,
+        tracker_checkpoint_bytes,
         _,
     ) = _estimate_components(cell)
-    checkpoint_storage = parameters * 16
+    checkpoint_storage = parameters * 16 + tracker_checkpoint_bytes
     storage_bytes = activation_storage + checkpoint_storage
     return ResourceEstimate(
         training_tokens=train_tokens,
@@ -4036,7 +4071,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     # that base exactly once for each capture contract.
     stores: dict[tuple[Any, ...], int] = {}
     raw_stores: dict[tuple[Any, ...], int] = {}
-    for _, _, store_bytes, _, _, _, key in components:
+    for _, _, store_bytes, _, _, _, _, key in components:
         stores[key] = max(stores.get(key, 0), store_bytes)
         if key[12] == "content_addressed_derived_view":
             raw_key = (*key[:13], "raw_source_view", *key[14:])
@@ -4047,7 +4082,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
         storage_bytes=(
             sum(stores.values())
             + sum(raw_stores.values())
-            + sum(item[1] * 16 for item in components)
+            + sum(item[1] * 16 + item[6] for item in components)
         ),
         compute_flops=sum(item[3] for item in components),
         peak_vram_bytes=max((item[4] for item in components), default=0),

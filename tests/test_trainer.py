@@ -158,6 +158,8 @@ def test_dead_tracker_criteria(device):
         device=device,
         max_tokens=6 * B,
         policy="sasa",
+        selector="token_topk",
+        active_blocks=1,
     )
     horizon_tracker = DeadTracker(
         n_blocks=4,
@@ -169,7 +171,8 @@ def test_dead_tracker_criteria(device):
     mask = torch.zeros(B, 4, dtype=torch.bool, device=device)
     mask[:, 0] = True  # block 0 always active
     first = mask.clone()
-    first[0, 2] = True  # block 2 active once, in the first batch only
+    first[0, 0] = False
+    first[0, 2] = True  # block 2 replaces block 0 once in the first batch
 
     frequency_tracker.update(first)
     horizon_tracker.update(first)
@@ -228,17 +231,29 @@ def test_dead_tracker_policy_updates_only_exact_required_state(device, policy):
         device=device,
         max_tokens=max_tokens,
         policy=policy,
+        selector=("token_topk" if policy == "sasa" else None),
+        active_blocks=(2 if policy == "sasa" else None),
     )
     generator = torch.Generator().manual_seed(919)
     for batch_size in (5, 3, 11, 2):
-        mask = torch.rand(batch_size, 7, generator=generator) > 0.7
+        scores = torch.rand(batch_size, 7, generator=generator)
+        if policy == "sasa":
+            mask = torch.zeros(batch_size, 7, dtype=torch.bool)
+            mask.scatter_(1, scores.topk(2, dim=1).indices, True)
+        else:
+            mask = scores > 0.7
         activity = torch.rand(batch_size, 7, 3, generator=generator) > 0.75
         mask = mask.to(device)
         activity = activity.to(device)
         tracker.update(mask, activity if policy == "sasa_release" else None)
 
     policy_keys = {
-        "sasa": {"chunks"},
+        "sasa": {
+            "selector",
+            "active_blocks",
+            "representation",
+            "chunks",
+        },
         "long_horizon": {"tokens_seen", "last_fire"},
         "decoder_weighted_token_horizon": {"tokens_since_fired"},
         "sasa_release": {
@@ -261,8 +276,12 @@ def test_dead_tracker_policy_updates_only_exact_required_state(device, policy):
         device=device,
         max_tokens=max_tokens,
         policy=policy,
+        selector=("token_topk" if policy == "sasa" else None),
+        active_blocks=(2 if policy == "sasa" else None),
     )
     restored.load_state_dict(state)
+    with pytest.raises(ValueError, match="mapping"):
+        restored.load_state_dict([])
     restored_state = restored.state_dict()
     for key, value in state.items():
         other = restored_state[key]
@@ -270,14 +289,25 @@ def test_dead_tracker_policy_updates_only_exact_required_state(device, policy):
             assert torch.equal(value, other)
         elif isinstance(value, list):
             assert len(value) == len(other)
-            assert all(torch.equal(a, b) for a, b in zip(value, other, strict=True))
+            for chunk, restored_chunk in zip(value, other, strict=True):
+                assert chunk.keys() == restored_chunk.keys()
+                assert torch.equal(
+                    chunk["indices"],
+                    restored_chunk["indices"],
+                )
+                assert chunk["n_tokens"] == restored_chunk["n_tokens"]
+                assert chunk["start_token"] == restored_chunk["start_token"]
         else:
             assert value == other
 
     forged = dict(state)
     if policy == "sasa":
         forged["chunks"] = [
-            torch.zeros(2, 1, dtype=torch.bool, device=device)
+            {
+                "indices": torch.zeros(2, 1, dtype=torch.int32, device=device),
+                "n_tokens": 2,
+                "start_token": 0,
+            }
         ]
     elif policy == "long_horizon":
         forged["last_fire"] = torch.zeros(1, dtype=torch.int64, device=device)
@@ -289,8 +319,101 @@ def test_dead_tracker_policy_updates_only_exact_required_state(device, policy):
         forged["coordinate_passes_since_fired"] = torch.zeros(
             1, dtype=torch.int64, device=device
         )
-    with pytest.raises(ValueError, match="dead-tracker"):
+    with pytest.raises(ValueError, match="tracker"):
         restored.load_state_dict(forged)
+    for name, value in (
+        ("capacity", float(state["capacity"])),
+        ("capacity", str(state["capacity"])),
+        ("block_dim", float(state["block_dim"])),
+        ("max_tokens", float(state["max_tokens"])),
+    ):
+        forged_metadata = dict(state)
+        forged_metadata[name] = value
+        with pytest.raises(ValueError, match="configuration"):
+            restored.load_state_dict(forged_metadata)
+
+
+@pytest.mark.parametrize(
+    ("selector", "active_blocks"),
+    (
+        ("token_topk", 2.0),
+        ("batch_topk", 1.5),
+        ("threshold", 2.0),
+        ("dense", 2.0),
+    ),
+)
+def test_sasa_sparse_and_bitpacked_history_match_dense_reference(
+    device,
+    selector,
+    active_blocks,
+):
+    n_blocks = 7
+    window = 17
+    tracker = DeadTracker(
+        n_blocks=n_blocks,
+        capacity=8,
+        device=device,
+        max_tokens=window,
+        policy="sasa",
+        selector=selector,
+        active_blocks=active_blocks,
+    )
+    dense = torch.empty(0, n_blocks, dtype=torch.bool, device=device)
+    generator = torch.Generator().manual_seed(1931)
+    for batch_size in (1, 5, 23, 3, 11):
+        scores = torch.rand(batch_size, n_blocks * 2, generator=generator)[:, ::2]
+        assert not scores.is_contiguous()
+        if selector == "token_topk":
+            selected = torch.zeros(batch_size, n_blocks, dtype=torch.bool)
+            selected.scatter_(1, scores.topk(2, dim=1).indices, True)
+        elif selector == "batch_topk":
+            selected = torch.zeros(batch_size, n_blocks, dtype=torch.bool)
+            keep = round(batch_size * active_blocks)
+            selected.view(-1).scatter_(
+                0,
+                scores.reshape(-1).topk(keep).indices,
+                True,
+            )
+        else:
+            selected = scores > 0.62
+        storage = torch.zeros(batch_size, n_blocks * 2, dtype=torch.bool)
+        storage[:, ::2] = selected
+        mask = storage[:, ::2]
+        assert not mask.is_contiguous()
+        mask = mask.to(device)
+        tracker.update(mask)
+        dense = torch.cat((dense, mask), dim=0)[-window:]
+        for suffix in {1, min(5, len(dense)), len(dense)}:
+            expected = dense[-suffix:].sum(dim=0, dtype=torch.int64).float() / suffix
+            assert torch.equal(tracker.frequency(suffix), expected)
+
+        restored = DeadTracker(
+            n_blocks=n_blocks,
+            capacity=8,
+            device=device,
+            max_tokens=window,
+            policy="sasa",
+            selector=selector,
+            active_blocks=active_blocks,
+        )
+        restored.load_state_dict(tracker.state_dict())
+        assert torch.equal(restored.frequency(len(dense)), tracker.frequency(len(dense)))
+        tracker = restored
+
+    if tracker.representation != "fixed_batch_indices":
+        state = tracker.state_dict()
+        forged = dict(state)
+        forged["chunks"] = [dict(chunk) for chunk in state["chunks"]]
+        forged["chunks"][0]["start_token"] = 1
+        with pytest.raises(ValueError, match="stale prefix"):
+            tracker.load_state_dict(forged)
+
+    state = tracker.state_dict()
+    forged = dict(state)
+    forged["chunks"] = [dict(chunk) for chunk in state["chunks"]]
+    forged["chunks"][0]["indices"] = forged["chunks"][0]["indices"].to_sparse()
+    with pytest.raises(ValueError, match="dense strided"):
+        tracker.load_state_dict(forged)
 
 
 def test_dead_tracker_windows_are_token_denominated(device):
@@ -300,6 +423,8 @@ def test_dead_tracker_windows_are_token_denominated(device):
         device=device,
         max_tokens=10,
         policy="sasa",
+        selector="token_topk",
+        active_blocks=1,
     )
     first = torch.tensor([[True, False]] * 6, device=device)
     second = torch.tensor([[False, True]] * 2, device=device)
@@ -322,6 +447,8 @@ def test_dead_tracker_windows_are_token_denominated(device):
         device=device,
         max_tokens=10,
         policy="sasa",
+        selector="token_topk",
+        active_blocks=1,
     )
     restored.load_state_dict(tracker.state_dict())
     assert restored.history_tokens == tracker.history_tokens
@@ -339,6 +466,8 @@ def test_dead_tracker_slices_the_oldest_batch_at_the_exact_window(device):
         device=device,
         max_tokens=1_000,
         policy="sasa",
+        selector="token_topk",
+        active_blocks=1,
     )
     mask = torch.zeros(4_096, 2, dtype=torch.bool, device=device)
     mask[:3_096, 0] = True
