@@ -2554,15 +2554,17 @@ def bsc_loss(
     total = l_rec
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
     if cfg.lambda_regularizer > 0 and cfg.regularizer != "none":
-        D = model.decoder_tensor() if decoder is None else decoder
         if cfg.regularizer == "map_nuclear":
+            D = model.decoder_tensor() if decoder is None else decoder
             E = model.encoder_tensor() if encoder is None else encoder
             reg = map_nuclear_penalty(D, E, eps=cfg.sv_eps)
             if cfg.map_nuclear_reduction == "sum_blocks":
                 reg = reg * cfg.n_blocks * cfg.block_dim
         elif cfg.regularizer == "decoder_nuclear":
+            D = model.decoder_tensor() if decoder is None else decoder
             reg = decoder_nuclear_penalty(D, eps=cfg.sv_eps)
         elif cfg.regularizer == "crosscoder_l1":
+            D = model.decoder_tensor() if decoder is None else decoder
             # Anthropic's sitewise decoder-norm-weighted activation L1.
             # For the paper-faithful bridge b=1; the Frobenius extension is
             # well-defined for blocks but is not claimed as their objective.

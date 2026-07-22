@@ -1697,6 +1697,34 @@ def test_group_lasso_bridge_has_positive_learned_threshold(device):
     assert model.log_threshold.grad is not None
 
 
+def test_factorized_group_lasso_loss_never_materializes_decoder(device, monkeypatch):
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=8,
+            block_dim=2,
+            n_sites=4,
+            d_model=6,
+            k=2,
+            selection="dense",
+            code_activation="group_soft_threshold",
+            decoder_constraint="free",
+            regularizer="group_l21",
+            lambda_regularizer=1e-3,
+            site_rank=2,
+        )
+    ).to(device)
+    x = torch.randn(32, 4, 6, device=device)
+    out = model(x)
+
+    def refuse_materialization():
+        raise AssertionError("group L2,1 does not consume decoder weights")
+
+    monkeypatch.setattr(model, "decoder_tensor", refuse_materialization)
+    parts = bsc_loss(out, x, model)
+    parts["total"].backward()
+    assert model.log_threshold.grad is not None
+
+
 def test_group_lasso_target_gate_keeps_exact_boundary_semantics(device):
     model = make_model(
         device,
