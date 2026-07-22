@@ -75,6 +75,8 @@ from block_crosscoder_experiment.store import (
     prefetch_batches,
 )
 from block_crosscoder_experiment.runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
+    CODE_NORM_NATIVE_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -2727,6 +2729,14 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     site_rank = (
         None if values["model.site_rank"] is None else int(values["model.site_rank"])
     )
+    code_norm_implementation = str(
+        values["implementation.code_norm_implementation"]
+    )
+    if code_norm_implementation not in {
+        CODE_NORM_CUDA_IMPLEMENTATION,
+        CODE_NORM_NATIVE_IMPLEMENTATION,
+    }:
+        raise CellExecutionError("unknown code-norm implementation identity")
     factorized_execution_implementation = str(
         values["implementation.factorized_execution_implementation"]
     )
@@ -2876,6 +2886,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         source_site=int(values["model.source_site"]),
         code_activation=activation,
         selection_score=selection_score,
+        code_norm_implementation=code_norm_implementation,
         decoded_energy_implementation=decoded_energy_implementation,
         isolated_loss_decrease_implementation=isolated_loss_implementation,
         decoder_retraction_implementation=decoder_retraction_implementation,

@@ -67,6 +67,7 @@ from block_crosscoder_experiment.cli.data import fit_transform_artifacts
 from block_crosscoder_experiment.codec import Codec
 from block_crosscoder_experiment.model import BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -802,6 +803,10 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         == FACTORIZED_EXECUTION_NOT_APPLICABLE
     )
     assert (
+        checkpoint_payload["model_cfg"]["code_norm_implementation"]
+        == CODE_NORM_CUDA_IMPLEMENTATION
+    )
+    assert (
         checkpoint_payload["model_cfg"]["sparse_decode_implementation"]
         == SPARSE_DECODE_CUDA_IMPLEMENTATION
     )
@@ -867,6 +872,22 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         _validate_final_checkpoint(
             missing_sparse_path,
             missing_sparse_identity["run_binding"],
+        )
+
+    missing_code_norm_identity = copy.deepcopy(checkpoint_payload)
+    missing_code_norm_identity["model_cfg"].pop("code_norm_implementation")
+    missing_code_norm_identity["run_binding"]["model_cfg"].pop(
+        "code_norm_implementation"
+    )
+    missing_code_norm_path = tmp_path / "missing-code-norm-identity.pt"
+    torch.save(missing_code_norm_identity, missing_code_norm_path)
+    with pytest.raises(
+        CellExecutionError,
+        match="lacks code_norm_implementation",
+    ):
+        _validate_final_checkpoint(
+            missing_code_norm_path,
+            missing_code_norm_identity["run_binding"],
         )
 
     missing_map_nuclear_identity = copy.deepcopy(checkpoint_payload)
@@ -1108,6 +1129,11 @@ def test_mapped_isolated_loss_identity_round_trips_and_refuses_forgery(
             "implementation.decoded_energy_implementation",
             "ambient_cuda_default",
             "unknown decoded-energy implementation identity",
+        ),
+        (
+            "implementation.code_norm_implementation",
+            "ambient_cuda_default",
+            "unknown code-norm implementation identity",
         ),
         (
             "optimizer.retract_every_steps",

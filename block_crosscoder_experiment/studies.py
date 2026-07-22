@@ -23,6 +23,8 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
+    CODE_NORM_NATIVE_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -593,6 +595,7 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "precision.preflight_support_iou_min",
         "inference.threshold_estimator",
         "inference.threshold_source",
+        "implementation.code_norm_implementation",
         "implementation.decoded_energy_implementation",
         "implementation.decoder_retraction_implementation",
         "implementation.factorized_execution_implementation",
@@ -4044,6 +4047,18 @@ def _resolved_sparse_decode_implementation(
     return declared
 
 
+def _resolved_code_norm_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    declared = str(values["implementation.code_norm_implementation"])
+    if declared not in {
+        CODE_NORM_CUDA_IMPLEMENTATION,
+        CODE_NORM_NATIVE_IMPLEMENTATION,
+    }:
+        raise StudyError("unknown code-norm implementation identity")
+    return declared
+
+
 def _resolved_map_nuclear_implementation(
     values: Mapping[str, DecisionValue],
 ) -> str:
@@ -4167,6 +4182,24 @@ def _bind_derived_score_implementations(
     """Recompute implementation identities after every effective cell delta."""
 
     bound = _bind_derived_factorized_execution_implementation(decisions)
+    filtered_code_norm = tuple(
+        decision
+        for decision in bound
+        if decision.name != "implementation.code_norm_implementation"
+    )
+    bound = merge_decisions(
+        filtered_code_norm,
+        (
+            engineering(
+                "implementation.code_norm_implementation",
+                CODE_NORM_CUDA_IMPLEMENTATION,
+                rationale=(
+                    "use the bitwise-native guarded BF16 four-coordinate CUDA "
+                    "norm for large no-grad pools and native vector_norm otherwise"
+                ),
+            ),
+        ),
+    )
     filtered_sparse = tuple(
         decision
         for decision in bound
@@ -4390,6 +4423,7 @@ def _estimate_components(
         values
     )
     _resolved_factorized_execution_implementation(values)
+    _resolved_code_norm_implementation(values)
     _resolved_sparse_decode_implementation(values)
     _resolved_map_nuclear_implementation(values)
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and

@@ -8,6 +8,7 @@ import block_crosscoder_experiment.studies as studies_module
 from block_crosscoder_experiment.campaign import Campaign
 from block_crosscoder_experiment.cli.run_cell import validate_cell_config
 from block_crosscoder_experiment.runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -1199,6 +1200,9 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
                     "implementation.factorized_execution_implementation"
                 ] == _expected_factorized_implementation(cell.decision_map)
                 assert cell.decision_map[
+                    "implementation.code_norm_implementation"
+                ] == CODE_NORM_CUDA_IMPLEMENTATION
+                assert cell.decision_map[
                     "implementation.sparse_decode_implementation"
                 ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
                 assert cell.decision_map[
@@ -1707,6 +1711,9 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
             "implementation.factorized_execution_implementation"
         ] == _expected_factorized_implementation(cell.decision_map)
         assert cell.decision_map[
+            "implementation.code_norm_implementation"
+        ] == CODE_NORM_CUDA_IMPLEMENTATION
+        assert cell.decision_map[
             "implementation.sparse_decode_implementation"
         ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
         assert cell.decision_map[
@@ -1911,6 +1918,18 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
     )
     with pytest.raises(StudyError, match=message):
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
+
+
+def test_code_norm_estimator_refuses_unknown_implementation_identity() -> None:
+    cell = build_phase2_plan(seeds=(0,), smoke=True).cells[0]
+    with pytest.raises(StudyError, match="unknown code-norm implementation identity"):
+        estimate_cell(
+            _replace_decision(
+                cell,
+                "implementation.code_norm_implementation",
+                "ambient_cuda_default",
+            )
+        )
 
 
 def test_v14_estimator_credits_only_the_explicit_fast_implementation() -> None:

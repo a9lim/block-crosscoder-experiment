@@ -3016,6 +3016,13 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     with pytest.raises(ValueError, match="lacks sparse_decode_implementation"):
         Trainer.load_checkpoint(missing_sparse_path, device=device)
 
+    missing_code_norm = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    missing_code_norm["model_cfg"].pop("code_norm_implementation")
+    missing_code_norm_path = tmp_path / "missing-code-norm-id.pt"
+    torch.save(missing_code_norm, missing_code_norm_path)
+    with pytest.raises(ValueError, match="lacks code_norm_implementation"):
+        Trainer.load_checkpoint(missing_code_norm_path, device=device)
+
     missing_map_nuclear = {**payload, "model_cfg": dict(payload["model_cfg"])}
     missing_map_nuclear["model_cfg"].pop("map_nuclear_implementation")
     missing_map_nuclear_path = tmp_path / "missing-map-nuclear-id.pt"

@@ -21,6 +21,8 @@ from block_crosscoder_experiment.model import (
     token_topk_mask,
 )
 from block_crosscoder_experiment.runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
+    CODE_NORM_NATIVE_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -120,6 +122,23 @@ def test_decoder_retraction_identity_resolves_explicitly(constraint, expected):
         decoder_constraint=constraint,
     )
     assert cfg.decoder_retraction_implementation == expected
+
+
+def test_code_norm_implementation_identity_is_explicit_and_fails_closed():
+    common = dict(n_blocks=4, block_dim=4, n_sites=2, d_model=5, k=2)
+    assert (
+        BSCConfig(**common).code_norm_implementation
+        == CODE_NORM_CUDA_IMPLEMENTATION
+    )
+    assert (
+        BSCConfig(
+            **common,
+            code_norm_implementation=CODE_NORM_NATIVE_IMPLEMENTATION,
+        ).code_norm_implementation
+        == CODE_NORM_NATIVE_IMPLEMENTATION
+    )
+    with pytest.raises(ValueError, match="unknown code_norm_implementation"):
+        BSCConfig(**common, code_norm_implementation="ambient_cuda_default")
 
 
 @pytest.mark.parametrize(

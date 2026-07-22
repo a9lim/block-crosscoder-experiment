@@ -85,6 +85,21 @@ FACTORIZED_EXECUTION_IMPLEMENTATIONS = (
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
 )
 
+# Code-norm execution is serialized independently from the scientific score.
+# The CUDA specialization is bitwise equal to native BF16 vector_norm on its
+# complete carrier; every other dtype, layout, shape, device, or grad-enabled
+# call falls back to the native reference.
+CODE_NORM_CUDA_IMPLEMENTATION = (
+    "bf16_b4_n4194304_tile256_n8388608_tile128_sqrt_rn_cuda_else_native_v1"
+)
+CODE_NORM_NATIVE_IMPLEMENTATION = "native_vector_norm_v1"
+CODE_NORM_IMPLEMENTATIONS = (
+    CODE_NORM_CUDA_IMPLEMENTATION,
+    CODE_NORM_NATIVE_IMPLEMENTATION,
+)
+CUDA_CODE_NORM_MIN_OUTPUTS = 1 << 22
+CUDA_CODE_NORM_LARGE_OUTPUTS = 1 << 23
+
 SPARSE_DECODE_CUDA_IMPLEMENTATION = (
     "native_or_rank_hard_topk_cuda_tile256_else_dense_v2"
 )
@@ -124,6 +139,7 @@ CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX = 2.0e-6
 CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX = 1.0e-4
 
 MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
+    "code_norm_implementation",
     "decoded_energy_implementation",
     "isolated_loss_decrease_implementation",
     "decoder_retraction_implementation",

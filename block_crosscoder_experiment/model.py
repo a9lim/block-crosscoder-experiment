@@ -40,6 +40,9 @@ from .gram import (
     map_nuclear_penalty,
 )
 from .runtime_limits import (
+    CODE_NORM_CUDA_IMPLEMENTATION,
+    CODE_NORM_IMPLEMENTATIONS,
+    CUDA_CODE_NORM_MIN_OUTPUTS,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_IMPLEMENTATIONS,
@@ -257,6 +260,9 @@ class BSCConfig:
     selection_score: str = (
         "code_norm"  # plus decoder_weighted/decoded_energy/loss decrease
     )
+    # The scientific norm is unchanged.  This identity binds only the
+    # bitwise-equivalent guarded CUDA execution schedule.
+    code_norm_implementation: str = CODE_NORM_CUDA_IMPLEMENTATION
     # The scientific score name remains decoded_energy.  This separate,
     # serialized implementation identity permits the Stiefel equality
     # ||D_g^T z_g||_sites = ||z_g|| only under the guarded carrier below.
@@ -574,6 +580,8 @@ class BSCConfig:
             not in FACTORIZED_EXECUTION_IMPLEMENTATIONS
         ):
             raise ValueError("unknown factorized_execution_implementation")
+        if self.code_norm_implementation not in CODE_NORM_IMPLEMENTATIONS:
+            raise ValueError("unknown code_norm_implementation")
         if self.sparse_decode_implementation not in SPARSE_DECODE_IMPLEMENTATIONS:
             raise ValueError("unknown sparse_decode_implementation")
         if self.map_nuclear_implementation not in MAP_NUCLEAR_IMPLEMENTATIONS:
@@ -1830,7 +1838,21 @@ class BlockCrosscoder(nn.Module):
         if self.cfg.selection_score in {"code_norm", "decoder_weighted"} or (
             self.cfg.selection_score == "decoded_energy" and fast_decoded_energy
         ):
-            score = z.norm(dim=-1)
+            if (
+                self.cfg.code_norm_implementation == CODE_NORM_CUDA_IMPLEMENTATION
+                and not torch.is_grad_enabled()
+                and z.is_cuda
+                and z.dtype == torch.bfloat16
+                and z.ndim >= 1
+                and z.shape[-1] == 4
+                and z.is_contiguous()
+                and z.numel() // 4 >= CUDA_CODE_NORM_MIN_OUTPUTS
+            ):
+                from .cuda_code_norm import cuda_code_norm4
+
+                score = cuda_code_norm4(z)
+            else:
+                score = z.norm(dim=-1)
         if self.cfg.selection_score == "decoder_weighted":
             if _score_geometry is None:
                 if direct_factorized:

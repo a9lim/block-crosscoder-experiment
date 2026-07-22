@@ -1249,6 +1249,28 @@ to three. Two 21-sample reverse-order jobe repetitions improve the median from
 `8.483` to `8.426 ms` (`0.66%`, `1.007x`) and from `8.616` to `8.480 ms`
 (`1.58%`, `1.016x`); peak allocation remains `656.31 MiB`.
 
+Large no-gradient bf16 code-norm pools with contiguous block width four use a
+dedicated CUDA reduction bound by the serialized identity
+`bf16_b4_n4194304_tile256_n8388608_tile128_sqrt_rn_cuda_else_native_v1`.
+It is admitted only from 4,194,304 output scores upward, using 256-element
+tiles below 8,388,608 outputs and 128-element tiles at and above that second
+threshold. Grad-enabled scoring, other widths, dtypes, layouts, devices,
+smaller pools, and the explicit `native_vector_norm_v1` oracle retain
+`torch.linalg.vector_norm`. The kernel accumulates four squared coordinates in
+fp32 and uses CUDA `sqrt.rn`: Triton's generic square root was rejected after
+changing 5--10 of 8,388,608 bf16 scores by one ULP. Fixed-scale,
+tiny/large-scale, signed-zero, infinity, and NaN fixtures require bitwise
+equality or paired NaNs, and the complete fallback predicate is directly
+tested. Changing the carrier, either threshold, reduction tree, square-root
+mode, or tile schedule requires a new implementation identity.
+
+On jobe at `[4096,2048,4]`, the isolated norm falls from `.162--.174 ms` to
+`.092 ms`. In alternating 26-step complete-Trainer gates from identical state,
+rank-four site-factorized execution falls from `9.351` to `9.295 ms` median
+(`.60%`) and the unfactorized control falls from `7.117` to `7.042 ms`
+(`1.06%`); fp32 master parameters, bf16 forward parameters, and AdamW state
+remain bitwise identical after every compared trajectory.
+
 The shared kernels also retain guarded configuration values used only by unit
 fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted
@@ -1527,7 +1549,7 @@ materially affect a claim:
 | calibrated deployment threshold | adapted engineering: replace batch/global training selection with source-free per-token inference | calibration target error, native/deployed endpoints, saved-codec round trip | live |
 | quantizer frontier and 256/384/512-bit budgets | engineering/scientific: compare methods at actual total deployment cost rather than nominal L0 | complete zero/2/4/6/8/12/16-bit frontier, exact codec bytes, no extrapolation | live |
 | deterministic row replay and checkpointing | engineering: make unique data and optimizer presentations auditable and resumable; Phase 2 writes atomically every 1,000,000 accepted tokens, bounds interruption replay below one million tokens, and prices both retained bytes and cumulative checkpoint-write traffic | uninterrupted-versus-resume equality, row-stream hashes, checkpoint count, and cumulative-write accounting | live |
-| CUDA execution and sparse data movement | engineering: fuse invariant checks and bf16-gradient transfer certificates, use the flattened direct encoder plus cached partial-view contractions, reuse frozen/materialized tensors, stage pinned batches, stop capture at the last requested hook, and decode or transfer only selected events without changing the mathematical cell | named `flattened_encoder_reduction_sensitivity` ablation and bounds; exact resume and pathological-gradient fallback under the bound clean implementation; dense/sparse packet round trips, CPU lifecycle, CUDA/CPU endpoint parity, deterministic stream order | universal pre-run implementation choice, not swept |
+| CUDA execution and sparse data movement | engineering: fuse invariant checks and bf16-gradient transfer certificates, specialize exact large bf16 four-coordinate code norms, use the flattened direct encoder plus cached partial-view contractions, reuse frozen/materialized tensors, stage pinned batches, stop capture at the last requested hook, and decode or transfer only selected events without changing the mathematical cell | bitwise native score/support and exact state trajectories; named `flattened_encoder_reduction_sensitivity` ablation and bounds; exact resume and pathological-gradient fallback under the bound clean implementation; dense/sparse packet round trips, CPU lifecycle, CUDA/CPU endpoint parity, deterministic stream order | universal pre-run implementation choice, not swept |
 | deterministic selector cutoff ties | engineering: exact zero/ReLU ties are common and backend TopK tie order is not a scientific choice | score descending, then lowest block index per token or lowest row-major event index batch-wide; invalid policy refused | universal, not swept |
 | smoke protocol selection | engineering: exercise the complete conditional state machine without laundering tiny runs into evidence | preserve full-cell promotable intent; `runtime.smoke` blocks promotion; mode is `smoke_protocol_only`; panel escalation refused | test-only |
 | site-axis factorization | adapted from FMX at the mechanism level: a low-rank layer axis may reduce parameters and impose useful cross-layer regularity without changing the sparse block coordinate | exact selected parent, unfactorized free-weight control, ranks `1/2/4`, fixed-rate and identification endpoints; repeat after nonzero/structured masking | Phase-1 capability; Phase-2 parsimony tuning and post-mask interaction revisit |

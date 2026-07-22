@@ -148,6 +148,15 @@ exit is not evidence by itself.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.
+- Code norm has a separate serialized execution identity. Large contiguous
+  no-grad bf16 CUDA pools of block width four bind the exact `sqrt.rn` kernel;
+  the identity binds both the 4,194,304-output admission threshold and the
+  8,388,608-output 256-to-128-element tile switch. Every other carrier and the
+  explicit native identity use
+  `torch.linalg.vector_norm`. Random, extreme-scale, signed-zero, Inf/NaN,
+  TopK-support, complete fallback, and multi-step master/forward/optimizer
+  equality gates must pass before release. Missing or unknown identities
+  refuse at model, cell, checkpoint, and frozen-artifact boundaries.
 - Stiefel QR and symmetric-polar retractions satisfy their declared Gram
   invariant and produce finite gradients. Canonical QR, polar, and other
   carriers respectively bind `cholesky_qr1_positive_diagonal_cond64_v1`,
