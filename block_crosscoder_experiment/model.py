@@ -699,6 +699,17 @@ def _pack_encoder_factor_core(core: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _pack_full_encoder(encoder: torch.Tensor) -> torch.Tensor:
+    """Store logical ``[S,G,b,d]`` in encode-GEMM order ``[S*d,G*b]``."""
+
+    sites, groups, block_dim, d_model = encoder.shape
+    return (
+        encoder.permute(0, 3, 1, 2)
+        .reshape(sites * d_model, groups * block_dim)
+        .contiguous()
+    )
+
+
 def _pack_decoder_factor_core(core: torch.Tensor) -> torch.Tensor:
     """Store logical ``[R,G,b,d]`` in decode-GEMM order ``[G*b,R*d]``."""
 
@@ -913,11 +924,11 @@ class BlockCrosscoder(nn.Module):
                 if cfg.identical_site_init:
                     encoder.copy_(encoder[:1].expand_as(encoder))
             if cfg.site_rank is None:
-                self.E = nn.Parameter(encoder)
+                if cfg.encoder_constraint == "unit_latent":
+                    _project_latent_rows_count_tensor_(encoder)
+                self.E = nn.Parameter(_pack_full_encoder(encoder))
                 self.register_parameter("E_site", None)
                 self.register_parameter("E_core", None)
-                if cfg.encoder_constraint == "unit_latent":
-                    _project_latent_rows_count_tensor_(self.E.data)
             else:
                 encoder_site, encoder_core = _site_axis_factorize(
                     encoder, cfg.site_rank
@@ -1069,10 +1080,22 @@ class BlockCrosscoder(nn.Module):
             assert self.D is not None and self.log_gamma is not None
             encoder = self.D * self.log_gamma.exp()
         else:
-            encoder = self.E
+            encoder = self._encoder_full_tensor()
         if self._has_padded_coordinates:
             return encoder * self.coordinate_mask
         return encoder
+
+    def _encoder_full_tensor(self) -> torch.Tensor:
+        """Logical ``[S,G,b,d]`` view of the physical full encoder map."""
+
+        cfg = self.cfg
+        assert cfg.site_rank is None and self.E is not None
+        return self.E.view(
+            cfg.n_sites,
+            cfg.d_model,
+            cfg.n_blocks,
+            cfg.block_dim,
+        ).permute(0, 2, 3, 1)
 
     def _factorized_flat_coordinate_mask(self, dtype: torch.dtype) -> torch.Tensor:
         """Return the common rank-major ``[R*d]`` padding mask."""
@@ -2204,11 +2227,11 @@ class BlockCrosscoder(nn.Module):
         if per_block:
             scale = mean_p.median() / mean_p  # [G]
             assert self.E is not None
-            self.E.mul_(scale.view(1, -1, 1, 1))
+            self._encoder_full_tensor().mul_(scale.view(1, -1, 1, 1))
         else:
             self.scale_encoder_(float(mean_p.median() / mean_p.mean()))
         if self.E is not None:
-            self.E.mul_(self.coordinate_mask)
+            self._encoder_full_tensor().mul_(self.coordinate_mask)
 
     @torch.no_grad()
     def scale_encoder_(self, multiplier: float) -> None:
@@ -2224,7 +2247,7 @@ class BlockCrosscoder(nn.Module):
         else:
             assert self.E is not None
             self.E.mul_(multiplier)
-            self.E.mul_(self.coordinate_mask)
+            self._encoder_full_tensor().mul_(self.coordinate_mask)
 
     @property
     def parameter_device(self) -> torch.device:
@@ -2296,14 +2319,15 @@ class BlockCrosscoder(nn.Module):
                 self.D.data.mul_(self.coordinate_mask)
                 mark(self.D)
             if self.E is not None:
+                encoder = self._encoder_full_tensor()
                 if self._has_padded_coordinates:
-                    self.E.data.mul_(self.coordinate_mask)
+                    encoder.mul_(self.coordinate_mask)
                     mark(self.E)
                 if self.cfg.encoder_constraint == "unit_latent":
-                    _project_latent_rows_count_tensor_(self.E.data)
+                    _project_latent_rows_count_tensor_(encoder)
                     mark(self.E)
                     if self._has_padded_coordinates:
-                        self.E.data.mul_(self.coordinate_mask)
+                        encoder.mul_(self.coordinate_mask)
                         mark(self.E)
         if not self.cfg.decoder_bias:
             self.c.data.zero_()

@@ -55,6 +55,12 @@ exit is not evidence by itself.
   uses the direct kernel exactly; only declared partial views use the cached
   per-site reduction. Any kernel or bound change requires a new clean
   implementation identity before launch.
+- The unfactorized untied encoder parameter is physically contiguous in the
+  flattened GEMM layout. Its logical adapter must share storage with that
+  parameter, exact mapped forward/backward and multi-step optimizer oracles
+  must pass, and a checkpoint carrying the superseded four-dimensional shape
+  must refuse. Tests that inspect scientific encoder geometry use the logical
+  adapter rather than relying on parameter storage order.
 - The compiled large-CUDA fp32 quadratic reduction is compared with its eager
   oracle at the fixed loss, prediction/target-gradient, multi-step
   model/optimizer-state, and selector-support bounds in `design.md`. Masked,

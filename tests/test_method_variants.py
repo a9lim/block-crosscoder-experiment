@@ -144,7 +144,9 @@ def test_availability_rescaled_sum_matches_full_sum_and_rescales_visible_sites()
         )
     )
     with torch.no_grad():
-        summed.E.copy_(torch.tensor([[[[1.0]], [[2.0]]], [[[3.0]], [[4.0]]]]))
+        summed._encoder_full_tensor().copy_(
+            torch.tensor([[[[1.0]], [[2.0]]], [[[3.0]], [[4.0]]]])
+        )
     rescaled.load_state_dict(summed.state_dict())
     x = torch.tensor([[[2.0], [5.0]], [[7.0], [11.0]]])
 
@@ -206,7 +208,7 @@ def test_geometric_median_bias_and_independent_encoder_init_are_executable():
             encoder_init="independent",
         )
     )
-    assert not torch.equal(model.E, model.D)
+    assert not torch.equal(model.encoder_tensor(), model.D)
     x = torch.tensor([[[0.0], [0.0]], [[0.0], [0.0]], [[100.0], [100.0]]])
     model.initialize_decoder_bias_(x)
     assert float(model.c.abs().max().detach()) < 1e-3
@@ -264,17 +266,24 @@ def test_rectangular_sites_ignore_padding_and_have_zero_padded_gradients():
     assert torch.equal(out.xhat, out_perturbed.xhat)
     _assert_exact_zero(out.xhat[:, 0, 2:])
 
-    encoder_mask = model.coordinate_mask.expand_as(model.E)
+    encoder = model._encoder_full_tensor()
+    encoder_mask = model.coordinate_mask.expand_as(encoder)
     decoder_mask = model.coordinate_mask.expand_as(model.D)
     _assert_exact_zero(model.encoder_tensor()[~encoder_mask])
     _assert_exact_zero(model.decoder_tensor()[~decoder_mask])
 
     bsc_loss(out, x, model)["total"].backward()
     assert model.E.grad is not None and model.D.grad is not None
-    _assert_exact_zero(model.E.grad[~encoder_mask])
+    encoder_grad = model.E.grad.view(
+        model.cfg.n_sites,
+        model.cfg.d_model,
+        model.cfg.n_blocks,
+        model.cfg.block_dim,
+    ).permute(0, 2, 3, 1)
+    _assert_exact_zero(encoder_grad[~encoder_mask])
     _assert_exact_zero(model.D.grad[~decoder_mask])
     _assert_exact_zero(model.c.grad[~model.coordinate_mask[:, 0, 0]])
-    assert model.E.grad[encoder_mask].abs().sum() > 0
+    assert encoder_grad[encoder_mask].abs().sum() > 0
     assert model.D.grad[decoder_mask].abs().sum() > 0
 
 
@@ -289,8 +298,9 @@ def test_sum_mean_and_source_encoder_fusion_are_distinct_exact_maps():
     sum_model = BlockCrosscoder(common)
     with torch.no_grad():
         sum_model.E.zero_()
-        sum_model.E[0, :, 0, 0] = torch.tensor([1.0, 2.0])
-        sum_model.E[1, :, 0, 0] = torch.tensor([3.0, 4.0])
+        encoder = sum_model._encoder_full_tensor()
+        encoder[0, :, 0, 0] = torch.tensor([1.0, 2.0])
+        encoder[1, :, 0, 0] = torch.tensor([3.0, 4.0])
 
     mean_model = BlockCrosscoder(
         _model_cfg(**{**asdict(common), "encoder_fusion": "mean"})
@@ -302,7 +312,7 @@ def test_sum_mean_and_source_encoder_fusion_are_distinct_exact_maps():
     source_model.load_state_dict(sum_model.state_dict())
 
     x = torch.tensor([[[2.0, 9.0], [5.0, -7.0]], [[-1.0, 2.0], [4.0, 3.0]]])
-    per_site = torch.einsum("bsd,sgkd->bsgk", x, sum_model.E)
+    per_site = torch.einsum("bsd,sgkd->bsgk", x, sum_model.encoder_tensor())
     expected_sum = per_site.sum(dim=1)
     assert torch.equal(sum_model.encode(x), expected_sum)
     assert torch.equal(mean_model.encode(x), expected_sum / 2)
@@ -405,13 +415,19 @@ def test_sasa_release_unit_latent_constraints_and_decoder_nuclear_loss():
         )
     )
     assert torch.allclose(model.D.norm(dim=-1), torch.ones(1, 3, 2))
-    assert torch.allclose(model.E.norm(dim=-1), torch.ones(1, 3, 2))
+    assert torch.allclose(model.encoder_tensor().norm(dim=-1), torch.ones(1, 3, 2))
     with torch.no_grad():
         model.D.mul_(torch.linspace(0.2, 2.0, 6).view(1, 3, 2, 1))
-        model.E.mul_(torch.linspace(2.0, 0.2, 6).view(1, 3, 2, 1))
+        model._encoder_full_tensor().mul_(
+            torch.linspace(2.0, 0.2, 6).view(1, 3, 2, 1)
+        )
     model.project_decoder_()
     assert torch.allclose(model.D.norm(dim=-1), torch.ones(1, 3, 2), atol=1e-6)
-    assert torch.allclose(model.E.norm(dim=-1), torch.ones(1, 3, 2), atol=1e-6)
+    assert torch.allclose(
+        model.encoder_tensor().norm(dim=-1),
+        torch.ones(1, 3, 2),
+        atol=1e-6,
+    )
     parts = bsc_loss(model(torch.randn(7, 1, 5)), torch.randn(7, 1, 5), model)
     assert parts["regularizer"].isfinite()
     assert parts["regularizer"] > 0
@@ -787,8 +803,9 @@ def test_decoded_energy_is_reciprocal_within_block_gauge_invariant():
     inverse_transpose = torch.linalg.inv(gauge).T
     with torch.no_grad():
         assert transformed.E is not None and transformed.D is not None
-        transformed.E[0] = torch.einsum("bc,gcd->gbd", gauge, transformed.E[0])
-        transformed.E[1] = torch.einsum("bc,gcd->gbd", gauge, transformed.E[1])
+        encoder = transformed._encoder_full_tensor()
+        encoder[0] = torch.einsum("bc,gcd->gbd", gauge, encoder[0])
+        encoder[1] = torch.einsum("bc,gcd->gbd", gauge, encoder[1])
         transformed.D[0] = torch.einsum(
             "bc,gcd->gbd", inverse_transpose, transformed.D[0]
         )

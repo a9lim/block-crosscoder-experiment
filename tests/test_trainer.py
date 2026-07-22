@@ -157,6 +157,46 @@ def test_fp32_step_ordering_loss_falls(device):
     assert history[-1]["decoder_constraint_residual_master"] < 1e-4
 
 
+def test_prepacked_full_encoder_matches_materialized_pack_trajectory(monkeypatch):
+    config = BSCConfig(
+        n_blocks=12,
+        block_dim=3,
+        n_sites=4,
+        d_model=9,
+        k=3,
+        seed=4701,
+        decoder_constraint="free",
+        encoder_mode="untied",
+        encoder_fusion="sum",
+    )
+    fast = Trainer(
+        BlockCrosscoder(config),
+        train_cfg(total_steps=6, warmup_steps=0, log_every=6),
+    )
+    oracle = Trainer(
+        BlockCrosscoder(config),
+        train_cfg(total_steps=6, warmup_steps=0, log_every=6),
+    )
+
+    def materialized_encoder():
+        # Reproduce the superseded logical parameter surface. The following
+        # `_encode_with_tensor` call must pack this contiguous [S,G,b,d]
+        # tensor before GEMM, while the release path consumes E directly.
+        return oracle.master._encoder_full_tensor().contiguous()
+
+    monkeypatch.setattr(oracle.master, "encoder_tensor", materialized_encoder)
+    generator = torch.Generator().manual_seed(4702)
+    batches = [torch.randn(32, 4, 9, generator=generator) for _ in range(6)]
+    for batch in batches:
+        fast.step(batch, materialize_record=False)
+        oracle.step(batch, materialize_record=False)
+
+    _assert_nested_exact(fast.master.state_dict(), oracle.master.state_dict())
+    _assert_nested_exact(fast.opt.state_dict(), oracle.opt.state_dict())
+    _assert_nested_exact(fast.sched.state_dict(), oracle.sched.state_dict())
+    _assert_nested_exact(fast.history, oracle.history)
+
+
 def test_step_releases_dead_forward_branches_before_backward(monkeypatch):
     trainer = Trainer(BlockCrosscoder(CFG), train_cfg(total_steps=2))
     original_forward = trainer.fwd.forward_with_materialized
@@ -1086,7 +1126,7 @@ def test_auxk_revives_dead_encoders(device):
     for variant in ("sasa", "none"):
         model = BlockCrosscoder(CFG).to(device)
         with torch.no_grad():
-            model.E[:, :4] = 0.0  # kill blocks 0-3 encoder-side
+            model._encoder_full_tensor()[:, :4] = 0.0  # kill blocks 0-3
         trainer = Trainer(
             model,
             train_cfg(
@@ -1098,7 +1138,9 @@ def test_auxk_revives_dead_encoders(device):
             ),
         )
         trainer.fit(planted_batches(device))
-        revived_norms[variant] = float(model.E.detach()[:, :4].float().norm())
+        revived_norms[variant] = float(
+            model._encoder_full_tensor().detach()[:, :4].float().norm()
+        )
     # Without aux there is no gradient path to a zeroed encoder.
     assert revived_norms["none"] == 0.0
     assert revived_norms["sasa"] > 1e-2

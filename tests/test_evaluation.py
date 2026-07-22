@@ -349,9 +349,10 @@ def test_cuda_sparse_evaluation_preserves_full_site_and_loo_mode_payloads(
     with torch.no_grad():
         assert model.E is not None
         model.E.zero_()
-        model.E[:, 0, 0, 0] = 4.0
-        model.E[:, 1, 0, 0] = 3.0
-        model.E[:, 2, 0, 0] = 1.0
+        encoder = model._encoder_full_tensor()
+        encoder[:, 0, 0, 0] = 4.0
+        encoder[:, 1, 0, 0] = 3.0
+        encoder[:, 2, 0, 0] = 1.0
         model.theta.fill_(4.0)
     scale = torch.linspace(0.9, 1.1, 64, device="cuda").view(-1, 1, 1)
     x = scale.expand(-1, cfg.n_sites, cfg.d_model).clone()
@@ -1406,8 +1407,9 @@ def test_partial_view_concordance_detects_coordinate_drift_at_fixed_support() ->
     )
     with torch.no_grad():
         assert model.E is not None and model.D is not None
-        model.E[0].fill_(1.0)
-        model.E[1].fill_(-2.0)
+        encoder = model._encoder_full_tensor()
+        encoder[0].fill_(1.0)
+        encoder[1].fill_(-2.0)
         model.D.fill_(1.0)
     values = torch.linspace(0.25, 2.0, 32).view(-1, 1, 1)
     x = values.expand(-1, 2, -1).clone()
@@ -1475,7 +1477,8 @@ def test_partial_view_coordinate_concordance_is_block_gauge_invariant() -> None:
         inverse_transpose = torch.linalg.inv(gauge).T
         with torch.no_grad():
             assert transformed.E is not None and transformed.D is not None
-            transformed.E.copy_(torch.einsum("bc,sgcd->sgbd", gauge, transformed.E))
+            encoder = transformed._encoder_full_tensor()
+            encoder.copy_(torch.einsum("bc,sgcd->sgbd", gauge, encoder))
             transformed.D.copy_(
                 torch.einsum("bc,sgcd->sgbd", inverse_transpose, transformed.D)
             )

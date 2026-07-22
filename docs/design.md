@@ -907,6 +907,19 @@ four `14.022` to `13.279 ms` (`5.29%`) with `96.0 MiB` lower peak. Across 24
 steps, the v1 and v2 materialized master weights, bf16 forward weights,
 supports, and losses are bitwise identical at ranks `1/2/4`.
 
+The unfactorized untied encoder likewise stores its sole parameter physically
+as contiguous `[sites*d_model,groups*block_width]`; `encoder_tensor()` is the
+logical `[sites,groups,block_width,d_model]` view used only by explicit
+objectives and oracles. The hot flattened GEMM therefore consumes the
+parameter directly and backward no longer unpacks its gradient. Checkpoints
+with the former four-dimensional `E` shape refuse at load rather than migrate.
+A six-step mapped materialization oracle is bitwise exact for model, optimizer,
+scheduler, and diagnostics. On the canonical Phase-2 bf16 shape (`B=4096`,
+four width-768 sites, 2,048 groups, block width four), 31 jobe wall samples
+reduce complete Trainer median from `12.469` to `11.349 ms` (`8.98%`,
+`1.099x`) and p95 from `12.803` to `12.279 ms`; the later full-step workspace,
+not the removed 48 MiB pack, remains the allocation peak.
+
 Version 3 retains those contraction-ready layouts and replaces the dense
 zero-filled rank-space decode only for bf16 CUDA hard-TopK batches of at least
 2,048 tokens and support density at most `1/32`. The batch gate retains dense

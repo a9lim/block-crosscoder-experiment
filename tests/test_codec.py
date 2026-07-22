@@ -66,13 +66,16 @@ def rotate_blocks_(model, seed):
     generator = torch.Generator().manual_seed(seed)
     block_dim = model.cfg.block_dim
     with torch.no_grad():
+        encoder = model._encoder_full_tensor()
         for block in range(model.cfg.n_blocks):
             q, r = torch.linalg.qr(
                 torch.randn(block_dim, block_dim, generator=generator)
             )
             rotation = (q * torch.sign(torch.diagonal(r))).to(model.D.device)
             model.D[:, block] = torch.einsum("bc,scd->sbd", rotation, model.D[:, block])
-            model.E[:, block] = torch.einsum("bc,scd->sbd", rotation, model.E[:, block])
+            encoder[:, block] = torch.einsum(
+                "bc,scd->sbd", rotation, encoder[:, block]
+            )
 
 
 def test_codec_fits_and_evaluates():

@@ -617,8 +617,38 @@ def test_encode_matches_naive(device):
     model = make_model(device)
     x = whitened_batch(device, n=8)
     z = model.encode(x)
-    naive = torch.einsum("bsd,sgkd->bgk", x, model.E)
+    naive = torch.einsum("bsd,sgkd->bgk", x, model.encoder_tensor())
     assert torch.allclose(z, naive, rtol=1e-4, atol=1e-5)
+
+
+def test_unfactorized_untied_encoder_is_stored_in_gemm_layout():
+    config = BSCConfig(
+        n_blocks=5,
+        block_dim=3,
+        n_sites=4,
+        d_model=7,
+        k=2,
+        encoder_mode="untied",
+        decoder_constraint="free",
+    )
+    model = BlockCrosscoder(config)
+    assert model.E is not None
+    assert model.E.shape == (config.n_sites * config.d_model, config.n_latents)
+    assert model.E.is_contiguous()
+
+    logical = model.encoder_tensor()
+    repacked = logical.reshape(
+        config.n_sites,
+        config.n_latents,
+        config.d_model,
+    ).transpose(1, 2).reshape(config.n_sites * config.d_model, config.n_latents)
+    assert repacked.untyped_storage().data_ptr() == model.E.untyped_storage().data_ptr()
+    assert torch.equal(repacked, model.E)
+
+    legacy_state = model.state_dict()
+    legacy_state["E"] = logical.detach().clone()
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        BlockCrosscoder(config).load_state_dict(legacy_state)
 
 
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
@@ -1984,7 +2014,7 @@ def test_fixed_threshold_training_selector_has_variable_counts(device):
 
 def test_init_tied_and_score_comparability(device):
     model = make_model(device)
-    assert torch.equal(model.E, model.D)  # transpose-tied at init
+    assert torch.equal(model.encoder_tensor(), model.D)  # transpose-tied at init
     x = whitened_batch(device, n=2048)
     model.calibrate_encoder_scale_(x)
     p = model.scores(model.encode(x)).mean(dim=0)  # [G]
@@ -2910,7 +2940,8 @@ def test_isolated_loss_decrease_is_reciprocal_block_gauge_invariant():
     inverse_transpose = torch.linalg.inv(gauge).T
     with torch.no_grad():
         assert transformed.E is not None and transformed.D is not None
-        transformed.E.copy_(torch.einsum("bc,sgcd->sgbd", gauge, transformed.E))
+        encoder = transformed._encoder_full_tensor()
+        encoder.copy_(torch.einsum("bc,sgcd->sgbd", gauge, encoder))
         transformed.D.copy_(
             torch.einsum("bc,sgcd->sgbd", inverse_transpose, transformed.D)
         )
