@@ -705,6 +705,97 @@ def test_post_step_nonfinite_refuses_run(device, monkeypatch):
         trainer.step(planted_batches(device, n_batches=1, seed=43)[0])
 
 
+def test_nonlogging_unclipped_fast_step_keeps_only_finite_scans(
+    device, monkeypatch
+):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(
+            total_steps=3,
+            log_every=100,
+            retract_every=100,
+            gradient_clip_norm=None,
+        ),
+    )
+    batches = planted_batches(device, n_batches=2, seed=44)
+    trainer.step(batches[0])
+    original = trainer_module._all_finite
+    finite_calls = 0
+    gradient_guard_calls = 0
+    original_gradient_guard = trainer_module._finite_gradients_with_l2_guard
+
+    def counted(obj):
+        nonlocal finite_calls
+        finite_calls += 1
+        return original(obj)
+
+    def counted_gradient_guard(*args, **kwargs):
+        nonlocal gradient_guard_calls
+        gradient_guard_calls += 1
+        return original_gradient_guard(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "_all_finite", counted)
+    monkeypatch.setattr(
+        trainer_module,
+        "_finite_gradients_with_l2_guard",
+        counted_gradient_guard,
+    )
+    record = trainer.step(batches[1], materialize_record=False)
+    assert record is None
+    assert finite_calls == 1
+    assert gradient_guard_calls == 1
+
+
+def test_nonlogging_fast_step_refuses_nonfinite_gradient_before_optimizer(
+    device, monkeypatch
+):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=3, log_every=100, retract_every=100),
+    )
+    batches = planted_batches(device, n_batches=2, seed=45)
+    trainer.step(batches[0])
+    parameter = next(
+        parameter
+        for parameter in trainer.master.parameters()
+        if parameter.requires_grad
+    )
+    handle = parameter.register_hook(lambda gradient: gradient.fill_(float("nan")))
+    optimizer_calls = 0
+    original_step = trainer.opt.step
+
+    def counted_step(*args, **kwargs):
+        nonlocal optimizer_calls
+        optimizer_calls += 1
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.opt, "step", counted_step)
+    with pytest.raises(RuntimeError, match="non-finite loss/gradient"):
+        trainer.step(batches[1], materialize_record=False)
+    handle.remove()
+    assert optimizer_calls == 0
+    assert trainer.step_idx == 1
+    assert trainer.accepted_tokens == len(batches[0])
+
+
+@pytest.mark.parametrize("magnitude", (1e30, 1e38))
+def test_fast_gradient_guard_matches_historical_finite_l2_refusal(
+    device, magnitude
+):
+    gradients = [torch.full((4096,), magnitude, device=device)]
+    historical = torch.linalg.vector_norm(
+        torch.stack(
+            [torch.linalg.vector_norm(gradient.float()) for gradient in gradients]
+        )
+    )
+    actual = trainer_module._finite_gradients_with_l2_guard(
+        torch.tensor(1.0, device=device),
+        torch.tensor(1.0, device=device),
+        gradients,
+    )
+    assert actual is bool(torch.isfinite(historical))
+
+
 def test_checkpoint_binding_roundtrip_and_mismatch(device, tmp_path):
     cfg = train_cfg(total_steps=2)
     binding = {

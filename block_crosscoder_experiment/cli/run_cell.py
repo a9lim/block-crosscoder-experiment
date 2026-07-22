@@ -4195,7 +4195,7 @@ def _train(
             if cuda_transform is not None:
                 x = x.to(device=device, non_blocking=True)
                 x = _apply_prepared_transform(x, preparation, cuda_transform)
-            trainer.step(x, observed=observed)
+            trainer.step(x, observed=observed, materialize_record=False)
             start_token += int(x.shape[0])
             trainer.data_cursor = {
                 "next_token": start_token,

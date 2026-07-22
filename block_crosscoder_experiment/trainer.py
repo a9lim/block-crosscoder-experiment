@@ -719,6 +719,7 @@ def _floating_tensors(obj) -> Iterator[torch.Tensor]:
             yield from _floating_tensors(value)
 
 
+@torch.no_grad()
 def _all_finite(obj) -> bool:
     tensors = [tensor for tensor in _floating_tensors(obj) if tensor.numel()]
     if not tensors:
@@ -736,6 +737,38 @@ def _all_finite(obj) -> bool:
         if not bool(torch.isfinite(torch.stack(norms)).all()):
             return False
     return True
+
+
+@torch.no_grad()
+def _finite_gradients_with_l2_guard(
+    rec: torch.Tensor,
+    total: torch.Tensor,
+    gradients: list[torch.Tensor],
+) -> bool:
+    """Match the historical finite-L2 refusal without a routine L2 scan.
+
+    Infinity norms scan every gradient for non-finite elements.  When their
+    maximum is below the dimension-aware bound, the global fp32 L2 norm cannot
+    overflow.  Only the pathological high-magnitude branch executes the exact
+    historical per-tensor/global L2 reductions to preserve its refusal set.
+    """
+    infinity_norms = torch._foreach_norm(gradients, ord=float("inf"))
+    health = torch.stack(
+        (rec.detach().float(), total.detach().float(), *infinity_norms)
+    )
+    basic_finite = torch.isfinite(health).all()
+    total_elements = sum(gradient.numel() for gradient in gradients)
+    safe_l2_limit = math.sqrt(torch.finfo(torch.float32).max / total_elements)
+    safely_bounded = torch.stack(infinity_norms).max() < safe_l2_limit
+    if bool(basic_finite & safely_bounded):
+        return True
+    if not bool(basic_finite):
+        return False
+    per_tensor_norms = [
+        torch.linalg.vector_norm(gradient.float()) for gradient in gradients
+    ]
+    historical_norm = torch.linalg.vector_norm(torch.stack(per_tensor_norms))
+    return bool(torch.isfinite(historical_norm))
 
 
 def _project_decoder_(model: BlockCrosscoder) -> int:
@@ -858,7 +891,9 @@ class Trainer:
         self,
         x: torch.Tensor,
         observed: torch.Tensor | None = None,
-    ) -> dict:
+        *,
+        materialize_record: bool = True,
+    ) -> dict | None:
         cfg = self.cfg
         fwd_param = next(self.fwd.parameters())
         x = x.to(
@@ -895,6 +930,7 @@ class Trainer:
                 raise ValueError("every token must have at least one true-observed site")
             encoder_observed = self._encoder_observation_mask(observed)
         log_step = self.step_idx % cfg.log_every == 0
+        want_record = materialize_record or log_step
 
         out, decoder, encoder = self.fwd.forward_with_materialized(
             x,
@@ -983,53 +1019,82 @@ class Trainer:
                 cfg.gradient_clip_norm / (unclipped_grad_norm_t + 1e-6)
             ).clamp(max=1.0)
             grad_norm_t = unclipped_grad_norm_t * clip_scale
-        else:
+        elif want_record:
             per_tensor_norms = [torch.linalg.vector_norm(g.float()) for g in gradients]
             unclipped_grad_norm_t = torch.linalg.vector_norm(
                 torch.stack(per_tensor_norms)
             )
             grad_norm_t = unclipped_grad_norm_t
-
-        if observed is None:
-            keep_fraction_t = torch.ones((), device=x.device, dtype=torch.float32)
         else:
-            assert encoder_observed is not None
-            keep_fraction_t = encoder_observed.sum() / observed.sum()
-        scalar_names = ["rec", "total", "grad_norm", "unclipped_grad_norm", "keep"]
-        scalar_tensors = [
-            parts["rec"].detach().float(),
-            parts["total"].detach().float(),
-            grad_norm_t.detach().float(),
-            unclipped_grad_norm_t.detach().float(),
-            keep_fraction_t.detach().float(),
-        ]
-        if "regularizer" in parts:
-            scalar_names.append("regularizer")
-            scalar_tensors.append(parts["regularizer"].detach().float())
-        if l_aux is not None:
-            scalar_names.append("aux")
-            scalar_tensors.append(l_aux.detach().float())
-        scalar_values = {
-            name: float(value)
-            for name, value in zip(
-                scalar_names,
-                torch.stack(scalar_tensors).cpu(),
+            unclipped_grad_norm_t = None
+            grad_norm_t = None
+
+        scalar_values: dict[str, float] | None = None
+        if want_record:
+            if observed is None:
+                keep_fraction_t = torch.ones(
+                    (), device=x.device, dtype=torch.float32
+                )
+            else:
+                assert encoder_observed is not None
+                keep_fraction_t = encoder_observed.sum() / observed.sum()
+            assert grad_norm_t is not None and unclipped_grad_norm_t is not None
+            scalar_names = [
+                "rec",
+                "total",
+                "keep",
+                "grad_norm",
+                "unclipped_grad_norm",
+            ]
+            scalar_tensors = [
+                parts["rec"].detach().float(),
+                parts["total"].detach().float(),
+                keep_fraction_t.detach().float(),
+                grad_norm_t.detach().float(),
+                unclipped_grad_norm_t.detach().float(),
+            ]
+            if "regularizer" in parts:
+                scalar_names.append("regularizer")
+                scalar_tensors.append(parts["regularizer"].detach().float())
+            if l_aux is not None:
+                scalar_names.append("aux")
+                scalar_tensors.append(l_aux.detach().float())
+            scalar_values = {
+                name: float(value)
+                for name, value in zip(
+                    scalar_names,
+                    torch.stack(scalar_tensors).cpu(),
+                )
+            }
+            if not all(
+                math.isfinite(scalar_values[name])
+                for name in (
+                    "rec",
+                    "total",
+                    "grad_norm",
+                    "unclipped_grad_norm",
+                )
+            ):
+                raise RuntimeError(
+                    "non-finite loss/gradient/parameter/optimizer state"
+                )
+        else:
+            finite = (
+                _all_finite((parts["rec"], parts["total"], unclipped_grad_norm_t))
+                if unclipped_grad_norm_t is not None
+                else _finite_gradients_with_l2_guard(
+                    parts["rec"], parts["total"], gradients
+                )
             )
-        }
-        rec_val = scalar_values["rec"]
-        total_val = scalar_values["total"]
-        grad_norm = scalar_values["grad_norm"]
-        unclipped_grad_norm = scalar_values["unclipped_grad_norm"]
-        keep_fraction = scalar_values["keep"]
-        if not all(
-            math.isfinite(value)
-            for value in (rec_val, total_val, grad_norm, unclipped_grad_norm)
-        ):
-            raise RuntimeError("non-finite loss/gradient/parameter/optimizer state")
+            if not finite:
+                raise RuntimeError(
+                    "non-finite loss/gradient/parameter/optimizer state"
+                )
 
         # The load-bearing ordering: step on master -> retract master ->
         # regenerate the forward copy -> measure the post-cast residual.
         self.opt.step()
+        projected_decoder = (self.step_idx + 1) % cfg.retract_every == 0
         if not _all_finite((tuple(self.master.parameters()), self.opt.state)):
             self.opt.zero_grad(set_to_none=True)
             raise RuntimeError(
@@ -1041,7 +1106,6 @@ class Trainer:
         # ``step_idx`` is zero-based while ``retract_every`` is a cadence
         # in completed optimizer updates. Initialization applies the declared
         # constraint separately, so cadence 20 means updates 20, 40, ....
-        projected_decoder = (self.step_idx + 1) % cfg.retract_every == 0
         if projected_decoder:
             floor_hits = _project_decoder_(self.master)
         if projected_decoder and not _all_finite(tuple(self.master.parameters())):
@@ -1067,22 +1131,28 @@ class Trainer:
             )
         self.accepted_tokens += int(x.shape[0])
 
-        record = {
-            "step": self.step_idx,
-            "rec": rec_val,
-            "total": total_val,
-            "lr": self.sched.get_last_lr()[0],
-            "grad_norm": grad_norm,
-            "floor_hits": floor_hits,
-            "encoder_site_keep_fraction": keep_fraction,
-        }
-        if cfg.gradient_clip_norm is not None:
-            record["grad_norm_unclipped"] = unclipped_grad_norm
-        if "regularizer" in parts:
-            record["regularizer"] = scalar_values["regularizer"]
-        if l_aux is not None:
-            record["aux"] = scalar_values["aux"]
+        record: dict | None = None
+        if want_record:
+            assert scalar_values is not None
+            record = {
+                "step": self.step_idx,
+                "rec": scalar_values["rec"],
+                "total": scalar_values["total"],
+                "lr": self.sched.get_last_lr()[0],
+                "grad_norm": scalar_values["grad_norm"],
+                "floor_hits": floor_hits,
+                "encoder_site_keep_fraction": scalar_values["keep"],
+            }
+            if cfg.gradient_clip_norm is not None:
+                record["grad_norm_unclipped"] = scalar_values[
+                    "unclipped_grad_norm"
+                ]
+            if "regularizer" in parts:
+                record["regularizer"] = scalar_values["regularizer"]
+            if l_aux is not None:
+                record["aux"] = scalar_values["aux"]
         if log_step:
+            assert record is not None
             record.update(self._diagnostics())
             self.history.append(record)
             if self._log_file is not None:
@@ -1141,9 +1211,9 @@ class Trainer:
             if self.step_idx >= self.cfg.total_steps:
                 break
             if isinstance(batch, tuple):
-                self.step(batch[0], observed=batch[1])
+                self.step(batch[0], observed=batch[1], materialize_record=False)
             else:
-                self.step(batch)
+                self.step(batch, materialize_record=False)
         if self._log_file is not None:
             self._log_file.flush()
         return self.history
