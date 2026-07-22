@@ -193,6 +193,7 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
         "ambient_cuda_default",
         "direct_rank_space_bmm_bounded_v1",
         "materialized_site_tensor_reference_v1",
+        "direct_rank_space_prepacked_core_bmm_v2",
     ):
         with pytest.raises(ValueError, match="unknown factorized"):
             BSCConfig(
@@ -213,6 +214,58 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
             site_rank=2,
             factorized_execution_implementation=FACTORIZED_EXECUTION_NOT_APPLICABLE,
         )
+
+
+def test_factorized_sparse_cuda_decode_has_static_shape_gate():
+    eligible = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=64,
+            block_dim=2,
+            n_sites=4,
+            d_model=32,
+            k=2,
+            selection="batch_topk",
+            decoder_constraint="free",
+            site_rank=1,
+        )
+    )
+    assert eligible._cuda_sparse_topk_decode_shape_eligible(
+        batch=2048,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        mode="topk",
+    )
+    assert not eligible._cuda_sparse_topk_decode_shape_eligible(
+        batch=256,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        mode="topk",
+    )
+    assert not eligible._cuda_sparse_topk_decode_shape_eligible(
+        batch=2048,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+        mode="topk",
+    )
+
+    dense_support = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=64,
+            block_dim=2,
+            n_sites=4,
+            d_model=32,
+            k=3,
+            selection="batch_topk",
+            decoder_constraint="free",
+            site_rank=1,
+        )
+    )
+    assert not dense_support._cuda_sparse_topk_decode_shape_eligible(
+        batch=2048,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        mode="topk",
+    )
 
 
 def test_stiefel_decoder_refuses_insufficient_active_coordinates():

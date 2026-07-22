@@ -591,6 +591,7 @@ def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
         ("ambient_cuda_default", "unknown factorized-execution"),
         ("direct_rank_space_bmm_bounded_v1", "unknown factorized-execution"),
         ("materialized_site_tensor_reference_v1", "unknown factorized-execution"),
+        ("direct_rank_space_prepacked_core_bmm_v2", "unknown factorized-execution"),
     ):
         with pytest.raises(CellExecutionError, match=message):
             _model_config(with_factorized_implementation(value))

@@ -49,6 +49,8 @@ from .runtime_limits import (
     DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH,
     FACTORIZED_EXECUTION_IMPLEMENTATIONS,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
@@ -69,6 +71,7 @@ __all__ = [
     "StreamingScoreQuantile",
     "batch_topk_mask",
     "token_topk_mask",
+    "bsc_reconstruction_loss",
     "bsc_loss",
     "isolated_loss_mapped_eligible",
 ]
@@ -1895,6 +1898,109 @@ class BlockCrosscoder(nn.Module):
             xhat = xhat * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
         return xhat
 
+    def _cuda_sparse_topk_decode_eligible(
+        self,
+        code: torch.Tensor,
+        *,
+        mode: str,
+    ) -> bool:
+        """Return the complete shape/device gate for rank-space sparse decode."""
+
+        return self._cuda_sparse_topk_decode_shape_eligible(
+            batch=code.shape[0],
+            device=code.device,
+            dtype=code.dtype,
+            mode=mode,
+        )
+
+    def _cuda_sparse_topk_decode_shape_eligible(
+        self,
+        *,
+        batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        mode: str,
+    ) -> bool:
+        if (
+            not self.uses_direct_factorized_execution
+            or mode != "topk"
+            or self.cfg.selection not in {"batch_topk", "token_topk"}
+            or device.type != "cuda"
+            or dtype != torch.bfloat16
+            or batch < FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH
+        ):
+            return False
+        groups = self.cfg.n_blocks
+        selected = self._hard_topk_selected_count(batch)
+        return (
+            selected > 0
+            and selected * FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR
+            <= batch * groups
+        )
+
+    def _hard_topk_selected_count(self, batch: int) -> int:
+        groups = self.cfg.n_blocks
+        if self.cfg.selection == "batch_topk":
+            return min(int(round(self.cfg.k * batch)), batch * groups)
+        if self.cfg.selection == "token_topk":
+            return batch * min(max(int(round(self.cfg.k)), 0), groups)
+        raise RuntimeError("hard TopK event count requires a hard TopK selector")
+
+    def _decode_factorized_cuda_sparse_topk(
+        self,
+        code: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode selected events without a dense zero-filled code tensor."""
+
+        from .cuda_sparse_decode import cuda_sparse_topk_decode
+
+        cfg = self.cfg
+        assert cfg.site_rank is not None
+        assert self.D_site is not None and self.D_core is not None
+        rank_output = cuda_sparse_topk_decode(
+            code,
+            mask,
+            self._decoder_factor_core_map(),
+            selected_count=self._hard_topk_selected_count(code.shape[0]),
+        ).view(code.shape[0], cfg.site_rank, cfg.d_model)
+        xhat = torch.matmul(
+            rank_output.transpose(1, 2),
+            self.D_site.transpose(0, 1),
+        ).transpose(1, 2)
+        if cfg.decoder_bias:
+            xhat = xhat + self.c.unsqueeze(0)
+        if self._has_padded_coordinates:
+            xhat = xhat * self.coordinate_mask[:, 0, 0].to(xhat.dtype)
+        return xhat
+
+    def _forward_factorized_cuda_sparse_topk_training(
+        self,
+        x: torch.Tensor,
+        *,
+        observed: torch.Tensor | None = None,
+        validate_observed: bool = True,
+        score_grad: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trainer-only sparse forward returning reconstruction and support."""
+
+        z, keep = self._encode_factorized_direct(
+            x,
+            observed=observed,
+            validate_observed=validate_observed,
+        )
+        if not self._cuda_sparse_topk_decode_eligible(z, mode="topk"):
+            raise RuntimeError("factorized CUDA sparse TopK decode is not eligible")
+        with torch.set_grad_enabled(torch.is_grad_enabled() and score_grad):
+            scores = self.scores(
+                z,
+                x=x,
+                observed=observed,
+                _observation_keep=keep,
+            )
+        mask = self._select_scores(scores, mode="topk", z=z)
+        return self._decode_factorized_cuda_sparse_topk(z, mask), mask
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1940,7 +2046,13 @@ class BlockCrosscoder(nn.Module):
             _encoder_sites=_encoder_sites,
             _score_grad=_score_grad,
         )
-        xhat = self.decode(selection.z_selected, _decoder=decoder)
+        if self._cuda_sparse_topk_decode_eligible(selection.z, mode=mode):
+            xhat = self._decode_factorized_cuda_sparse_topk(
+                selection.z,
+                selection.mask,
+            )
+        else:
+            xhat = self.decode(selection.z_selected, _decoder=decoder)
         return BSCOutput(xhat, *selection), decoder, encoder
 
     def select_with_materialized(
@@ -2342,6 +2454,76 @@ def _fp32_squared_error_reduction(
     return _eager_fp32_squared_error_reduction(prediction, target, denominator)
 
 
+def bsc_reconstruction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    model: BlockCrosscoder,
+    observation_mask: torch.Tensor | None = None,
+    *,
+    validate_observation_mask: bool = True,
+) -> torch.Tensor:
+    """Compute the pinned reconstruction objective from one prediction."""
+
+    cfg = model.cfg
+    coord = model.coordinate_mask[:, 0, 0].to(target.device)
+    all_observed = observation_mask is None
+    if observation_mask is None:
+        observed = None
+    else:
+        if observation_mask.shape != (target.shape[0], cfg.n_sites):
+            raise ValueError(
+                f"observation_mask must have shape [{target.shape[0]}, {cfg.n_sites}]"
+            )
+        observed = observation_mask.to(device=target.device, dtype=torch.bool)
+        if validate_observation_mask and not bool(observed.any()):
+            raise ValueError("observation_mask excludes the entire batch")
+
+    # The dominant real-model objective is all-observed, rectangular, and
+    # quadratic. Fuse its fp32 casts/subtract/square/sum together with the
+    # declared normalization division. Missingness, padding, nonquadratic
+    # objectives, small tensors, and non-CUDA devices keep the ordinary eager
+    # implementation.
+    if (
+        all_observed
+        and not model._has_padded_coordinates
+        and cfg.reconstruction_loss in {"mean_squared", "squared_l2"}
+    ):
+        denominator = (
+            target.shape[0]
+            if cfg.reconstruction_loss == "squared_l2"
+            else target.shape[0] * sum(cfg.site_dims)
+        )
+        return _fp32_squared_error_reduction(prediction, target, denominator)
+
+    residual = prediction.float() - target.float()
+    if model._has_padded_coordinates:
+        residual = residual * coord
+    if all_observed:
+        if cfg.reconstruction_loss == "mean_l2":
+            return residual.norm(dim=-1).sum() / (target.shape[0] * cfg.n_sites)
+        if cfg.reconstruction_loss == "mean_l1":
+            return residual.abs().sum(dim=-1).sum() / (target.shape[0] * cfg.n_sites)
+        if cfg.reconstruction_loss == "squared_l2":
+            return residual.pow(2).sum() / target.shape[0]
+        denominator = target.shape[0] * sum(cfg.site_dims)
+        return residual.pow(2).sum() / denominator
+    assert observed is not None
+    site_mask = observed.to(torch.float32).unsqueeze(-1)
+    residual = residual * site_mask
+    if cfg.reconstruction_loss == "mean_l2":
+        # Released Minder code minimizes the mean Euclidean norm per
+        # example/site, not the squared objective written in the papers.
+        return residual.norm(dim=-1).sum() / observed.sum()
+    if cfg.reconstruction_loss == "mean_l1":
+        return residual.abs().sum(dim=-1).sum() / observed.sum()
+    if cfg.reconstruction_loss == "squared_l2":
+        return residual.pow(2).sum() / target.shape[0]
+    denominator = (
+        (observed.to(torch.float32).unsqueeze(-1) * coord).sum().clamp_min(1.0)
+    )
+    return residual.pow(2).sum() / denominator
+
+
 def bsc_loss(
     out: BSCOutput,
     x: torch.Tensor,
@@ -2361,68 +2543,14 @@ def bsc_loss(
     millions of elements loses the precision the comparisons need.
     """
     cfg = model.cfg
-    coord = model.coordinate_mask[:, 0, 0].to(x.device)
-    all_observed = observation_mask is None
-    if observation_mask is None:
-        observed = None
-    else:
-        if observation_mask.shape != (x.shape[0], cfg.n_sites):
-            raise ValueError(
-                f"observation_mask must have shape [{x.shape[0]}, {cfg.n_sites}]"
-            )
-        observed = observation_mask.to(device=x.device, dtype=torch.bool)
-        if validate_observation_mask and not bool(observed.any()):
-            raise ValueError("observation_mask excludes the entire batch")
 
-    def reconstruction(target: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        # The dominant real-model objective is all-observed, rectangular, and
-        # quadratic. Fuse its fp32 casts/subtract/square/sum together with the
-        # declared normalization division. Missingness, padding, nonquadratic
-        # objectives, small tensors, and non-CUDA devices keep the ordinary
-        # eager implementation.
-        if (
-            all_observed
-            and not model._has_padded_coordinates
-            and cfg.reconstruction_loss in {"mean_squared", "squared_l2"}
-        ):
-            denominator = (
-                target.shape[0]
-                if cfg.reconstruction_loss == "squared_l2"
-                else target.shape[0] * sum(cfg.site_dims)
-            )
-            return _fp32_squared_error_reduction(pred, target, denominator)
-
-        residual = pred.float() - target.float()
-        if model._has_padded_coordinates:
-            residual = residual * coord
-        if all_observed:
-            if cfg.reconstruction_loss == "mean_l2":
-                return residual.norm(dim=-1).sum() / (target.shape[0] * cfg.n_sites)
-            if cfg.reconstruction_loss == "mean_l1":
-                return residual.abs().sum(dim=-1).sum() / (
-                    target.shape[0] * cfg.n_sites
-                )
-            if cfg.reconstruction_loss == "squared_l2":
-                return residual.pow(2).sum() / target.shape[0]
-            denominator = target.shape[0] * sum(cfg.site_dims)
-            return residual.pow(2).sum() / denominator
-        assert observed is not None
-        site_mask = observed.to(torch.float32).unsqueeze(-1)
-        residual = residual * site_mask
-        if cfg.reconstruction_loss == "mean_l2":
-            # Released Minder code minimizes the mean Euclidean norm per
-            # example/site, not the squared objective written in the papers.
-            return residual.norm(dim=-1).sum() / observed.sum()
-        if cfg.reconstruction_loss == "mean_l1":
-            return residual.abs().sum(dim=-1).sum() / observed.sum()
-        if cfg.reconstruction_loss == "squared_l2":
-            return residual.pow(2).sum() / target.shape[0]
-        denominator = (
-            (observed.to(torch.float32).unsqueeze(-1) * coord).sum().clamp_min(1.0)
-        )
-        return residual.pow(2).sum() / denominator
-
-    l_rec = reconstruction(x, out.xhat)
+    l_rec = bsc_reconstruction_loss(
+        out.xhat,
+        x,
+        model,
+        observation_mask,
+        validate_observation_mask=validate_observation_mask,
+    )
     total = l_rec
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
     if cfg.lambda_regularizer > 0 and cfg.regularizer != "none":

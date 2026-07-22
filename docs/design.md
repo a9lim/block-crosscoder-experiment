@@ -867,7 +867,7 @@ direct-rank lifetime.
 
 Every cell serializes `factorized_execution_implementation`. Unfactorized
 carriers derive `not_applicable_v1`; site-rank carriers derive
-`direct_rank_space_prepacked_core_bmm_v2`. The explicit
+`direct_rank_space_sparse_topk_cuda_v3`. The explicit
 `materialized_prepacked_core_reference_v2` identity is an oracle only. Unknown or
 carrier-incompatible identities refuse, and root, smoke, and child
 materialization rederive the canonical identity after each effective delta.
@@ -885,8 +885,8 @@ and all factor gradients. The bf16 bounds are code/score relative L2 at most
 most `.02`, support IoU at least `.95`, loss drift at most `.005`, and maximum
 factor-gradient drift at most `.30`; fp32 bounds are respectively `3e-6`, exact
 support, `3e-6`, and `1e-5`. On the Phase-2 rank-one stress shape
-(`B=4096`, four width-768 sites, 2,048 groups, block width four, 32 active
-blocks, bf16 forward, fused AdamW), five warmups and 31 CUDA-event samples of a
+(`B=4096`, four width-768 sites, 2,048 groups, block width four, eight active
+blocks/32 active coordinates, bf16 forward, fused AdamW), five warmups and 31 CUDA-event samples of a
 complete Trainer step measure `10.482 ms` median / `11.360 ms` p95 for the
 materialized oracle and `4.198 ms` / `4.514 ms` for direct rank space: a
 `59.95%` median reduction (`2.497x`) and `130.0 MiB` lower incremental peak.
@@ -906,6 +906,29 @@ rank two `7.842` to `7.460 ms` (`4.87%`) with `24.0 MiB` lower peak, and rank
 four `14.022` to `13.279 ms` (`5.29%`) with `96.0 MiB` lower peak. Across 24
 steps, the v1 and v2 materialized master weights, bf16 forward weights,
 supports, and losses are bitwise identical at ranks `1/2/4`.
+
+Version 3 retains those contraction-ready layouts and replaces the dense
+zero-filled rank-space decode only for bf16 CUDA hard-TopK batches of at least
+2,048 tokens and support density at most `1/32`. The batch gate retains dense
+Tensor Core decode for Phase-3's 256-token geometry, where the sparse kernel is
+slower. A fixed-size row-major event extraction avoids a dynamic-nonzero host
+synchronization; deterministic Triton kernels reduce by row in the forward
+pass and by group in the decoder-weight backward. Other dtypes, selectors,
+densities, and nonfactorized carriers remain dense. The no-Aux,
+zero-regularizer Trainer also bypasses the otherwise unused dense selected-code
+tensor; objective-bearing consumers keep it while still receiving sparse
+decode.
+
+The release kernel bounds forward, code-gradient, and decoder-gradient relative
+L2 drift by `.005`, repeated sparse trajectories deterministically reproduce,
+and a 24-step canonical rank-one comparison bounds maximum loss drift by
+`1.30e-6`, optimizer-state relative L2 by `7.81e-7`, model-parameter relative
+L2 by `.00265`, and support disagreement over the union by `.0063`. On jobe,
+100 post-warmup CUDA-event samples reduce median rank-one step time from
+`4.0643` to `3.3657 ms` (`17.19%`, `1.208x`), p95 from `4.1271` to
+`3.5712 ms`, and peak allocation from `492.348` to `440.747 MiB`. This bounded
+bf16 reduction-order change is content-bound engineering evidence, not a new
+scientific arm. Old v2 identities refuse rather than migrate.
 
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M

@@ -144,12 +144,15 @@ exit is not evidence by itself.
   constrained untied encoders. Its optimizer roles and codec round trip remain
   operational.
 - Factorized cells derive and serialize
-  `direct_rank_space_prepacked_core_bmm_v2`; unfactorized cells derive
+  `direct_rank_space_sparse_topk_cuda_v3`; unfactorized cells derive
   `not_applicable_v1`, and `materialized_prepacked_core_reference_v2` is an
   explicit release oracle only. Canonical rank-space encode, every score
   geometry, and decode must not materialize a full site tensor. Encoder and
   decoder cores use their declared contiguous contraction-ready physical
-  layouts; stale v1 identities refuse. Unknown or
+  layouts; stale v1/v2 identities refuse. Low-density bf16 hard-TopK decode
+  uses the content-bound Triton forward/backward only at batch size at least
+  2,048 and density at most `1/32`; every other carrier retains dense
+  rank-space decode. Unknown or
   carrier-incompatible identities refuse in cells, checkpoints, run bindings,
   and codecs. Checkpoint loading validates every non-scalar Adam moment against
   the fresh parameter shape before PyTorch may accept positional optimizer

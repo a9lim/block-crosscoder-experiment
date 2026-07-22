@@ -55,10 +55,11 @@ DECODER_RETRACTION_IMPLEMENTATIONS = (
 
 # Site-axis factorization is either absent, evaluated directly in its compact
 # rank carrier, or executed through the full materialized tensor only as a
-# release oracle.  The direct CUDA contraction deliberately changes bf16
-# reduction order and therefore remains an explicit serialized identity.
+# release oracle. The direct CUDA contraction and sparse TopK decoder
+# deliberately change bf16 reduction order and therefore remain one explicit
+# serialized identity.
 FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION = (
-    "direct_rank_space_prepacked_core_bmm_v2"
+    "direct_rank_space_sparse_topk_cuda_v3"
 )
 FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION = (
     "materialized_prepacked_core_reference_v2"
@@ -69,6 +70,12 @@ FACTORIZED_EXECUTION_IMPLEMENTATIONS = (
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
 )
+
+# The custom CUDA decoder wins only while hard selection retains at most one
+# block in this many.  The gate is shape-derived and therefore introduces no
+# device synchronization or data-dependent algorithm switch.
+FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR = 32
+FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH = 2048
 
 # Cholesky-QR1 squares the input condition number.  The admitted fp32 carrier
 # is deliberately narrow enough that the post-retraction Gram remains inside

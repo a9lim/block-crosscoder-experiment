@@ -49,7 +49,13 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 
 from .gram import _retract_count_tensor_, gram_residual, site_frobenius_shares
-from .model import BlockCrosscoder, BSCConfig, BSCOutput, bsc_loss
+from .model import (
+    BlockCrosscoder,
+    BSCConfig,
+    BSCOutput,
+    bsc_loss,
+    bsc_reconstruction_loss,
+)
 from .runtime_limits import (
     MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
     decoded_energy_code_norm_eligible,
@@ -1645,29 +1651,59 @@ class Trainer:
         log_step = self.step_idx % cfg.log_every == 0
         want_record = materialize_record or log_step
 
-        out, decoder, encoder = self.fwd.forward_with_materialized(
-            x,
-            observed=encoder_observed,
-            validate_observed=False,
-            _score_grad=(
-                self.fwd.cfg.lambda_regularizer > 0
-                and self.fwd.cfg.regularizer == "crosscoder_l1"
-            ),
+        sparse_training_decode = (
+            cfg.aux_variant == "none"
+            and self.fwd.cfg.lambda_regularizer == 0
+            and self.fwd._cuda_sparse_topk_decode_shape_eligible(
+                batch=x.shape[0],
+                device=x.device,
+                dtype=x.dtype,
+                mode="topk",
+            )
         )
-        # The target mask is the true data-availability mask, not the stochastic
-        # augmentation mask: hidden clean sites remain reconstruction targets.
-        parts = bsc_loss(
-            out,
-            x,
-            self.fwd,
-            observation_mask=observed,
-            decoder=decoder,
-            encoder=encoder,
-            validate_observation_mask=False,
-        )
+        if sparse_training_decode:
+            xhat, _ = self.fwd._forward_factorized_cuda_sparse_topk_training(
+                x,
+                observed=encoder_observed,
+                validate_observed=False,
+            )
+            # The target mask is the true data-availability mask, not the
+            # stochastic augmentation mask: hidden clean sites remain targets.
+            l_rec = bsc_reconstruction_loss(
+                xhat,
+                x,
+                self.fwd,
+                observation_mask=observed,
+                validate_observation_mask=False,
+            )
+            parts = {"rec": l_rec, "total": l_rec}
+            out = decoder = encoder = None
+            del xhat
+        else:
+            out, decoder, encoder = self.fwd.forward_with_materialized(
+                x,
+                observed=encoder_observed,
+                validate_observed=False,
+                _score_grad=(
+                    self.fwd.cfg.lambda_regularizer > 0
+                    and self.fwd.cfg.regularizer == "crosscoder_l1"
+                ),
+            )
+            # The target mask is the true data-availability mask, not the
+            # stochastic augmentation mask: hidden clean sites remain targets.
+            parts = bsc_loss(
+                out,
+                x,
+                self.fwd,
+                observation_mask=observed,
+                decoder=decoder,
+                encoder=encoder,
+                validate_observation_mask=False,
+            )
 
         l_aux = None
         if cfg.aux_variant != "none" and self._auxiliary_can_have_dead_features(len(x)):
+            assert out is not None
             dead = None
             if cfg.aux_variant in (
                 "sasa",
@@ -1704,9 +1740,15 @@ class Trainer:
                 parts["aux"] = l_aux
                 parts["total"] = parts["total"] + alpha * l_aux
 
-        tracker_mask = out.mask if cfg.aux_variant not in {"none", "fel"} else None
+        tracker_mask = (
+            out.mask
+            if out is not None and cfg.aux_variant not in {"none", "fel"}
+            else None
+        )
         tracker_coordinate_activity = (
-            (out.z_selected != 0) if cfg.aux_variant == "sasa_release" else None
+            (out.z_selected != 0)
+            if out is not None and cfg.aux_variant == "sasa_release"
+            else None
         )
         # The loss graph owns every tensor its backward still needs.  Dropping
         # the aggregate forward result here releases dead score/preselection

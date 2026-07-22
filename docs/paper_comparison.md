@@ -412,13 +412,15 @@ the exact decoder-Gram implementation. The implementation identity and its
 residual thresholds are project engineering decisions and are content-bound in
 the cell, checkpoint, run binding, and deployable codec.
 
-Factorized arms separately derive `direct_rank_space_prepacked_core_bmm_v2`; the
+Factorized arms separately derive `direct_rank_space_sparse_topk_cuda_v3`; the
 materialized site tensor is retained only under the explicit
 `materialized_prepacked_core_reference_v2` oracle identity. Direct rank-space
 contraction is a project execution optimization, not an FMX procedure claim or
 a new experimental arm. The cell, checkpoint, run binding, and deployable
 codec bind this identity. The physical encoder and decoder cores are contiguous
-in their respective GEMM orders; stale v1 layouts refuse rather than migrate.
+in their respective GEMM orders; stale v1/v2 layouts refuse rather than
+migrate. Its low-density bf16 hard-TopK CUDA decoder is a bounded engineering
+specialization, not a change to the factorization hypothesis.
 Estimator v14 conservatively retains the prior operational compute and
 workspace price.
 
