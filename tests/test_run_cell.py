@@ -742,8 +742,15 @@ def test_persistent_worker_exits_after_digest_bound_stage_failure(
 
 def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
     source = inspect.getsource(run_cell_module._evaluate)
-    assert source.count("_prefetched_evaluation_batches(") == 1
-    assert "evaluate_selector_and_shared_code_modes(" in source
+    joint_source = inspect.getsource(
+        run_cell_module._evaluate_rate_distortion_and_raw_space
+    )
+    assert source.count("_prefetched_evaluation_batches(") == 0
+    assert "evaluate_selector_and_shared_code_modes(" not in source
+    assert joint_source.count("evaluate_selector_and_shared_code_modes(") == 1
+    assert joint_source.count("_RDEvaluationSession(") == 1
+    assert joint_source.count("for rd_input in joint_inputs()") == 1
+    assert "_threshold_batch_consumer=consume_threshold_batch" in joint_source
     assert "_evaluate_native_selector(" not in source
     assert source.count("_evaluate_rate_distortion_and_raw_space(") == 1
     assert "evaluate_rd(" not in source

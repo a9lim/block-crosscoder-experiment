@@ -51,13 +51,15 @@ from block_crosscoder_experiment.codec import (
     CodecSpec,
     _RDEvaluationBatch,
     _RDEvaluationInput,
-    _evaluate_rd_stream,
+    _RDEvaluationSelection,
+    _RDEvaluationSession,
     _packet_from_events,
     decode_batch,
     estimate_calibration_peak_bytes,
     fit_codec,
 )
 from block_crosscoder_experiment.evaluation import (
+    EvaluationModeEndpoints,
     evaluate_selector_and_shared_code_modes,
     load_trained_model,
 )
@@ -6130,7 +6132,15 @@ def _synthetic_recovery(
             design = torch.cat(
                 (latent, torch.ones(len(latent), 1, dtype=torch.float64)), dim=1
             )
-            alignment_coefficients[factor] = torch.linalg.lstsq(design, target).solution
+            # The default pivoted-QR driver can choose different solutions for
+            # a rank-deficient calibration design in persistent versus fresh
+            # worker processes.  The SVD driver fixes the canonical
+            # minimum-norm solution, preserving byte-exact resume artifacts.
+            alignment_coefficients[factor] = torch.linalg.lstsq(
+                design,
+                target,
+                driver="gelsd",
+            ).solution
             alignment_references[factor] = target.mean(dim=0, keepdim=True)
 
     category_masks = tuple(
@@ -7253,6 +7263,7 @@ def _evaluate_rate_distortion_and_raw_space(
     *,
     retain_endpoint_errors: bool = False,
 ) -> tuple[
+    EvaluationModeEndpoints,
     dict[str, Any],
     dict[str, Any],
     _RawEndpointErrorCache | None,
@@ -7674,16 +7685,72 @@ def _evaluate_rate_distortion_and_raw_space(
             )
             del encoder_input, x_raw_device
 
-    try:
-        rd = _evaluate_rd_stream(
-            model,
-            codec,
-            joint_inputs(),
-            row_len=1 if data["kind"] == "synthetic" else None,
-            device=str(device),
-            observer=observer,
+    evaluation_decoder = model.decoder_tensor()
+    evaluation_encoder = (
+        model._tied_encoder_tensor(evaluation_decoder)
+        if model.cfg.encoder_mode == "tied"
+        else model.encoder_tensor()
+    )
+    evaluation_score_geometry = model._frozen_score_geometry(evaluation_decoder)
+    direct_factorized = model.uses_direct_factorized_execution
+    rd_session = _RDEvaluationSession(
+        model,
+        codec,
+        row_len=1 if data["kind"] == "synthetic" else None,
+        device=str(device),
+        observer=observer,
+        materialized_decoder=None if direct_factorized else evaluation_decoder,
+        materialized_encoder=None if direct_factorized else evaluation_encoder,
+        score_geometry=None if direct_factorized else evaluation_score_geometry,
+    )
+    current_rd_input: _RDEvaluationInput | None = None
+
+    def mode_inputs() -> Iterator[torch.Tensor]:
+        nonlocal current_rd_input
+        for rd_input in joint_inputs():
+            if current_rd_input is not None:
+                raise CellExecutionError(
+                    "joint evaluator advanced before consuming its R-D batch"
+                )
+            current_rd_input = rd_input
+            yield rd_input.transformed
+            if current_rd_input is not None:
+                raise CellExecutionError(
+                    "joint evaluator omitted the current R-D batch"
+                )
+
+    def consume_threshold_batch(
+        transformed: torch.Tensor,
+        z: torch.Tensor,
+        scores: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        nonlocal current_rd_input
+        rd_input = current_rd_input
+        if rd_input is None or transformed is not rd_input.transformed:
+            raise CellExecutionError("joint selector/R-D batch identity diverged")
+        rd_session.consume(
+            rd_input,
+            threshold_selection=_RDEvaluationSelection(z, scores, mask),
         )
+        current_rd_input = None
+
+    try:
+        mode_endpoints = evaluate_selector_and_shared_code_modes(
+            model,
+            mode_inputs(),
+            device=device,
+            selection_modes=("topk", "threshold"),
+            _threshold_batch_consumer=consume_threshold_batch,
+            _materialized_decoder=evaluation_decoder,
+            _materialized_encoder=evaluation_encoder,
+            _score_geometry=evaluation_score_geometry,
+        )
+        if current_rd_input is not None:
+            raise CellExecutionError("joint evaluator left an R-D batch unconsumed")
+        rd = rd_session.finalize()
     finally:
+        rd_session.close()
         close_evaluation = getattr(evaluation_stream, "close", None)
         if close_evaluation is not None:
             close_evaluation()
@@ -7774,7 +7841,7 @@ def _evaluate_rate_distortion_and_raw_space(
         if retain_endpoint_errors
         else None
     )
-    return rd, payload, cache, observer.roundtrip
+    return mode_endpoints, rd, payload, cache, observer.roundtrip
 
 
 @torch.no_grad()
@@ -8532,17 +8599,6 @@ def _evaluate(
     ):
         raise CellExecutionError("deployable codec/input binding mismatch")
 
-    mode_endpoints = evaluate_selector_and_shared_code_modes(
-        model,
-        _prefetched_evaluation_batches(ctx, preparation),
-        device=device,
-        selection_modes=("topk", "threshold"),
-    )
-    native = mode_endpoints.selector["topk"]
-    deployed = mode_endpoints.selector["threshold"]
-    shared_native = mode_endpoints.shared_code["topk"]
-    shared_deployed = mode_endpoints.shared_code["threshold"]
-
     recovery: dict[str, Any] | None = None
     identification: dict[str, Any] | None = None
     if ctx.cell.phase is Phase.PHASE1:
@@ -8585,7 +8641,7 @@ def _evaluate(
             )
             for endpoint in ("native", "deployed")
         }
-    rd, raw_space, raw_endpoint_cache, roundtrip = (
+    mode_endpoints, rd, raw_space, raw_endpoint_cache, roundtrip = (
         _evaluate_rate_distortion_and_raw_space(
             ctx,
             preparation,
@@ -8595,6 +8651,10 @@ def _evaluate(
             retain_endpoint_errors=True,
         )
     )
+    native = mode_endpoints.selector["topk"]
+    deployed = mode_endpoints.selector["threshold"]
+    shared_native = mode_endpoints.shared_code["topk"]
+    shared_deployed = mode_endpoints.shared_code["threshold"]
     assert raw_endpoint_cache is not None
     schedule_plans = _selected_time_sharing_plans(
         ctx,

@@ -54,7 +54,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v15"
+    "dense-linear-memory-v16"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3795,10 +3795,11 @@ def _evaluation_workspace_bytes(
 
     Deployment always uses the calibrated threshold, independent of the
     training selector, and that threshold has no hard cardinality ceiling.
-    Every cell's packet path is therefore priced at dense support.  Decode and
-    shared-code analysis do not run concurrently; the larger workspace is the
-    relevant peak.  Model outputs are included explicitly even though the
-    generic dense training allowance below also covers much of that storage.
+    Every cell's packet path is therefore priced at dense support. Decode and
+    shared-code analysis consume one full-view carrier; persistent endpoint
+    reducers and paired raw/transformed targets therefore overlap and are
+    priced explicitly. Model outputs are included even though the generic
+    dense training allowance below also covers much of that storage.
     """
 
     q_chunk = min(TRUSTED_DECODE_Q_CHUNK, quantizer_count)
@@ -3910,7 +3911,19 @@ def _evaluation_workspace_bytes(
         score_geometry_bytes = groups * 4
     else:
         score_geometry_bytes = 0
-    return max(joint_rd_bytes, shared_code_bytes) + score_geometry_bytes
+    endpoint_resident_bytes = (
+        decoder_gram_bytes
+        + 2 * per_mode_accumulator_bytes
+        + selector_accumulator_bytes
+    )
+    fused_rd_bytes = joint_rd_bytes + endpoint_resident_bytes
+    fused_shared_bytes = (
+        shared_code_bytes
+        + joint_target_bytes
+        + normalization_operator_bytes
+        + device_prefetch_bytes
+    )
+    return max(fused_rd_bytes, fused_shared_bytes) + score_geometry_bytes
 
 
 def _decoded_energy_code_norm_eligible_values(
@@ -4464,11 +4477,12 @@ def _estimate_components(
         sites=len(site_dims),
         site_dim=max(site_dims),
         # The dedicated copy stream retains one device batch beyond the current
-        # batch. Synthetic cells carry one fp32 tensor without identities;
+        # batch. Synthetic paired evaluation carries normalized and raw fp32
+        # tensors without stored identities;
         # Phase 2 carries raw and normalized store-precision tensors plus row
         # identities; Phase 3 normalizes one raw tensor on CUDA.
         device_prefetch_bytes=(
-            batch_tokens * total_dim * 4
+            2 * batch_tokens * total_dim * 4
             if cell.phase is Phase.PHASE1
             else batch_tokens
             * (

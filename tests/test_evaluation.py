@@ -8,6 +8,7 @@ import weakref
 import pytest
 import torch
 
+import block_crosscoder_experiment.codec as codec_module
 import block_crosscoder_experiment.evaluation as evaluation_module
 from block_crosscoder_experiment.evaluation import (
     centered_fvu,
@@ -16,11 +17,16 @@ from block_crosscoder_experiment.evaluation import (
     evaluate_shared_code_modes,
     load_trained_model,
 )
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
+from block_crosscoder_experiment.model import (
+    BSCConfig,
+    BlockCrosscoder,
+    ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+)
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
 )
 
 
@@ -1117,8 +1123,7 @@ def test_joint_mode_endpoints_consume_one_stream_and_reuse_full_outputs(
     assert encoder_calls == 1
     assert score_calls == 1 + 2 * config.n_sites
     assert decode_calls == 2 * (1 + 2 * config.n_sites)
-    assert observed_views[0] is not None
-    assert bool(observed_views[0].all())
+    assert observed_views[0] is None
 
 
 def test_joint_mode_endpoints_apply_max_tokens_before_every_reduction() -> None:
@@ -1156,6 +1161,126 @@ def test_joint_mode_endpoints_apply_max_tokens_before_every_reduction() -> None:
     }
     assert all(payload["n_tokens"] == 13 for payload in joint.selector.values())
     assert all(payload["n_tokens"] == 13 for payload in joint.shared_code.values())
+
+
+def test_joint_mode_threshold_consumer_reuses_exact_full_view_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=3,
+        d_model=6,
+        k=2,
+        encoder_fusion="availability_rescaled_sum",
+        selection="batch_topk",
+    )
+    model = BlockCrosscoder(config)
+    batches = [
+        torch.randn(11, config.n_sites, config.d_model),
+        torch.randn(7, config.n_sites, config.d_model),
+    ]
+    model.fit_threshold_(batches, target_avg_blocks=2)
+    expected = evaluate_selector_and_shared_code_modes(model, batches)
+    consumed = []
+    select_calls = 0
+    original_select = model.select_with_materialized
+
+    def counted_select(*args, **kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(model, "select_with_materialized", counted_select)
+
+    def consume(transformed, z, scores, mask) -> None:
+        consumed.append(
+            (
+                transformed.detach().clone(),
+                tuple(field.detach().clone() for field in (z, scores, mask)),
+            )
+        )
+
+    actual = evaluate_selector_and_shared_code_modes(
+        model,
+        batches,
+        _threshold_batch_consumer=consume,
+    )
+
+    assert actual == expected
+    assert len(consumed) == len(batches)
+    assert select_calls == len(batches) * (1 + 2 * config.n_sites)
+    for batch, (transformed, fields) in zip(batches, consumed, strict=True):
+        direct, _, _ = original_select(batch, mode="threshold")
+        assert torch.equal(transformed, batch)
+        for actual_field, expected_field in zip(
+            fields,
+            (direct.z, direct.scores, direct.mask),
+            strict=True,
+        ):
+            assert torch.equal(actual_field, expected_field)
+
+
+@pytest.mark.parametrize("carrier", ("factorized", "mapped_isolated"))
+def test_joint_mode_full_view_is_exact_deployable_codec_carrier(carrier: str) -> None:
+    common = dict(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=3,
+        d_model=6,
+        k=2,
+        decoder_constraint="free",
+        decoder_bias=False,
+    )
+    if carrier == "factorized":
+        config = BSCConfig(
+            **common,
+            site_rank=2,
+            encoder_mode="untied",
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            ),
+        )
+    else:
+        config = BSCConfig(
+            **common,
+            selection_score="isolated_loss_decrease",
+            isolated_loss_decrease_implementation=(
+                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            ),
+        )
+    model = BlockCrosscoder(config)
+    x = torch.randn(13, config.n_sites, config.d_model)
+    model.fit_threshold_([x], target_avg_blocks=2)
+    captured = []
+
+    def consume(transformed, z, scores, mask) -> None:
+        captured.append((transformed, z, scores, mask))
+
+    evaluate_selector_and_shared_code_modes(
+        model,
+        [x],
+        _threshold_batch_consumer=consume,
+    )
+    with torch.no_grad():
+        decoder, encoder = codec_module._materialized_model_tensors(model)
+        geometry = (
+            None if decoder is None else model._frozen_score_geometry(decoder)
+        )
+        expected = codec_module._threshold_select(
+            model,
+            x,
+            decoder,
+            encoder,
+            geometry,
+        )
+
+    assert len(captured) == 1
+    transformed, z, scores, mask = captured[0]
+    assert transformed is x
+    assert torch.equal(z, expected.z)
+    assert torch.equal(scores, expected.scores)
+    assert torch.equal(mask, expected.mask)
 
 
 @pytest.mark.parametrize("include_selector_payloads", (False, True))

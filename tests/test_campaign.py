@@ -646,7 +646,9 @@ def evaluation_payload(
     }
     return {
         "schema": EVALUATION_SCHEMA,
-        "evaluation_execution_implementation": ("joint_transformed_raw_packet_v1"),
+        "evaluation_execution_implementation": (
+            "fused_deployable_full_view_packet_v2"
+        ),
         "cell_id": cell_id,
         "inputs": inputs,
         "validation": validation,
@@ -3402,7 +3404,7 @@ for kind in stage_kinds[a.stage]:
         payload = {
             "schema": "bsc-evaluation-v2",
             "evaluation_execution_implementation": (
-                "joint_transformed_raw_packet_v1"
+                "fused_deployable_full_view_packet_v2"
             ),
             "cell_id": cell["cell_id"],
             "inputs": {name: refs[name]["sha256"] for name in (

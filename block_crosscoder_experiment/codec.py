@@ -57,7 +57,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import torch
 
@@ -268,6 +268,20 @@ class _RDEvaluationInput:
     transformed: torch.Tensor
     row_ids: torch.Tensor | None = None
     context: object | None = None
+
+
+class _RDEvaluationSelection(NamedTuple):
+    """Full-view threshold geometry reused solely for sparse packet events.
+
+    Packetization gathers only positions selected by ``mask``. At those
+    positions the raw and post-selection codes are bit-identical, so carrying
+    another dense masked ``[tokens, blocks, block_dim]`` tensor would only
+    inflate the fused evaluator's peak memory.
+    """
+
+    z: torch.Tensor
+    scores: torch.Tensor
+    mask: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -740,6 +754,7 @@ def _packet_events_from_output(
     out,
     *,
     support: _PacketSupport | None = None,
+    _selected_code: torch.Tensor | None = None,
 ) -> _PacketEvents:
     """Extract support and rotate only selected events.
 
@@ -753,7 +768,8 @@ def _packet_events_from_output(
         included = codec._tensor_on("included", device)
         support = _packet_support(out.mask & included.unsqueeze(0))
     original_ids = support.original_ids
-    selected = out.z_selected[support.rows, original_ids]
+    selected_source = out.z_selected if _selected_code is None else _selected_code
+    selected = selected_source[support.rows, original_ids]
     canonical = torch.einsum(
         "eij,ej->ei",
         codec._tensor_on("rotation", device)[original_ids],
@@ -1574,24 +1590,24 @@ def fit_codec(model, batches, spec: CodecSpec, *, device: str = "cpu") -> Codec:
     )
 
 
-@torch.no_grad()
-def _evaluate_rd_stream(
+def _rd_evaluation_coroutine(
     model,
     codec: Codec,
-    batches,
     *,
     row_len: int | None = None,
     device: str = "cpu",
     observer: _RDEvaluationObserver | None = None,
-) -> dict:
-    """Traverse threshold packets once for transformed and observed endpoints.
+    materialized_decoder: torch.Tensor | None = None,
+    materialized_encoder: torch.Tensor | None = None,
+    score_geometry=None,
+) -> object:
+    """Coroutine implementing one incremental threshold-packet traversal.
 
-    Real-data callers must yield ``(x, row_ids)`` pairs from the sequential
-    store reader; column zero is the immutable sequence ID.  Tensor-only
-    batches require ``row_len`` and are labelled as the fixed-length
-    synthetic/test fallback.  ``_RDEvaluationInput`` additionally lets the
-    executor attach paired raw-space state.  Mixing stored-ID and fallback
-    contracts is rejected.
+    Send ``(item, selection)`` pairs, where ``selection`` may be ``None`` to
+    execute the codec-owned threshold selection. Sending ``None`` finalizes
+    and returns the payload. The incremental surface lets the executor feed
+    the exact full-view threshold selection already produced by the joint
+    selector/shared-code evaluator without retaining an evaluation split.
 
     The codec remains the sole owner of threshold selection, trusted packet
     events, q-chunk decoding, rate arithmetic, transformed SSE, sequence
@@ -1647,12 +1663,13 @@ def _evaluate_rd_stream(
     sequence_mode: str | None = None
     current_sequence: int | None = None
     fallback_token_offset = 0
-    materialized_decoder, materialized_encoder = _materialized_model_tensors(model)
-    score_geometry = (
-        None
-        if materialized_decoder is None
-        else model._frozen_score_geometry(materialized_decoder)
+    materialized_decoder, materialized_encoder = _materialized_model_tensors(
+        model,
+        materialized_decoder,
+        materialized_encoder,
     )
+    if score_geometry is None and materialized_decoder is not None:
+        score_geometry = model._frozen_score_geometry(materialized_decoder)
     materialized_decoder_matrix = (
         None
         if materialized_decoder is None
@@ -1661,7 +1678,11 @@ def _evaluate_rd_stream(
             model.cfg.n_sites * model.cfg.d_model,
         )
     )
-    for item in batches:
+    while True:
+        driven = yield
+        if driven is None:
+            break
+        item, out = driven
         observer_context: object | None = None
         source_row_ids: torch.Tensor | None = None
         if isinstance(item, _RDEvaluationInput):
@@ -1702,13 +1723,31 @@ def _evaluate_rd_stream(
             )
             fallback_token_offset += x.shape[0]
         x = x.to(device, torch.float32, non_blocking=True)
-        out = _threshold_select(
-            model,
-            x,
-            materialized_decoder,
-            materialized_encoder,
-            score_geometry,
-        )
+        if out is None:
+            out = _threshold_select(
+                model,
+                x,
+                materialized_decoder,
+                materialized_encoder,
+                score_geometry,
+            )
+        elif (
+            not isinstance(out, (BSCSelection, _RDEvaluationSelection))
+            or out.z.shape != (x.shape[0], model.cfg.n_blocks, b)
+            or out.scores.shape != out.mask.shape
+            or out.mask.shape != (x.shape[0], model.cfg.n_blocks)
+            or out.z.device != x.device
+            or out.scores.device != x.device
+            or out.mask.device != x.device
+            or (
+                isinstance(out, BSCSelection)
+                and (
+                    out.z_selected.shape != out.z.shape
+                    or out.z_selected.device != x.device
+                )
+            )
+        ):
+            raise ValueError("precomputed R-D threshold selection is misbound")
         raw_mask = out.mask
         mask = raw_mask & inc.unsqueeze(0)
         support = _packet_support(mask)
@@ -1735,12 +1774,21 @@ def _evaluate_rd_stream(
             act_p = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
             act_q = torch.zeros_like(act_p)
 
-        packet_events = _packet_events_from_output(
-            model,
-            codec,
-            out,
-            support=support,
-        )
+        if isinstance(out, _RDEvaluationSelection):
+            packet_events = _packet_events_from_output(
+                model,
+                codec,
+                out,
+                support=support,
+                _selected_code=out.z,
+            )
+        else:
+            packet_events = _packet_events_from_output(
+                model,
+                codec,
+                out,
+                support=support,
+            )
         del out, raw_mask, mask, support
         if codec.n_included:
             del mask_fp32
@@ -1812,40 +1860,62 @@ def _evaluate_rd_stream(
             rows_bits_bern.extend(bern_bits.tolist())
             rows_counts.extend(counts_host.tolist())
             rows_n.extend([1] * x.shape[0])
-            if observer is not None:
-                observer.end_batch(batch)
-            continue
-
-        # Assemble exact stored sequences (or the labelled synthetic fallback).
-        unique_sequences, run_counts = torch.unique_consecutive(
-            sequence_ids, return_counts=True
-        )
-        start = 0
-        for sequence_tensor, run_count_tensor in zip(
-            unique_sequences, run_counts, strict=True
-        ):
-            sequence = int(sequence_tensor)
-            run_count = int(run_count_tensor)
-            if current_sequence is None:
-                current_sequence = sequence
-            elif sequence != current_sequence:
-                if sequence <= current_sequence:
-                    raise ValueError(
-                        "sequence IDs must be contiguous and strictly increasing"
-                    )
-                close_row()
-                current_sequence = sequence
-            sl = slice(start, start + run_count)
-            for q in spec.qs:
-                pend["err"][q] += err_site[q][sl].sum(dim=0)
-            pend["tot"] += tot_site[sl].sum(dim=0)
-            pend["sup"] += float(sup_bits[sl].sum())
-            pend["bern"] += float(bern_bits[sl].sum())
-            pend["cnt"] += float(counts_host[sl].sum())
-            pend["n"] += run_count
-            start += run_count
+        else:
+            # Assemble exact stored sequences (or the labelled synthetic fallback).
+            unique_sequences, run_counts = torch.unique_consecutive(
+                sequence_ids, return_counts=True
+            )
+            start = 0
+            for sequence_tensor, run_count_tensor in zip(
+                unique_sequences, run_counts, strict=True
+            ):
+                sequence = int(sequence_tensor)
+                run_count = int(run_count_tensor)
+                if current_sequence is None:
+                    current_sequence = sequence
+                elif sequence != current_sequence:
+                    if sequence <= current_sequence:
+                        raise ValueError(
+                            "sequence IDs must be contiguous and strictly increasing"
+                        )
+                    close_row()
+                    current_sequence = sequence
+                sl = slice(start, start + run_count)
+                for q in spec.qs:
+                    pend["err"][q] += err_site[q][sl].sum(dim=0)
+                pend["tot"] += tot_site[sl].sum(dim=0)
+                pend["sup"] += float(sup_bits[sl].sum())
+                pend["bern"] += float(bern_bits[sl].sum())
+                pend["cnt"] += float(counts_host[sl].sum())
+                pend["n"] += run_count
+                start += run_count
         if observer is not None:
             observer.end_batch(batch)
+        # A suspended coroutine retains every live local. Release all
+        # batch-owned CPU/GPU carriers before yielding control back to the
+        # selector/shared-code driver so no batch crosses the callback seam.
+        del (
+            driven,
+            item,
+            x,
+            source_row_ids,
+            observer_context,
+            sequence_ids,
+            counts,
+            raw_event_count,
+            act_p,
+            act_q,
+            packet_events,
+            batch,
+            err_site_device,
+            tot_site_device,
+            metric_host,
+            counts_host,
+            sup_bits,
+            bern_bits,
+            err_site,
+            tot_site,
+        )
     if current_sequence is not None:
         close_row()
 
@@ -1936,6 +2006,97 @@ def _evaluate_rd_stream(
             "rate_bits_bernoulli": results["bernoulli_bits_per_token"] + amp_bits,
         }
     return results
+
+
+class _RDEvaluationSession:
+    """Single-owner incremental facade over the exact R-D reduction stream."""
+
+    @torch.no_grad()
+    def __init__(
+        self,
+        model,
+        codec: Codec,
+        *,
+        row_len: int | None = None,
+        device: str = "cpu",
+        observer: _RDEvaluationObserver | None = None,
+        materialized_decoder: torch.Tensor | None = None,
+        materialized_encoder: torch.Tensor | None = None,
+        score_geometry=None,
+    ) -> None:
+        self._coroutine = _rd_evaluation_coroutine(
+            model,
+            codec,
+            row_len=row_len,
+            device=device,
+            observer=observer,
+            materialized_decoder=materialized_decoder,
+            materialized_encoder=materialized_encoder,
+            score_geometry=score_geometry,
+        )
+        self._finished = False
+        next(self._coroutine)
+
+    @torch.no_grad()
+    def consume(
+        self,
+        item,
+        *,
+        threshold_selection: BSCSelection | _RDEvaluationSelection | None = None,
+    ) -> None:
+        if self._finished:
+            raise RuntimeError("R-D evaluation session is already finalized")
+        self._coroutine.send((item, threshold_selection))
+
+    @torch.no_grad()
+    def finalize(self) -> dict:
+        if self._finished:
+            raise RuntimeError("R-D evaluation session is already finalized")
+        self._finished = True
+        try:
+            self._coroutine.send(None)
+        except StopIteration as stopped:
+            return stopped.value
+        raise RuntimeError("R-D evaluation coroutine did not terminate")
+
+    def close(self) -> None:
+        """Release an unfinished stream after an upstream evaluation failure."""
+
+        if not self._finished:
+            self._finished = True
+            self._coroutine.close()
+
+
+@torch.no_grad()
+def _evaluate_rd_stream(
+    model,
+    codec: Codec,
+    batches,
+    *,
+    row_len: int | None = None,
+    device: str = "cpu",
+    observer: _RDEvaluationObserver | None = None,
+) -> dict:
+    """Traverse threshold packets once for transformed and observed endpoints.
+
+    Real-data callers must yield ``(x, row_ids)`` pairs from the sequential
+    store reader; column zero is the immutable sequence ID. Tensor-only
+    batches require ``row_len`` and are labelled as the fixed-length
+    synthetic/test fallback. ``_RDEvaluationInput`` additionally lets the
+    executor attach paired raw-space state. Mixing stored-ID and fallback
+    contracts is rejected.
+    """
+
+    session = _RDEvaluationSession(
+        model,
+        codec,
+        row_len=row_len,
+        device=device,
+        observer=observer,
+    )
+    for item in batches:
+        session.consume(item)
+    return session.finalize()
 
 
 @torch.no_grad()

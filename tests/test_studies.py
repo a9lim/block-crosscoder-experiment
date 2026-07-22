@@ -1528,7 +1528,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v15"
+        "dense-linear-memory-v16"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -2163,12 +2163,16 @@ def test_evaluation_workspace_prices_dense_support_and_all_q_raw_errors():
         **common,
     )
     assert 0 < prefetched - one_q <= 123_456
+    # Push the fused R-D branch above the concurrently resident endpoint
+    # reducers; beyond the trusted decode chunk each additional q contributes
+    # only its all-token, all-site raw error carrier.
+    saturated_qs = 50
     saturated = _evaluation_workspace_bytes(
-        quantizer_count=TRUSTED_DECODE_Q_CHUNK,
+        quantizer_count=saturated_qs,
         **common,
     )
     extra_qs = _evaluation_workspace_bytes(
-        quantizer_count=TRUSTED_DECODE_Q_CHUNK + 3,
+        quantizer_count=saturated_qs + 3,
         **common,
     )
     assert one_q > 0
@@ -2264,7 +2268,7 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
         + sparse_native_decode
     )
     assert shared_code > joint_rd
-    assert actual == shared_code
+    assert actual == shared_code + joint_targets + normalization_operators
 
 
 def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():

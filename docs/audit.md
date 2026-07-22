@@ -113,16 +113,16 @@ exit is not evidence by itself.
   coexist. Repeated full/null views may retain only their reduced per-site SSE;
   payload-equality, selector-sharing, and call-count tests preserve every
   endpoint and decode.
-- Rate-distortion artifacts bind `joint_transformed_raw_packet_v1` under
-  evaluation schema v2 and executor schema v6. One paired stream, one threshold
-  selection, one packet-event construction, and `ceil(Q/2)` trusted decodes
-  must produce both transformed and raw endpoints; the first event stream must
-  also feed the independent public packet roundtrip. Codec payload equality,
+- Rate-distortion artifacts bind `fused_deployable_full_view_packet_v2` under
+  evaluation schema v2. One paired stream, one deployable full-view encode,
+  one packet-event construction, and `ceil(Q/2)` trusted decodes must produce
+  selector/shared-code, transformed, and raw endpoints; the first event stream
+  must also feed the independent public packet roundtrip. Codec payload equality,
   sequence/bootstrap order, row and persisted-view mismatch refusal,
   normalization modes, zero support, q order/tails, padding/bias, packet
   corruption, and CUDA drift use the gates and benchmark in `design.md`.
   Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
-  Estimator v14 prices the complete joint lifetime and dedicated-stream device
+  Estimator v16 prices the complete fused lifetime and dedicated-stream device
   lookahead without a traversal credit. Training and ordinary metric iterators
   use the same ordered event-bound transfer pipeline. All three calibration
   traversals use separately closed instances of that host/CUDA prefetch

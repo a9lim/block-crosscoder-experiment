@@ -11,7 +11,7 @@ import json
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import Callable, Iterable, NamedTuple
 
 import torch
 
@@ -513,6 +513,13 @@ def _evaluate_code_modes(
     max_tokens: int | None = None,
     selection_modes: tuple[str, ...] = ("topk", "threshold"),
     include_selector_payloads: bool,
+    threshold_batch_consumer: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+    ]
+    | None = None,
+    materialized_decoder: torch.Tensor | None = None,
+    materialized_encoder: torch.Tensor | None = None,
+    score_geometry=None,
 ) -> tuple[dict[str, dict], dict[str, dict] | None]:
     """Evaluate one or more selector endpoints over one shared view pass.
 
@@ -533,6 +540,8 @@ def _evaluate_code_modes(
             "selection_modes must be a nonempty unique tuple drawn from "
             "{'topk', 'threshold'}"
         )
+    if threshold_batch_consumer is not None and "threshold" not in selection_modes:
+        raise ValueError("threshold batch consumer requires threshold selection mode")
     model = model.to(device).eval()
     cfg = model.cfg
     S, G, b = cfg.n_sites, cfg.n_blocks, cfg.block_dim
@@ -612,13 +621,18 @@ def _evaluate_code_modes(
         if include_selector_payloads
         else None
     )
-    materialized_decoder = model.decoder_tensor()
-    materialized_encoder = (
-        model._tied_encoder_tensor(materialized_decoder)
-        if cfg.encoder_mode == "tied"
-        else model.encoder_tensor()
-    )
-    score_geometry = model._frozen_score_geometry(materialized_decoder)
+    if materialized_decoder is None:
+        if materialized_encoder is not None or score_geometry is not None:
+            raise ValueError("partial evaluator materialization is incomplete")
+        materialized_decoder = model.decoder_tensor()
+        materialized_encoder = (
+            model._tied_encoder_tensor(materialized_decoder)
+            if cfg.encoder_mode == "tied"
+            else model.encoder_tensor()
+        )
+        score_geometry = model._frozen_score_geometry(materialized_decoder)
+    elif materialized_encoder is None or score_geometry is None:
+        raise ValueError("partial evaluator materialization is incomplete")
     # A publication-scale decoder can be several GiB in fp32.  Keeping a
     # complete fp64 copy alive for evaluation can therefore exceed the 24 GiB
     # device even though the Gram products themselves are tiny.  Materialize
@@ -677,16 +691,18 @@ def _evaluate_code_modes(
         observed: torch.Tensor | None = None,
         validate_observed: bool = True,
         encoder_sites=None,
+        deployable_full: bool = False,
     ) -> dict[str, _EvaluationViewOutput]:
+        direct_deployable = deployable_full and model.uses_direct_factorized_execution
         selection, _, _ = model.select_with_materialized(
             value,
             mode=primary_mode,
             observed=observed,
             validate_observed=validate_observed,
-            _decoder=materialized_decoder,
-            _encoder=materialized_encoder,
-            _score_geometry=score_geometry,
-            _encoder_sites=encoder_sites,
+            _decoder=None if direct_deployable else materialized_decoder,
+            _encoder=None if direct_deployable else materialized_encoder,
+            _score_geometry=None if direct_deployable else score_geometry,
+            _encoder_sites=None if direct_deployable else encoder_sites,
         )
         result: dict[str, _EvaluationViewOutput] = {}
         for mode in selection_modes:
@@ -735,22 +751,14 @@ def _evaluate_code_modes(
             if cfg.encoder_fusion == "source" or S == 1
             else model._frozen_encoder_sites(x, materialized_encoder)
         )
-        # The legacy selector summaries explicitly supplied an all-observed
-        # mask for isolated-loss scoring.  Preserve that operational path in
-        # the joint evaluator; bypassing the partial-view cache keeps this full
-        # endpoint on the same direct flattened contraction as native forward.
-        explicit_full_observed = (
-            observed_all
-            if include_selector_payloads
-            and cfg.selection_score == "isolated_loss_decrease"
-            else None
-        )
+        # The full-view carrier is now the exact deployable-codec geometry.
+        # In particular, direct-factorized execution remains in rank space and
+        # mapped isolated-loss scoring uses the canonical observed=None full
+        # path. This is the only full encode in the fused endpoint/R-D stream.
         full_outputs = outputs_for_view(
             x,
-            observed=explicit_full_observed,
-            encoder_sites=(
-                None if explicit_full_observed is not None else encoder_sites
-            ),
+            encoder_sites=encoder_sites,
+            deployable_full=True,
         )
         full_mode_masks = torch.stack(
             tuple(full_outputs[mode].mask for mode in selection_modes)
@@ -854,6 +862,7 @@ def _evaluate_code_modes(
             source_missing: bool,
             empty: bool,
             frozen_encoder_sites,
+            full_outputs_for_batch: dict[str, _EvaluationViewOutput],
         ) -> dict[str, _EvaluationViewOutput]:
             """Run one mode-independent partial encoding and both selectors."""
             if source_missing or empty:
@@ -872,7 +881,7 @@ def _evaluate_code_modes(
                 )
                 return null_outputs
             if cfg.encoder_fusion == "source" or S == 1:
-                return full_outputs
+                return full_outputs_for_batch
             return outputs_for_view(
                 x,
                 observed=view_observed,
@@ -888,6 +897,11 @@ def _evaluate_code_modes(
             support_intersection_key: str,
             support_union_key: str,
             include_loo_deltas: bool = False,
+            full_mask_count64_for_batch: torch.Tensor,
+            all_full_energy64_for_batch: torch.Tensor,
+            raw_full_code_for_batch: torch.Tensor,
+            full_mode_masks_for_batch: torch.Tensor,
+            full_support_total64_for_batch: torch.Tensor,
         ) -> torch.Tensor:
             """Accumulate every selector from one raw partial-view geometry."""
 
@@ -901,23 +915,27 @@ def _evaluate_code_modes(
                 device=device,
             )
             for mode_index, state in enumerate(mode_states):
-                state[f"{prefix}_full_count"][index] += full_mask_count64[mode_index]
-                state[f"{prefix}_full_energy"][index] += all_full_energy64[mode_index]
+                state[f"{prefix}_full_count"][index] += full_mask_count64_for_batch[
+                    mode_index
+                ]
+                state[f"{prefix}_full_energy"][index] += all_full_energy64_for_batch[
+                    mode_index
+                ]
 
             raw_partial_code = partial_outputs[primary_mode].z
             for start in range(0, G, EVALUATION_CONCORDANCE_BLOCK_CHUNK):
                 stop = min(start + EVALUATION_CONCORDANCE_BLOCK_CHUNK, G)
                 block_slice = slice(start, stop)
                 intersection = (
-                    full_mode_masks[:, :, block_slice]
+                    full_mode_masks_for_batch[:, :, block_slice]
                     & partial_mode_masks[:, :, block_slice]
                 )
                 if include_loo_deltas:
                     loo_reductions = _batched_mode_loo_reductions(
-                        raw_full_code[:, block_slice],
+                        raw_full_code_for_batch[:, block_slice],
                         raw_partial_code[:, block_slice],
                         all_site_decoder_gram[block_slice],
-                        full_mode_masks[:, :, block_slice],
+                        full_mode_masks_for_batch[:, :, block_slice],
                         partial_mode_masks[:, :, block_slice],
                         intersection,
                     )
@@ -932,7 +950,7 @@ def _evaluate_code_modes(
                 else:
                     loo_reductions = None
                     reductions = _batched_mode_concordance(
-                        raw_full_code[:, block_slice],
+                        raw_full_code_for_batch[:, block_slice],
                         raw_partial_code[:, block_slice],
                         all_site_decoder_gram[block_slice],
                         intersection=intersection,
@@ -959,7 +977,9 @@ def _evaluate_code_modes(
                     )
                 del intersection, reductions, loo_reductions
             union_totals = (
-                full_support_total64 + partial_totals - intersection_totals
+                full_support_total64_for_batch
+                + partial_totals
+                - intersection_totals
             )
             for mode_index, state in enumerate(mode_states):
                 state[support_intersection_key][index] += intersection_totals[
@@ -979,6 +999,7 @@ def _evaluate_code_modes(
                 ),
                 empty=False,
                 frozen_encoder_sites=encoder_sites,
+                full_outputs_for_batch=full_outputs,
             )
             for mode, only in only_outputs.items():
                 state = states[mode]
@@ -993,6 +1014,11 @@ def _evaluate_code_modes(
                 prefix="site",
                 support_intersection_key="support_intersection",
                 support_union_key="support_union",
+                full_mask_count64_for_batch=full_mask_count64,
+                all_full_energy64_for_batch=all_full_energy64,
+                raw_full_code_for_batch=raw_full_code,
+                full_mode_masks_for_batch=full_mode_masks,
+                full_support_total64_for_batch=full_support_total64,
             )
             del only, state, only_outputs, only_mode_masks
 
@@ -1005,6 +1031,7 @@ def _evaluate_code_modes(
                 ),
                 empty=S == 1,
                 frozen_encoder_sites=encoder_sites,
+                full_outputs_for_batch=full_outputs,
             )
             for mode, missing in missing_outputs.items():
                 state = states[mode]
@@ -1020,6 +1047,11 @@ def _evaluate_code_modes(
                 support_intersection_key="loo_intersection",
                 support_union_key="loo_union",
                 include_loo_deltas=True,
+                full_mask_count64_for_batch=full_mask_count64,
+                all_full_energy64_for_batch=all_full_energy64,
+                raw_full_code_for_batch=raw_full_code,
+                full_mode_masks_for_batch=full_mode_masks,
+                full_support_total64_for_batch=full_support_total64,
             )
             del (
                 missing,
@@ -1027,6 +1059,15 @@ def _evaluate_code_modes(
                 missing_outputs,
                 missing_mode_masks,
             )
+        if threshold_batch_consumer is not None:
+            threshold_output = full_outputs["threshold"]
+            threshold_batch_consumer(
+                x,
+                threshold_output.z,
+                threshold_output.scores,
+                threshold_output.mask,
+            )
+            del threshold_output
         del (
             encoder_sites,
             null_outputs,
@@ -1520,6 +1561,13 @@ def evaluate_selector_and_shared_code_modes(
     device: str | torch.device = "cpu",
     max_tokens: int | None = None,
     selection_modes: tuple[str, ...] = ("topk", "threshold"),
+    _threshold_batch_consumer: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+    ]
+    | None = None,
+    _materialized_decoder: torch.Tensor | None = None,
+    _materialized_encoder: torch.Tensor | None = None,
+    _score_geometry=None,
 ) -> EvaluationModeEndpoints:
     """Evaluate selector summaries and shared-code endpoints in one traversal."""
     shared_code, selector = _evaluate_code_modes(
@@ -1529,6 +1577,10 @@ def evaluate_selector_and_shared_code_modes(
         max_tokens=max_tokens,
         selection_modes=selection_modes,
         include_selector_payloads=True,
+        threshold_batch_consumer=_threshold_batch_consumer,
+        materialized_decoder=_materialized_decoder,
+        materialized_encoder=_materialized_encoder,
+        score_geometry=_score_geometry,
     )
     assert selector is not None
     return EvaluationModeEndpoints(selector=selector, shared_code=shared_code)

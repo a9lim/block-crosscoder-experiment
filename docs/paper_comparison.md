@@ -435,12 +435,15 @@ Estimator v14 conservatively retains the prior operational compute and
 workspace price.
 
 Deployment evaluation binds the engineering identity
-`joint_transformed_raw_packet_v1`: transformed-space packet diagnostics and
-paired raw-space selection endpoints consume one threshold/event/decode
-traversal, while the public codec result, raw evidence contract, and independent
-source-free packet validation remain unchanged. This is not a paper-method
-adaptation or experimental condition. Evaluation schema v2, executor schema v6,
-the campaign gate, and estimator v14 bind and price the joint implementation.
+`fused_deployable_full_view_packet_v2`: selector/shared-code endpoints,
+transformed-space packet diagnostics, and paired raw-space selection endpoints
+consume one paired input traversal and one deployable full-view encode while
+the public codec result, raw evidence contract, and independent source-free
+packet validation remain unchanged. The deployable carrier canonically
+resolves formerly distinct factorized, mapped-score, and persisted-view full
+paths; this is an execution-identity change, not a paper-method adaptation or
+experimental condition. Evaluation schema v2, the campaign gate, and estimator
+v16 bind and price the fused implementation.
 Executor v6 overlaps one ordered device transfer with the current CUDA batch
 and applies the same explicitly closed pipeline to all calibration traversals;
 this does not alter the data stream or scientific method.

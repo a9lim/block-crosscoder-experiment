@@ -1337,17 +1337,36 @@ complete shared-code evaluation remains neutral (`495.063` initially;
 operation or endpoint schema changes.
 
 Rate-distortion evaluation serializes
-`evaluation_execution_implementation=joint_transformed_raw_packet_v1` under
-evaluation schema v2 and executor schema v6. One paired evaluation stream now
-owns threshold selection, the q-independent packet events, and exactly
+`evaluation_execution_implementation=fused_deployable_full_view_packet_v2`
+under evaluation schema v2. One paired evaluation stream owns the deployable
+full-view encode and scores, both selector masks, shared-code endpoints, the
+q-independent packet events, and exactly
 `ceil(number_of_quantizers / 2)` trusted sparse decodes per batch. The codec
 accumulator preserves transformed-space rate arithmetic, sequence grouping,
 bootstrap draw order, and its public `evaluate_rd` payload; a synchronous raw
 observer consumes those same decoded chunks, applies the deployment inverse,
 and accumulates paired raw-space endpoints and schedule-cache errors. The first
 packet event stream is also reused for the independent public source-free
-roundtrip. The executor no longer rereads or re-encodes the first batch.
-Executor v6 composes ordered pinned-host prefetch with a one-batch-ahead
+roundtrip. The selector/shared-code pass no longer rereads the normalized
+split, repeats its H2D copy, or repeats the full-view encode. The unique full
+carrier is deliberately the deployable path: direct-factorized cells remain
+in rank space, mapped isolated-loss scoring uses the canonical unmasked full
+view, and real endpoints consume the fp32 view reconstructed from deployment
+bytes rather than a tolerated persisted bf16 copy. This is a new execution
+identity because those formerly distinct full carriers cannot be fused while
+preserving all three old arithmetic paths. Packet/rate arithmetic and every
+site-only/leave-one-out re-encoding retain their prior semantics.
+On jobe at the canonical Phase-2 geometry (four width-768 sites, 2,048 groups,
+block width four, 512 pinned-host tokens, a 201,338,880-byte model), five
+alternating end-to-end in-memory passes measured `116.836 ms` for the separate
+selector/shared plus R-D traversals and `116.156 ms` for the fused traversal:
+`1.0059x`, saving `0.680 ms` per batch before counting the eliminated second
+store read. Peak CUDA allocation rose from `4,795,438,080` to
+`4,896,102,400` bytes (`+96.001 MiB`) because endpoint reducers now remain
+resident during packet decodes; estimator v16 prices this overlap. Direct
+packet-event comparison proved counts, block IDs, original IDs, and canonical
+codes bit-identical when gathering raw `z` at the selected positions.
+The executor composes ordered pinned-host prefetch with a one-batch-ahead
 dedicated CUDA copy stream for training, ordinary metric evaluation, and the
 paired rate-distortion stream. Threshold fitting, achieved-rate preflight, and
 codec fitting independently use the same pipeline and explicitly close each

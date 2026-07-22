@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import replace
+import gc
 import weakref
 
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
     _RDEvaluationInput,
+    _RDEvaluationSelection,
+    _RDEvaluationSession,
     _artifact_digest,
     _decode_trusted_packet_events_q_chunks,
     _encode_batch_all_q_events,
@@ -29,7 +32,12 @@ from block_crosscoder_experiment.codec import (
     evaluate_rd,
     fit_codec,
 )
-from block_crosscoder_experiment.model import BSCOutput, BlockCrosscoder, BSCConfig
+from block_crosscoder_experiment.model import (
+    BSCOutput,
+    BSCSelection,
+    BlockCrosscoder,
+    BSCConfig,
+)
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
@@ -1017,6 +1025,85 @@ def test_joint_rd_stream_preserves_public_payload_and_reuses_one_packet_traversa
     for events, sl in zip(observer.packet_events, slices, strict=True):
         assert events.n_tokens == len(evaluation[sl])
         assert int(events.counts.sum()) == len(events.block_ids)
+
+
+def test_incremental_rd_reuses_precomputed_threshold_selection_bit_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, codec, evaluation, row_ids = _joint_rd_fixture(qs=(2, 4, 8))
+    slices = (slice(0, 5), slice(5, 13), slice(13, 19))
+    expected = evaluate_rd(
+        model,
+        codec,
+        [(evaluation[sl], row_ids[sl]) for sl in slices],
+    )
+    selections: list[BSCSelection] = []
+    for sl in slices:
+        selection, _, _ = model.select_with_materialized(
+            evaluation[sl],
+            mode="threshold",
+        )
+        selections.append(selection)
+
+    def forbid_duplicate_threshold(*args, **kwargs):
+        raise AssertionError("incremental R-D stream recomputed threshold selection")
+
+    monkeypatch.setattr(codec_module, "_threshold_select", forbid_duplicate_threshold)
+    session = _RDEvaluationSession(model, codec)
+    for sl, selection in zip(slices, selections, strict=True):
+        session.consume(
+            _RDEvaluationInput(evaluation[sl], row_ids[sl]),
+            threshold_selection=_RDEvaluationSelection(
+                selection.z,
+                selection.scores,
+                selection.mask,
+            ),
+        )
+    actual = session.finalize()
+
+    assert actual == expected
+    assert _artifact_digest(actual) == _artifact_digest(expected)
+
+
+def test_incremental_rd_rejects_misbound_precomputed_selection() -> None:
+    model, codec, evaluation, row_ids = _joint_rd_fixture(qs=(4,))
+    selection, _, _ = model.select_with_materialized(
+        evaluation[:4],
+        mode="threshold",
+    )
+    session = _RDEvaluationSession(model, codec)
+    with pytest.raises(ValueError, match="misbound"):
+        session.consume(
+            _RDEvaluationInput(evaluation[:5], row_ids[:5]),
+            threshold_selection=selection,
+        )
+    session.close()
+
+
+def test_incremental_rd_releases_precomputed_batch_before_callback_returns() -> None:
+    model, codec, evaluation, row_ids = _joint_rd_fixture(qs=(4,))
+    session = _RDEvaluationSession(model, codec)
+    selection, _, _ = model.select_with_materialized(
+        evaluation[:5],
+        mode="threshold",
+    )
+    code_ref = weakref.ref(selection.z)
+    score_ref = weakref.ref(selection.scores)
+    mask_ref = weakref.ref(selection.mask)
+    session.consume(
+        _RDEvaluationInput(evaluation[:5], row_ids[:5]),
+        threshold_selection=_RDEvaluationSelection(
+            selection.z,
+            selection.scores,
+            selection.mask,
+        ),
+    )
+    del selection
+    gc.collect()
+    assert code_ref() is None
+    assert score_ref() is None
+    assert mask_ref() is None
+    session.finalize()
 
 
 @pytest.mark.parametrize("decoder_bias", (False, True))
