@@ -1507,7 +1507,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v13"
+        "dense-linear-memory-v14"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1761,10 +1761,21 @@ def test_decoded_energy_implementation_is_rederived_after_child_deltas() -> None
         _freeze(plan.stages[-1], parent),
     )
     while plan.stages[-1].name != "site_factorization_4m":
+        eligible = _eligible_groups(plan.stages[-1])
+        # Follow the declared parent carrier explicitly. Content-ID ordering
+        # legitimately changes when the resource-estimator schema changes.
+        selected_parent = next(
+            (
+                group
+                for group in eligible
+                if group[0].recipe_name.endswith("selected_parent")
+            ),
+            eligible[0],
+        )
         plan = materialize_child_plan(
             plan,
             blueprint,
-            _freeze(plan.stages[-1]),
+            _freeze(plan.stages[-1], selected_parent),
         )
 
     cells = plan.stages[-1].cells
@@ -2048,6 +2059,12 @@ def test_evaluation_workspace_prices_dense_support_and_all_q_raw_errors():
         "selection_score": "decoded_energy",
     }
     one_q = _evaluation_workspace_bytes(quantizer_count=1, **common)
+    prefetched = _evaluation_workspace_bytes(
+        quantizer_count=1,
+        device_prefetch_bytes=123_456,
+        **common,
+    )
+    assert 0 < prefetched - one_q <= 123_456
     saturated = _evaluation_workspace_bytes(
         quantizer_count=TRUSTED_DECODE_Q_CHUNK,
         **common,

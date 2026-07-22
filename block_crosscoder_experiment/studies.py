@@ -46,7 +46,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v13"
+    "dense-linear-memory-v14"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -3767,6 +3767,7 @@ def _evaluation_workspace_bytes(
     sites: int,
     site_dim: int,
     selection_score: str,
+    device_prefetch_bytes: int = 0,
     decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION,
     isolated_loss_decrease_implementation: str = (ISOLATED_LOSS_EXACT_IMPLEMENTATION),
 ) -> int:
@@ -3818,6 +3819,7 @@ def _evaluation_workspace_bytes(
         + joint_target_bytes
         + joint_metric_bytes
         + normalization_operator_bytes
+        + device_prefetch_bytes
     )
 
     # Fused native/deployed sharing evaluation retains the full and one
@@ -4322,6 +4324,21 @@ def _estimate_components(
         quantizer_count=len(quantizer_bits),
         sites=len(site_dims),
         site_dim=max(site_dims),
+        # The dedicated copy stream retains one device batch beyond the current
+        # batch. Synthetic cells carry one fp32 tensor without identities;
+        # Phase 2 carries raw and normalized store-precision tensors plus row
+        # identities; Phase 3 normalizes one raw tensor on CUDA.
+        device_prefetch_bytes=(
+            batch_tokens * total_dim * 4
+            if cell.phase is Phase.PHASE1
+            else batch_tokens
+            * (
+                total_dim
+                * store_bytes_per_value
+                * (2 if cell.phase is Phase.PHASE2 else 1)
+                + row_id_width * row_id_bytes
+            )
+        ),
         selection_score=str(values["model.selection_score"]),
         decoded_energy_implementation=decoded_energy_implementation,
         isolated_loss_decrease_implementation=isolated_loss_implementation,
@@ -4376,6 +4393,12 @@ def _estimate_components(
         + factorized_materialization_bytes
         + retraction_workspace_bytes
         + tracker_residency_bytes
+        # One device batch is copied ahead of the batch being consumed. Phase
+        # 1 generators are fp32; captured real activations use store precision.
+        + batch_tokens
+        * total_dim
+        * (4 if cell.phase is Phase.PHASE1 else store_bytes_per_value)
+        + batch_tokens * len(site_dims)
     )
     # Evaluation runs after training state is released, so adding its complete
     # workspace to Adam residency would invent a peak that cannot occur.  Keep

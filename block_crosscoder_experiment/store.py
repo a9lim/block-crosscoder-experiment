@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import torch
 
 __all__ = [
+    "cuda_prefetch_batches",
     "DEFAULT_RIDGE_SCALE",
     "NORMALIZATION_MODES",
     "Whitener",
@@ -1145,6 +1146,174 @@ def prefetch_batches(
     finally:
         stop.set()
         thread.join(timeout=1.0)
+
+
+@dataclass(slots=True)
+class _PendingCudaBatch:
+    """One host batch retained until its dedicated-stream copy is consumed."""
+
+    host: Any
+    device: Any
+    ready: torch.cuda.Event
+
+
+@dataclass(slots=True)
+class _PendingCudaFailure:
+    """A source/transfer failure queued after every preceding valid batch."""
+
+    error: BaseException
+
+
+def cuda_prefetch_batches(
+    it: Iterator,
+    *,
+    device: str | torch.device,
+    depth: int = 1,
+    dtype_policy: (
+        torch.dtype | Callable[[torch.Tensor], torch.dtype | None] | None
+    ) = None,
+) -> Iterator:
+    """Copy nested CPU tensor batches ahead on one dedicated CUDA stream.
+
+    ``depth`` is the number of device batches held ahead of the batch currently
+    yielded to the consumer. Therefore total live lookahead is at most
+    ``depth + 1`` batches, matching :func:`prefetch_batches`' queue-plus-current
+    accounting. The source iterator is consumed synchronously; composing this
+    wrapper outside ``prefetch_batches(..., pin_memory=True)`` overlaps both I/O
+    and H2D transfer with CUDA work.
+
+    A static ``torch.dtype`` policy casts floating tensor leaves only. A
+    callable receives every tensor leaf and returns its target dtype, or
+    ``None`` to preserve that leaf's dtype. Nested tuples, lists, and mappings
+    are reconstructed with the same order; all leaves must be CPU tensors.
+
+    Each copy records a CUDA event. Before yielding, the consumer's current
+    stream waits for that event and every device tensor records the consumer
+    stream, so allocator reuse remains correct without a device-wide
+    synchronization. Closing the iterator drains the bounded copy stream and
+    closes the source when supported. CPU devices are rejected explicitly: a
+    silent fallback here would falsely claim copy/compute overlap.
+    """
+
+    resolved_device = torch.device(device)
+    if resolved_device.type != "cuda":
+        raise ValueError("cuda_prefetch_batches requires a CUDA device")
+    if depth <= 0:
+        raise ValueError("CUDA prefetch depth must be positive")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable for cuda_prefetch_batches")
+    if resolved_device.index is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    if (
+        dtype_policy is not None
+        and not isinstance(dtype_policy, torch.dtype)
+        and not callable(dtype_policy)
+    ):
+        raise TypeError("dtype_policy must be a torch.dtype, callable, or None")
+
+    source = iter(it)
+    copy_stream = torch.cuda.Stream(device=resolved_device)
+
+    def target_dtype(tensor: torch.Tensor) -> torch.dtype:
+        if dtype_policy is None:
+            return tensor.dtype
+        if isinstance(dtype_policy, torch.dtype):
+            return dtype_policy if tensor.is_floating_point() else tensor.dtype
+        resolved = dtype_policy(tensor)
+        if resolved is None:
+            return tensor.dtype
+        if not isinstance(resolved, torch.dtype):
+            raise TypeError("dtype_policy callable must return a torch.dtype or None")
+        return resolved
+
+    def map_batch(value: Any, leaf: Callable[[torch.Tensor], torch.Tensor]) -> Any:
+        if torch.is_tensor(value):
+            return leaf(value)
+        if isinstance(value, tuple):
+            children = tuple(map_batch(item, leaf) for item in value)
+            if hasattr(value, "_fields"):
+                return type(value)(*children)
+            return children
+        if isinstance(value, list):
+            return [map_batch(item, leaf) for item in value]
+        if isinstance(value, Mapping):
+            return {key: map_batch(item, leaf) for key, item in value.items()}
+        raise TypeError(
+            "CUDA-prefetched batches must contain only tensors or nested "
+            "tuples/lists/mappings of tensors"
+        )
+
+    def pin_leaf(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type != "cpu":
+            raise ValueError("CUDA-prefetched tensor leaves must be on CPU")
+        return tensor if tensor.is_pinned() else tensor.pin_memory()
+
+    def copy_leaf(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.to(
+            device=resolved_device,
+            dtype=target_dtype(tensor),
+            non_blocking=True,
+        )
+
+    def record_leaf(tensor: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+        tensor.record_stream(stream)
+        return tensor
+
+    def generate() -> Iterator:
+        from collections import deque
+
+        pending: deque[_PendingCudaBatch | _PendingCudaFailure] = deque()
+        source_done = False
+
+        def enqueue_one() -> None:
+            nonlocal source_done
+            if source_done:
+                return
+            try:
+                host_batch = map_batch(next(source), pin_leaf)
+                with torch.cuda.stream(copy_stream):
+                    device_batch = map_batch(host_batch, copy_leaf)
+                    ready = torch.cuda.Event()
+                    ready.record(copy_stream)
+                pending.append(_PendingCudaBatch(host_batch, device_batch, ready))
+            except StopIteration:
+                source_done = True
+            except BaseException as exc:  # noqa: BLE001 - preserve exact source cause
+                source_done = True
+                pending.append(_PendingCudaFailure(exc))
+
+        def fill(target: int) -> None:
+            while len(pending) < target and not source_done:
+                enqueue_one()
+
+        try:
+            # One batch is current and ``depth`` more are bounded lookahead.
+            fill(depth + 1)
+            while pending:
+                current = pending.popleft()
+                fill(depth)
+                if isinstance(current, _PendingCudaFailure):
+                    raise current.error
+                consumer_stream = torch.cuda.current_stream(resolved_device)
+                consumer_stream.wait_event(current.ready)
+                map_batch(
+                    current.device,
+                    lambda tensor: record_leaf(tensor, consumer_stream),
+                )
+                # Retain ``current.host`` across the yield. This is stricter
+                # than relying only on pinned-allocator event tracking.
+                yield current.device
+        finally:
+            try:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                # Pending copies own host buffers. Drain before releasing them
+                # on explicit close or consumer-side failure.
+                copy_stream.synchronize()
+
+    return generate()
 
 
 class StoreReader:

@@ -70,6 +70,7 @@ from block_crosscoder_experiment.store import (
     MANIFEST_NAME,
     StoreReader,
     Whitener,
+    cuda_prefetch_batches,
     prefetch_batches,
 )
 from block_crosscoder_experiment.runtime_limits import (
@@ -116,7 +117,7 @@ from block_crosscoder_experiment.trainer import (
 
 PREPARATION_SCHEMA = "bsc-preparation-v1"
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v4"
+EXECUTOR_SCHEMA = "bsc-cell-executor-v5"
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
 _VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
@@ -3602,8 +3603,10 @@ def _prefetched_evaluation_batches(
     role: str = "evaluation",
 ) -> Iterator[torch.Tensor]:
     batches: Iterator[torch.Tensor] = _evaluation_batches(ctx, preparation, role)
-    if _device(ctx).type == "cuda":
+    device = _device(ctx)
+    if device.type == "cuda":
         batches = prefetch_batches(batches, depth=2, pin_memory=True)
+        batches = cuda_prefetch_batches(batches, device=device, depth=1)
     return batches
 
 
@@ -4387,13 +4390,19 @@ def _train(
         apply_transform=not transform_on_cuda,
     )
     if device.type == "cuda":
-        # Keep two pinned raw batches ready so shard latency and the next H2D
-        # transfer do not sit on the GPU's critical path.  On-the-fly Phase-3
-        # transforms execute after that nonblocking transfer on CUDA.
+        # Keep two pinned raw batches ready, then copy one device batch ahead
+        # on a dedicated stream. Shard latency and H2D transfer therefore stay
+        # off the GPU's compute critical path. On-the-fly Phase-3 transforms
+        # execute after the per-batch copy event on the consumer stream.
         training_batches = prefetch_batches(
             training_batches,
             depth=2,
             pin_memory=True,
+        )
+        training_batches = cuda_prefetch_batches(
+            training_batches,
+            device=device,
+            depth=1,
         )
     try:
         for batch in training_batches:
@@ -6218,6 +6227,11 @@ def _evaluate_rate_distortion_and_raw_space(
             evaluation_stream,
             depth=2,
             pin_memory=True,
+        )
+        evaluation_stream = cuda_prefetch_batches(
+            evaluation_stream,
+            device=device,
+            depth=1,
         )
 
     class _RawObserver:

@@ -12,6 +12,7 @@ from block_crosscoder_experiment.store import (
     StoreReader,
     Whitener,
     WhitenerAccumulator,
+    cuda_prefetch_batches,
 )
 
 S, D = 3, 16
@@ -592,3 +593,125 @@ def test_prefetch_close_cancels_early_exit():
     next(it)
     it.close()
     assert source_closed.wait(timeout=2.0)
+
+
+def test_cuda_prefetch_rejects_non_cuda_device_and_bad_depth():
+    source = iter((torch.zeros(1),))
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        cuda_prefetch_batches(source, device="cpu")
+    if torch.cuda.is_available():
+        with pytest.raises(ValueError, match="depth must be positive"):
+            cuda_prefetch_batches(iter((torch.zeros(1),)), device="cuda", depth=0)
+        with pytest.raises(TypeError, match="dtype_policy"):
+            cuda_prefetch_batches(
+                iter((torch.zeros(1),)),
+                device="cuda",
+                dtype_policy="float32",  # type: ignore[arg-type]
+            )
+    else:
+        with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+            cuda_prefetch_batches(iter((torch.zeros(1),)), device="cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_nested_order_dtype_stream_and_depth_bound():
+    device = torch.device("cuda", torch.cuda.current_device())
+    consumer_stream = torch.cuda.current_stream(device)
+    produced: list[int] = []
+    policy_streams: list[int] = []
+
+    def source():
+        for index in range(6):
+            produced.append(index)
+            yield {
+                "x": torch.full((128,), index, dtype=torch.bfloat16),
+                "metadata": (
+                    torch.tensor([index], dtype=torch.int64),
+                    [torch.tensor([index % 2 == 0], dtype=torch.bool)],
+                ),
+            }
+
+    def floating_fp32(tensor: torch.Tensor) -> torch.dtype | None:
+        policy_streams.append(torch.cuda.current_stream(device).cuda_stream)
+        return torch.float32 if tensor.is_floating_point() else None
+
+    batches = cuda_prefetch_batches(
+        source(),
+        device=device,
+        depth=2,
+        dtype_policy=floating_fp32,
+    )
+    first = next(batches)
+    # The current batch plus exactly two lookahead batches were requested.
+    assert produced == [0, 1, 2]
+    assert first["x"].device == device
+    assert first["x"].dtype == torch.float32
+    assert first["metadata"][0].dtype == torch.int64
+    assert first["metadata"][1][0].dtype == torch.bool
+    assert float(first["x"].sum()) == 0.0
+
+    second = next(batches)
+    assert produced == [0, 1, 2, 3]
+    assert float(second["x"].sum()) == 128.0
+    remaining = list(batches)
+    assert [int(batch["metadata"][0]) for batch in remaining] == [2, 3, 4, 5]
+    assert policy_streams
+    assert all(stream != consumer_stream.cuda_stream for stream in policy_streams)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_static_dtype_casts_only_floating_leaves():
+    batch = (
+        torch.arange(8, dtype=torch.bfloat16),
+        torch.arange(8, dtype=torch.int64),
+    )
+    floating, integer = next(
+        cuda_prefetch_batches(
+            iter((batch,)),
+            device="cuda",
+            dtype_policy=torch.float32,
+        )
+    )
+    assert floating.dtype == torch.float32
+    assert integer.dtype == torch.int64
+    assert torch.equal(floating.cpu(), batch[0].float())
+    assert torch.equal(integer.cpu(), batch[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_preserves_error_position_and_closes_source():
+    closed = False
+
+    def source():
+        nonlocal closed
+        try:
+            yield torch.tensor([1.0])
+            yield torch.tensor([2.0])
+            raise RuntimeError("copy source died")
+        finally:
+            closed = True
+
+    batches = cuda_prefetch_batches(source(), device="cuda", depth=4)
+    assert float(next(batches)) == 1.0
+    assert float(next(batches)) == 2.0
+    with pytest.raises(RuntimeError, match="copy source died"):
+        next(batches)
+    assert closed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_prefetch_close_drains_and_closes_source():
+    closed = False
+
+    def source():
+        nonlocal closed
+        try:
+            while True:
+                yield torch.ones(32)
+        finally:
+            closed = True
+
+    batches = cuda_prefetch_batches(source(), device="cuda", depth=2)
+    next(batches)
+    batches.close()
+    assert closed
