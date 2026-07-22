@@ -1335,6 +1335,22 @@ class Trainer:
 
     # -- one training step -------------------------------------------------
 
+    def _auxiliary_can_have_dead_features(self, batch_tokens: int) -> bool:
+        """Return whether the bound deadness criterion can be nonempty."""
+        variant = self.cfg.aux_variant
+        if variant == "sasa":
+            return self.tracker.history_tokens >= self.cfg.dead_window_tokens
+        if variant == "long_horizon":
+            return self.tracker.tokens_seen >= self.cfg.dead_horizon_tokens
+        if variant == "sasa_release":
+            return self.tracker.forward_passes > self.cfg.dead_window_passes
+        if variant == "decoder_weighted_token_horizon":
+            return (
+                self.accepted_tokens + batch_tokens
+                >= self.cfg.dead_horizon_tokens
+            )
+        return True
+
     def _encoder_observation_mask(self, observed: torch.Tensor) -> torch.Tensor:
         """Sample the augmentation mask without changing missing-data truth.
 
@@ -1443,7 +1459,9 @@ class Trainer:
         )
 
         l_aux = None
-        if cfg.aux_variant != "none":
+        if cfg.aux_variant != "none" and self._auxiliary_can_have_dead_features(
+            len(x)
+        ):
             dead = None
             if cfg.aux_variant in (
                 "sasa",
@@ -1797,6 +1815,22 @@ class Trainer:
         expected_binding: dict | None = None,
     ) -> "Trainer":
         payload = torch.load(path, map_location=device, weights_only=True)
+        accepted_tokens = payload.get("accepted_tokens")
+        if (
+            not isinstance(accepted_tokens, int)
+            or isinstance(accepted_tokens, bool)
+            or accepted_tokens < 0
+        ):
+            raise ValueError(
+                "checkpoint lacks a valid exact accepted-token counter"
+            )
+        step_idx = payload.get("step_idx")
+        if (
+            not isinstance(step_idx, int)
+            or isinstance(step_idx, bool)
+            or step_idx < 0
+        ):
+            raise ValueError("checkpoint lacks a valid exact step counter")
         stored_binding = payload.get("run_binding")
         if stored_binding is not None:
             validate_run_binding(
@@ -1822,8 +1856,33 @@ class Trainer:
         trainer.opt.load_state_dict(payload["optimizer"])
         trainer.sched.load_state_dict(payload["scheduler"])
         trainer.tracker.load_state_dict(payload["tracker"])
-        trainer.step_idx = payload["step_idx"]
-        trainer.accepted_tokens = payload.get("accepted_tokens", 0)
+        trainer.step_idx = step_idx
+        trainer.accepted_tokens = accepted_tokens
+        if cfg.aux_variant == "sasa":
+            expected_history_tokens = min(
+                accepted_tokens,
+                cfg.dead_window_tokens,
+            )
+            if trainer.tracker.history_tokens != expected_history_tokens:
+                raise ValueError(
+                    "checkpoint dead tracker disagrees with accepted-token counter"
+                )
+        elif cfg.aux_variant == "long_horizon":
+            if trainer.tracker.tokens_seen != accepted_tokens:
+                raise ValueError(
+                    "checkpoint dead tracker disagrees with accepted-token counter"
+                )
+        elif cfg.aux_variant == "sasa_release":
+            if trainer.tracker.forward_passes != step_idx:
+                raise ValueError(
+                    "checkpoint dead tracker disagrees with exact step counter"
+                )
+        if cfg.aux_variant == "decoder_weighted_token_horizon":
+            assert trainer.tracker.tokens_since_fired is not None
+            if bool((trainer.tracker.tokens_since_fired > accepted_tokens).any()):
+                raise ValueError(
+                    "checkpoint dead tracker exceeds accepted-token counter"
+                )
         trainer.data_cursor = dict(payload.get("data_cursor", {}))
         history = payload.get("history")
         previous_shares = payload.get("diagnostic_prev_shares")

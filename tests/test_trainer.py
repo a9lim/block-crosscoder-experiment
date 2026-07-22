@@ -601,6 +601,165 @@ def test_decoder_weighted_token_horizon_uses_scaled_rank_and_unscaled_values(dev
     assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "sasa",
+        "long_horizon",
+        "sasa_release",
+        "decoder_weighted_token_horizon",
+    ),
+)
+def test_auxiliary_warmup_readiness_has_exact_boundary(device, variant):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(
+            total_steps=2,
+            aux_variant=variant,
+            dead_window_tokens=10,
+            dead_horizon_tokens=20,
+            dead_window_passes=3,
+        ),
+    )
+    if variant == "sasa":
+        trainer.tracker._history_tokens = 9
+        assert not trainer._auxiliary_can_have_dead_features(4)
+        trainer.tracker._history_tokens = 10
+    elif variant == "long_horizon":
+        trainer.tracker.tokens_seen = 19
+        assert not trainer._auxiliary_can_have_dead_features(4)
+        trainer.tracker.tokens_seen = 20
+    elif variant == "sasa_release":
+        trainer.tracker.forward_passes = 3
+        assert not trainer._auxiliary_can_have_dead_features(4)
+        trainer.tracker.forward_passes = 4
+    else:
+        trainer.accepted_tokens = 15
+        assert not trainer._auxiliary_can_have_dead_features(4)
+        trainer.accepted_tokens = 16
+    assert trainer._auxiliary_can_have_dead_features(4)
+
+
+def test_known_empty_deadness_skips_auxiliary_work(device, monkeypatch):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(
+            total_steps=1,
+            aux_variant="long_horizon",
+            dead_horizon_tokens=10_000,
+        ),
+    )
+
+    def forbidden_aux(*args, **kwargs):
+        raise AssertionError("known-empty warmup must not enter AuxK")
+
+    monkeypatch.setattr(trainer_module, "aux_loss", forbidden_aux)
+    trainer.step(planted_batches(device, n_batches=1, batch=16)[0])
+
+
+@pytest.mark.parametrize("accepted_tokens", (None, True, -1, 1.5))
+def test_checkpoint_requires_exact_accepted_token_counter(
+    device, tmp_path, accepted_tokens
+):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=1, aux_variant="long_horizon"),
+    )
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if accepted_tokens is None:
+        del payload["accepted_tokens"]
+    else:
+        payload["accepted_tokens"] = accepted_tokens
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="accepted-token counter"):
+        Trainer.load_checkpoint(checkpoint, device=device)
+
+
+@pytest.mark.parametrize(
+    ("variant", "tracker_key", "tracker_value", "message"),
+    (
+        ("long_horizon", "tokens_seen", 1, "disagrees"),
+        (
+            "decoder_weighted_token_horizon",
+            "tokens_since_fired",
+            torch.ones(G, dtype=torch.int64),
+            "exceeds",
+        ),
+    ),
+)
+def test_checkpoint_rejects_dead_tracker_token_clock_forgery(
+    device,
+    tmp_path,
+    variant,
+    tracker_key,
+    tracker_value,
+    message,
+):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=1, aux_variant=variant),
+    )
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["tracker"][tracker_key] = tracker_value
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match=message):
+        Trainer.load_checkpoint(checkpoint, device=device)
+
+
+def test_checkpoint_rejects_sasa_history_clock_forgery(device, tmp_path):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=2, aux_variant="sasa", dead_window_tokens=100),
+    )
+    trainer.step(planted_batches(device, n_batches=1, batch=16)[0])
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["accepted_tokens"] -= 1
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="accepted-token counter"):
+        Trainer.load_checkpoint(checkpoint, device=device)
+
+
+def test_checkpoint_rejects_sasa_release_step_clock_forgery(device, tmp_path):
+    trainer = Trainer(
+        BlockCrosscoder(CFG).to(device),
+        train_cfg(total_steps=2, aux_variant="sasa_release"),
+    )
+    trainer.step(planted_batches(device, n_batches=1, batch=16)[0])
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["step_idx"] += 1
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="exact step counter"):
+        Trainer.load_checkpoint(checkpoint, device=device)
+
+
+@pytest.mark.parametrize("step_idx", (None, True, -1, 1.5))
+def test_checkpoint_requires_exact_step_counter(device, tmp_path, step_idx):
+    trainer = Trainer(BlockCrosscoder(CFG).to(device), train_cfg(total_steps=1))
+    checkpoint = tmp_path / "checkpoint.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if step_idx is None:
+        del payload["step_idx"]
+    else:
+        payload["step_idx"] = step_idx
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(ValueError, match="exact step counter"):
+        Trainer.load_checkpoint(checkpoint, device=device)
+
+
 def test_auxk_revives_dead_encoders(device):
     """The pilot's synthetic dead-encoder revival test: blocks with zeroed
     encoders are never selected, get flagged dead, and only the aux loss
