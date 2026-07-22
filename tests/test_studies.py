@@ -8,6 +8,10 @@ import block_crosscoder_experiment.studies as studies_module
 from block_crosscoder_experiment.campaign import Campaign
 from block_crosscoder_experiment.cli.run_cell import validate_cell_config
 from block_crosscoder_experiment.runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
@@ -1501,7 +1505,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v10"
+        "dense-linear-memory-v11"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -1594,6 +1598,139 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     )
 
 
+def _expected_retraction_implementation(decoder: str) -> str:
+    if decoder in {"per_block_stiefel", "concatenated_stiefel"}:
+        return DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    if decoder == "concatenated_stiefel_polar":
+        return DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+    return DECODER_RETRACTION_NOT_APPLICABLE
+
+
+def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_children() -> (
+    None
+):
+    roots = (
+        *build_phase1_plan().cells,
+        *build_phase1_plan(seeds=(0,), smoke=True).cells,
+        *build_phase2_plan().cells,
+        *build_phase2_plan(seeds=(0,), smoke=True).cells,
+    )
+    assert roots
+    for cell in roots:
+        assert cell.decision_map[
+            "implementation.decoder_retraction_implementation"
+        ] == _expected_retraction_implementation(
+            str(cell.decision_map["model.decoder"])
+        )
+
+    blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
+    plan = build_phase1_plan(seeds=(0,), smoke=True)
+    while not any(stage.name == "retraction_identification" for stage in plan.stages):
+        plan = materialize_child_plan(plan, blueprint, _freeze(plan.stages[-1]))
+    retraction_stage = next(
+        stage for stage in plan.stages if stage.name == "retraction_identification"
+    )
+    identities = {
+        cell.decision_map["factor.retraction"]: cell.decision_map[
+            "implementation.decoder_retraction_implementation"
+        ]
+        for cell in retraction_stage.cells
+    }
+    assert identities == {
+        "qr": DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+        "symmetric_polar": DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    }
+
+
+@pytest.mark.parametrize(
+    ("implementation", "decoder", "accepted"),
+    (
+        (
+            DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+            "concatenated_stiefel",
+            True,
+        ),
+        (
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+            "concatenated_stiefel",
+            False,
+        ),
+        (
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+            "free_scale_controlled",
+            False,
+        ),
+        ("ambient_cuda_default", "concatenated_stiefel", False),
+    ),
+)
+def test_decoder_retraction_estimator_admits_only_bound_carriers(
+    implementation: str,
+    decoder: str,
+    accepted: bool,
+) -> None:
+    base = next(
+        cell
+        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        if cell.decision_map["model.decoder"]
+        in {"per_block_stiefel", "concatenated_stiefel"}
+    )
+    changed = _replace_decision(base, "model.decoder", decoder)
+    changed = _replace_decision(
+        changed,
+        "implementation.decoder_retraction_implementation",
+        implementation,
+    )
+    if accepted:
+        assert estimate_cell(changed).estimator == ESTIMATOR_VERSION
+    else:
+        with pytest.raises(
+            StudyError,
+            match="unknown decoder-retraction|violates its carrier predicate",
+        ):
+            estimate_cell(changed)
+
+
+def test_v11_estimator_prices_cholesky_qr1_training_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cholesky = next(
+        cell
+        for cell in build_phase1_plan().cells
+        if cell.decision_map["model.decoder"] == "concatenated_stiefel"
+    )
+    original_dims = tuple(int(item) for item in cholesky.decision_map["data.site_dims"])
+    unequal_dims = tuple(value - index for index, value in enumerate(original_dims))
+    assert len(set(unequal_dims)) > 1 and min(unequal_dims) > 0
+    cholesky = _replace_decision(cholesky, "data.site_dims", unequal_dims)
+    householder = _replace_decision(
+        cholesky,
+        "implementation.decoder_retraction_implementation",
+        DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    )
+    monkeypatch.setattr(
+        studies_module,
+        "_evaluation_workspace_bytes",
+        lambda **_kwargs: 0,
+    )
+    cholesky_estimate = estimate_cell(cholesky)
+    householder_estimate = estimate_cell(householder)
+    values = cholesky.decision_map
+    groups = int(values["model.groups"])
+    block_width = int(values["model.block_width"])
+    padded_decoder_elements = (
+        groups
+        * block_width
+        * len(values["data.site_dims"])
+        * max(int(item) for item in values["data.site_dims"])
+    )
+    expected_workspace = 4 * (padded_decoder_elements + 6 * groups * block_width**2)
+    assert cholesky_estimate.estimator == ESTIMATOR_VERSION
+    assert (
+        cholesky_estimate.peak_vram_bytes - householder_estimate.peak_vram_bytes
+        == expected_workspace
+    )
+
+
 def test_decoded_energy_implementation_is_rederived_after_child_deltas() -> None:
     blueprint = build_phase2_blueprint(seeds=(0,), smoke=True)
     plan = build_phase2_plan(seeds=(0,), smoke=True)
@@ -1675,7 +1812,7 @@ def test_decoded_energy_estimator_refuses_unknown_or_ineligible_fast_mode(
         estimate_cell(_replace_decision(cell, decision_name, decision_value))
 
 
-def test_v10_estimator_credits_only_the_explicit_fast_implementation() -> None:
+def test_v11_estimator_credits_only_the_explicit_fast_implementation() -> None:
     fast = next(
         cell
         for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
@@ -1724,14 +1861,10 @@ def test_v10_estimator_credits_only_the_explicit_fast_implementation() -> None:
     )
     fast_workspace = _evaluation_workspace_bytes(
         **workspace,
-        decoded_energy_implementation=(
-            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
-        ),
+        decoded_energy_implementation=(DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION),
     )
     assert exact_workspace - fast_workspace == (
-        int(values["model.groups"])
-        * int(values["model.block_width"]) ** 2
-        * 4
+        int(values["model.groups"]) * int(values["model.block_width"]) ** 2 * 4
     )
 
 
@@ -1742,23 +1875,18 @@ def test_isolated_loss_implementation_is_derived_from_the_final_carrier() -> Non
         build_phase1_plan(seeds=(0,), smoke=True),
     )
     stage = next(
-        stage
-        for stage in plan.stages
-        if stage.name == "selection_score_identification"
+        stage for stage in plan.stages if stage.name == "selection_score_identification"
     )
     isolated = tuple(
         cell
         for cell in stage.cells
-        if cell.decision_map["model.selection_score"]
-        == "isolated_loss_decrease"
+        if cell.decision_map["model.selection_score"] == "isolated_loss_decrease"
     )
     assert len(isolated) == 2
     assert {
         (
             cell.decision_map["model.decoder"],
-            cell.decision_map[
-                "implementation.isolated_loss_decrease_implementation"
-            ],
+            cell.decision_map["implementation.isolated_loss_decrease_implementation"],
         )
         for cell in isolated
     } == {
@@ -1778,6 +1906,9 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
         "model.decoder": "free_scale_controlled",
         "model.decoder_bias": False,
         "objective.reconstruction": "squared_l2",
+        "implementation.decoder_retraction_implementation": (
+            DECODER_RETRACTION_NOT_APPLICABLE
+        ),
         "implementation.isolated_loss_decrease_implementation": implementation,
     }
     return replace(
@@ -1791,7 +1922,7 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
     )
 
 
-def test_v10_estimator_prices_mapped_isolated_loss_training_and_geometry(
+def test_v11_estimator_prices_mapped_isolated_loss_training_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapped = _isolated_loss_estimator_cell(
@@ -1835,9 +1966,7 @@ def test_v10_estimator_prices_mapped_isolated_loss_training_and_geometry(
         "block_width": block_width,
         "total_dim": sum(int(item) for item in values["data.site_dims"]),
         "operational_decoder_elements": (
-            groups
-            * block_width
-            * sum(int(item) for item in values["data.site_dims"])
+            groups * block_width * sum(int(item) for item in values["data.site_dims"])
         ),
         "quantizer_count": len(values["codec.quantizer_bits"]),
         "sites": sites,
@@ -1846,19 +1975,14 @@ def test_v10_estimator_prices_mapped_isolated_loss_training_and_geometry(
     }
     exact_workspace = workspace_estimator(
         **common,
-        isolated_loss_decrease_implementation=(
-            ISOLATED_LOSS_EXACT_IMPLEMENTATION
-        ),
+        isolated_loss_decrease_implementation=(ISOLATED_LOSS_EXACT_IMPLEMENTATION),
     )
     mapped_workspace = workspace_estimator(
         **common,
-        isolated_loss_decrease_implementation=(
-            ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-        ),
+        isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
     )
     assert mapped_workspace - exact_workspace == 4 * (
-        groups * block_width**2
-        + sites * site_dim * groups * block_width
+        groups * block_width**2 + sites * site_dim * groups * block_width
     )
 
 

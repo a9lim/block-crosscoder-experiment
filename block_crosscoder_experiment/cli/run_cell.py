@@ -70,6 +70,10 @@ from block_crosscoder_experiment.store import (
     prefetch_batches,
 )
 from block_crosscoder_experiment.runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
@@ -2617,8 +2621,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     }:
         raise CellExecutionError("unknown decoded-energy implementation identity")
     if (
-        decoded_energy_implementation
-        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+        decoded_energy_implementation == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
         and not eligible_score_specialization
     ):
         raise CellExecutionError(
@@ -2645,6 +2648,28 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         raise CellExecutionError(
             "mapped isolated-loss implementation violates its carrier predicate"
         )
+    decoder_retraction_implementation = str(
+        values["implementation.decoder_retraction_implementation"]
+    )
+    known_retraction_implementations = {
+        DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+        DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+        DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+        DECODER_RETRACTION_NOT_APPLICABLE,
+    }
+    if decoder_retraction_implementation not in known_retraction_implementations:
+        raise CellExecutionError("unknown decoder-retraction implementation identity")
+    allowed_retraction_implementations = {
+        "qr": {
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+            DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+        },
+        "gram": {DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION},
+    }.get(constraint, {DECODER_RETRACTION_NOT_APPLICABLE})
+    if decoder_retraction_implementation not in allowed_retraction_implementations:
+        raise CellExecutionError(
+            "decoder-retraction implementation violates its carrier predicate"
+        )
     return BSCConfig(
         n_blocks=total_groups,
         block_dim=int(values["model.block_width"]),
@@ -2668,6 +2693,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         selection_score=selection_score,
         decoded_energy_implementation=decoded_energy_implementation,
         isolated_loss_decrease_implementation=isolated_loss_implementation,
+        decoder_retraction_implementation=decoder_retraction_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
         site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),
@@ -3004,16 +3030,19 @@ def _apply_prepared_transform(
         index = torch.tensor(selected, dtype=torch.long)
         mean = transform.mean.index_select(0, index).to(x.device)
         selected_dims = tuple(transform.site_dims[item] for item in selected)
-        coordinate_mask = (
-            torch.arange(x.shape[2], device=x.device).view(1, -1)
-            < torch.tensor(selected_dims, device=x.device).view(-1, 1)
-        )
+        coordinate_mask = torch.arange(x.shape[2], device=x.device).view(
+            1, -1
+        ) < torch.tensor(selected_dims, device=x.device).view(-1, 1)
         if mode in {"none", "scalar_rms", "sqrt_d"}:
-            operator = torch.diagonal(
-                transform.W,
-                dim1=-2,
-                dim2=-1,
-            ).index_select(0, index).to(x.device)
+            operator = (
+                torch.diagonal(
+                    transform.W,
+                    dim1=-2,
+                    dim2=-1,
+                )
+                .index_select(0, index)
+                .to(x.device)
+            )
         elif mode == "whiten":
             operator = transform.W.index_select(0, index).to(x.device)
         else:
@@ -3266,10 +3295,9 @@ def _load_deployable_codec(
             raise TypeError("nested codec payload must be a mapping")
         codec = Codec.from_payload(codec_payload, source=f"{path}:codec_payload")
         nested_model_cfg = codec.meta.get("model_cfg")
-        if (
-            not isinstance(nested_model_cfg, dict)
-            or canonical_json(nested_model_cfg) != canonical_json(cfg_payload)
-        ):
+        if not isinstance(nested_model_cfg, dict) or canonical_json(
+            nested_model_cfg
+        ) != canonical_json(cfg_payload):
             raise ValueError(
                 "nested codec model config differs from the deployed model config"
             )
@@ -4482,9 +4510,7 @@ def _calibrate(
             if model.cfg.encoder_mode == "tied"
             else model.encoder_tensor()
         )
-        calibration_score_geometry = model._frozen_score_geometry(
-            calibration_decoder
-        )
+        calibration_score_geometry = model._frozen_score_geometry(calibration_decoder)
         for batch in _evaluation_batches(ctx, preparation, "calibration"):
             x = batch.to(device=_device(ctx), dtype=torch.float32)
             z, keep = model._encode_with_tensor(x, calibration_encoder)
@@ -6010,9 +6036,7 @@ def _evaluate_raw_space(
         if model.cfg.encoder_mode == "tied"
         else model.encoder_tensor()
     )
-    materialized_score_geometry = model._frozen_score_geometry(
-        materialized_decoder
-    )
+    materialized_score_geometry = model._frozen_score_geometry(materialized_decoder)
     materialized_decoder_matrix = materialized_decoder.permute(1, 2, 0, 3).reshape(
         model.cfg.n_latents,
         model.cfg.n_sites * model.cfg.d_model,
@@ -6094,37 +6118,28 @@ def _evaluate_raw_space(
         on_the_fly = data.get("normalization", {}).get("application") == "on_the_fly"
         if on_the_fly and (
             Path(data["root"]).resolve() != Path(data["raw_root"]).resolve()
-            or data["bindings"]["evaluation"]
-            != data["raw_bindings"]["evaluation"]
+            or data["bindings"]["evaluation"] != data["raw_bindings"]["evaluation"]
         ):
             raise CellExecutionError(
                 "single-view evaluation root/binding differs from its raw view"
             )
-        normalized = (
-            None if on_the_fly else _store_reader(preparation, "evaluation")
-        )
+        normalized = None if on_the_fly else _store_reader(preparation, "evaluation")
         raw = _store_reader(preparation, "evaluation", raw=True)
         saved_mode = str(saved_normalization.get("mode", "none"))
         oracle_layer_inverse = (
             saved_normalization.get("kind") == "frozen_transform"
             and saved_mode == "layer"
         )
-        if (
-            saved_normalization.get("kind") == "frozen_transform"
-        ):
+        if saved_normalization.get("kind") == "frozen_transform":
             saved_mean_cpu = saved_normalization["mean"].to(dtype=torch.float32)
             saved_mean_device = saved_mean_cpu.to(device=device)
             saved_W_cpu = saved_normalization["W"].to(dtype=torch.float32)
             if saved_mode in {"none", "scalar_rms", "sqrt_d"}:
-                saved_operator_cpu = torch.diagonal(
-                    saved_W_cpu, dim1=-2, dim2=-1
-                )
+                saved_operator_cpu = torch.diagonal(saved_W_cpu, dim1=-2, dim2=-1)
                 saved_diagonal_device = saved_operator_cpu.to(device=device)
             elif saved_mode == "whiten":
                 saved_operator_cpu = saved_W_cpu
-                inverse_W = (
-                    torch.linalg.inv(saved_W_cpu.double()).float().to(device)
-                )
+                inverse_W = torch.linalg.inv(saved_W_cpu.double()).float().to(device)
             elif saved_mode != "layer":
                 saved_operator_cpu = saved_W_cpu
 
@@ -6172,9 +6187,7 @@ def _evaluate_raw_space(
                     mean=saved_mean_cpu,
                     operator=saved_operator_cpu,
                 )
-                difference = float(
-                    (encoder_input - x_normalized.float()).abs().max()
-                )
+                difference = float((encoder_input - x_normalized.float()).abs().max())
                 persisted_view_max_abs_difference = max(
                     persisted_view_max_abs_difference, difference
                 )
@@ -6307,8 +6320,7 @@ def _evaluate_raw_space(
             sequence_values = unique_sequences.cpu().tolist()
             denominator_values = grouped_denominator.sum(dim=1).cpu().tolist()
             error_values = {
-                q: grouped_errors[q].sum(dim=1).cpu().tolist()
-                for q in codec.spec.qs
+                q: grouped_errors[q].sum(dim=1).cpu().tolist() for q in codec.spec.qs
             }
             for group, sequence in enumerate(sequence_values):
                 den_value = denominator_values[group]
@@ -6431,9 +6443,7 @@ def _evaluate_cached_time_sharing(
         raise CellExecutionError("raw endpoint cache repeats an endpoint name")
     horizons = {int(plan["horizon_tokens"]) for plan in resolved.values()}
     if len(horizons) != 1:
-        raise CellExecutionError(
-            "deployment schedules do not share one common horizon"
-        )
+        raise CellExecutionError("deployment schedules do not share one common horizon")
     horizon = next(iter(horizons))
     if horizon <= 0 or cache.tokens > horizon:
         raise CellExecutionError(

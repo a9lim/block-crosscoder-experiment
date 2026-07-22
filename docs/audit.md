@@ -59,7 +59,9 @@ exit is not evidence by itself.
   oracle at the fixed loss, prediction/target-gradient, multi-step
   model/optimizer-state, and selector-support bounds in `design.md`. Masked,
   padded, nonquadratic, small, and non-CUDA paths remain eager, and exact
-  checkpoint resume is tested inside the compiled path.
+  checkpoint resume is tested inside the compiled path. One CUDA gate drives
+  more than eight distinct tensor shapes through the same dynamic graph so a
+  campaign cannot exhaust Dynamo's static recompile limit.
 - Every production CUDA cell binds fused Adam/AdamW and every CPU smoke cell
   binds the scalar kernel, with `foreach=False` in both. Construction refuses
   fused non-CUDA/non-fp32 masters. Checkpoint save, post-load exact resume, and
@@ -98,14 +100,22 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v10 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v11 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
   lowest row-major event index batch-wide; zero/ReLU tie fixtures pass on every
   supported device and any undeclared tie policy is refused.
 - Stiefel QR and symmetric-polar retractions satisfy their declared Gram
-  invariant and produce finite gradients.
+  invariant and produce finite gradients. Canonical QR, polar, and other
+  carriers respectively bind `cholesky_qr1_positive_diagonal_cond64_v1`,
+  `symmetric_polar_eigh_floor_v1`, and `not_applicable_v1`; root, smoke, and
+  child cells rederive the identity. Positive-diagonal Householder QR remains a
+  reference/test oracle. Unknown or mismatched identities, condition above 64,
+  nonfinite state, factorization failure, or residual failure refuse without
+  fallback, and all serialized artifact identities must agree. Primitive,
+  complete-Trainer, 20-step trajectory, exact-resume, both-hard-selector, and
+  code-norm/decoded-energy gates use the fixed bounds reported in `design.md`.
 - Site-axis factorization includes an exact selected-parent carrier. Phase 1
   records full and rank `1/2/4` as nonpromotable capability evidence and
   advances the exact carrier. In Phase 2 the common free carrier must pass the
@@ -411,10 +421,16 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v10-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v11-q2-c512-t256-s32` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
-  checks.
+  checks. Cholesky-QR1 reserves
+  `4 * (sites * padded_site_width * groups * block_width + 6 * groups *
+  block_width^2)` bytes of training workspace and receives no speculative
+  speed or FLOP credit. Direct jobe peak probes at the Phase-2 and Phase-3
+  geometries remain below those respective estimates after warmup; the roughly
+  8 MiB cold Inductor finite-check compile is covered by the separate fixed
+  2 GiB CUDA/PyTorch context and allocator allowance.
 - The planner refuses a declared budget violation before registration.
 - Local filesystem planning checks live free space unless explicitly overridden
   for planning only.

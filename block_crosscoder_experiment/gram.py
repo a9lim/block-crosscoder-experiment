@@ -20,8 +20,15 @@ on the fp32 master weights.
 from __future__ import annotations
 
 import math
+from functools import cache
 
 import torch
+
+from .runtime_limits import (
+    CHOLESKY_QR_GRAM_CONDITION_MAX,
+    CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX,
+    CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX,
+)
 
 # Safe batch count for cusolver's batched symmetric eigensolvers
 # (empirical ceiling sits between 24576 and 32768 on CUDA 12.8).
@@ -34,12 +41,15 @@ _RETRACT_UNCHUNKED_MAX = 4096
 _SPECTRUM_BLOCK_CHUNK = 256
 _SPECTRUM_CUDA_BLOCK_CHUNK = 256
 _SPECTRUM_UNCHUNKED_MAX = 4096
+_CUDA_FINITE_FUSION_MIN_ELEMENTS = 1 << 20
 
 __all__ = [
+    "CholeskyQRRetractionError",
     "block_gram",
     "gram_residual",
     "retract_",
     "qr_retract_",
+    "cholesky_qr_retract_",
     "site_singular_values",
     "map_nuclear_penalty",
     "decoder_nuclear_penalty",
@@ -49,6 +59,43 @@ __all__ = [
     "site_frobenius_shares",
     "init_decoder_stack",
 ]
+
+
+class CholeskyQRRetractionError(RuntimeError):
+    """Fail-closed refusal from the guarded Cholesky-QR implementation."""
+
+
+def _eager_all_finite(value: torch.Tensor) -> torch.Tensor:
+    return torch.isfinite(value).all()
+
+
+@cache
+def _compiled_cuda_all_finite():
+    """Fuse finite classification and reduction without a bool-sized tensor."""
+
+    return torch.compile(
+        _eager_all_finite,
+        backend="inductor",
+        fullgraph=True,
+        dynamic=True,
+    )
+
+
+def _all_finite(value: torch.Tensor) -> torch.Tensor:
+    if value.is_cuda and value.numel() >= _CUDA_FINITE_FUSION_MIN_ELEMENTS:
+        return _compiled_cuda_all_finite()(value)
+    return _eager_all_finite(value)
+
+
+def _validate_qr_retraction_input(D: torch.Tensor) -> None:
+    if D.dtype != torch.float32:
+        raise TypeError(f"QR retraction operates on fp32 master weights, got {D.dtype}")
+    if D.ndim != 4 or any(size <= 0 for size in D.shape):
+        raise ValueError("QR retraction requires a nonempty [S,G,b,d] tensor")
+    if D.shape[0] * D.shape[3] < D.shape[2]:
+        raise ValueError(
+            "QR retraction requires at least block_dim concatenated coordinates"
+        )
 
 
 def block_gram(D: torch.Tensor) -> torch.Tensor:
@@ -69,6 +116,28 @@ def block_gram(D: torch.Tensor) -> torch.Tensor:
         ],
         dim=0,
     )
+
+
+@torch.no_grad()
+def _block_gram_no_grad(D: torch.Tensor) -> torch.Tensor:
+    """Accumulate a block Gram directly, without decoder-sized einsum work."""
+
+    gram = torch.empty(
+        D.shape[1],
+        D.shape[2],
+        D.shape[2],
+        dtype=D.dtype,
+        device=D.device,
+    )
+    torch.bmm(D[0], D[0].transpose(-1, -2), out=gram)
+    for site in range(1, D.shape[0]):
+        torch.baddbmm(
+            gram,
+            D[site],
+            D[site].transpose(-1, -2),
+            out=gram,
+        )
+    return gram
 
 
 def gram_residual(D: torch.Tensor) -> torch.Tensor:
@@ -123,28 +192,169 @@ def retract_(D: torch.Tensor, *, eig_floor: float = 1e-6) -> int:
 
 @torch.no_grad()
 def _qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
-    """Thin-QR Stiefel retraction used by the BSF Grassmannian procedure.
+    """Canonical positive-diagonal Householder-QR reference retraction.
 
     Each block's site-concatenated decoder is a ``b x sum(d_s)`` matrix.  QR
     on its transpose produces orthonormal columns, which are transposed back
-    to orthonormal decoder rows.  This is not silently interchangeable with
-    the symmetric polar retraction in :func:`retract_`; both are executable
-    choices in the matrix.
+    to orthonormal decoder rows.  Multiplying each Q column by the sign of its
+    R diagonal makes R strictly positive on every full-rank block.  This fixes
+    QR's diagonal-sign ambiguity for the ordered input; it does not quotient
+    the surviving O(b) gauge.  The complete candidate is validated before the
+    caller's tensor is changed.
     """
 
+    _validate_qr_retraction_input(D)
+    if not bool(_all_finite(D)):
+        raise ValueError("Householder QR retraction requires finite input")
     sites, groups, block_dim, width = D.shape
     concatenated = D.permute(1, 0, 3, 2).reshape(groups, sites * width, block_dim)
-    q, _ = torch.linalg.qr(concatenated, mode="reduced")
-    D.copy_(q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2))
+    q, r = torch.linalg.qr(concatenated, mode="reduced")
+    diagonal = torch.diagonal(r, dim1=-2, dim2=-1)
+    if not bool(torch.isfinite(q).all() & torch.isfinite(diagonal).all()):
+        raise ValueError("Householder QR produced non-finite factors")
+    if bool((diagonal == 0).any()):
+        raise ValueError("Householder QR requires full-column-rank blocks")
+    signs = torch.where(diagonal < 0, -torch.ones_like(diagonal), 1.0)
+    q = q * signs.unsqueeze(-2)
+    candidate = q.reshape(groups, sites, width, block_dim).permute(1, 0, 3, 2)
+    residual = gram_residual(candidate)
+    if not bool(
+        _all_finite(candidate)
+        & torch.isfinite(residual).all()
+        & (residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
+    ):
+        raise ValueError("Householder QR candidate violates the Gram bound")
+    D.copy_(candidate)
     count = torch.zeros((), dtype=torch.int64, device=D.device)
     return count
 
 
 @torch.no_grad()
 def qr_retract_(D: torch.Tensor) -> int:
-    """Public integer-count wrapper for the thin-QR retraction."""
+    """Public wrapper for canonical positive-diagonal Householder QR."""
     _qr_retract_count_tensor_(D)
     return 0
+
+
+@torch.no_grad()
+def _cholesky_qr_retract_count_tensor_(D: torch.Tensor) -> torch.Tensor:
+    """Transactional guarded Cholesky-QR1 Stiefel retraction.
+
+    For ordered decoder rows ``B_g`` this computes ``M_g = B_g B_g.T``, the
+    positive-diagonal lower Cholesky factor ``L_g``, and ``B'_g=L_g^-1 B_g``.
+    This is the same exact QR convention as :func:`qr_retract_` on the admitted
+    full-rank carrier.  Cholesky failure, excessive conditioning, or a failed
+    numeric postcondition raises without changing ``D``.  There is no jitter,
+    eigenvalue floor, or fallback retraction.
+    """
+
+    _validate_qr_retraction_input(D)
+    if not bool(_all_finite(D)):
+        raise CholeskyQRRetractionError(
+            "Cholesky-QR requires finite fp32 master weights"
+        )
+
+    gram = _block_gram_no_grad(D)
+    cholesky, info = torch.linalg.cholesky_ex(gram, check_errors=False)
+    diagonal = torch.diagonal(cholesky, dim1=-2, dim2=-1)
+    precondition_ok = (
+        torch.isfinite(gram).all()
+        & torch.isfinite(cholesky).all()
+        & (info == 0).all()
+        & (diagonal > 0).all()
+    )
+    if not bool(precondition_ok):
+        failed = int((info != 0).sum())
+        raise CholeskyQRRetractionError(
+            "Cholesky-QR requires finite positive-definite decoder Grams "
+            f"({failed} Cholesky failures)"
+        )
+
+    block_dim = D.shape[2]
+    eye = torch.eye(block_dim, dtype=D.dtype, device=D.device).expand(
+        D.shape[1], -1, -1
+    )
+    inverse_cholesky = torch.linalg.solve_triangular(
+        cholesky,
+        eye,
+        upper=False,
+    )
+    inverse_gram = inverse_cholesky.transpose(-1, -2) @ inverse_cholesky
+    gram_norm_inf = gram.abs().sum(dim=-1).amax(dim=-1)
+    inverse_norm_inf = inverse_gram.abs().sum(dim=-1).amax(dim=-1)
+    condition = gram_norm_inf * inverse_norm_inf
+    reconstruction_residual = (cholesky @ cholesky.transpose(-1, -2) - gram).norm(
+        dim=(-2, -1)
+    ) / gram.norm(dim=(-2, -1)).clamp_min(torch.finfo(D.dtype).tiny)
+    factor_ok = (
+        torch.isfinite(inverse_cholesky).all()
+        & torch.isfinite(condition).all()
+        & torch.isfinite(reconstruction_residual).all()
+        & (condition <= CHOLESKY_QR_GRAM_CONDITION_MAX).all()
+        & (
+            reconstruction_residual <= CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX
+        ).all()
+    )
+    if not bool(factor_ok):
+        max_condition = float(
+            condition.nan_to_num(
+                nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+            ).max()
+        )
+        max_reconstruction = float(
+            reconstruction_residual.nan_to_num(
+                nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+            ).max()
+        )
+        raise CholeskyQRRetractionError(
+            "Cholesky-QR conditioning/reconstruction guard failed: "
+            f"condition_inf={max_condition:.6g} "
+            f"(max {CHOLESKY_QR_GRAM_CONDITION_MAX:g}), "
+            f"relative_residual={max_reconstruction:.6g} "
+            "(max "
+            f"{CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX:g})"
+        )
+
+    candidate = torch.empty_like(D)
+    # Write each site directly into its contiguous destination.  The former
+    # broadcast einsum also materialized an [S, chunk(G), b, d] result before
+    # copy_, adding tens of MiB to the live retraction peak on real cells.
+    for site in range(D.shape[0]):
+        torch.bmm(
+            inverse_cholesky,
+            D[site],
+            out=candidate[site],
+        )
+    post_gram = _block_gram_no_grad(candidate)
+    diagonal = torch.diagonal(post_gram, dim1=-2, dim2=-1)
+    diagonal.sub_(1.0)
+    post_residual = post_gram.norm(dim=(-2, -1))
+    post_ok = (
+        _all_finite(candidate)
+        & torch.isfinite(post_residual).all()
+        & (post_residual <= CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX).all()
+    )
+    if not bool(post_ok):
+        maximum = float(
+            post_residual.nan_to_num(
+                nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+            ).max()
+        )
+        raise CholeskyQRRetractionError(
+            "Cholesky-QR post-Gram guard failed: "
+            f"residual={maximum:.6g} "
+            f"(max {CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX:g})"
+        )
+
+    D.copy_(candidate)
+    return torch.zeros((), dtype=torch.int64, device=D.device)
+
+
+@torch.no_grad()
+def cholesky_qr_retract_(D: torch.Tensor) -> int:
+    """Public integer-count wrapper for guarded Cholesky-QR1."""
+
+    return int(_cholesky_qr_retract_count_tensor_(D).item())
 
 
 def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
@@ -275,9 +485,7 @@ def _project_block_frobenius_count_tensor_(
 @torch.no_grad()
 def project_block_frobenius_(D: torch.Tensor, *, max_norm: float = 1.0) -> int:
     """Public integer-count wrapper for the concatenated block projection."""
-    return int(
-        _project_block_frobenius_count_tensor_(D, max_norm=max_norm).item()
-    )
+    return int(_project_block_frobenius_count_tensor_(D, max_norm=max_norm).item())
 
 
 @torch.no_grad()
@@ -305,9 +513,7 @@ def _normalize_block_frobenius_count_tensor_(
 def normalize_block_frobenius_(D: torch.Tensor, *, target_norm: float = 1.0) -> int:
     """Public integer-count wrapper for equality Frobenius normalization."""
     return int(
-        _normalize_block_frobenius_count_tensor_(
-            D, target_norm=target_norm
-        ).item()
+        _normalize_block_frobenius_count_tensor_(D, target_norm=target_norm).item()
     )
 
 
@@ -339,9 +545,7 @@ def _project_latent_rows_count_tensor_(
 @torch.no_grad()
 def project_latent_rows_(W: torch.Tensor, *, target_norm: float = 1.0) -> int:
     """Public integer-count wrapper for latent-row normalization."""
-    return int(
-        _project_latent_rows_count_tensor_(W, target_norm=target_norm).item()
-    )
+    return int(_project_latent_rows_count_tensor_(W, target_norm=target_norm).item())
 
 
 def site_frobenius_shares(D: torch.Tensor) -> torch.Tensor:

@@ -9,6 +9,7 @@ import block_crosscoder_experiment.gram as gram_module
 
 from block_crosscoder_experiment.gram import (
     block_gram,
+    cholesky_qr_retract_,
     gram_residual,
     init_decoder_stack,
     map_nuclear_penalty,
@@ -16,6 +17,9 @@ from block_crosscoder_experiment.gram import (
     retract_,
     site_frobenius_shares,
     site_singular_values,
+)
+from block_crosscoder_experiment.runtime_limits import (
+    CHOLESKY_QR_GRAM_CONDITION_MAX,
 )
 
 S, G, B_DIM, D_MODEL = 4, 16, 4, 32
@@ -72,6 +76,153 @@ def test_retraction_floor_hits_on_deficient_block(device):
     assert torch.isfinite(D).all()
     # Healthy blocks still land on the constraint.
     assert gram_residual(D)[1:].max().item() < 1e-5
+
+
+def test_cholesky_qr_matches_positive_diagonal_householder(device):
+    source = random_stack(device, seed=120, scale=0.7)
+    householder = source.clone()
+    cholesky = source.clone()
+
+    gram_module.qr_retract_(householder)
+    cholesky_qr_retract_(cholesky)
+
+    torch.testing.assert_close(cholesky, householder, rtol=2e-6, atol=2e-6)
+    assert float(gram_residual(cholesky).max()) <= 1e-4
+
+    # Recover the canonical R from the returned Q and original input.  Its
+    # diagonal is strictly positive by contract on every full-rank block.
+    groups = source.shape[1]
+    source_columns = source.permute(1, 0, 3, 2).reshape(groups, S * D_MODEL, B_DIM)
+    q = householder.permute(1, 0, 3, 2).reshape(groups, S * D_MODEL, B_DIM)
+    r = q.transpose(-1, -2) @ source_columns
+    assert bool((torch.diagonal(r, dim1=-2, dim2=-1) > 0).all())
+    torch.testing.assert_close(r, torch.triu(r), rtol=0, atol=2e-5)
+
+
+def test_cholesky_qr_is_idempotent_and_positive_scale_invariant(device):
+    source = random_stack(device, seed=121)
+    scaled = source * 9.25
+    cholesky_qr_retract_(source)
+    cholesky_qr_retract_(scaled)
+    torch.testing.assert_close(source, scaled, rtol=2e-6, atol=2e-6)
+    before = source.clone()
+    cholesky_qr_retract_(source)
+    torch.testing.assert_close(source, before, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("nonfinite", "rank_deficient", "condition", "reconstruction", "post_gram"),
+)
+def test_cholesky_qr_failures_are_transactional_and_have_no_fallback(
+    device,
+    monkeypatch,
+    failure,
+):
+    if failure == "condition":
+        D = torch.zeros(1, 1, 4, 4, dtype=torch.float32, device=device)
+        D[0, 0].copy_(torch.diag(torch.tensor([1.0, 0.1, 0.1, 0.1], device=device)))
+        expected = "conditioning/reconstruction"
+        gram = block_gram(D)
+        assert float(torch.linalg.cond(gram, p=float("inf"))) > (
+            CHOLESKY_QR_GRAM_CONDITION_MAX
+        )
+    else:
+        D = random_stack(device, seed=122)
+        if failure == "nonfinite":
+            D[0, 0, 0, 0] = float("nan")
+            expected = "finite"
+        elif failure == "rank_deficient":
+            D[:, 0].zero_()
+            D[0, 0, 0, 0] = 1.0
+            expected = "positive-definite"
+        elif failure == "reconstruction":
+            monkeypatch.setattr(
+                gram_module,
+                "CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX",
+                -1.0,
+            )
+            expected = "conditioning/reconstruction"
+        else:
+            assert failure == "post_gram"
+            monkeypatch.setattr(
+                gram_module,
+                "CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX",
+                -1.0,
+            )
+            expected = "post-Gram"
+    before = D.clone()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("fallback retraction was called")
+
+    monkeypatch.setattr(torch.linalg, "qr", forbidden)
+    monkeypatch.setattr(torch.linalg, "eigh", forbidden)
+    with pytest.raises(RuntimeError, match=expected):
+        cholesky_qr_retract_(D)
+    assert torch.equal(torch.isnan(D), torch.isnan(before))
+    assert torch.equal(torch.nan_to_num(D), torch.nan_to_num(before))
+
+
+def test_cholesky_qr_requires_fp32_and_sufficient_geometry(device):
+    D = random_stack(device, seed=123).to(torch.bfloat16)
+    with pytest.raises(TypeError, match="fp32"):
+        cholesky_qr_retract_(D)
+    too_narrow = torch.randn(1, 2, 4, 3, device=device)
+    before = too_narrow.clone()
+    with pytest.raises(ValueError, match="block_dim"):
+        cholesky_qr_retract_(too_narrow)
+    assert torch.equal(too_narrow, before)
+
+
+def test_cuda_finite_guard_is_dynamic_cached_and_size_gated(device, monkeypatch):
+    compile_calls = []
+    compiled_calls = 0
+
+    def fake_compile(function, **options):
+        compile_calls.append(options)
+
+        def compiled(*args):
+            nonlocal compiled_calls
+            compiled_calls += 1
+            return function(*args)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    gram_module._compiled_cuda_all_finite.cache_clear()
+    try:
+        n = gram_module._CUDA_FINITE_FUSION_MIN_ELEMENTS
+        large = torch.ones(n, device=device)
+        assert bool(gram_module._all_finite(large))
+        assert bool(gram_module._all_finite(large))
+        assert bool(gram_module._all_finite(large[:-1]))
+        if device.type == "cuda":
+            assert compile_calls == [
+                {"backend": "inductor", "fullgraph": True, "dynamic": True}
+            ]
+            assert compiled_calls == 2
+        else:
+            assert compile_calls == []
+            assert compiled_calls == 0
+    finally:
+        gram_module._compiled_cuda_all_finite.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+def test_compiled_cuda_finite_guard_handles_more_than_static_shape_limit():
+    gram_module._compiled_cuda_all_finite.cache_clear()
+    base = gram_module._CUDA_FINITE_FUSION_MIN_ELEMENTS
+    try:
+        for offset in range(9):
+            value = torch.ones(base + offset, device="cuda")
+            if offset % 3 == 1:
+                value[-1] = float("nan")
+            elif offset % 3 == 2:
+                value[-1] = float("inf")
+            assert bool(gram_module._all_finite(value)) is (offset % 3 == 0)
+    finally:
+        gram_module._compiled_cuda_all_finite.cache_clear()
 
 
 def test_site_shares_sum_to_one_and_start_equal(device):
@@ -171,6 +322,10 @@ def test_private_projection_counts_remain_device_resident_and_exact(device):
     for private, public in (
         (gram_module._retract_count_tensor_, retract_),
         (gram_module._qr_retract_count_tensor_, gram_module.qr_retract_),
+        (
+            gram_module._cholesky_qr_retract_count_tensor_,
+            cholesky_qr_retract_,
+        ),
         (
             gram_module._project_block_frobenius_count_tensor_,
             project_block_frobenius_,

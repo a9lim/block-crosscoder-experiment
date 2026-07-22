@@ -12,6 +12,8 @@ import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
 )
@@ -1030,6 +1032,112 @@ def test_checkpoint_resume_matches(device, tmp_path):
         assert torch.allclose(a, b, atol=1e-5)
 
 
+def test_cholesky_qr_checkpoint_resume_is_exact_at_retraction_boundary(
+    device,
+    tmp_path,
+):
+    cfg = BSCConfig(
+        n_blocks=24,
+        block_dim=4,
+        n_sites=4,
+        d_model=24,
+        k=4,
+        seed=1671,
+        decoder_constraint="qr",
+        decoder_retraction_implementation=(
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+        ),
+    )
+    training = train_cfg(total_steps=4, lr=3e-4, retract_every=1, log_every=1)
+    generator = torch.Generator().manual_seed(1672)
+    batches = [torch.randn(64, 4, 24, generator=generator).to(device) for _ in range(4)]
+    uninterrupted = Trainer(BlockCrosscoder(cfg).to(device), training)
+    split = Trainer(BlockCrosscoder(cfg).to(device), training)
+    expected = [uninterrupted.step(batch) for batch in batches]
+    actual = [split.step(batch) for batch in batches[:2]]
+    path = tmp_path / "cholesky-qr.pt"
+    split.save_checkpoint(path)
+    resumed = Trainer.load_checkpoint(path, device=device)
+    actual.extend(resumed.step(batch) for batch in batches[2:])
+    _assert_nested_exact(actual, expected)
+    _assert_nested_exact(resumed.master.state_dict(), uninterrupted.master.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), uninterrupted.opt.state_dict())
+
+
+@pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
+@pytest.mark.parametrize("selection_score", ("code_norm", "decoded_energy"))
+def test_cholesky_qr_bounds_canonical_householder_training_trajectory(
+    device,
+    selection,
+    selection_score,
+):
+    common = {
+        "n_blocks": 32,
+        "block_dim": 4,
+        "n_sites": 4,
+        "d_model": 32,
+        "k": 4,
+        "seed": 1673,
+        "selection": selection,
+        "selection_score": selection_score,
+        "decoder_constraint": "qr",
+    }
+    cholesky = BlockCrosscoder(
+        BSCConfig(
+            **common,
+            decoder_retraction_implementation=(
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+            ),
+        )
+    ).to(device)
+    householder = BlockCrosscoder(
+        BSCConfig(
+            **common,
+            decoder_retraction_implementation=(
+                DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
+            ),
+        )
+    ).to(device)
+    householder.load_state_dict(cholesky.state_dict())
+    training = train_cfg(total_steps=5, lr=3e-4, retract_every=1, log_every=1)
+    actual = Trainer(cholesky, training)
+    reference = Trainer(householder, training)
+    batches = planted_batches(device, n_batches=5, batch=96, seed=1674)
+    maximum_loss_drift = 0.0
+    intersections = 0
+    unions = 0
+    for batch in batches:
+        actual_record = actual.step(batch)
+        reference_record = reference.step(batch)
+        maximum_loss_drift = max(
+            maximum_loss_drift,
+            abs(actual_record["total"] - reference_record["total"])
+            / max(abs(reference_record["total"]), 1e-30),
+        )
+        with torch.no_grad():
+            actual_mask = actual.fwd(batch).mask
+            reference_mask = reference.fwd(batch).mask
+        intersections += int((actual_mask & reference_mask).sum())
+        unions += int((actual_mask | reference_mask).sum())
+
+    assert maximum_loss_drift <= 1e-4
+    assert intersections / max(unions, 1) >= 0.999
+    assert (
+        _nested_relative_l2(
+            actual.master.state_dict(),
+            reference.master.state_dict(),
+        )
+        <= 1e-3
+    )
+    assert (
+        _nested_relative_l2(
+            actual.opt.state_dict()["state"],
+            reference.opt.state_dict()["state"],
+        )
+        <= 1e-3
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
 def test_compiled_quadratic_trainer_bounds_trajectory_and_support_drift(
     tmp_path, monkeypatch
@@ -1783,8 +1891,7 @@ def test_fused_cuda_optimizer_bounds_scalar_trajectory_and_support():
     fused = Trainer(copy.deepcopy(base), train_cfg(**common, fused=True))
     generator = torch.Generator().manual_seed(1664)
     batches = [
-        torch.randn(512, 4, 128, generator=generator).to("cuda")
-        for _ in range(20)
+        torch.randn(512, 4, 128, generator=generator).to("cuda") for _ in range(20)
     ]
     scalar_records = []
     fused_records = []
@@ -1800,8 +1907,7 @@ def test_fused_cuda_optimizer_bounds_scalar_trajectory_and_support():
         unions += int((scalar_mask | fused_mask).sum())
 
     maximum_loss_drift = max(
-        abs(actual["total"] - expected["total"])
-        / max(abs(expected["total"]), 1e-30)
+        abs(actual["total"] - expected["total"]) / max(abs(expected["total"]), 1e-30)
         for actual, expected in zip(fused_records, scalar_records, strict=True)
     )
     assert maximum_loss_drift <= 5e-4
@@ -1832,9 +1938,7 @@ def _fast_decoded_energy_cfg() -> BSCConfig:
         seed=719,
         selection="token_topk",
         selection_score="decoded_energy",
-        decoded_energy_implementation=(
-            DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
-        ),
+        decoded_energy_implementation=(DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION),
         decoder_constraint="gram",
     )
 
@@ -1871,9 +1975,10 @@ def test_stiefel_decoded_energy_diagnostics_resume_and_save_refusal(
     ).to(device)
     record = trainer.step(batch)
     assert record["decoded_energy_master_gram_residual"] <= 1e-4
-    assert record["decoder_constraint_residual_master"] == record[
-        "decoded_energy_master_gram_residual"
-    ]
+    assert (
+        record["decoder_constraint_residual_master"]
+        == record["decoded_energy_master_gram_residual"]
+    )
 
     checkpoint = tmp_path / "stiefel-fast.pt"
     trainer.save_checkpoint(checkpoint)
@@ -1933,9 +2038,7 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
         Trainer.load_checkpoint(missing_path, device=device)
 
     missing_isolated = {**payload, "model_cfg": dict(payload["model_cfg"])}
-    missing_isolated["model_cfg"].pop(
-        "isolated_loss_decrease_implementation"
-    )
+    missing_isolated["model_cfg"].pop("isolated_loss_decrease_implementation")
     missing_isolated_path = tmp_path / "missing-isolated-loss-id.pt"
     torch.save(missing_isolated, missing_isolated_path)
     with pytest.raises(

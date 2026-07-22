@@ -23,6 +23,10 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
@@ -39,7 +43,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v10"
+    "dense-linear-memory-v11"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -580,6 +584,7 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "inference.threshold_estimator",
         "inference.threshold_source",
         "implementation.decoded_energy_implementation",
+        "implementation.decoder_retraction_implementation",
         "implementation.isolated_loss_decrease_implementation",
         "qualification.profile",
         "qualification.phase1_identification_thresholds",
@@ -3759,9 +3764,7 @@ def _evaluation_workspace_bytes(
     site_dim: int,
     selection_score: str,
     decoded_energy_implementation: str = DECODED_ENERGY_EXACT_IMPLEMENTATION,
-    isolated_loss_decrease_implementation: str = (
-        ISOLATED_LOSS_EXACT_IMPLEMENTATION
-    ),
+    isolated_loss_decrease_implementation: str = (ISOLATED_LOSS_EXACT_IMPLEMENTATION),
 ) -> int:
     """Conservative peak for the fixed-shape CUDA evaluation kernels.
 
@@ -3850,10 +3853,7 @@ def _evaluation_workspace_bytes(
         score_geometry_bytes = groups * block_width**2 * 4
     elif selection_score == "isolated_loss_decrease":
         score_geometry_values = sites * groups * block_width**2
-        if (
-            isolated_loss_decrease_implementation
-            == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-        ):
+        if isolated_loss_decrease_implementation == ISOLATED_LOSS_MAPPED_IMPLEMENTATION:
             score_geometry_values += groups * block_width**2
             score_geometry_values += sites * site_dim * groups * block_width
         score_geometry_bytes = score_geometry_values * 4
@@ -3869,11 +3869,7 @@ def _decoded_energy_code_norm_eligible_values(
 ) -> bool:
     """Apply the shared predicate to one resolved decision mapping."""
 
-    decoder_constraint = {
-        "per_block_stiefel": "qr",
-        "concatenated_stiefel": "qr",
-        "concatenated_stiefel_polar": "gram",
-    }.get(str(values["model.decoder"]), "other")
+    decoder_constraint = _decoder_constraint_from_values(values)
     training_selector = {
         "token_topk": "token_topk",
         "block_batchtopk": "batch_topk",
@@ -3889,6 +3885,89 @@ def _decoded_energy_code_norm_eligible_values(
         ),
         retract_every=int(values["optimizer.retract_every_steps"]),
     )
+
+
+def _decoder_constraint_from_values(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    return {
+        "per_block_stiefel": "qr",
+        "concatenated_stiefel": "qr",
+        "concatenated_stiefel_polar": "gram",
+        "per_block_frobenius_ball": "frobenius",
+        "concatenated_frobenius_ball": "frobenius",
+        "unit_block_frobenius": "unit_frobenius",
+        "concatenated_unit_block_frobenius": "unit_frobenius",
+        "unit_row_renorm": "unit_latent",
+        "free_scale_controlled": "free",
+        "free_weight_decay": "free",
+        "free_per_site_affine": "free",
+    }.get(str(values["model.decoder"]), "other")
+
+
+def _derived_decoder_retraction_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    constraint = _decoder_constraint_from_values(values)
+    if constraint == "qr":
+        return DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    if constraint == "gram":
+        return DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+    return DECODER_RETRACTION_NOT_APPLICABLE
+
+
+def _bind_derived_decoder_retraction_implementation(
+    decisions: Sequence[Decision],
+) -> tuple[Decision, ...]:
+    """Bind the final decoder carrier to one explicit retraction kernel."""
+
+    values = {decision.name: decision.value for decision in decisions}
+    filtered = tuple(
+        decision
+        for decision in decisions
+        if decision.name != "implementation.decoder_retraction_implementation"
+    )
+    return merge_decisions(
+        filtered,
+        (
+            engineering(
+                "implementation.decoder_retraction_implementation",
+                _derived_decoder_retraction_implementation(values),
+                rationale=(
+                    "derive the CUDA retraction kernel from the final decoder "
+                    "carrier; QR uses bounded positive-diagonal Cholesky QR1, "
+                    "polar uses the symmetric eigendecomposition, and "
+                    "unconstrained carriers declare no retraction"
+                ),
+            ),
+        ),
+    )
+
+
+def _resolved_decoder_retraction_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    declared = str(values["implementation.decoder_retraction_implementation"])
+    constraint = _decoder_constraint_from_values(values)
+    allowed = {
+        "qr": {
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+            DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+        },
+        "gram": {DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION},
+    }.get(constraint, {DECODER_RETRACTION_NOT_APPLICABLE})
+    if declared not in {
+        DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+        DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+        DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+        DECODER_RETRACTION_NOT_APPLICABLE,
+    }:
+        raise StudyError("unknown decoder-retraction implementation identity")
+    if declared not in allowed:
+        raise StudyError(
+            "decoder-retraction implementation violates its carrier predicate"
+        )
+    return declared
 
 
 def _derived_decoded_energy_implementation(
@@ -3932,13 +4011,13 @@ def _bind_derived_score_implementations(
 ) -> tuple[Decision, ...]:
     """Recompute implementation identities after every effective cell delta."""
 
-    bound = _bind_derived_decoded_energy_implementation(decisions)
+    bound = _bind_derived_decoder_retraction_implementation(decisions)
+    bound = _bind_derived_decoded_energy_implementation(bound)
     values = {decision.name: decision.value for decision in bound}
     filtered = tuple(
         decision
         for decision in bound
-        if decision.name
-        != "implementation.isolated_loss_decrease_implementation"
+        if decision.name != "implementation.isolated_loss_decrease_implementation"
     )
     return merge_decisions(
         filtered,
@@ -3977,12 +4056,7 @@ def _resolved_decoded_energy_implementation(
 def _isolated_loss_mapped_eligible_values(
     values: Mapping[str, DecisionValue],
 ) -> bool:
-    decoder_constraint = (
-        "free"
-        if str(values["model.decoder"])
-        in {"free_scale_controlled", "free_weight_decay", "free_per_site_affine"}
-        else "other"
-    )
+    decoder_constraint = _decoder_constraint_from_values(values)
     reconstruction = {
         "mean_squared": "mean_squared",
         "squared_l2": "squared_l2",
@@ -4116,21 +4190,28 @@ def _estimate_components(
     )
     decoded_energy_implementation = _resolved_decoded_energy_implementation(values)
     isolated_loss_implementation = _resolved_isolated_loss_implementation(values)
+    decoder_retraction_implementation = _resolved_decoder_retraction_implementation(
+        values
+    )
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the
     # preflight.  Fixed evaluation chunk geometry is content-bound through the
     # estimator version and priced explicitly below.  A fixed 2 GiB covers
     # CUDA/PyTorch context and allocator slack.
-    latent_workspace_buffers = 6 - (
-        DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
-        if decoded_energy_implementation
-        == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
-        else 0
-    ) - (
-        ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS
-        if isolated_loss_implementation == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-        else 0
+    latent_workspace_buffers = (
+        6
+        - (
+            DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
+            if decoded_energy_implementation
+            == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
+            else 0
+        )
+        - (
+            ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS
+            if isolated_loss_implementation == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+            else 0
+        )
     )
     dense_workspace_values = batch_tokens * (
         len(site_dims) * max(site_dims)
@@ -4155,6 +4236,16 @@ def _estimate_components(
     )
     factorized_materialization_bytes = (
         operational_weight_elements * 8 if site_rank_value is not None else 0
+    )
+    retraction_workspace_bytes = (
+        4
+        * (
+            len(site_dims) * max(site_dims) * groups * block_width
+            + 6 * groups * block_width**2
+        )
+        if decoder_retraction_implementation
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+        else 0
     )
     auxiliary = str(values["objective.auxiliary"])
     if auxiliary == "frequency_dead_residual":
@@ -4191,6 +4282,7 @@ def _estimate_components(
         parameters * 28
         + dense_workspace_values * 4
         + factorized_materialization_bytes
+        + retraction_workspace_bytes
         + tracker_residency_bytes
     )
     # Evaluation runs after training state is released, so adding its complete
@@ -7373,9 +7465,7 @@ def _resolved_cell_defaults(
             rationale="no unrecorded singular-value smoothing is permitted",
         ),
     )
-    return _bind_derived_score_implementations(
-        merge_decisions(decisions, additions)
-    )
+    return _bind_derived_score_implementations(merge_decisions(decisions, additions))
 
 
 def _smoke_overrides(
@@ -13046,6 +13136,14 @@ def _production_overrides(recipe: Recipe) -> tuple[Decision, ...]:
             rationale=(
                 "bf16 is permitted only behind the executable fp32/bf16 initialization "
                 "parity and short-run stability stage"
+            ),
+        ),
+        engineering(
+            "optimizer.fused",
+            True,
+            rationale=(
+                "Phase-3 production rebinds the canonical fused CUDA optimizer "
+                "even when its frozen design was selected by a CPU smoke campaign"
             ),
         ),
         engineering(

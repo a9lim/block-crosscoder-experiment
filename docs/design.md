@@ -846,7 +846,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v10-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v11-q2-c512-t256-s32` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -931,6 +931,36 @@ improve from `15.986` to `13.887 ms` (`13.12%`); QR peak allocation falls by
 trajectory changes are authorized before the first experiment run. The
 resource planner remains conservative and grants no fused-kernel memory credit.
 
+Decoder retraction has a separate serialized implementation identity. Canonical
+QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar cells derive
+`symmetric_polar_eigh_floor_v1`, and other decoder carriers derive
+`not_applicable_v1`; root, smoke, and child cells recompute that identity.
+Positive-diagonal Cholesky-QR1 fails closed above condition 64 or on nonfinite,
+factorization, reconstruction-residual, or post-Gram-residual failure, with no
+runtime fallback. `householder_qr_positive_diagonal_v1` is an admitted
+reference/test oracle but is never canonically derived. QR versus polar remains
+scientific; Cholesky versus Householder within QR is engineering.
+
+The fixed jobe benchmark uses five warmups and 31 separately synchronized
+CUDA-event samples, with nearest-rank p95, peak reset after warmup, and all
+input preparation outside the timed region. At the Phase-2 QR geometry
+(`S=4`, `G=2048`, `b=4`, `d=768`), the fully guarded primitive measures
+`88.784 -> 1.765 ms` median and `88.829 -> 1.777 ms` p95 (`50.00x` at p95),
+while incremental workspace falls from `360.125` to `96.688 MiB`. Final
+post-Gram residuals are `7.25e-7` and `5.66e-7`. The canonical in-memory
+Trainer fixture uses an already CUDA-resident bf16 `[4096,4,768]` batch,
+block-BatchTopK/code-norm selection at `k=32`, no auxiliary, constant-rate
+fused AdamW, and `materialize_record=False`; it deliberately excludes store
+I/O, H2D transfer, and on-the-fly normalization. Median step time falls from
+`100.952` to `14.216 ms` (`85.92%`, `7.10x`), p95 falls from `101.002` to
+`14.241 ms` (`7.09x`), and peak allocation falls by `176.125 MiB`. Across 20 paired
+campaign-shape updates from one canonical state, loss relative drift is
+`5.86e-6`, support disagreement `7.51e-5`, support IoU `.980960`, model-state
+relative drift `.002377`, optimizer-state drift `5.69e-6`, and both terminal
+Gram residuals remain below `7e-7`. These bounds authorize the engineering
+replacement before the first experiment run; changing a guard or gauge
+convention requires a new implementation identity.
+
 The shared kernels also retain guarded configuration values used only by unit
 fixtures or explicitly quarantined source-release adapters. Those values are
 test-only or quarantined, not latent matrix rows: only a canonical cell emitted
@@ -968,7 +998,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v10-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v11-...-s32`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -1022,15 +1052,26 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v10 conservatively credits only four fp32
+Estimator v11 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse
 evaluation workspace and exact fp64 sharing-Gram residency are unchanged.
+Cholesky-QR1 additionally reserves
+`4 * (sites * padded_site_width * groups * block_width + 6 * groups *
+block_width^2)` bytes of training workspace. The direct-output batched matmul
+does not materialize a second transformed-decoder tensor. Large-CUDA finite
+classification and reduction use one shape-polymorphic compiled kernel rather
+than materializing a bool tensor; smaller and CPU tensors stay eager. Measured
+incremental Cholesky workspace is `96.688 MiB` against a `96.750 MiB` Phase-2
+estimate and `641.373 MiB` against a `641.500 MiB` Phase-3 estimate. The
+planner grants no speculative retraction speed or FLOP credit.
 
 The dominant all-observed, unpadded CUDA quadratic objective compiles the fp32
 cast, residual, square, scalar sum, and declared normalization division as one
-static reduction. That parallel reduction is an authorized implementation-order
+shape-polymorphic reduction. This avoids the hard eight-static-shape Dynamo
+recompile limit across heterogeneous campaign cells. The parallel reduction is
+an authorized implementation-order
 change, not a new scientific objective. Its eager-oracle release gate requires
 relative loss and prediction/target-gradient drift at most `2e-6`, multi-step
 model and optimizer state relative L2 drift at most `1e-5`, and hard-support
@@ -1103,7 +1144,7 @@ materially affect a claim:
 |---|---|---|---|
 | common vector coordinate | novel: one intrinsic coordinate can decode at every layer | support-only DGP, scalar controls, same-block aligned-code R2 | live |
 | sum, availability-rescaled sum, and source-only evidence | novel/adapted: aggregation scale and available evidence change identifiability | Phase-1 sum/mean parity and missing-site fusion capability; Phase-2 joint/source anchors | fusion semantics transferred; source-only is a control, not a tuning round |
-| concatenated Stiefel gauge and QR/polar retraction | novel/engineering: fix total decoded block energy while testing numerically distinct retractions | Gram invariant, same initialized parent, recovery/rate parity | Phase-1 capability; narrow Phase-2 architecture tuning |
+| concatenated Stiefel gauge and QR/polar retraction | novel/engineering: fix total decoded block energy while testing numerically distinct scientific retractions; canonical QR uses positive-diagonal Cholesky-QR1 and retains Householder QR only as a reference oracle | Gram invariant, same initialized parent, recovery/rate parity; condition and residual gates refuse with no fallback | Phase-1 capability; narrow Phase-2 architecture tuning |
 | block width, capacity, and activity | novel: intrinsic rank, dictionary size, and event budget are different causes | change exactly one while holding the other two fixed | Phase-1 capability; Phase-2 tuning |
 | block BatchTopK | novel adaptation: heterogeneous token event counts may improve allocation | token block-TopK at identical parent and achieved packet rate | Phase-1 capability; Phase-2 tuning |
 | decoder site-profile concentration penalty | rejected local proposal: concentrating decoder energy into fewer sites is directionally opposed to the shared cross-layer object, and the raw-weight profile is gauge-dependent | removed from the executable model and matrix; any future site smoothness proposal must use invariant energy/Gram profiles and explicit smooth/step truth controls | rejected, not executable |

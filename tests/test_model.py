@@ -21,6 +21,10 @@ from block_crosscoder_experiment.model import (
     token_topk_mask,
 )
 from block_crosscoder_experiment.runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
 )
@@ -29,6 +33,11 @@ CFG = BSCConfig(n_blocks=16, block_dim=4, n_sites=4, d_model=32, k=3, seed=0)
 
 
 def make_model(device, **overrides):
+    if (
+        "decoder_constraint" in overrides
+        and "decoder_retraction_implementation" not in overrides
+    ):
+        overrides["decoder_retraction_implementation"] = None
     cfg = BSCConfig(**{**CFG.__dict__, **overrides})
     return BlockCrosscoder(cfg).to(device)
 
@@ -80,6 +89,125 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     numerator = (actual.float() - expected.float()).norm()
     denominator = expected.float().norm().clamp_min(1e-12)
     return float((numerator / denominator).detach())
+
+
+@pytest.mark.parametrize(
+    ("constraint", "expected"),
+    (
+        ("qr", DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION),
+        ("gram", DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION),
+        ("free", DECODER_RETRACTION_NOT_APPLICABLE),
+        ("frobenius", DECODER_RETRACTION_NOT_APPLICABLE),
+    ),
+)
+def test_decoder_retraction_identity_resolves_explicitly(constraint, expected):
+    cfg = BSCConfig(
+        n_blocks=4,
+        block_dim=2,
+        n_sites=2,
+        d_model=5,
+        k=2,
+        decoder_constraint=constraint,
+    )
+    assert cfg.decoder_retraction_implementation == expected
+
+
+@pytest.mark.parametrize(
+    ("constraint", "implementation", "message"),
+    (
+        ("qr", "ambient_cuda_default", "unknown"),
+        (
+            "qr",
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+            "requires a QR",
+        ),
+        (
+            "gram",
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+            "requires symmetric-polar",
+        ),
+        (
+            "free",
+            DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+            "not-applicable",
+        ),
+    ),
+)
+def test_decoder_retraction_identity_pairs_fail_closed(
+    constraint,
+    implementation,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        BSCConfig(
+            n_blocks=4,
+            block_dim=2,
+            n_sites=2,
+            d_model=5,
+            k=2,
+            decoder_constraint=constraint,
+            decoder_retraction_implementation=implementation,
+        )
+
+
+def test_stiefel_decoder_refuses_insufficient_active_coordinates():
+    with pytest.raises(ValueError, match="at least block_dim active coordinates"):
+        BSCConfig(
+            n_blocks=4,
+            block_dim=4,
+            n_sites=2,
+            d_model=3,
+            site_dims=(1, 2),
+            k=2,
+            decoder_constraint="qr",
+        )
+
+
+@pytest.mark.parametrize(
+    ("implementation", "function_name"),
+    (
+        (
+            DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+            "_cholesky_qr_retract_count_tensor_",
+        ),
+        (
+            DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+            "_qr_retract_count_tensor_",
+        ),
+    ),
+)
+def test_model_qr_retraction_dispatch_is_identity_bound(
+    monkeypatch,
+    implementation,
+    function_name,
+):
+    calls = 0
+    original = getattr(model_module, function_name)
+
+    def tracked(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(model_module, function_name, tracked)
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=8,
+            block_dim=3,
+            n_sites=2,
+            d_model=7,
+            k=2,
+            decoder_constraint="qr",
+            decoder_retraction_implementation=implementation,
+        )
+    )
+    assert calls == 1
+    with torch.no_grad():
+        assert model.D is not None
+        model.D.add_(0.01 * torch.randn_like(model.D))
+    model.project_decoder_()
+    assert calls == 2
+    assert float(gram_residual(model.decoder_tensor()).detach().max()) <= 1e-4
 
 
 def _loss_output(prediction: torch.Tensor, n_blocks: int, block_dim: int) -> BSCOutput:
@@ -278,13 +406,37 @@ def test_cuda_quadratic_compile_wrapper_is_lazy_cached_and_size_gated(
                 {
                     "backend": "inductor",
                     "fullgraph": True,
-                    "dynamic": False,
+                    "dynamic": True,
                 }
             ]
             assert compiled_calls == 2
         else:
             assert compile_calls == []
             assert compiled_calls == 0
+    finally:
+        model_module._compiled_cuda_fp32_squared_error_reduction.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Inductor")
+def test_compiled_cuda_quadratic_accepts_more_than_dynamo_static_shape_limit():
+    model_module._compiled_cuda_fp32_squared_error_reduction.cache_clear()
+    base = model_module._CUDA_QUADRATIC_FUSION_MIN_ELEMENTS
+    try:
+        for offset in range(9):
+            n = base + offset
+            prediction = torch.linspace(-1.0, 1.0, n, device="cuda")
+            target = prediction.flip(0)
+            actual = model_module._fp32_squared_error_reduction(
+                prediction,
+                target,
+                n,
+            )
+            expected = model_module._eager_fp32_squared_error_reduction(
+                prediction,
+                target,
+                n,
+            )
+            assert torch.allclose(actual, expected, rtol=2e-6, atol=1e-6)
     finally:
         model_module._compiled_cuda_fp32_squared_error_reduction.cache_clear()
 
@@ -1901,9 +2053,7 @@ def test_mapped_isolated_loss_decrease_bounds_score_and_gradient_drift(
     exact = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_EXACT_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_EXACT_IMPLEMENTATION),
         )
     )
     with torch.no_grad():
@@ -1913,23 +2063,29 @@ def test_mapped_isolated_loss_decrease_bounds_score_and_gradient_drift(
     mapped = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
         )
     )
     mapped.load_state_dict(exact.state_dict())
     exact = exact.to(device=device, dtype=dtype)
     mapped = mapped.to(device=device, dtype=dtype)
     generator = torch.Generator().manual_seed(985)
-    x_exact = torch.randn(96, 4, 32, generator=generator).to(
-        device=device,
-        dtype=dtype,
-    ).requires_grad_()
-    z_exact = torch.randn(96, 32, 4, generator=generator).to(
-        device=device,
-        dtype=dtype,
-    ).requires_grad_()
+    x_exact = (
+        torch.randn(96, 4, 32, generator=generator)
+        .to(
+            device=device,
+            dtype=dtype,
+        )
+        .requires_grad_()
+    )
+    z_exact = (
+        torch.randn(96, 32, 4, generator=generator)
+        .to(
+            device=device,
+            dtype=dtype,
+        )
+        .requires_grad_()
+    )
     x_mapped = x_exact.detach().clone().requires_grad_()
     z_mapped = z_exact.detach().clone().requires_grad_()
     observed = None
@@ -1984,9 +2140,7 @@ def test_mapped_isolated_loss_frozen_geometry_binds_cached_map_and_grams(view):
             decoder_bias=False,
             reconstruction_loss="squared_l2",
             selection_score="isolated_loss_decrease",
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
         )
     )
     x = torch.randn(31, 3, 9, generator=torch.Generator().manual_seed(986))
@@ -2039,17 +2193,13 @@ def test_mapped_isolated_loss_preserves_factorized_free_decoder_gradients():
     exact = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_EXACT_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_EXACT_IMPLEMENTATION),
         )
     )
     mapped = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
         )
     )
     mapped.load_state_dict(exact.state_dict())
@@ -2074,10 +2224,13 @@ def test_mapped_isolated_loss_preserves_factorized_free_decoder_gradients():
         (x_mapped, z_mapped, mapped.D_site, mapped.D_core),
     )
     assert _relative_l2(mapped_scores, exact_scores) <= 2e-6
-    assert max(
-        _relative_l2(actual, expected)
-        for actual, expected in zip(mapped_grads, exact_grads, strict=True)
-    ) <= 5e-6
+    assert (
+        max(
+            _relative_l2(actual, expected)
+            for actual, expected in zip(mapped_grads, exact_grads, strict=True)
+        )
+        <= 5e-6
+    )
 
 
 @pytest.mark.parametrize(
@@ -2149,9 +2302,7 @@ def test_cuda_mapped_isolated_loss_campaign_shape_bounds_full_step_drift(
     exact = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_EXACT_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_EXACT_IMPLEMENTATION),
         ),
         device="cuda",
     )
@@ -2162,9 +2313,7 @@ def test_cuda_mapped_isolated_loss_campaign_shape_bounds_full_step_drift(
     mapped = BlockCrosscoder(
         BSCConfig(
             **cfg_values,
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
         ),
         device="cuda",
     )

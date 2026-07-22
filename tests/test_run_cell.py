@@ -61,6 +61,10 @@ from block_crosscoder_experiment.cli.data import fit_transform_artifacts
 from block_crosscoder_experiment.codec import Codec
 from block_crosscoder_experiment.model import BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
@@ -169,6 +173,9 @@ def _mapped_isolated_loss_cell(*, seed: int = 0) -> CellSpec:
         "model.decoder": "free_scale_controlled",
         "model.decoder_bias": False,
         "objective.reconstruction": "squared_l2",
+        "implementation.decoder_retraction_implementation": (
+            DECODER_RETRACTION_NOT_APPLICABLE
+        ),
         "implementation.isolated_loss_decrease_implementation": (
             ISOLATED_LOSS_MAPPED_IMPLEMENTATION
         ),
@@ -517,6 +524,7 @@ def test_factorized_masked_decoded_energy_cell_runs_through_saved_codec(
         "model.site_rank": 2,
         "model.selection_score": "decoded_energy",
         "objective.encoder_site_mask_probability": 0.10,
+        "implementation.decoder_retraction_implementation": "not_applicable_v1",
     }
     cell = replace(
         base,
@@ -572,12 +580,26 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         model.cfg.decoded_energy_implementation
         == DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION
     )
+    assert (
+        model.cfg.decoder_retraction_implementation
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    )
     assert summary["accepted_tokens"] > 0
 
     checkpoint_payload = torch.load(
         refs["checkpoint"].resolve(campaign.root),
         map_location="cpu",
         weights_only=True,
+    )
+    assert (
+        checkpoint_payload["model_cfg"]["decoder_retraction_implementation"]
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    )
+    assert (
+        checkpoint_payload["run_binding"]["model_cfg"][
+            "decoder_retraction_implementation"
+        ]
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
     )
     mismatched_checkpoint = copy.deepcopy(checkpoint_payload)
     mismatched_checkpoint["model_cfg"]["decoded_energy_implementation"] = (
@@ -589,6 +611,22 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         _validate_final_checkpoint(
             checkpoint_path,
             checkpoint_payload["run_binding"],
+        )
+
+    missing_retraction_identity = copy.deepcopy(checkpoint_payload)
+    missing_retraction_identity["model_cfg"].pop("decoder_retraction_implementation")
+    missing_retraction_identity["run_binding"]["model_cfg"].pop(
+        "decoder_retraction_implementation"
+    )
+    missing_retraction_path = tmp_path / "missing-retraction-identity.pt"
+    torch.save(missing_retraction_identity, missing_retraction_path)
+    with pytest.raises(
+        CellExecutionError,
+        match="lacks decoder_retraction_implementation",
+    ):
+        _validate_final_checkpoint(
+            missing_retraction_path,
+            missing_retraction_identity["run_binding"],
         )
 
     forged_optimizer = copy.deepcopy(checkpoint_payload)
@@ -763,9 +801,10 @@ def test_mapped_isolated_loss_identity_round_trips_and_refuses_forgery(
     assert payload["model_cfg"]["isolated_loss_decrease_implementation"] == (
         ISOLATED_LOSS_MAPPED_IMPLEMENTATION
     )
-    assert codec.meta["model_cfg"][
-        "isolated_loss_decrease_implementation"
-    ] == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    assert (
+        codec.meta["model_cfg"]["isolated_loss_decrease_implementation"]
+        == ISOLATED_LOSS_MAPPED_IMPLEMENTATION
+    )
 
     forged = copy.deepcopy(payload)
     forged["model_cfg"]["isolated_loss_decrease_implementation"] = (
@@ -790,9 +829,7 @@ def test_mapped_isolated_loss_identity_round_trips_and_refuses_forgery(
         map_location="cpu",
         weights_only=True,
     )
-    checkpoint_payload["model_cfg"].pop(
-        "isolated_loss_decrease_implementation"
-    )
+    checkpoint_payload["model_cfg"].pop("isolated_loss_decrease_implementation")
     checkpoint_payload["run_binding"]["model_cfg"].pop(
         "isolated_loss_decrease_implementation"
     )
@@ -883,6 +920,85 @@ def test_runner_resolves_and_refuses_mapped_isolated_loss_implementation() -> No
         ),
     )
     assert _model_config(mean_squared).reconstruction_loss == "mean_squared"
+
+
+def test_runner_resolves_and_refuses_decoder_retraction_implementations() -> None:
+    qr = _cell()
+    assert (
+        _model_config(qr).decoder_retraction_implementation
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    )
+
+    def changed(cell: CellSpec, **overrides) -> CellSpec:
+        return replace(
+            cell,
+            decisions=tuple(
+                replace(decision, value=overrides[decision.name])
+                if decision.name in overrides
+                else decision
+                for decision in cell.decisions
+            ),
+        )
+
+    householder = changed(
+        qr,
+        **{
+            "implementation.decoder_retraction_implementation": (
+                DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
+            )
+        },
+    )
+    assert (
+        _model_config(householder).decoder_retraction_implementation
+        == DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
+    )
+
+    polar = changed(
+        qr,
+        **{
+            "model.decoder": "concatenated_stiefel_polar",
+            "implementation.decoder_retraction_implementation": (
+                DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+            ),
+        },
+    )
+    assert (
+        _model_config(polar).decoder_retraction_implementation
+        == DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+    )
+
+    free = changed(
+        qr,
+        **{
+            "model.decoder": "free_scale_controlled",
+            "implementation.decoder_retraction_implementation": (
+                DECODER_RETRACTION_NOT_APPLICABLE
+            ),
+            "implementation.decoded_energy_implementation": (
+                DECODED_ENERGY_EXACT_IMPLEMENTATION
+            ),
+        },
+    )
+    assert (
+        _model_config(free).decoder_retraction_implementation
+        == DECODER_RETRACTION_NOT_APPLICABLE
+    )
+
+    for identity, message in (
+        ("ambient_cuda_default", "unknown decoder-retraction"),
+        (
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+            "violates its carrier predicate",
+        ),
+        (DECODER_RETRACTION_NOT_APPLICABLE, "violates its carrier predicate"),
+    ):
+        with pytest.raises(CellExecutionError, match=message):
+            _model_config(
+                changed(
+                    qr,
+                    **{"implementation.decoder_retraction_implementation": identity},
+                )
+            )
 
 
 def test_decoded_energy_preflight_precedes_every_score_call(
@@ -1614,8 +1730,19 @@ def test_declared_but_unimplemented_semantics_fail_closed(tmp_path: Path) -> Non
     cell = replace(
         base,
         decisions=tuple(
-            replace(decision, value="unimplemented_decoder")
-            if decision.name == "model.decoder"
+            replace(
+                decision,
+                value=(
+                    "unimplemented_decoder"
+                    if decision.name == "model.decoder"
+                    else DECODER_RETRACTION_NOT_APPLICABLE
+                ),
+            )
+            if decision.name
+            in {
+                "model.decoder",
+                "implementation.decoder_retraction_implementation",
+            }
             else decision
             for decision in base.decisions
         ),
@@ -2458,10 +2585,7 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
 def test_training_batches_do_not_copy_aligned_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    chunks = [
-        torch.full((8, 2, 3), float(index))
-        for index in range(4)
-    ]
+    chunks = [torch.full((8, 2, 3), float(index)) for index in range(4)]
 
     class Reader:
         def shuffled_batches(self, *args, **kwargs):

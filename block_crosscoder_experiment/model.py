@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 from .gram import (
+    _cholesky_qr_retract_count_tensor_,
     _normalize_block_frobenius_count_tensor_,
     _project_block_frobenius_count_tensor_,
     _project_latent_rows_count_tensor_,
@@ -34,6 +35,11 @@ from .gram import (
     map_nuclear_penalty,
 )
 from .runtime_limits import (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_IMPLEMENTATIONS,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_IMPLEMENTATIONS,
     DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX,
@@ -241,9 +247,11 @@ class BSCConfig:
     # Isolated loss decrease remains the signed scientific score.  The mapped
     # free-decoder implementation changes only its contraction schedule and is
     # serialized separately so orchestration cannot select it implicitly.
-    isolated_loss_decrease_implementation: str = (
-        ISOLATED_LOSS_EXACT_IMPLEMENTATION
-    )
+    isolated_loss_decrease_implementation: str = ISOLATED_LOSS_EXACT_IMPLEMENTATION
+    # Resolved into an explicit serialized identity in ``__post_init__``.  A
+    # None constructor default preserves ergonomic direct construction without
+    # permitting checkpoints or orchestration to omit the realized algorithm.
+    decoder_retraction_implementation: str | None = None
     decoder_constraint: str = "gram"  # plus QR, ball/equality Frobenius, row-unit, free
     encoder_constraint: str = "none"  # none | unit_latent
     regularizer: str | None = None  # plus map nuclear, crosscoder L1, group L21
@@ -333,6 +341,41 @@ class BSCConfig:
                 "decoder_constraint must be gram, qr, frobenius, unit_frobenius, "
                 "unit_latent, or free"
             )
+        if self.decoder_retraction_implementation is None:
+            self.decoder_retraction_implementation = (
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+                if self.decoder_constraint == "qr"
+                else DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+                if self.decoder_constraint == "gram"
+                else DECODER_RETRACTION_NOT_APPLICABLE
+            )
+        if (
+            self.decoder_retraction_implementation
+            not in DECODER_RETRACTION_IMPLEMENTATIONS
+        ):
+            raise ValueError("unknown decoder_retraction_implementation")
+        if self.decoder_constraint == "qr":
+            if self.decoder_retraction_implementation not in {
+                DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+                DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+            }:
+                raise ValueError(
+                    "QR decoder constraint requires a QR retraction implementation"
+                )
+        elif self.decoder_constraint == "gram":
+            if (
+                self.decoder_retraction_implementation
+                != DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+            ):
+                raise ValueError(
+                    "Gram decoder constraint requires symmetric-polar retraction"
+                )
+        elif (
+            self.decoder_retraction_implementation != DECODER_RETRACTION_NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "non-Stiefel decoder constraint requires not-applicable retraction"
+            )
         if self.encoder_constraint not in {"none", "unit_latent"}:
             raise ValueError("encoder_constraint must be none or unit_latent")
         if self.site_dims is None:
@@ -343,6 +386,13 @@ class BSCConfig:
             raise ValueError("site_dims must have one entry per site")
         if any(v <= 0 or v > self.d_model for v in self.site_dims):
             raise ValueError("site_dims entries must be in [1, d_model]")
+        if (
+            self.decoder_constraint in {"gram", "qr"}
+            and sum(self.site_dims) < self.block_dim
+        ):
+            raise ValueError(
+                "Stiefel decoder requires at least block_dim active coordinates"
+            )
         if self.encoder_fusion not in {
             "sum",
             "mean",
@@ -756,7 +806,17 @@ class BlockCrosscoder(nn.Module):
         if cfg.decoder_constraint == "gram":
             _retract_count_tensor_(D, eig_floor=cfg.eig_floor)
         elif cfg.decoder_constraint == "qr":
-            _qr_retract_count_tensor_(D)
+            if (
+                cfg.decoder_retraction_implementation
+                == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+            ):
+                _cholesky_qr_retract_count_tensor_(D)
+            else:
+                assert (
+                    cfg.decoder_retraction_implementation
+                    == DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
+                )
+                _qr_retract_count_tensor_(D)
         elif cfg.decoder_constraint == "frobenius":
             _project_block_frobenius_count_tensor_(D)
         elif cfg.decoder_constraint == "unit_frobenius":
@@ -1237,9 +1297,7 @@ class BlockCrosscoder(nn.Module):
                 # Match the operational all-view contraction exactly.  A sum
                 # of cached site Grams is algebraically equal but changes the
                 # fp32 reduction tree and can move a threshold tie.
-                isolated_loss_all_site_gram = torch.einsum(
-                    "sgbd,sgcd->gbc", D, D
-                )
+                isolated_loss_all_site_gram = torch.einsum("sgbd,sgcd->gbc", D, D)
         return _ScoreGeometry(
             self._decoder_binding_key(decoder),
             decoder_weight,
@@ -1274,15 +1332,11 @@ class BlockCrosscoder(nn.Module):
                 )
             )
             if score_geometry is None:
-                site_gram = torch.einsum(
-                    "gbd,gcd->gbc", decoder[site], decoder[site]
-                )
+                site_gram = torch.einsum("gbd,gcd->gbc", decoder[site], decoder[site])
             else:
                 assert score_geometry.site_decoder_gram is not None
                 site_gram = score_geometry.site_decoder_gram[site]
-            site_energy = torch.einsum(
-                "ngb,gbc,ngc->ng", code, site_gram, code
-            )
+            site_energy = torch.einsum("ngb,gbc,ngc->ng", code, site_gram, code)
             energy_sq.add_(keep[:, site, 0].float().unsqueeze(1) * site_energy)
         return 2.0 * (projected * code).sum(dim=-1) - energy_sq
 
@@ -1315,16 +1369,12 @@ class BlockCrosscoder(nn.Module):
                 # Contract the site axis directly; allocating every G_s only
                 # to reduce it would retain the reference path's avoidable
                 # site-Gram stack in the dominant full-view training kernel.
-                all_site_gram = torch.einsum(
-                    "sgbd,sgcd->gbc", decoder, decoder
-                )
+                all_site_gram = torch.einsum("sgbd,sgcd->gbc", decoder, decoder)
                 site_grams = None
             else:
                 site_grams = torch.stack(
                     [
-                        torch.einsum(
-                            "gbd,gcd->gbc", decoder[site], decoder[site]
-                        )
+                        torch.einsum("gbd,gcd->gbc", decoder[site], decoder[site])
                         for site in range(cfg.n_sites)
                     ]
                 )
@@ -1338,8 +1388,7 @@ class BlockCrosscoder(nn.Module):
             all_site_gram = score_geometry.isolated_loss_all_site_gram
 
         projected = (
-            residual.reshape(residual.shape[0], cfg.n_sites * cfg.d_model)
-            @ decoder_map
+            residual.reshape(residual.shape[0], cfg.n_sites * cfg.d_model) @ decoder_map
         ).reshape_as(code)
         code_by_group = code.transpose(0, 1)
         if all_sites_observed:
@@ -1375,10 +1424,7 @@ class BlockCrosscoder(nn.Module):
         fast_decoded_energy = self.uses_stiefel_code_norm_decoded_energy
         if decoder is None and (
             _score_geometry is not None
-            or (
-                self.cfg.selection_score != "code_norm"
-                and not fast_decoded_energy
-            )
+            or (self.cfg.selection_score != "code_norm" and not fast_decoded_energy)
         ):
             decoder = self.decoder_tensor()
         if _score_geometry is not None:
@@ -1796,7 +1842,17 @@ class BlockCrosscoder(nn.Module):
                 )
                 mark(self.D)
             elif self.cfg.decoder_constraint == "qr":
-                bad = _qr_retract_count_tensor_(self.D.data)
+                if (
+                    self.cfg.decoder_retraction_implementation
+                    == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+                ):
+                    bad = _cholesky_qr_retract_count_tensor_(self.D.data)
+                else:
+                    assert (
+                        self.cfg.decoder_retraction_implementation
+                        == DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION
+                    )
+                    bad = _qr_retract_count_tensor_(self.D.data)
                 mark(self.D)
             elif self.cfg.decoder_constraint == "frobenius":
                 bad = _project_block_frobenius_count_tensor_(self.D.data)
@@ -1909,10 +1965,14 @@ class BlockCrosscoder(nn.Module):
         return theta
 
 
-# A compiled static quadratic reduction becomes worthwhile well below the
+# A compiled quadratic reduction becomes worthwhile well below the
 # smallest Phase-2 batch (2048 * 4 * 768 = 6,291,456 values).  Keep a fixed
 # one-megavalue gate so tiny Phase-1 cells, calibration tails, and unit tests do
-# not pay shape-specialized TorchInductor compilation churn.  Compiling the
+# not pay TorchInductor compilation churn.  Dynamic batch/site/width symbols
+# keep a multi-cell campaign on one graph: a static wrapper hits Dynamo's hard
+# recompile limit after eight distinct campaign shapes.  Inductor still emits
+# the same fused cast/subtract/square/reduction kernel for the live tensors.
+# Compiling the
 # reduction changes its parallel summation order, so the release gate bounds
 # loss, input-gradient, optimizer-trajectory, and selector-support drift rather
 # than claiming bit-exact parity with the eager reduction.
@@ -1936,13 +1996,13 @@ def _eager_fp32_squared_error_reduction(
 
 @cache
 def _compiled_cuda_fp32_squared_error_reduction():
-    """Create one Torch 2.8 Inductor wrapper; it caches static CUDA graphs."""
+    """Create one shape-polymorphic Torch 2.8 Inductor reduction wrapper."""
 
     return torch.compile(
         _eager_fp32_squared_error_reduction,
         backend="inductor",
         fullgraph=True,
-        dynamic=False,
+        dynamic=True,
     )
 
 

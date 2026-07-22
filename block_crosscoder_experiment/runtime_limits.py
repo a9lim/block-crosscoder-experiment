@@ -10,9 +10,7 @@ EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR = 32
 # every optimizer update.  These strings are serialized in model configs and
 # therefore form part of checkpoint/run identity, not an ambient CUDA choice.
 DECODED_ENERGY_EXACT_IMPLEMENTATION = "exact_decoder_gram_v1"
-DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION = (
-    "stiefel_code_norm_bounded_v1"
-)
+DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION = "stiefel_code_norm_bounded_v1"
 DECODED_ENERGY_IMPLEMENTATIONS = (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
@@ -23,7 +21,7 @@ DECODED_ENERGY_IMPLEMENTATIONS = (
 DECODED_ENERGY_MASTER_GRAM_RESIDUAL_MAX = 1.0e-4
 DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX = 2.0e-3
 
-# The v10 planner removes only this conservative subset of the measured score
+# The v11 planner removes only this conservative subset of the measured score
 # graph residency.  Four fp32 [tokens, groups, block_width] buffers are less
 # than the observed Phase-2/3 peak reduction and so do not over-credit VRAM.
 DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS = 4
@@ -38,9 +36,35 @@ ISOLATED_LOSS_IMPLEMENTATIONS = (
 )
 ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS = 3
 
+# Decoder retraction is part of the serialized model implementation, not an
+# ambient device or shape dispatch.  Cholesky-QR and the canonical Householder
+# reference share the positive-diagonal QR convention; the latter is retained
+# as an exact oracle rather than silently selected at runtime.
+DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION = (
+    "cholesky_qr1_positive_diagonal_cond64_v1"
+)
+DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION = "householder_qr_positive_diagonal_v1"
+DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION = "symmetric_polar_eigh_floor_v1"
+DECODER_RETRACTION_NOT_APPLICABLE = "not_applicable_v1"
+DECODER_RETRACTION_IMPLEMENTATIONS = (
+    DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
+    DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+    DECODER_RETRACTION_NOT_APPLICABLE,
+)
+
+# Cholesky-QR1 squares the input condition number.  The admitted fp32 carrier
+# is deliberately narrow enough that the post-retraction Gram remains inside
+# the existing decoded-energy master bound.  Any bound change requires a new
+# implementation identity.
+CHOLESKY_QR_GRAM_CONDITION_MAX = 64.0
+CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX = 2.0e-6
+CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX = 1.0e-4
+
 MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
     "decoded_energy_implementation",
     "isolated_loss_decrease_implementation",
+    "decoder_retraction_implementation",
 )
 
 
