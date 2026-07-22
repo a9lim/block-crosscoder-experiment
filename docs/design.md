@@ -947,6 +947,15 @@ and preserves the complete artifact hash. This reduces rank-space fit time
 from `67.340` to `28.712 ms` (`57.36%`, `2.345x`) and improves on the original
 materialized fit's `73.311 ms` by `60.84%` (`2.553x`).
 
+R-D evaluation queues every q-chunk and observer consumer before packing
+counts, Bernoulli terms, all-q per-site errors, and centered totals into one
+fp64 D2H transfer. Sequence grouping consumes the transferred count column,
+never the CUDA source. A direct `row_len=1` append path preserves row and
+bootstrap order without one Python/CUDA scalar synchronization per token. The
+complete result JSON hash is unchanged; canonical 128-token-row evaluation
+falls from `15.984` to `14.932 ms` (`6.58%`), while the Phase-1-style
+one-token-row case falls from `349.824` to `37.567 ms` (`89.26%`, `9.312x`).
+
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M
 parameters per cell, 22GB peak VRAM, 55GB peak host RAM, 850GB storage against

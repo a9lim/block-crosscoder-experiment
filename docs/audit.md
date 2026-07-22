@@ -161,7 +161,9 @@ exit is not evidence by itself.
   use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
   remains conservative and grants no runtime credit for this optimization.
   Codec fitting, packet encoding, public packet decode, and trusted multi-q
-  decode must also remain in rank space.
+  decode must also remain in rank space. R-D metric D2H uses one packed
+  transfer per batch, and fixed one-token rows must never read CUDA scalars
+  inside the per-sequence loop.
 - Phase-1 masking has a preceding scale-control panel: literal sum at `p=0`,
   nonpromotable literal sum at `p=.10`, and availability-rescaled sum at
   `p=.10`. Its fixed rescaled carrier enters the subsequent

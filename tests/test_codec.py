@@ -101,6 +101,21 @@ def test_codec_fits_and_evaluates():
     assert len(p4["rate_bits_ci95"]) == 2
 
 
+def test_row_length_one_fast_path_is_exact_across_batching():
+    torch.manual_seed(1899)
+    model = calibrated(make_model(), torch.randn(512, S, D))
+    calibration = torch.randn(512, S, D)
+    codec = fit_codec(
+        model,
+        list(calibration.split(128)),
+        CodecSpec(qs=(4, 8), floor=1, n_bootstrap=8),
+    )
+    evaluation = torch.randn(64, S, D)
+    batched = evaluate_rd(model, codec, list(evaluation.split(16)), row_len=1)
+    singleton = evaluate_rd(model, codec, list(evaluation.split(1)), row_len=1)
+    assert batched == singleton
+
+
 def test_grouped_coordinate_quantiles_are_bitwise_exact_and_bounded():
     generator = torch.Generator().manual_seed(1900)
     counts = torch.tensor((3, 11, 2, 19, 5, 7), dtype=torch.long)

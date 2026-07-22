@@ -1684,10 +1684,6 @@ def _evaluate_rd_stream(
         # Non-operational support-rate sensitivities, per token.  The exact
         # fixed-width packet rate is assembled below from count and ID widths.
         if codec.n_included:
-            counts_host = counts.cpu()
-            sup_bits = -codec.log2_count_prob(counts_host).double() + _log2_binom(
-                codec.n_included, counts_host
-            )
             act_p = (
                 (codec._tensor_on("bernoulli_log2p", device) * mask.float())
                 .sum(dim=1)
@@ -1698,10 +1694,9 @@ def _evaluate_rd_stream(
                 .sum(dim=1)
                 .double()
             )
-            bern_bits = -(act_p.cpu() + (log2_1mq_total - act_q.cpu()))
         else:
-            sup_bits = torch.zeros(x.shape[0], dtype=torch.float64)
-            bern_bits = torch.zeros(x.shape[0], dtype=torch.float64)
+            act_p = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
+            act_q = torch.zeros_like(act_p)
 
         packet_events = _packet_events_from_output(model, codec, out)
         del out, raw_mask, mask
@@ -1716,7 +1711,7 @@ def _evaluate_rd_stream(
         )
         if observer is not None:
             observer.begin_batch(batch)
-        err_site = {}
+        err_site_device = {}
         for decoded_chunk in _decode_trusted_packet_events_q_chunks(
             model,
             codec,
@@ -1728,11 +1723,54 @@ def _evaluate_rd_stream(
             for q, xhat in decoded_chunk.items():
                 # Distortion uses the exact integer packet a saved artifact
                 # will decode. Only redundant validation is elided here.
-                err_site[q] = (x - xhat).double().pow(2).sum(dim=2).cpu()  # [n, S]
+                err_site_device[q] = (x - xhat).double().pow(2).sum(dim=2)
             if observer is not None:
                 observer.consume_decoded_chunk(batch, decoded_chunk)
             del xhat, decoded_chunk
-        tot_site = (x - mu).double().pow(2).sum(dim=2).cpu()  # [n, S]
+        tot_site_device = (x - mu).double().pow(2).sum(dim=2)
+
+        # Queue every q/raw consumer before the one blocking D2H transfer. The
+        # packed fp64 matrix preserves each existing reduction and transfers
+        # counts exactly while collapsing Q+4 synchronization points to one.
+        metric_host = torch.cat(
+            (
+                counts.double().unsqueeze(1),
+                act_p.unsqueeze(1),
+                act_q.unsqueeze(1),
+                *(err_site_device[q] for q in spec.qs),
+                tot_site_device,
+            ),
+            dim=1,
+        ).cpu()
+        counts_host = metric_host[:, 0].to(torch.int64)
+        if codec.n_included:
+            sup_bits = -codec.log2_count_prob(counts_host).double() + _log2_binom(
+                codec.n_included, counts_host
+            )
+            bern_bits = -(metric_host[:, 1] + (log2_1mq_total - metric_host[:, 2]))
+        else:
+            sup_bits = torch.zeros(x.shape[0], dtype=torch.float64)
+            bern_bits = torch.zeros(x.shape[0], dtype=torch.float64)
+        metric_offset = 3
+        err_site = {}
+        for q in spec.qs:
+            err_site[q] = metric_host[:, metric_offset : metric_offset + S]
+            metric_offset += S
+        tot_site = metric_host[:, metric_offset : metric_offset + S]
+
+        if sequence_mode == "fixed_length_fallback" and row_len == 1:
+            for q in spec.qs:
+                rows_err[q].extend(err_site[q].sum(dim=1).tolist())
+                rows_err_site[q].extend(err_site[q].unbind(dim=0))
+            rows_tot.extend(tot_site.sum(dim=1).tolist())
+            rows_tot_site.extend(tot_site.unbind(dim=0))
+            rows_bits_sup.extend(sup_bits.tolist())
+            rows_bits_bern.extend(bern_bits.tolist())
+            rows_counts.extend(counts_host.tolist())
+            rows_n.extend([1] * x.shape[0])
+            if observer is not None:
+                observer.end_batch(batch)
+            continue
 
         # Assemble exact stored sequences (or the labelled synthetic fallback).
         unique_sequences, run_counts = torch.unique_consecutive(
@@ -1759,7 +1797,7 @@ def _evaluate_rd_stream(
             pend["tot"] += tot_site[sl].sum(dim=0)
             pend["sup"] += float(sup_bits[sl].sum())
             pend["bern"] += float(bern_bits[sl].sum())
-            pend["cnt"] += float(counts[sl].sum())
+            pend["cnt"] += float(counts_host[sl].sum())
             pend["n"] += run_count
             start += run_count
         if observer is not None:
