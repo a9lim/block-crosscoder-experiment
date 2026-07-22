@@ -4954,13 +4954,15 @@ def _mapped_support_confusion_counts(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map learned groups to factors and return exact device-resident counts."""
 
-    active_events = block_mask.nonzero(as_tuple=False)
-    predicted = torch.zeros_like(truth_active)
-    if len(active_events):
-        predicted[
-            active_events[:, 0],
-            group_to_factor[active_events[:, 1]],
-        ] = True
+    predicted_uint8 = torch.zeros_like(truth_active, dtype=torch.uint8)
+    predicted_uint8.scatter_reduce_(
+        1,
+        group_to_factor.unsqueeze(0).expand_as(block_mask),
+        block_mask.to(torch.uint8),
+        reduce="amax",
+        include_self=False,
+    )
+    predicted = predicted_uint8.bool()
     totals = torch.stack(
         (
             (predicted & truth_active).sum(),
