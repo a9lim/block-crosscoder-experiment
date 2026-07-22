@@ -40,6 +40,8 @@ from .runtime_limits import (
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
     TRUSTED_DECODE_Q_CHUNK,
@@ -593,6 +595,7 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "implementation.decoder_retraction_implementation",
         "implementation.factorized_execution_implementation",
         "implementation.isolated_loss_decrease_implementation",
+        "implementation.map_nuclear_implementation",
         "implementation.sparse_decode_implementation",
         "qualification.profile",
         "qualification.phase1_identification_thresholds",
@@ -4031,6 +4034,18 @@ def _resolved_sparse_decode_implementation(
     return declared
 
 
+def _resolved_map_nuclear_implementation(
+    values: Mapping[str, DecisionValue],
+) -> str:
+    declared = str(values["implementation.map_nuclear_implementation"])
+    if declared not in {
+        MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+        MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    }:
+        raise StudyError("unknown map-nuclear implementation identity")
+    return declared
+
+
 def _derived_decoder_retraction_implementation(
     values: Mapping[str, DecisionValue],
 ) -> str:
@@ -4152,6 +4167,24 @@ def _bind_derived_score_implementations(
                 rationale=(
                     "use the bounded native-or-rank sparse CUDA decoder for "
                     "eligible hard-TopK batches and dense decode otherwise"
+                ),
+            ),
+        ),
+    )
+    filtered_map_nuclear = tuple(
+        decision
+        for decision in bound
+        if decision.name != "implementation.map_nuclear_implementation"
+    )
+    bound = merge_decisions(
+        filtered_map_nuclear,
+        (
+            engineering(
+                "implementation.map_nuclear_implementation",
+                MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+                rationale=(
+                    "form full unfactorized map-nuclear block Grams by batched "
+                    "matmul and a bounded fp32 site reduction"
                 ),
             ),
         ),
@@ -4340,6 +4373,7 @@ def _estimate_components(
     )
     _resolved_factorized_execution_implementation(values)
     _resolved_sparse_decode_implementation(values)
+    _resolved_map_nuclear_implementation(values)
     # Adam state, fp32 masters/gradients, optional bf16 forward copies, and
     # conservative temporary tensors.  The dense score/code workspaces are
     # counted independently so BatchTopK pool size cannot disappear from the

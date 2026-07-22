@@ -1005,6 +1005,24 @@ nuclear rank one `7.214` to `3.938 ms` (`1.832x`, `311.9 MiB` lower), and
 decoder rank two `8.227` to `6.993 ms` (`1.176x`, `71.0 MiB` lower). Estimator
 v14 retains its conservative materialization allowance.
 
+The full unfactorized map-nuclear carrier separately serializes
+`batched_site_gram_reference_guard_d1e-3_e1e-4_v1`: it forms each site's fp32
+block Gram with batched matmul and then reduces the site axis, instead of
+contracting sites inside one einsum. The whole call falls back to the old
+`site_reduced_einsum_reference_v1` unless every decoder Cholesky diagonal
+ratio exceeds `1e-3` and every transformed-map spectral ratio exceeds `1e-4`.
+This preserves exact rank-deficient-encoder behavior and near-singular-decoder
+refusal rather than loosening either scientific contract. Fast-path fp32/bf16
+value relative drift is at most `2e-6`; decoder/encoder gradient relative L2
+drift is at most `1e-4` in fp32 and `5e-4` in bf16. Fallback tensors and errors
+must match the reference exactly. The 25-step bf16 trajectory gate requires
+loss drift at most `1e-5`, support IoU at least `.995`, model relative L2 drift
+at most `2e-3`, and optimizer relative L2 drift at most `1e-5`; exact resume
+under the selected identity is bitwise. On jobe at four width-768 sites,
+2,048 groups, and block width four, complete regularizer forward/backward
+including both guards falls from `7.200` to `4.353 ms` (`39.5%`) and
+incremental peak allocation falls by `384 MiB`.
+
 Frozen threshold fitting also stays in the direct rank carrier instead of
 materializing full encoder and decoder site tensors. On eight canonical
 4,096-token calibration batches, the streaming pass falls from `17.747` to

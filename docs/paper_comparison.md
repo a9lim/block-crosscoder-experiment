@@ -425,6 +425,12 @@ codec bind this identity. The physical encoder and decoder cores are contiguous
 in their respective GEMM orders; stale v1/v2 layouts refuse rather than
 migrate. Its low-density bf16 hard-TopK CUDA decoder is a bounded engineering
 specialization, not a change to the factorization hypothesis.
+Full unfactorized map-nuclear cells bind the separate
+`batched_site_gram_reference_guard_d1e-3_e1e-4_v1` engineering identity. It
+changes only the fp32 site-summation schedule of the same SASA objective and
+falls back wholesale around low-rank or ill-conditioned boundaries; the
+former site-reduced einsum remains its oracle rather than a scientific
+comparator.
 Estimator v14 conservatively retains the prior operational compute and
 workspace price.
 

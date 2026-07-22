@@ -24,6 +24,7 @@ from block_crosscoder_experiment.runtime_limits import (
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     TRUSTED_DECODE_Q_CHUNK,
 )
@@ -1200,6 +1201,9 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
                 assert cell.decision_map[
                     "implementation.sparse_decode_implementation"
                 ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
+                assert cell.decision_map[
+                    "implementation.map_nuclear_implementation"
+                ] == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
                 validate_cell_config(cell)
         return plan
 
@@ -1656,6 +1660,9 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
         assert cell.decision_map[
             "implementation.sparse_decode_implementation"
         ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
+        assert cell.decision_map[
+            "implementation.map_nuclear_implementation"
+        ] == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
 
     blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
     plan = build_phase1_plan(seeds=(0,), smoke=True)

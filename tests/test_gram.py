@@ -23,6 +23,8 @@ from block_crosscoder_experiment.gram import (
 )
 from block_crosscoder_experiment.runtime_limits import (
     CHOLESKY_QR_GRAM_CONDITION_MAX,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
 )
 
 S, G, B_DIM, D_MODEL = 4, 16, 4, 32
@@ -407,6 +409,196 @@ def test_map_nuclear_accepts_rank_deficient_encoder(device):
         ebar = E[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
         explicit.append(torch.linalg.svdvals(dbar.T @ ebar).sum() / B_DIM)
     assert torch.allclose(actual, torch.stack(explicit).mean(), atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("sites", (1, 4, 6))
+def test_guarded_map_nuclear_fast_path_has_bounded_reference_value_and_gradients(
+    dtype,
+    sites,
+):
+    generator = torch.Generator(device="cuda").manual_seed(5250 + sites)
+    values = [
+        torch.randn(
+            sites,
+            127,
+            4,
+            96,
+            generator=generator,
+            device="cuda",
+            dtype=dtype,
+        )
+        .mul_(0.1)
+        .requires_grad_()
+        for _ in range(2)
+    ]
+    oracle_values = [value.detach().clone().requires_grad_() for value in values]
+    actual = map_nuclear_penalty(
+        *values,
+        implementation=MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    )
+    expected = map_nuclear_penalty(
+        *oracle_values,
+        implementation=MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    )
+    value_drift = (
+        (actual - expected).detach().float().abs()
+        / expected.detach().float().abs()
+    )
+    assert float(value_drift) <= 2e-6
+    actual_gradients = torch.autograd.grad(actual, values)
+    expected_gradients = torch.autograd.grad(expected, oracle_values)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        difference = (actual_gradient.float() - expected_gradient.float()).norm()
+        scale = expected_gradient.float().norm().clamp_min(1e-30)
+        gradient_limit = 1e-4 if dtype == torch.float32 else 5e-4
+        assert float(difference / scale) <= gradient_limit
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_guarded_map_nuclear_low_rank_fallback_is_reference_exact(dtype):
+    generator = torch.Generator(device="cuda").manual_seed(5258)
+    decoder = torch.randn(
+        4,
+        31,
+        4,
+        32,
+        generator=generator,
+        device="cuda",
+        dtype=dtype,
+    ).mul_(0.1)
+    encoder = torch.zeros_like(decoder)
+    encoder[:, :, 0] = torch.randn(
+        4,
+        31,
+        32,
+        generator=generator,
+        device="cuda",
+        dtype=dtype,
+    ).mul_(0.1)
+    actual_inputs = [value.requires_grad_() for value in (decoder, encoder)]
+    reference_inputs = [
+        value.detach().clone().requires_grad_() for value in actual_inputs
+    ]
+    actual = map_nuclear_penalty(
+        *actual_inputs,
+        implementation=MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    )
+    expected = map_nuclear_penalty(
+        *reference_inputs,
+        implementation=MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    )
+    actual_gradients = torch.autograd.grad(actual, actual_inputs)
+    expected_gradients = torch.autograd.grad(expected, reference_inputs)
+    assert torch.equal(actual, expected)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        assert torch.equal(actual_gradient, expected_gradient)
+
+
+def test_guarded_map_nuclear_healthy_carrier_does_not_call_reference(
+    monkeypatch,
+    device,
+):
+    decoder = init_decoder_stack(S, G, B_DIM, D_MODEL, device=device)
+    encoder = random_stack(device, seed=5259, scale=0.1)
+
+    def refuse_reference(*args, **kwargs):
+        raise AssertionError("healthy guarded map-nuclear carrier used reference")
+
+    monkeypatch.setattr(gram_module.torch, "einsum", refuse_reference)
+    result = map_nuclear_penalty(
+        decoder,
+        encoder,
+        implementation=MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    )
+    assert torch.isfinite(result)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_guarded_map_nuclear_near_singular_decoder_matches_reference_outcome(dtype):
+    generator = torch.Generator(device="cuda").manual_seed(5262)
+    decoder = torch.randn(
+        4,
+        31,
+        4,
+        32,
+        generator=generator,
+        device="cuda",
+        dtype=dtype,
+    ).mul_(0.1)
+    decoder[:, :, 3] = decoder[:, :, 0] + torch.randn(
+        4,
+        31,
+        32,
+        generator=generator,
+        device="cuda",
+        dtype=dtype,
+    ).mul_(1e-5)
+    encoder = torch.randn_like(decoder)
+
+    def evaluate(implementation):
+        inputs = [
+            value.detach().clone().requires_grad_() for value in (decoder, encoder)
+        ]
+        try:
+            value = map_nuclear_penalty(*inputs, implementation=implementation)
+        except ValueError as exc:
+            return exc, None, None
+        return None, value, torch.autograd.grad(value, inputs)
+
+    actual_error, actual, actual_gradients = evaluate(
+        MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+    )
+    expected_error, expected, expected_gradients = evaluate(
+        MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION
+    )
+    assert (actual_error is None) == (expected_error is None)
+    if expected_error is not None:
+        assert str(actual_error) == str(expected_error)
+    else:
+        assert torch.equal(actual, expected)
+        for actual_gradient, expected_gradient in zip(
+            actual_gradients,
+            expected_gradients,
+            strict=True,
+        ):
+            assert torch.equal(actual_gradient, expected_gradient)
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    (
+        MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+        MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    ),
+)
+def test_map_nuclear_implementation_retains_rank_deficient_decoder_refusal(
+    device,
+    implementation,
+):
+    decoder = random_stack(device, seed=5260)
+    decoder[:, :, 1:] = 0.0
+    encoder = random_stack(device, seed=5261)
+    with pytest.raises(
+        ValueError,
+        match="requires full-row-rank decoder blocks",
+    ):
+        map_nuclear_penalty(
+            decoder,
+            encoder,
+            implementation=implementation,
+        )
 
 
 @pytest.mark.parametrize("site_rank", (1, 2))

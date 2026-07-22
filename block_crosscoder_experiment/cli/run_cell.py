@@ -86,6 +86,8 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
@@ -2624,6 +2626,14 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
     }:
         raise CellExecutionError("unknown sparse-decode implementation identity")
+    map_nuclear_implementation = str(
+        values["implementation.map_nuclear_implementation"]
+    )
+    if map_nuclear_implementation not in {
+        MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+        MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    }:
+        raise CellExecutionError("unknown map-nuclear implementation identity")
     known_factorized_implementations = {
         FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
         FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
@@ -2755,6 +2765,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
         decoder_retraction_implementation=decoder_retraction_implementation,
         factorized_execution_implementation=factorized_execution_implementation,
         sparse_decode_implementation=sparse_decode_implementation,
+        map_nuclear_implementation=map_nuclear_implementation,
         selector_tie_break=str(values["model.selector_tie_break"]),
         site_rank=site_rank,
         decoder_norm_geometry=str(values["model.decoder_norm_geometry"]),

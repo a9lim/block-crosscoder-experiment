@@ -20,6 +20,8 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
 )
 from block_crosscoder_experiment.trainer import (
     DeadTracker,
@@ -2315,6 +2317,122 @@ def test_fused_cuda_optimizer_bounds_scalar_trajectory_and_support():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_guarded_map_nuclear_bounds_trajectory_and_resumes_exactly(tmp_path):
+    common = dict(
+        n_blocks=64,
+        block_dim=4,
+        n_sites=4,
+        d_model=64,
+        k=4,
+        seed=5270,
+        selection="token_topk",
+        encoder_mode="untied",
+        decoder_constraint="qr",
+        regularizer="map_nuclear",
+        lambda_regularizer=0.03,
+    )
+    optimized_cfg = BSCConfig(
+        **common,
+        map_nuclear_implementation=MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    )
+    reference_cfg = BSCConfig(
+        **common,
+        map_nuclear_implementation=MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    )
+    training = train_cfg(
+        total_steps=25,
+        lr=3e-4,
+        warmup_steps=1,
+        forward_dtype="bf16",
+        fused=True,
+        retract_every=1,
+        log_every=1,
+    )
+    generator = torch.Generator().manual_seed(5271)
+    batches = list(
+        torch.randn(25 * 256, 4, 64, generator=generator).to("cuda").split(256)
+    )
+
+    def run(
+        trainer: Trainer,
+        step_batches: list[torch.Tensor],
+    ) -> tuple[list[dict], list[torch.Tensor]]:
+        records = []
+        supports = []
+        for batch in step_batches:
+            record = trainer.step(batch)
+            assert record is not None
+            records.append(record)
+            with torch.no_grad():
+                supports.append(trainer.fwd(batch.to(torch.bfloat16)).mask.cpu())
+        return records, supports
+
+    optimized = Trainer(BlockCrosscoder(optimized_cfg).to("cuda"), training)
+    optimized_records, optimized_supports = run(optimized, batches)
+
+    resumable = Trainer(BlockCrosscoder(optimized_cfg).to("cuda"), training)
+    resumed_records, resumed_supports = run(resumable, batches[:12])
+    checkpoint = tmp_path / "map-nuclear-matmul.pt"
+    resumable.save_checkpoint(checkpoint)
+    resumed = Trainer.load_checkpoint(checkpoint, device="cuda")
+    tail_records, tail_supports = run(resumed, batches[12:])
+    resumed_records.extend(tail_records)
+    resumed_supports.extend(tail_supports)
+    _assert_nested_exact(resumed_records, optimized_records)
+    _assert_nested_exact(resumed_supports, optimized_supports)
+    _assert_nested_exact(resumed.master.state_dict(), optimized.master.state_dict())
+    _assert_nested_exact(resumed.opt.state_dict(), optimized.opt.state_dict())
+
+    reference = Trainer(BlockCrosscoder(reference_cfg).to("cuda"), training)
+    reference_records, reference_supports = run(reference, batches)
+    maximum_loss_drift = max(
+        abs(actual["total"] - expected["total"])
+        / max(abs(expected["total"]), 1e-30)
+        for actual, expected in zip(
+            optimized_records,
+            reference_records,
+            strict=True,
+        )
+    )
+    maximum_regularizer_drift = max(
+        abs(actual["regularizer"] - expected["regularizer"])
+        / max(abs(expected["regularizer"]), 1e-30)
+        for actual, expected in zip(
+            optimized_records,
+            reference_records,
+            strict=True,
+        )
+    )
+    intersections = sum(
+        int((actual & expected).sum())
+        for actual, expected in zip(
+            optimized_supports,
+            reference_supports,
+            strict=True,
+        )
+    )
+    unions = sum(
+        int((actual | expected).sum())
+        for actual, expected in zip(
+            optimized_supports,
+            reference_supports,
+            strict=True,
+        )
+    )
+    assert maximum_loss_drift <= 1e-5
+    assert maximum_regularizer_drift <= 2e-5
+    assert intersections / max(unions, 1) >= 0.995
+    assert _nested_relative_l2(
+        optimized.master.state_dict(),
+        reference.master.state_dict(),
+    ) <= 2e-3
+    assert _nested_relative_l2(
+        optimized.opt.state_dict()["state"],
+        reference.opt.state_dict()["state"],
+    ) <= 1e-5
+
+
 def _fast_decoded_energy_cfg() -> BSCConfig:
     return BSCConfig(
         n_blocks=12,
@@ -2441,6 +2559,13 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     with pytest.raises(ValueError, match="lacks sparse_decode_implementation"):
         Trainer.load_checkpoint(missing_sparse_path, device=device)
 
+    missing_map_nuclear = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    missing_map_nuclear["model_cfg"].pop("map_nuclear_implementation")
+    missing_map_nuclear_path = tmp_path / "missing-map-nuclear-id.pt"
+    torch.save(missing_map_nuclear, missing_map_nuclear_path)
+    with pytest.raises(ValueError, match="lacks map_nuclear_implementation"):
+        Trainer.load_checkpoint(missing_map_nuclear_path, device=device)
+
     forged = {**payload, "model_cfg": dict(payload["model_cfg"])}
     forged["model_cfg"]["decoded_energy_implementation"] = (
         DECODED_ENERGY_EXACT_IMPLEMENTATION
@@ -2449,6 +2574,15 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     torch.save(forged, forged_path)
     with pytest.raises(ValueError, match="run binding mismatch"):
         Trainer.load_checkpoint(forged_path, device=device)
+
+    forged_map_nuclear = {**payload, "model_cfg": dict(payload["model_cfg"])}
+    forged_map_nuclear["model_cfg"]["map_nuclear_implementation"] = (
+        MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION
+    )
+    forged_map_nuclear_path = tmp_path / "forged-map-nuclear-id.pt"
+    torch.save(forged_map_nuclear, forged_map_nuclear_path)
+    with pytest.raises(ValueError, match="run binding mismatch"):
+        Trainer.load_checkpoint(forged_map_nuclear_path, device=device)
 
 
 def test_factor_regularizer_checkpoint_refuses_stale_v3_identity(device, tmp_path):

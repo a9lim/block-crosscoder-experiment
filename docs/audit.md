@@ -196,6 +196,11 @@ exit is not evidence by itself.
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
   use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v14
   remains conservative and grants no runtime credit for this optimization.
+  Unfactorized map-nuclear cells additionally bind
+  `batched_site_gram_reference_guard_d1e-3_e1e-4_v1`; the old site-reducing
+  einsum is the mandatory whole-call fallback and explicit oracle. Its
+  value/gradient, rank-deficient, near-singular refusal, branch, trajectory,
+  checkpoint, and exact-resume gates use the fixed bounds in `design.md`.
   Every carrier also serializes
   `native_or_rank_hard_topk_cuda_else_dense_v1` or the explicit
   `dense_reference_v1` sparse-decode oracle. The CUDA identity may consume

@@ -74,6 +74,7 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
 )
 from block_crosscoder_experiment.store import ShardWriter, StoreReader
@@ -666,6 +667,10 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         checkpoint_payload["model_cfg"]["sparse_decode_implementation"]
         == SPARSE_DECODE_CUDA_IMPLEMENTATION
     )
+    assert (
+        checkpoint_payload["model_cfg"]["map_nuclear_implementation"]
+        == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+    )
     mismatched_checkpoint = copy.deepcopy(checkpoint_payload)
     mismatched_checkpoint["model_cfg"]["decoded_energy_implementation"] = (
         DECODED_ENERGY_EXACT_IMPLEMENTATION
@@ -724,6 +729,22 @@ def test_deployable_codec_is_the_complete_validated_consumer_artifact(
         _validate_final_checkpoint(
             missing_sparse_path,
             missing_sparse_identity["run_binding"],
+        )
+
+    missing_map_nuclear_identity = copy.deepcopy(checkpoint_payload)
+    missing_map_nuclear_identity["model_cfg"].pop("map_nuclear_implementation")
+    missing_map_nuclear_identity["run_binding"]["model_cfg"].pop(
+        "map_nuclear_implementation"
+    )
+    missing_map_nuclear_path = tmp_path / "missing-map-nuclear-identity.pt"
+    torch.save(missing_map_nuclear_identity, missing_map_nuclear_path)
+    with pytest.raises(
+        CellExecutionError,
+        match="lacks map_nuclear_implementation",
+    ):
+        _validate_final_checkpoint(
+            missing_map_nuclear_path,
+            missing_map_nuclear_identity["run_binding"],
         )
 
     forged_optimizer = copy.deepcopy(checkpoint_payload)

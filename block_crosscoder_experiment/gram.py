@@ -28,6 +28,10 @@ from .runtime_limits import (
     CHOLESKY_QR_GRAM_CONDITION_MAX,
     CHOLESKY_QR_POST_GRAM_RESIDUAL_MAX,
     CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX,
+    MAP_NUCLEAR_DECODER_CHOLESKY_DIAGONAL_RATIO_MIN,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    MAP_NUCLEAR_SPECTRUM_RATIO_MIN,
 )
 
 # Safe batch count for cusolver's batched symmetric eigensolvers
@@ -458,7 +462,11 @@ def _map_nuclear_from_grams(
 
 
 def map_nuclear_penalty(
-    D: torch.Tensor, E: torch.Tensor, *, eps: float = 1e-8
+    D: torch.Tensor,
+    E: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    implementation: str = MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
 ) -> torch.Tensor:
     """SASA end-to-end map nuclear penalty for concatenated site maps.
 
@@ -475,8 +483,60 @@ def map_nuclear_penalty(
             f"D and E must have identical shape, got {D.shape} and {E.shape}"
         )
     Df, Ef = D.float(), E.float()
-    md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
-    me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+    if implementation == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION:
+        md = torch.matmul(Df, Df.transpose(-1, -2)).sum(dim=0)
+        me = torch.matmul(Ef, Ef.transpose(-1, -2)).sum(dim=0)
+        if eps < 0:
+            raise ValueError("eps must be nonnegative")
+        ld, info_d = torch.linalg.cholesky_ex(md)
+        diagonal = ld.diagonal(dim1=-2, dim2=-1)
+        diagonal_scale = diagonal.abs().amax(dim=-1)
+        decoder_safe = (
+            (info_d == 0)
+            & torch.isfinite(diagonal).all(dim=-1)
+            & (
+                diagonal.abs().amin(dim=-1)
+                / diagonal_scale.clamp_min(torch.finfo(diagonal.dtype).tiny)
+                > MAP_NUCLEAR_DECODER_CHOLESKY_DIAGONAL_RATIO_MIN
+            )
+        )
+        if bool((~decoder_safe).any()):
+            reference_md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
+            reference_me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+            return _map_nuclear_from_grams(
+                reference_md,
+                reference_me,
+                block_dim=E.shape[2],
+                eps=eps,
+            )
+        squared_singular_values = torch.linalg.eigvalsh(
+            ld.transpose(-1, -2) @ me @ ld
+        )
+        spectral_max = squared_singular_values.amax(dim=-1)
+        spectral_safe = (
+            torch.isfinite(squared_singular_values).all(dim=-1)
+            & (spectral_max > 0)
+            & (
+                squared_singular_values.amin(dim=-1) / spectral_max
+                > MAP_NUCLEAR_SPECTRUM_RATIO_MIN
+            )
+        )
+        if bool((~spectral_safe).any()):
+            reference_md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
+            reference_me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+            return _map_nuclear_from_grams(
+                reference_md,
+                reference_me,
+                block_dim=E.shape[2],
+                eps=eps,
+            )
+        terms = (squared_singular_values.clamp_min(0.0) + eps).sqrt()
+        return (terms.sum(dim=-1) / E.shape[2]).mean()
+    elif implementation == MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION:
+        md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
+        me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+    else:
+        raise ValueError("unknown map nuclear implementation")
     return _map_nuclear_from_grams(md, me, block_dim=E.shape[2], eps=eps)
 
 

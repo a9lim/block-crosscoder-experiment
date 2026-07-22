@@ -84,6 +84,21 @@ SPARSE_DECODE_IMPLEMENTATIONS = (
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
 )
 
+# The full unfactorized SASA map objective can form each site's small block
+# Gram and then reduce sites, instead of asking einsum to contract the site
+# axis in the same kernel.  The matmul schedule changes fp32 summation order,
+# so it is serialized independently from the scientific regularizer name.
+MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION = (
+    "batched_site_gram_reference_guard_d1e-3_e1e-4_v1"
+)
+MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION = "site_reduced_einsum_reference_v1"
+MAP_NUCLEAR_IMPLEMENTATIONS = (
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
+)
+MAP_NUCLEAR_DECODER_CHOLESKY_DIAGONAL_RATIO_MIN = 1.0e-3
+MAP_NUCLEAR_SPECTRUM_RATIO_MIN = 1.0e-4
+
 # The custom CUDA decoder wins only while hard selection retains at most one
 # block in this many.  The gate is shape-derived and therefore introduces no
 # device synchronization or data-dependent algorithm switch.
@@ -104,6 +119,7 @@ MODEL_IMPLEMENTATION_IDENTITY_FIELDS = (
     "decoder_retraction_implementation",
     "factorized_execution_implementation",
     "sparse_decode_implementation",
+    "map_nuclear_implementation",
 )
 
 

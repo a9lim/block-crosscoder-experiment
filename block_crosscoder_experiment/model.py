@@ -59,6 +59,8 @@ from .runtime_limits import (
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_IMPLEMENTATIONS,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    MAP_NUCLEAR_IMPLEMENTATIONS,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_IMPLEMENTATIONS,
     decoded_energy_code_norm_eligible,
@@ -310,6 +312,7 @@ class BSCConfig:
     # oracle, never an ambient device-dependent fallback.
     factorized_execution_implementation: str | None = None
     sparse_decode_implementation: str = SPARSE_DECODE_CUDA_IMPLEMENTATION
+    map_nuclear_implementation: str = MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
 
     def __post_init__(self) -> None:
         if self.selection not in {"batch_topk", "token_topk", "threshold", "dense"}:
@@ -572,6 +575,8 @@ class BSCConfig:
             raise ValueError("unknown factorized_execution_implementation")
         if self.sparse_decode_implementation not in SPARSE_DECODE_IMPLEMENTATIONS:
             raise ValueError("unknown sparse_decode_implementation")
+        if self.map_nuclear_implementation not in MAP_NUCLEAR_IMPLEMENTATIONS:
+            raise ValueError("unknown map_nuclear_implementation")
         if self.site_rank is None:
             if (
                 self.factorized_execution_implementation
@@ -2773,7 +2778,12 @@ def bsc_loss(
             else:
                 D = model.decoder_tensor() if decoder is None else decoder
                 E = model.encoder_tensor() if encoder is None else encoder
-                reg = map_nuclear_penalty(D, E, eps=cfg.sv_eps)
+                reg = map_nuclear_penalty(
+                    D,
+                    E,
+                    eps=cfg.sv_eps,
+                    implementation=cfg.map_nuclear_implementation,
+                )
             if cfg.map_nuclear_reduction == "sum_blocks":
                 reg = reg * cfg.n_blocks * cfg.block_dim
         elif cfg.regularizer == "decoder_nuclear":
