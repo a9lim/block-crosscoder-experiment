@@ -33,6 +33,8 @@ from .gram import (
     _qr_retract_count_tensor_,
     _retract_count_tensor_,
     decoder_nuclear_penalty,
+    factorized_decoder_nuclear_penalty,
+    factorized_map_nuclear_penalty,
     gram_residual,
     init_decoder_stack,
     map_nuclear_penalty,
@@ -49,6 +51,7 @@ from .runtime_limits import (
     DECODED_ENERGY_POSTCAST_GRAM_RESIDUAL_MAX,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR,
     FACTORIZED_CUDA_SPARSE_DECODE_MIN_BATCH,
     FACTORIZED_EXECUTION_IMPLEMENTATIONS,
@@ -552,7 +555,12 @@ class BSCConfig:
             self.factorized_execution_implementation = (
                 FACTORIZED_EXECUTION_NOT_APPLICABLE
                 if self.site_rank is None
-                else FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+                else (
+                    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+                    if self.site_rank in {1, 2}
+                    and self.regularizer in {"map_nuclear", "decoder_nuclear"}
+                    else FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+                )
             )
         if (
             self.factorized_execution_implementation
@@ -596,6 +604,28 @@ class BSCConfig:
             if self.encoder_constraint != "none":
                 raise ValueError(
                     "site-axis factorization requires encoder_constraint='none'"
+                )
+            factor_regularizer_eligible = (
+                self.site_rank in {1, 2}
+                and self.regularizer in {"map_nuclear", "decoder_nuclear"}
+            )
+            if (
+                self.factorized_execution_implementation
+                == FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+                and not factor_regularizer_eligible
+            ):
+                raise ValueError(
+                    "factor-regularizer execution requires site rank 1/2 and "
+                    "map_nuclear or decoder_nuclear"
+                )
+            if (
+                self.factorized_execution_implementation
+                == FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+                and factor_regularizer_eligible
+            ):
+                raise ValueError(
+                    "rank-1/2 factorized nuclear regularization requires the v4 "
+                    "factor-regularizer execution identity"
                 )
         if (
             self.decoded_energy_implementation
@@ -1049,7 +1079,17 @@ class BlockCrosscoder(nn.Module):
         return (
             self.cfg.site_rank is not None
             and self.cfg.factorized_execution_implementation
-            == FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            in {
+                FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+                FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+            }
+        )
+
+    @property
+    def uses_factorized_nuclear_regularizers(self) -> bool:
+        return (
+            self.cfg.factorized_execution_implementation
+            == FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
         )
 
     @property
@@ -1180,12 +1220,13 @@ class BlockCrosscoder(nn.Module):
             self.D_core.dtype
         ).unsqueeze(0)
 
-    def _encoder_factor_core_tensor(self) -> torch.Tensor:
+    def _encoder_factor_core_tensor(self, *, masked: bool = False) -> torch.Tensor:
         """Logical ``[R,G,b,d]`` adapter for explicit materialization."""
 
         cfg = self.cfg
         assert cfg.site_rank is not None and self.E_core is not None
-        return self.E_core.view(
+        core = self._encoder_factor_core_map() if masked else self.E_core
+        return core.view(
             cfg.site_rank,
             cfg.d_model,
             cfg.n_blocks,
@@ -2645,14 +2686,44 @@ def bsc_loss(
     parts: dict[str, torch.Tensor] = {"rec": l_rec}
     if cfg.lambda_regularizer > 0 and cfg.regularizer != "none":
         if cfg.regularizer == "map_nuclear":
-            D = model.decoder_tensor() if decoder is None else decoder
-            E = model.encoder_tensor() if encoder is None else encoder
-            reg = map_nuclear_penalty(D, E, eps=cfg.sv_eps)
+            factor_kernel = (
+                decoder is None
+                and encoder is None
+                and model.uses_factorized_nuclear_regularizers
+                and model.D_core is not None
+                and model.E_core is not None
+            )
+            if factor_kernel:
+                assert model.D_site is not None and model.E_site is not None
+                reg = factorized_map_nuclear_penalty(
+                    model.D_site,
+                    model._decoder_factor_core_tensor(masked=True),
+                    model.E_site,
+                    model._encoder_factor_core_tensor(masked=True),
+                    eps=cfg.sv_eps,
+                )
+            else:
+                D = model.decoder_tensor() if decoder is None else decoder
+                E = model.encoder_tensor() if encoder is None else encoder
+                reg = map_nuclear_penalty(D, E, eps=cfg.sv_eps)
             if cfg.map_nuclear_reduction == "sum_blocks":
                 reg = reg * cfg.n_blocks * cfg.block_dim
         elif cfg.regularizer == "decoder_nuclear":
-            D = model.decoder_tensor() if decoder is None else decoder
-            reg = decoder_nuclear_penalty(D, eps=cfg.sv_eps)
+            factor_kernel = (
+                decoder is None
+                and model.uses_factorized_nuclear_regularizers
+                and model.D_core is not None
+            )
+            if factor_kernel:
+                assert model.D_site is not None
+                reg = factorized_decoder_nuclear_penalty(
+                    model.D_site,
+                    model._decoder_factor_core_tensor(masked=True),
+                    eps=cfg.sv_eps,
+                )
+            else:
+                D = model.decoder_tensor() if decoder is None else decoder
+                reg = decoder_nuclear_penalty(D, eps=cfg.sv_eps)
         elif cfg.regularizer == "crosscoder_l1":
             D = model.decoder_tensor() if decoder is None else decoder
             # Anthropic's sitewise decoder-norm-weighted activation L1.

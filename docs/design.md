@@ -647,6 +647,14 @@ eigenvalues do not create undefined eigenvector gradients. Decoder-only
 nuclear norm is globally schema-forced nonpromotable: it is inspected
 release-drift evidence, not SASA's paper objective.
 
+For rank-one and rank-two site-factorized cells, the same objectives operate
+directly on factor Grams. If `D[s]=sum_r A_D[s,r] C_D[r]`, the decoder row Gram
+is `sum_rt (A_D.T A_D)[r,t] C_D[r] C_D[t].T`; the encoder and per-site decoder
+Grams use the analogous contraction. This is the identical real-arithmetic
+map or decoder nuclear norm without a rounded full bf16 site tensor. It is
+serialized separately because casting the factors before contraction changes
+bf16 reduction order.
+
 Every adaptive main-chain Phase-2 selected-parent or revisit policy carries
 frozen sharing guards. Root-anchor policies are deliberately ungated baselines:
 the first sharing admission occurs at the first adaptive main-chain selection,
@@ -867,9 +875,11 @@ direct-rank lifetime.
 
 Every cell serializes `factorized_execution_implementation`. Unfactorized
 carriers derive `not_applicable_v1`; site-rank carriers derive
-`direct_rank_space_sparse_topk_cuda_v3`. The explicit
+`direct_rank_space_sparse_topk_cuda_v3`, except rank-one/two map- and
+decoder-nuclear cells, which derive
+`direct_rank_space_sparse_topk_cuda_factor_regularizers_v4`. The explicit
 `materialized_prepacked_core_reference_v2` identity is an oracle only. Unknown or
-carrier-incompatible identities refuse, and root, smoke, and child
+carrier/objective-incompatible identities refuse, and root, smoke, and child
 materialization rederive the canonical identity after each effective delta.
 The direct path contracts `[batch,d_model,sites]` with the site basis, applies
 one flattened rank-core encoder map, evaluates decoder weight and Gram scores
@@ -954,6 +964,24 @@ L2 by `.00265`, and support disagreement over the union by `.0063`. On jobe,
 `3.5712 ms`, and peak allocation from `492.348` to `440.747 MiB`. This bounded
 bf16 reduction-order change is content-bound engineering evidence, not a new
 scientific arm. Old v2 identities refuse rather than migrate.
+
+Version 4 leaves the version-3 encode, score, selector, and decode carrier
+unchanged, but rank-one/two map and decoder nuclear objectives contract the
+site/core pair Grams directly. Structurally padded coordinates are masked in
+both cores. Supplied materialized tensors and the v2 identity remain explicit
+oracles; affected v3 checkpoints refuse rather than silently changing the
+objective kernel. Across eight fp32/bf16 oracle seeds, fp32 value and maximum
+factor-gradient relative errors are at most `2.28e-7` and `4.39e-7`; bf16
+value and gradient errors are at most `.001499` and `.004348`, with gradient
+cosine at least `.9999938`. Exact-zero smoothing, rank-deficient encoders,
+padding, ratio calibration, nonzero training, and exact resume are release
+fixtures. On jobe at `B=2048`, four width-768 sites, 2,048 groups, block width
+four, bf16 forward, and fused AdamW, complete Trainer medians change as follows:
+map nuclear rank one `11.043` to `5.716 ms` (`1.932x`, `623.7 MiB` lower peak),
+map rank two `13.258` to `8.583 ms` (`1.545x`, `527.0 MiB` lower), decoder
+nuclear rank one `7.214` to `3.938 ms` (`1.832x`, `311.9 MiB` lower), and
+decoder rank two `8.227` to `6.993 ms` (`1.176x`, `71.0 MiB` lower). Estimator
+v14 retains its conservative materialization allowance.
 
 Frozen threshold fitting also stays in the direct rank carrier instead of
 materializing full encoder and decoder site tensors. On eight canonical

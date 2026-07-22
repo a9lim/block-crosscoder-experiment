@@ -10,6 +10,9 @@ import block_crosscoder_experiment.gram as gram_module
 from block_crosscoder_experiment.gram import (
     block_gram,
     cholesky_qr_retract_,
+    decoder_nuclear_penalty,
+    factorized_decoder_nuclear_penalty,
+    factorized_map_nuclear_penalty,
     gram_residual,
     init_decoder_stack,
     map_nuclear_penalty,
@@ -308,6 +311,164 @@ def test_map_nuclear_accepts_rank_deficient_encoder(device):
         ebar = E[:, g].permute(1, 0, 2).reshape(B_DIM, S * D_MODEL)
         explicit.append(torch.linalg.svdvals(dbar.T @ ebar).sum() / B_DIM)
     assert torch.allclose(actual, torch.stack(explicit).mean(), atol=1e-4)
+
+
+@pytest.mark.parametrize("site_rank", (1, 2))
+@pytest.mark.parametrize("penalty", ("map", "decoder"))
+def test_factorized_nuclear_penalties_match_materialized_value_and_gradients(
+    device, site_rank, penalty
+):
+    generator = torch.Generator(device="cpu").manual_seed(5101 + site_rank)
+    d_site = torch.randn(S, site_rank, generator=generator).to(device).requires_grad_()
+    d_core = torch.randn(
+        site_rank,
+        G,
+        B_DIM,
+        D_MODEL,
+        generator=generator,
+    ).to(device).requires_grad_()
+    e_site = torch.randn(S, site_rank, generator=generator).to(device).requires_grad_()
+    e_core = torch.randn(
+        site_rank,
+        G,
+        B_DIM,
+        D_MODEL,
+        generator=generator,
+    ).to(device).requires_grad_()
+    oracle_inputs = [
+        value.detach().clone().requires_grad_()
+        for value in (d_site, d_core, e_site, e_core)
+    ]
+
+    if penalty == "map":
+        actual = factorized_map_nuclear_penalty(
+            d_site,
+            d_core,
+            e_site,
+            e_core,
+            eps=1e-8,
+        )
+        od_site, od_core, oe_site, oe_core = oracle_inputs
+        expected = map_nuclear_penalty(
+            torch.einsum("sr,rgbd->sgbd", od_site, od_core),
+            torch.einsum("sr,rgbd->sgbd", oe_site, oe_core),
+            eps=1e-8,
+        )
+        actual_inputs = (d_site, d_core, e_site, e_core)
+        expected_inputs = tuple(oracle_inputs)
+    else:
+        actual = factorized_decoder_nuclear_penalty(d_site, d_core, eps=1e-8)
+        od_site, od_core = oracle_inputs[:2]
+        expected = decoder_nuclear_penalty(
+            torch.einsum("sr,rgbd->sgbd", od_site, od_core),
+            eps=1e-8,
+        )
+        actual_inputs = (d_site, d_core)
+        expected_inputs = (od_site, od_core)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    actual_gradients = torch.autograd.grad(actual, actual_inputs)
+    expected_gradients = torch.autograd.grad(expected, expected_inputs)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        difference = (actual_gradient - expected_gradient).float().norm()
+        scale = expected_gradient.float().norm().clamp_min(1e-30)
+        assert float(difference / scale) <= 1e-5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("site_rank", (1, 2))
+@pytest.mark.parametrize("penalty", ("map", "decoder"))
+def test_factorized_bf16_nuclear_penalties_have_bounded_materialization_drift(
+    site_rank, penalty
+):
+    generator = torch.Generator(device="cuda").manual_seed(5151 + site_rank)
+    tensors = [
+        torch.randn(*shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.2)
+        .requires_grad_()
+        for shape in (
+            (S, site_rank),
+            (site_rank, G, B_DIM, D_MODEL),
+            (S, site_rank),
+            (site_rank, G, B_DIM, D_MODEL),
+        )
+    ]
+    oracle_inputs = [value.detach().clone().requires_grad_() for value in tensors]
+    d_site, d_core, e_site, e_core = tensors
+    if penalty == "map":
+        actual = factorized_map_nuclear_penalty(
+            d_site, d_core, e_site, e_core, eps=1e-8
+        )
+        od_site, od_core, oe_site, oe_core = oracle_inputs
+        expected = map_nuclear_penalty(
+            torch.einsum("sr,rgbd->sgbd", od_site, od_core),
+            torch.einsum("sr,rgbd->sgbd", oe_site, oe_core),
+            eps=1e-8,
+        )
+        actual_inputs = tuple(tensors)
+        expected_inputs = tuple(oracle_inputs)
+    else:
+        actual = factorized_decoder_nuclear_penalty(d_site, d_core, eps=1e-8)
+        od_site, od_core = oracle_inputs[:2]
+        expected = decoder_nuclear_penalty(
+            torch.einsum("sr,rgbd->sgbd", od_site, od_core),
+            eps=1e-8,
+        )
+        actual_inputs = (d_site, d_core)
+        expected_inputs = (od_site, od_core)
+
+    value_scale = expected.detach().float().abs().clamp_min(1e-30)
+    assert float((actual - expected).detach().float().abs() / value_scale) <= 0.003
+    actual_gradients = torch.autograd.grad(actual, actual_inputs)
+    expected_gradients = torch.autograd.grad(expected, expected_inputs)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        actual32, expected32 = actual_gradient.float(), expected_gradient.float()
+        difference = (actual32 - expected32).norm()
+        scale = expected32.norm().clamp_min(1e-30)
+        assert float(difference / scale) <= 0.01
+        cosine = torch.nn.functional.cosine_similarity(
+            actual32.flatten(), expected32.flatten(), dim=0
+        )
+        assert float(cosine) >= 0.9999
+
+
+@pytest.mark.parametrize("site_rank", (1, 2))
+def test_factorized_map_exact_zero_has_finite_gradients_and_accepts_rank_deficiency(
+    device, site_rank
+):
+    generator = torch.Generator(device="cpu").manual_seed(5190 + site_rank)
+    values = [
+        torch.randn(*shape, generator=generator).to(device).requires_grad_()
+        for shape in (
+            (S, site_rank),
+            (site_rank, G, B_DIM, D_MODEL),
+            (S, site_rank),
+            (site_rank, G, B_DIM, D_MODEL),
+        )
+    ]
+    loss = factorized_map_nuclear_penalty(*values, eps=0.0)
+    gradients = torch.autograd.grad(loss, values)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+    d_site, d_core, e_site, e_core = [value.detach().clone() for value in values]
+    e_core[:, :, 1:] = 0.0
+    actual = factorized_map_nuclear_penalty(
+        d_site,
+        d_core,
+        e_site,
+        e_core,
+        eps=0.0,
+    )
+    expected = map_nuclear_penalty(
+        torch.einsum("sr,rgbd->sgbd", d_site, d_core),
+        torch.einsum("sr,rgbd->sgbd", e_site, e_core),
+        eps=0.0,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
 
 
 def test_frobenius_projection(device):

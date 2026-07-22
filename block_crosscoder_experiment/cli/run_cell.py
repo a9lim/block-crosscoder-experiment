@@ -79,6 +79,7 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -2615,6 +2616,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     )
     known_factorized_implementations = {
         FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
         FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
         FACTORIZED_EXECUTION_NOT_APPLICABLE,
     }
@@ -2623,6 +2625,7 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     allowed_factorized_implementations = (
         {
             FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+            FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
             FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
         }
         if site_rank is not None
@@ -2631,6 +2634,24 @@ def _model_config(cell: CellSpec) -> BSCConfig:
     if factorized_execution_implementation not in allowed_factorized_implementations:
         raise CellExecutionError(
             "factorized-execution implementation violates its carrier predicate"
+        )
+    factor_regularizer_eligible = (
+        site_rank in {1, 2}
+        and regularizer in {"map_nuclear", "decoder_nuclear"}
+    )
+    if factorized_execution_implementation in {
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+    } and (
+        factorized_execution_implementation
+        != (
+            FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+            if factor_regularizer_eligible
+            else FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+        )
+    ):
+        raise CellExecutionError(
+            "factorized-execution implementation violates its objective predicate"
         )
     selection_score = str(values["model.selection_score"])
     decoded_energy_implementation = str(

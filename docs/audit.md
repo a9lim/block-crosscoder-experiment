@@ -166,7 +166,10 @@ exit is not evidence by itself.
   constrained untied encoders. Its optimizer roles and codec round trip remain
   operational.
 - Factorized cells derive and serialize
-  `direct_rank_space_sparse_topk_cuda_v3`; unfactorized cells derive
+  `direct_rank_space_sparse_topk_cuda_v3`; rank `1/2` map- or decoder-nuclear
+  cells instead derive
+  `direct_rank_space_sparse_topk_cuda_factor_regularizers_v4`; unfactorized
+  cells derive
   `not_applicable_v1`, and `materialized_prepacked_core_reference_v2` is an
   explicit release oracle only. Canonical rank-space encode, every score
   geometry, threshold fitting, and decode must not materialize a full site
@@ -174,9 +177,13 @@ exit is not evidence by itself.
   layouts; stale v1/v2 identities refuse. Low-density bf16 hard-TopK decode
   uses the content-bound Triton forward/backward only at batch size at least
   2,048 and density at most `1/32`; every other carrier retains dense
-  rank-space decode. Unknown or
-  carrier-incompatible identities refuse in cells, checkpoints, run bindings,
-  and codecs. Checkpoint loading validates every non-scalar Adam moment against
+  rank-space decode. Unknown or carrier/objective-incompatible identities
+  refuse in cells, checkpoints, run bindings, and codecs. Version 4 must
+  contract masked site/core pair Grams without materializing either structured
+  weight; its fp32/bf16 value, every factor gradient, exact-zero,
+  rank-deficient, padded, ratio-calibration, nonzero-step, and exact-resume
+  gates use the bounds in `design.md`. Checkpoint loading validates every
+  non-scalar Adam moment against
   the fresh parameter shape before PyTorch may accept positional optimizer
   state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
@@ -259,7 +266,9 @@ exit is not evidence by itself.
   Its raw losses, target, resolved coefficient, achieved ratio, and input
   digest are identical in the checkpoint binding and training report; exact
   resume refuses any drift. The exact zero-smoothing map nuclear path has a
-  finite-gradient repeated-Gram test.
+  finite-gradient repeated-Gram test. A rank-`1/2` factorized map cell must use
+  the v4 factor-Gram implementation even when the target ratio is zero, because
+  calibration temporarily evaluates the unweighted objective.
 - Every decoder-only nuclear-norm cell is schema-forced diagnostic and
   nonpromotable.
 - Decoder-weighted BatchTopK ranks the scaled candidate but decodes the unscaled

@@ -13,6 +13,7 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -1192,6 +1193,9 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
             plan = materialize_child_plan(plan, blueprint, _freeze(stage, selected))
             for cell in plan.stages[-1].cells:
                 assert REQUIRED_CELL_DECISIONS.issubset(cell.decision_map)
+                assert cell.decision_map[
+                    "implementation.factorized_execution_implementation"
+                ] == _expected_factorized_implementation(cell.decision_map)
                 validate_cell_config(cell)
         return plan
 
@@ -1208,6 +1212,10 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
         },
         {"group_threshold_method_4m": "group_soft_threshold_1e_minus_3"},
         {"regularization_16m": "map_nuclear_initial_ratio_0p03"},
+        {
+            "site_factorization_revisit_4m": "site_rank_2",
+            "regularization_16m": "map_nuclear_initial_ratio_0p03",
+        },
         {"auxiliary_16m": "sasa_low_weight"},
     ):
         materialize(
@@ -1610,6 +1618,18 @@ def _expected_retraction_implementation(decoder: str) -> str:
     return DECODER_RETRACTION_NOT_APPLICABLE
 
 
+def _expected_factorized_implementation(values) -> str:
+    site_rank = values["model.site_rank"]
+    if site_rank is None:
+        return FACTORIZED_EXECUTION_NOT_APPLICABLE
+    if int(site_rank) in {1, 2} and values["objective.regularizer"] in {
+        "end_to_end_map_nuclear",
+        "decoder_nuclear",
+    }:
+        return FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+    return FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+
+
 def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_children() -> (
     None
 ):
@@ -1628,11 +1648,7 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
         )
         assert cell.decision_map[
             "implementation.factorized_execution_implementation"
-        ] == (
-            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
-            if cell.decision_map["model.site_rank"] is not None
-            else FACTORIZED_EXECUTION_NOT_APPLICABLE
-        )
+        ] == _expected_factorized_implementation(cell.decision_map)
 
     blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
     plan = build_phase1_plan(seeds=(0,), smoke=True)

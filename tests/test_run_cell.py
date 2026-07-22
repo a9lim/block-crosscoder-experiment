@@ -67,6 +67,7 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -1255,17 +1256,45 @@ def test_isolated_loss_decrease_manifest_lifecycle_and_resume_are_exact(
     assert qualification["checks"]["selection_score_diagnostics_integrity"] is True
 
 
-@pytest.mark.parametrize("target_ratio", (0.0, 0.03))
+@pytest.mark.parametrize("target_ratio,site_rank", ((0.0, None), (0.03, 2)))
 def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
     tmp_path: Path,
     target_ratio: float,
+    site_rank: int | None,
 ) -> None:
     base = _cell(recipe_index=2, seed=43)
+    factorized_decisions = (
+        ()
+        if site_rank is None
+        else (
+            engineering(
+                "model.decoder",
+                "free_scale_controlled",
+                rationale="exercise factor-space regularization",
+            ),
+            engineering(
+                "model.site_rank",
+                site_rank,
+                rationale="exercise rank-two factor-space regularization",
+            ),
+            engineering(
+                "implementation.decoder_retraction_implementation",
+                DECODER_RETRACTION_NOT_APPLICABLE,
+                rationale="free factorized decoders do not retract",
+            ),
+            engineering(
+                "implementation.factorized_execution_implementation",
+                FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+                rationale="bind the factor-space nuclear objective",
+            ),
+        )
+    )
     cell = replace(
         base,
         name=(
             "phase1.test.regularizer_ratio_"
             + str(target_ratio).replace(".", "p")
+            + ("_full" if site_rank is None else f"_rank{site_rank}")
             + ".s43"
         ),
         decisions=merge_decisions(
@@ -1301,9 +1330,26 @@ def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
                     "post_init_train_prefix_true_observation_fp32_v1",
                     rationale="bind the first training batch and fp32 fit",
                 ),
+                *factorized_decisions,
             ),
         ),
     )
+    if site_rank is not None:
+        stale = replace(
+            cell,
+            decisions=tuple(
+                replace(
+                    decision,
+                    value=FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+                )
+                if decision.name
+                == "implementation.factorized_execution_implementation"
+                else decision
+                for decision in cell.decisions
+            ),
+        )
+        with pytest.raises(CellExecutionError, match="objective predicate"):
+            _model_config(stale)
     campaign = _campaign(tmp_path / f"ratio-{target_ratio}", cell)
     runner = _runner(campaign)
     assert runner.run(stop_after="prepare").completed_cells == 1
@@ -1326,6 +1372,11 @@ def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
     assert calibration["initial_regularizer_unweighted"] > 0
     assert (
         calibration["resolved_coefficient"] == report["model_cfg"]["lambda_regularizer"]
+    )
+    assert report["model_cfg"]["factorized_execution_implementation"] == (
+        FACTORIZED_EXECUTION_NOT_APPLICABLE
+        if site_rank is None
+        else FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
     )
     assert (calibration["resolved_coefficient"] == 0.0) is (target_ratio == 0.0)
     second = {

@@ -28,6 +28,7 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
 )
@@ -176,6 +177,11 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
             FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
         ),
     )
+    factor_regularizer = BSCConfig(
+        **common,
+        site_rank=2,
+        regularizer="map_nuclear",
+    )
     assert (
         unfactorized.factorized_execution_implementation
         == FACTORIZED_EXECUTION_NOT_APPLICABLE
@@ -187,6 +193,10 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
     assert (
         reference.factorized_execution_implementation
         == FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+    )
+    assert (
+        factor_regularizer.factorized_execution_implementation
+        == FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
     )
 
     for stale_identity in (
@@ -213,6 +223,23 @@ def test_factorized_execution_identity_resolves_and_fails_closed():
             **common,
             site_rank=2,
             factorized_execution_implementation=FACTORIZED_EXECUTION_NOT_APPLICABLE,
+        )
+    with pytest.raises(ValueError, match="v4 factor-regularizer"):
+        BSCConfig(
+            **common,
+            site_rank=2,
+            regularizer="map_nuclear",
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+            ),
+        )
+    with pytest.raises(ValueError, match="factor-regularizer execution"):
+        BSCConfig(
+            **common,
+            site_rank=2,
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+            ),
         )
 
 
@@ -1252,6 +1279,76 @@ def test_direct_factorized_dispatch_never_materializes_structured_weights(
     out, decoder, encoder = model.forward_with_materialized(x)
     assert out.xhat.shape == x.shape
     assert decoder is None and encoder is None
+
+
+@pytest.mark.parametrize("regularizer", ("map_nuclear", "decoder_nuclear"))
+def test_factorized_nuclear_regularizer_v4_avoids_materialization_and_matches_oracle(
+    monkeypatch,
+    device,
+    regularizer,
+):
+    common = dict(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=4,
+        d_model=7,
+        site_dims=(5, 5, 5, 5),
+        k=2,
+        selection="token_topk",
+        decoder_constraint="free",
+        site_rank=2,
+        regularizer=regularizer,
+        lambda_regularizer=1.0,
+    )
+    direct = BlockCrosscoder(BSCConfig(**common)).to(device)
+    reference = BlockCrosscoder(
+        BSCConfig(
+            **common,
+            factorized_execution_implementation=(
+                FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION
+            ),
+        )
+    ).to(device)
+    reference.load_state_dict(direct.state_dict())
+    x = torch.randn(19, 4, 7, generator=torch.Generator().manual_seed(5102)).to(
+        device
+    )
+
+    def refuse_materialization():
+        raise AssertionError("v4 factorized nuclear regularizer materialized SGBD")
+
+    monkeypatch.setattr(direct, "decoder_tensor", refuse_materialization)
+    monkeypatch.setattr(direct, "encoder_tensor", refuse_materialization)
+    actual = bsc_loss(direct(x), x, direct)["regularizer"]
+    expected_out, expected_decoder, expected_encoder = (
+        reference.forward_with_materialized(x)
+    )
+    expected = bsc_loss(
+        expected_out,
+        x,
+        reference,
+        decoder=expected_decoder,
+        encoder=expected_encoder,
+    )["regularizer"]
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+
+    parameter_names = ["D_site", "D_core"]
+    if regularizer == "map_nuclear":
+        parameter_names += ["E_site", "E_core"]
+    actual_parameters = dict(direct.named_parameters())
+    expected_parameters = dict(reference.named_parameters())
+    actual_gradients = torch.autograd.grad(
+        actual,
+        [actual_parameters[name] for name in parameter_names],
+    )
+    expected_gradients = torch.autograd.grad(
+        expected,
+        [expected_parameters[name] for name in parameter_names],
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        assert _relative_l2(actual_gradient, expected_gradient) <= 1e-5
 
 
 def test_materialized_reference_identity_dispatches_through_oracle(monkeypatch, device):

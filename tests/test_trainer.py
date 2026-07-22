@@ -17,6 +17,8 @@ from block_crosscoder_experiment.runtime_limits import (
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
     DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
 )
 from block_crosscoder_experiment.trainer import (
     DeadTracker,
@@ -2277,3 +2279,40 @@ def test_stiefel_decoded_energy_checkpoint_identity_is_bound(device, tmp_path):
     torch.save(forged, forged_path)
     with pytest.raises(ValueError, match="run binding mismatch"):
         Trainer.load_checkpoint(forged_path, device=device)
+
+
+def test_factor_regularizer_checkpoint_refuses_stale_v3_identity(device, tmp_path):
+    cfg = BSCConfig(
+        n_blocks=8,
+        block_dim=2,
+        n_sites=4,
+        d_model=8,
+        k=2,
+        selection="token_topk",
+        decoder_constraint="free",
+        site_rank=2,
+        regularizer="map_nuclear",
+        lambda_regularizer=0.1,
+    )
+    assert cfg.factorized_execution_implementation == (
+        FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+    )
+    train = train_cfg(total_steps=1, warmup_steps=0)
+    binding = {"model_cfg": asdict(cfg), "train_cfg": asdict(train)}
+    trainer = Trainer(BlockCrosscoder(cfg).to(device), train, run_binding=binding)
+    trainer.step(torch.randn(16, 4, 8, device=device))
+    checkpoint = tmp_path / "factor-regularizer-v4.pt"
+    trainer.save_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+
+    stale = copy.deepcopy(payload)
+    stale["model_cfg"]["factorized_execution_implementation"] = (
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+    )
+    stale["run_binding"]["model_cfg"]["factorized_execution_implementation"] = (
+        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
+    )
+    stale_path = tmp_path / "factor-regularizer-stale-v3.pt"
+    torch.save(stale, stale_path)
+    with pytest.raises(ValueError, match="v4 factor-regularizer"):
+        Trainer.load_checkpoint(stale_path, device=device)

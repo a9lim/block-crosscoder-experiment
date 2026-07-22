@@ -28,6 +28,7 @@ from .runtime_limits import (
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -3937,11 +3938,15 @@ def _decoder_constraint_from_values(
 def _derived_factorized_execution_implementation(
     values: Mapping[str, DecisionValue],
 ) -> str:
-    return (
-        FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
-        if values["model.site_rank"] is not None
-        else FACTORIZED_EXECUTION_NOT_APPLICABLE
-    )
+    site_rank = values["model.site_rank"]
+    if site_rank is None:
+        return FACTORIZED_EXECUTION_NOT_APPLICABLE
+    if int(site_rank) in {1, 2} and str(values["objective.regularizer"]) in {
+        "end_to_end_map_nuclear",
+        "decoder_nuclear",
+    }:
+        return FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
+    return FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION
 
 
 def _bind_derived_factorized_execution_implementation(
@@ -3963,8 +3968,8 @@ def _bind_derived_factorized_execution_implementation(
                 _derived_factorized_execution_implementation(values),
                 rationale=(
                     "execute site-rank arms directly in rank space without full "
-                    "site-tensor materialization; nonfactorized arms declare no "
-                    "factorized execution"
+                    "site-tensor materialization, including rank-1/2 nuclear "
+                    "objectives; nonfactorized arms declare no factorized execution"
                 ),
             ),
         ),
@@ -3979,6 +3984,7 @@ def _resolved_factorized_execution_implementation(
     allowed = (
         {
             FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+            FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
             FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
         }
         if factorized
@@ -3986,6 +3992,7 @@ def _resolved_factorized_execution_implementation(
     )
     if declared not in {
         FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+        FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
         FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
         FACTORIZED_EXECUTION_NOT_APPLICABLE,
     }:
@@ -3993,6 +4000,18 @@ def _resolved_factorized_execution_implementation(
     if declared not in allowed:
         raise StudyError(
             "factorized-execution implementation violates its carrier predicate"
+        )
+    derived = _derived_factorized_execution_implementation(values)
+    if (
+        declared
+        in {
+            FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+            FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+        }
+        and declared != derived
+    ):
+        raise StudyError(
+            "factorized-execution implementation violates its objective predicate"
         )
     return declared
 
@@ -4274,9 +4293,9 @@ def _estimate_components(
         operational_decoder_elements + operational_encoder_elements
     )
     # Factorization reduces learned parameters, checkpoint size, and optimizer
-    # state, but the current kernel materializes full site tensors and performs
-    # the same dense encoder/decoder matmuls.  Compute therefore follows the
-    # operational tensor, not trainable parameter count.
+    # state. Direct-rank kernels also reduce measured execution work, but v14
+    # conservatively retains the unfactorized FLOP price until every direct
+    # lifetime has a separately audited accounting model.
     compute_flops = train_tokens * operational_weight_elements * 6
     batch_tokens = _positive_int(
         values["optimizer.batch_tokens"], "optimizer.batch_tokens"

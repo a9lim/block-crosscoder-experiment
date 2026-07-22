@@ -53,6 +53,8 @@ __all__ = [
     "site_singular_values",
     "map_nuclear_penalty",
     "decoder_nuclear_penalty",
+    "factorized_map_nuclear_penalty",
+    "factorized_decoder_nuclear_penalty",
     "project_block_frobenius_",
     "normalize_block_frobenius_",
     "project_latent_rows_",
@@ -413,6 +415,33 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     return (evals.clamp_min(0.0) + eps).sqrt()
 
 
+def _map_nuclear_from_grams(
+    md: torch.Tensor,
+    me: torch.Tensor,
+    *,
+    block_dim: int,
+    eps: float,
+) -> torch.Tensor:
+    if eps < 0:
+        raise ValueError("eps must be nonnegative")
+    # Cholesky only the decoder Gram: if M_D = L L.T, the squared non-zero
+    # singular values of Dbar.T @ Ebar are the eigenvalues of L.T M_E L.
+    # Unlike a second Cholesky this remains defined for rank-deficient encoder
+    # blocks, and unlike an eigendecomposition-based square root of M_D it
+    # avoids undefined eigenvector gradients when the Grassmann constraint
+    # deliberately makes all decoder-Gram eigenvalues equal to one.
+    ld, info_d = torch.linalg.cholesky_ex(md)
+    if bool((info_d != 0).any()):
+        raise ValueError(
+            "map nuclear regularization requires full-row-rank decoder blocks"
+        )
+    squared_singular_values = torch.linalg.eigvalsh(
+        ld.transpose(-1, -2) @ me @ ld
+    ).clamp_min(0.0)
+    terms = (squared_singular_values + eps).sqrt()
+    return (terms.sum(dim=-1) / block_dim).mean()
+
+
 def map_nuclear_penalty(
     D: torch.Tensor, E: torch.Tensor, *, eps: float = 1e-8
 ) -> torch.Tensor:
@@ -431,27 +460,117 @@ def map_nuclear_penalty(
             f"D and E must have identical shape, got {D.shape} and {E.shape}"
         )
     Df, Ef = D.float(), E.float()
-    if eps < 0:
-        raise ValueError("eps must be nonnegative")
     md = torch.einsum("sgbd,sgcd->gbc", Df, Df)
     me = torch.einsum("sgbd,sgcd->gbc", Ef, Ef)
+    return _map_nuclear_from_grams(md, me, block_dim=E.shape[2], eps=eps)
 
-    # Cholesky only the decoder Gram: if M_D = L L.T, the squared non-zero
-    # singular values of Dbar.T @ Ebar are the eigenvalues of L.T M_E L.
-    # Unlike a second Cholesky this remains defined for rank-deficient encoder
-    # blocks, and unlike an eigendecomposition-based square root of M_D it
-    # avoids undefined eigenvector gradients when the Grassmann constraint
-    # deliberately makes all decoder-Gram eigenvalues equal to one.
-    ld, info_d = torch.linalg.cholesky_ex(md)
-    if bool((info_d != 0).any()):
-        raise ValueError(
-            "map nuclear regularization requires full-row-rank decoder blocks"
+
+def _validate_factorized_regularizer_inputs(
+    site: torch.Tensor,
+    core: torch.Tensor,
+) -> None:
+    if site.ndim != 2 or core.ndim != 4:
+        raise ValueError("factorized regularizer tensors have invalid rank")
+    if site.shape[1] != core.shape[0]:
+        raise ValueError("factorized regularizer site/core ranks disagree")
+
+
+def _factorized_core_pair_gram(core: torch.Tensor) -> torch.Tensor:
+    value = core.float()
+    return torch.einsum("rgbd,tgcd->rtgbc", value, value)
+
+
+def factorized_map_nuclear_penalty(
+    D_site: torch.Tensor,
+    D_core: torch.Tensor,
+    E_site: torch.Tensor,
+    E_core: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Map nuclear penalty directly from a rank-1/2 site factorization.
+
+    The contraction is algebraically identical to materializing both
+    ``[site,group,block,width]`` tensors, but casts the factors to fp32 before
+    forming their pair Grams.  That avoids the large rounded bf16 full-tensor
+    intermediates and is therefore a separately serialized implementation.
+    """
+
+    _validate_factorized_regularizer_inputs(D_site, D_core)
+    _validate_factorized_regularizer_inputs(E_site, E_core)
+    if D_site.shape != E_site.shape or D_core.shape != E_core.shape:
+        raise ValueError("factorized map decoder and encoder shapes disagree")
+    decoder_site_gram = D_site.float().transpose(0, 1) @ D_site.float()
+    encoder_site_gram = E_site.float().transpose(0, 1) @ E_site.float()
+    decoder_gram = torch.einsum(
+        "rt,rtgbc->gbc",
+        decoder_site_gram,
+        _factorized_core_pair_gram(D_core),
+    )
+    encoder_gram = torch.einsum(
+        "rt,rtgbc->gbc",
+        encoder_site_gram,
+        _factorized_core_pair_gram(E_core),
+    )
+    return _map_nuclear_from_grams(
+        decoder_gram,
+        encoder_gram,
+        block_dim=D_core.shape[2],
+        eps=eps,
+    )
+
+
+def _factorized_decoder_gram_eigenvalues(
+    site: torch.Tensor,
+    core: torch.Tensor,
+) -> torch.Tensor:
+    pair_gram = _factorized_core_pair_gram(core)
+    gram = torch.einsum(
+        "sr,st,rtgbc->sgbc",
+        site.float(),
+        site.float(),
+        pair_gram,
+    )
+    flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
+    if flat.shape[0] > _EIGH_MAX_BATCH:
+        evals = torch.cat(
+            [
+                torch.linalg.eigvalsh(flat[i : i + _EIGH_MAX_BATCH])
+                for i in range(0, flat.shape[0], _EIGH_MAX_BATCH)
+            ]
         )
-    squared_singular_values = torch.linalg.eigvalsh(
-        ld.transpose(-1, -2) @ me @ ld
-    ).clamp_min(0.0)
-    terms = (squared_singular_values + eps).sqrt()
-    return (terms.sum(dim=-1) / E.shape[2]).mean()
+    else:
+        evals = torch.linalg.eigvalsh(flat)
+    return evals.reshape(gram.shape[:-1])
+
+
+def factorized_decoder_nuclear_penalty(
+    D_site: torch.Tensor,
+    D_core: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-site decoder nuclear penalty without full tensor materialization."""
+
+    _validate_factorized_regularizer_inputs(D_site, D_core)
+    if eps < 0:
+        raise ValueError("eps must be nonnegative")
+    if D_core.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
+        chunks = [
+            _factorized_decoder_gram_eigenvalues(
+                D_site,
+                D_core[:, start : start + _SPECTRUM_CUDA_BLOCK_CHUNK],
+            )
+            for start in range(
+                0,
+                D_core.shape[1],
+                _SPECTRUM_CUDA_BLOCK_CHUNK,
+            )
+        ]
+        eigenvalues = torch.cat(chunks, dim=1)
+    else:
+        eigenvalues = _factorized_decoder_gram_eigenvalues(D_site, D_core)
+    return (eigenvalues.clamp_min(0.0) + eps).sqrt().sum(dim=-1).mean()
 
 
 def decoder_nuclear_penalty(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:

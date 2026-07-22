@@ -412,8 +412,12 @@ the exact decoder-Gram implementation. The implementation identity and its
 residual thresholds are project engineering decisions and are content-bound in
 the cell, checkpoint, run binding, and deployable codec.
 
-Factorized arms separately derive `direct_rank_space_sparse_topk_cuda_v3`; the
-materialized site tensor is retained only under the explicit
+Factorized arms separately derive `direct_rank_space_sparse_topk_cuda_v3`;
+rank-one/two map- and decoder-nuclear cells derive the composite engineering
+identity `direct_rank_space_sparse_topk_cuda_factor_regularizers_v4`. Their
+factor-Gram contraction is the same scientific nuclear objective and is not an
+FMX or SASA procedure claim. The materialized site tensor is retained only
+under the explicit
 `materialized_prepacked_core_reference_v2` oracle identity. Direct rank-space
 contraction is a project execution optimization, not an FMX procedure claim or
 a new experimental arm. The cell, checkpoint, run binding, and deployable
