@@ -200,6 +200,8 @@ exit is not evidence by itself.
   `native_or_rank_hard_topk_cuda_else_dense_v1` or the explicit
   `dense_reference_v1` sparse-decode oracle. The CUDA identity may consume
   native contiguous `[S,G,b,d]` directly but must never pack the full decoder;
+  token TopK must derive its exact constant-count row pointer without a
+  `bincount`/cumulative-sum pass, while BatchTopK retains the generic path;
   its primitive, tied/untied trajectory, support, bias, padding, and
   determinism bounds are the release gates in `design.md`.
   Codec fitting, packet encoding, public packet decode, and trusted multi-q

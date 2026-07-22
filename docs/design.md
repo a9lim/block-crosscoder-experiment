@@ -979,7 +979,13 @@ Trainer median falls from `11.792` to `8.820 ms` at eight active blocks
 (`25.20%`, `1.337x`) and from `11.810` to `10.548 ms` at 32 active blocks
 (`10.69%`, `1.120x`). Peak allocation falls from `768.31 MiB` to
 `680.70 MiB` and `681.83 MiB`, respectively. The conservative estimator grants
-no credit for this reduction.
+no credit for this reduction. Token TopK additionally binds its exact constant
+events per row into the sparse decoder, deriving the CSR row pointer directly
+instead of counting and cumulatively summing the already row-major event list;
+BatchTopK retains the generic construction. The specialized and generic
+forward and backward tensors are bitwise identical. On the same jobe shape,
+paired complete-step medians improve from `8.836` to `8.524 ms` at eight
+active blocks and from `10.507` to `10.425 ms` at 32, with unchanged peaks.
 
 Version 4 leaves the version-3 encode, score, selector, and decode carrier
 unchanged, but rank-one/two map and decoder nuclear objectives contract the

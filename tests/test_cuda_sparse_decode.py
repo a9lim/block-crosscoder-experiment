@@ -165,20 +165,29 @@ def test_cuda_sparse_topk_native_decoder_tracks_dense_forward_backward(
     assert torch.equal(
         sparse_code.grad[~mask], torch.zeros_like(sparse_code.grad[~mask])
     )
-    assert torch.equal(
-        cuda_sparse_topk_decode(
-            initial_code,
-            mask,
-            initial_decoder,
-            selected_count=batch * active,
-        ),
-        cuda_sparse_topk_decode(
-            initial_code,
-            mask,
-            initial_decoder,
-            selected_count=batch * active,
-        ),
+    specialized_code = initial_code.detach().clone().requires_grad_(True)
+    specialized_decoder = initial_decoder.detach().clone().requires_grad_(True)
+    specialized = cuda_sparse_topk_decode(
+        specialized_code,
+        mask,
+        specialized_decoder,
+        selected_count=batch * active,
+        events_per_row=active,
     )
+    generic_code = initial_code.detach().clone().requires_grad_(True)
+    generic_decoder = initial_decoder.detach().clone().requires_grad_(True)
+    generic = cuda_sparse_topk_decode(
+        generic_code,
+        mask,
+        generic_decoder,
+        selected_count=batch * active,
+    )
+    probe = torch.randn_like(generic)
+    specialized.backward(probe)
+    generic.backward(probe)
+    assert torch.equal(specialized, generic)
+    assert torch.equal(specialized_code.grad, generic_code.grad)
+    assert torch.equal(specialized_decoder.grad, generic_decoder.grad)
 
 
 def test_sparse_factorized_trainer_has_bounded_trajectory_drift(monkeypatch):

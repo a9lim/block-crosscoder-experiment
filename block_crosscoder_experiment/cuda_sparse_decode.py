@@ -177,6 +177,7 @@ class _SparseTopKDecode(torch.autograd.Function):
         mask: torch.Tensor,
         weight: torch.Tensor,
         selected_count: int,
+        events_per_row: int,
     ) -> torch.Tensor:
         batch, groups, block_dim = code.shape
         native_site_layout = weight.ndim == 4
@@ -191,10 +192,19 @@ class _SparseTopKDecode(torch.autograd.Function):
         rows = events[:, 0].to(torch.int32)
         selected_groups = events[:, 1].to(torch.int32)
 
-        row_counts = torch.bincount(rows, minlength=batch)
-        row_ptr = torch.empty(batch + 1, dtype=torch.int64, device=code.device)
-        row_ptr[0] = 0
-        torch.cumsum(row_counts, dim=0, out=row_ptr[1:])
+        if events_per_row:
+            row_ptr = torch.arange(
+                0,
+                selected_count + 1,
+                events_per_row,
+                dtype=torch.int64,
+                device=code.device,
+            )
+        else:
+            row_counts = torch.bincount(rows, minlength=batch)
+            row_ptr = torch.empty(batch + 1, dtype=torch.int64, device=code.device)
+            row_ptr[0] = 0
+            torch.cumsum(row_counts, dim=0, out=row_ptr[1:])
 
         group_order = torch.argsort(selected_groups, stable=True)
         group_rows = rows[group_order]
@@ -250,7 +260,7 @@ class _SparseTopKDecode(torch.autograd.Function):
     def backward(
         ctx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, None, torch.Tensor, None, None]:
         (
             code,
             weight,
@@ -306,7 +316,7 @@ class _SparseTopKDecode(torch.autograd.Function):
             site_width=site_width,
             num_warps=4,
         )
-        return grad_code, None, grad_weight, None
+        return grad_code, None, grad_weight, None, None
 
 
 def cuda_sparse_topk_decode(
@@ -315,6 +325,7 @@ def cuda_sparse_topk_decode(
     weight: torch.Tensor,
     *,
     selected_count: int,
+    events_per_row: int | None = None,
 ) -> torch.Tensor:
     """Decode a low-density hard-TopK code through a packed rank-space map."""
 
@@ -344,10 +355,26 @@ def cuda_sparse_topk_decode(
         or not 0 < selected_count <= mask.numel()
     ):
         raise ValueError("selected_count must be an integer in [1, mask.numel()]")
+    if events_per_row is not None:
+        if (
+            isinstance(events_per_row, bool)
+            or int(events_per_row) != events_per_row
+            or events_per_row <= 0
+            or selected_count != mask.shape[0] * events_per_row
+        ):
+            raise ValueError(
+                "events_per_row must be positive and exactly bind selected_count"
+            )
     if (
         not code.is_contiguous()
         or not mask.is_contiguous()
         or not weight.is_contiguous()
     ):
         raise ValueError("sparse TopK decode tensors must be contiguous")
-    return _SparseTopKDecode.apply(code, mask, weight, int(selected_count))
+    return _SparseTopKDecode.apply(
+        code,
+        mask,
+        weight,
+        int(selected_count),
+        0 if events_per_row is None else int(events_per_row),
+    )

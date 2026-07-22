@@ -2089,6 +2089,11 @@ class BlockCrosscoder(nn.Module):
 
         cfg = self.cfg
         selected_count = self._hard_topk_selected_count(code.shape[0])
+        events_per_row = (
+            min(max(int(round(cfg.k)), 0), cfg.n_blocks)
+            if cfg.selection == "token_topk"
+            else None
+        )
         if self.uses_direct_factorized_execution:
             assert cfg.site_rank is not None
             assert self.D_site is not None and self.D_core is not None
@@ -2097,6 +2102,7 @@ class BlockCrosscoder(nn.Module):
                 mask,
                 self._decoder_factor_core_map(),
                 selected_count=selected_count,
+                events_per_row=events_per_row,
             ).view(code.shape[0], cfg.site_rank, cfg.d_model)
             xhat = torch.matmul(
                 rank_output.transpose(1, 2),
@@ -2114,6 +2120,7 @@ class BlockCrosscoder(nn.Module):
                 mask,
                 decoder,
                 selected_count=selected_count,
+                events_per_row=events_per_row,
             )
         if cfg.decoder_bias:
             xhat = xhat + self.c.unsqueeze(0)
