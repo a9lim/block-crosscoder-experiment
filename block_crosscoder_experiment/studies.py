@@ -52,7 +52,7 @@ from .runtime_limits import (
 
 SCHEMA_VERSION = "bsc-study-v1"
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v14"
+    "dense-linear-memory-v15"
     f"-q{TRUSTED_DECODE_Q_CHUNK}"
     f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
     f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
@@ -76,6 +76,7 @@ PHASE3_COMPUTE_CEILING_FLOPS = (
     PHASE3_MIN_SUSTAINED_FLOPS * PHASE3_RUNTIME_CEILING_SECONDS
 )
 PHASE2_DEFAULT_WARMUP_FRACTION = 0.05
+PHASE2_CHECKPOINT_TOKENS = 1_000_000
 PHASE2_SHARING_FVU_ABSOLUTE_MAX = 1.0
 PHASE2_SHARING_ROOT_FVU_DEGRADATION_MAX = 0.02
 PHASE2_SHARING_COORDINATE_CONCORDANCE_MIN = 0.8
@@ -3684,6 +3685,8 @@ class ResourceEstimate:
     training_tokens: int
     parameters: int
     storage_bytes: int
+    checkpoint_write_count: int
+    cumulative_checkpoint_write_bytes: int
     compute_flops: int
     peak_vram_bytes: int
     peak_host_ram_bytes: int
@@ -3696,6 +3699,8 @@ class ResourceEstimate:
                 self.training_tokens,
                 self.parameters,
                 self.storage_bytes,
+                self.checkpoint_write_count,
+                self.cumulative_checkpoint_write_bytes,
                 self.compute_flops,
                 self.peak_vram_bytes,
                 self.peak_host_ram_bytes,
@@ -3712,6 +3717,10 @@ class ResourceEstimate:
             "training_tokens": self.training_tokens,
             "parameters": self.parameters,
             "storage_bytes": self.storage_bytes,
+            "checkpoint_write_count": self.checkpoint_write_count,
+            "cumulative_checkpoint_write_bytes": (
+                self.cumulative_checkpoint_write_bytes
+            ),
             "compute_flops": self.compute_flops,
             "peak_vram_bytes": self.peak_vram_bytes,
             "peak_host_ram_bytes": self.peak_host_ram_bytes,
@@ -4283,7 +4292,7 @@ def _resolved_isolated_loss_implementation(
 
 def _estimate_components(
     cell: CellSpec,
-) -> tuple[int, int, int, int, int, int, int, tuple[Any, ...]]:
+) -> tuple[int, int, int, int, int, int, int, int, tuple[Any, ...]]:
     """Return tokens, parameters, storage, FLOPs, memory, tracker, and key."""
 
     values = cell.decision_map
@@ -4295,6 +4304,10 @@ def _estimate_components(
     groups = _positive_int(values["model.groups"], "model.groups")
     block_width = _positive_int(values["model.block_width"], "model.block_width")
     train_tokens = _positive_int(values["data.train_tokens"], "data.train_tokens")
+    checkpoint_tokens = _positive_int(
+        values["runtime.checkpoint_tokens"], "runtime.checkpoint_tokens"
+    )
+    checkpoint_write_count = math.ceil(train_tokens / checkpoint_tokens)
     tied = str(values["model.encoder"]).startswith("tied")
     affine = "affine" in str(values["model.encoder"])
     decoder_bias = bool(values.get("model.decoder_bias", False))
@@ -4553,6 +4566,7 @@ def _estimate_components(
         peak_vram_bytes,
         peak_host_ram_bytes,
         tracker_checkpoint_bytes,
+        checkpoint_write_count,
         store_key,
     )
 
@@ -4576,6 +4590,7 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
         peak_vram_bytes,
         peak_host_ram_bytes,
         tracker_checkpoint_bytes,
+        checkpoint_write_count,
         _,
     ) = _estimate_components(cell)
     checkpoint_storage = parameters * 16 + tracker_checkpoint_bytes
@@ -4584,6 +4599,10 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
         training_tokens=train_tokens,
         parameters=parameters,
         storage_bytes=storage_bytes,
+        checkpoint_write_count=checkpoint_write_count,
+        cumulative_checkpoint_write_bytes=(
+            checkpoint_write_count * checkpoint_storage
+        ),
         compute_flops=compute_flops,
         peak_vram_bytes=peak_vram_bytes,
         peak_host_ram_bytes=peak_host_ram_bytes,
@@ -4599,7 +4618,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     # that base exactly once for each capture contract.
     stores: dict[tuple[Any, ...], int] = {}
     raw_stores: dict[tuple[Any, ...], int] = {}
-    for _, _, store_bytes, _, _, _, _, key in components:
+    for _, _, store_bytes, _, _, _, _, _, key in components:
         stores[key] = max(stores.get(key, 0), store_bytes)
         if key[12] == "content_addressed_derived_view":
             raw_key = (*key[:13], "raw_source_view", *key[14:])
@@ -4611,6 +4630,10 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
             sum(stores.values())
             + sum(raw_stores.values())
             + sum(item[1] * 16 + item[6] for item in components)
+        ),
+        checkpoint_write_count=sum(item[7] for item in components),
+        cumulative_checkpoint_write_bytes=sum(
+            item[7] * (item[1] * 16 + item[6]) for item in components
         ),
         compute_flops=sum(item[3] for item in components),
         peak_vram_bytes=max((item[4] for item in components), default=0),
@@ -8910,6 +8933,14 @@ def _pilot_overrides(
             rationale=(
                 "the pilot uses declared bf16 forward precision; executable "
                 "fp32/bf16 parity is reserved for the Phase-3 preflight"
+            ),
+        ),
+        engineering(
+            "runtime.checkpoint_tokens",
+            PHASE2_CHECKPOINT_TOKENS,
+            rationale=(
+                "one-million-token atomic checkpoints cut optimizer-state write "
+                "amplification while bounding interruption replay to one pilot rung"
             ),
         ),
         engineering(

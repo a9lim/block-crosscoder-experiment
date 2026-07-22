@@ -1221,6 +1221,7 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
         {"group_threshold_method_4m": "group_soft_threshold_1e_minus_3"},
         {"regularization_16m": "map_nuclear_initial_ratio_0p03"},
         {
+            "site_masking_4m": "site_mask_002",
             "site_factorization_revisit_4m": "site_rank_2",
             "regularization_16m": "map_nuclear_initial_ratio_0p03",
         },
@@ -1523,13 +1524,17 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
     assert phase1_estimate.estimator == (
-        "dense-linear-memory-v14"
+        "dense-linear-memory-v15"
         f"-q{TRUSTED_DECODE_Q_CHUNK}"
         f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
         f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
         f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
     )
     assert phase1_estimate.storage_bytes == phase1_estimate.parameters * 16
+    assert phase1_estimate.checkpoint_write_count == 2
+    assert phase1_estimate.cumulative_checkpoint_write_bytes == (
+        phase1_estimate.checkpoint_write_count * phase1_estimate.storage_bytes
+    )
     assert phase1_estimate.peak_vram_bytes > phase1_estimate.parameters * 28
     assert phase1_estimate.peak_host_ram_bytes >= 8 * 1024**3
     phase2 = build_phase2_plan(seeds=(0,), smoke=True)
@@ -1538,6 +1543,12 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         for cell in phase2.cells
     )
     estimate = estimate_plan(phase2)
+    assert estimate.checkpoint_write_count == sum(
+        estimate_cell(cell).checkpoint_write_count for cell in phase2.cells
+    )
+    assert estimate.cumulative_checkpoint_write_bytes == sum(
+        estimate_cell(cell).cumulative_checkpoint_write_bytes for cell in phase2.cells
+    )
     plan_store = estimate.storage_bytes - sum(
         estimate_cell(cell).parameters * 16 for cell in phase2.cells
     )
@@ -1566,6 +1577,44 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         Budget(max_peak_host_ram_bytes=estimate.peak_host_ram_bytes - 1).enforce(
             estimate
         )
+
+    phase2_production = build_phase2_blueprint().initial_stage.cells[0]
+    assert phase2_production.decision_map["runtime.checkpoint_tokens"] == 1_000_000
+
+    def with_token_budget(tokens):
+        values = phase2_production.decision_map
+        replacements = {
+            "data.train_tokens": tokens,
+            "data.unique_tokens": tokens,
+            "optimizer.warmup_steps": studies_module._fractional_warmup_steps(
+                tokens,
+                values["optimizer.batch_tokens"],
+                values["optimizer.warmup_fraction"],
+            ),
+        }
+        return replace(
+            phase2_production,
+            decisions=tuple(
+                replace(decision, value=replacements[decision.name])
+                if decision.name in replacements
+                else decision
+                for decision in phase2_production.decisions
+            ),
+        )
+
+    four_million = with_token_budget(4_000_000)
+    sixteen_million = with_token_budget(16_000_000)
+    old_cadence = _replace_decision(
+        sixteen_million,
+        "runtime.checkpoint_tokens",
+        100_000,
+    )
+    assert estimate_cell(four_million).checkpoint_write_count == 4
+    assert estimate_cell(sixteen_million).checkpoint_write_count == 16
+    assert estimate_cell(old_cadence).checkpoint_write_count == 160
+    assert estimate_cell(sixteen_million).cumulative_checkpoint_write_bytes * 10 == (
+        estimate_cell(old_cadence).cumulative_checkpoint_write_bytes
+    )
 
     larger_window = _replace_decision(
         sasa,
