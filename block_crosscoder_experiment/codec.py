@@ -246,6 +246,16 @@ class _PacketEvents:
 
 
 @dataclass(frozen=True)
+class _PacketSupport:
+    """Q-independent support tensors shared by rate and packet accounting."""
+
+    mask: torch.Tensor  # [tokens,groups] bool on model device
+    counts: torch.Tensor  # [tokens] int64 on model device
+    rows: torch.Tensor  # [events] int64 on model device
+    original_ids: torch.Tensor  # [events] dictionary IDs on model device
+
+
+@dataclass(frozen=True)
 class _RDEvaluationInput:
     """One transformed R-D batch plus executor-owned paired context.
 
@@ -713,7 +723,24 @@ def _packet_from_output(model, codec: Codec, out, q: int) -> EncodedBatch:
 
 
 @torch.no_grad()
-def _packet_events_from_output(model, codec: Codec, out) -> _PacketEvents:
+def _packet_support(mask: torch.Tensor) -> _PacketSupport:
+    events = mask.nonzero(as_tuple=False)
+    return _PacketSupport(
+        mask=mask,
+        counts=mask.sum(dim=1),
+        rows=events[:, 0],
+        original_ids=events[:, 1],
+    )
+
+
+@torch.no_grad()
+def _packet_events_from_output(
+    model,
+    codec: Codec,
+    out,
+    *,
+    support: _PacketSupport | None = None,
+) -> _PacketEvents:
     """Extract support and rotate only selected events.
 
     The previous path rotated and quantized a dense ``[tokens, groups, block]``
@@ -722,11 +749,11 @@ def _packet_events_from_output(model, codec: Codec, out) -> _PacketEvents:
     event stream once.
     """
     device = next(model.parameters()).device
-    included = codec._tensor_on("included", device)
-    mask = out.mask & included.unsqueeze(0)
-    nz = mask.nonzero(as_tuple=False)
-    original_ids = nz[:, 1]
-    selected = out.z_selected[nz[:, 0], original_ids]
+    if support is None:
+        included = codec._tensor_on("included", device)
+        support = _packet_support(out.mask & included.unsqueeze(0))
+    original_ids = support.original_ids
+    selected = out.z_selected[support.rows, original_ids]
     canonical = torch.einsum(
         "eij,ej->ei",
         codec._tensor_on("rotation", device)[original_ids],
@@ -736,7 +763,7 @@ def _packet_events_from_output(model, codec: Codec, out) -> _PacketEvents:
     compact_ranks = torch.searchsorted(rank_to_block, original_ids)
     return _PacketEvents(
         n_tokens=out.mask.shape[0],
-        counts=mask.sum(dim=1).to(torch.int32),
+        counts=support.counts.to(torch.int32),
         block_ids=compact_ranks.to(torch.int32),
         original_ids=original_ids,
         canonical_codes=canonical,
@@ -1677,20 +1704,23 @@ def _evaluate_rd_stream(
         )
         raw_mask = out.mask
         mask = raw_mask & inc.unsqueeze(0)
-        excluded_events += (raw_mask & ~inc.unsqueeze(0)).sum()
-        total_events += raw_mask.sum()
-        counts = mask.sum(dim=1)
+        support = _packet_support(mask)
+        counts = support.counts
+        raw_event_count = raw_mask.sum()
+        total_events += raw_event_count
+        excluded_events += raw_event_count - counts.sum()
 
         # Non-operational support-rate sensitivities, per token.  The exact
         # fixed-width packet rate is assembled below from count and ID widths.
         if codec.n_included:
+            mask_fp32 = mask.float()
             act_p = (
-                (codec._tensor_on("bernoulli_log2p", device) * mask.float())
+                (codec._tensor_on("bernoulli_log2p", device) * mask_fp32)
                 .sum(dim=1)
                 .double()
             )
             act_q = (
-                (codec._tensor_on("bernoulli_log2q", device) * mask.float())
+                (codec._tensor_on("bernoulli_log2q", device) * mask_fp32)
                 .sum(dim=1)
                 .double()
             )
@@ -1698,8 +1728,15 @@ def _evaluate_rd_stream(
             act_p = torch.zeros(x.shape[0], dtype=torch.float64, device=x.device)
             act_q = torch.zeros_like(act_p)
 
-        packet_events = _packet_events_from_output(model, codec, out)
-        del out, raw_mask, mask
+        packet_events = _packet_events_from_output(
+            model,
+            codec,
+            out,
+            support=support,
+        )
+        del out, raw_mask, mask, support
+        if codec.n_included:
+            del mask_fp32
         batch = _RDEvaluationBatch(
             transformed=x,
             sequence_ids=sequence_ids,

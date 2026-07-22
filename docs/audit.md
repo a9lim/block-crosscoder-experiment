@@ -187,7 +187,9 @@ exit is not evidence by itself.
   activation leaves only: row identities remain on CPU, retain their original
   storage through both host and CUDA prefetch, and receive neither pinning nor
   a CUDA stream record. Mixed nested-leaf and invalid-policy tests enforce the
-  default and selected-copy contracts.
+  default and selected-copy contracts. Included support mask/count/index
+  tensors are constructed once per batch and shared by rate and packet paths;
+  an explicit duplicated-support oracle must produce the identical payload.
 - Phase-1 masking has a preceding scale-control panel: literal sum at `p=0`,
   nonpromotable literal sum at `p=.10`, and availability-rescaled sum at
   `p=.10`. Its fixed rescaled carrier enters the subsequent

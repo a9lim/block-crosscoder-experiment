@@ -119,6 +119,28 @@ def test_row_length_one_fast_path_is_exact_across_batching():
     assert batched == singleton
 
 
+def test_rd_shared_packet_support_matches_independent_reconstruction(monkeypatch):
+    torch.manual_seed(1902)
+    model = calibrated(make_model(), torch.randn(256, S, D))
+    codec = fit_codec(
+        model,
+        list(torch.randn(256, S, D).split(64)),
+        CodecSpec(qs=(4, 8), floor=1, n_bootstrap=8),
+    )
+    evaluation = torch.randn(128, S, D)
+    batches = list(evaluation.split(32))
+    shared = evaluate_rd(model, codec, batches, row_len=16)
+    original = codec_module._packet_events_from_output
+
+    def rebuild(model, codec, out, *, support=None):
+        del support
+        return original(model, codec, out, support=None)
+
+    monkeypatch.setattr(codec_module, "_packet_events_from_output", rebuild)
+    duplicated = evaluate_rd(model, codec, batches, row_len=16)
+    assert shared == duplicated
+
+
 def test_grouped_coordinate_quantiles_are_bitwise_exact_and_bounded():
     generator = torch.Generator().manual_seed(1900)
     counts = torch.tensor((3, 11, 2, 19, 5, 7), dtype=torch.long)

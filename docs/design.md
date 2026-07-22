@@ -987,6 +987,15 @@ benchmark improves a transfer-bound width-64 pair from `.3299` to `.3194 ms`
 (`3.18%`) and is neutral at the Phase-2 width-768 pair (`3.7748` to
 `3.7687 ms`).
 
+Within that traversal, included support now has one trusted q-independent
+carrier: its mask, per-token counts, row indices, and original block IDs feed
+both rate accounting and packet rotation. The fp32 mask cast is shared by both
+Bernoulli terms, and excluded events are the exact raw-minus-included integer
+count. An independent-support reconstruction oracle produces the identical
+complete R-D payload. In paired jobe measurements, support reuse reduces an
+8,192-token evaluation from `32.634` to `31.898 ms` with 512-token batches
+(`2.26%`) and from `25.582` to `25.258 ms` with 2,048-token batches (`1.26%`).
+
 The blueprint enforces hard ceilings: 4,002,097,152 aggregate optimizer tokens
 (4B final plus eight 262,144-token stability cells), 400M
 parameters per cell, 22GB peak VRAM, 55GB peak host RAM, 850GB storage against
