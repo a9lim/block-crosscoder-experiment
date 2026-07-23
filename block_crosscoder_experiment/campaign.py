@@ -2186,7 +2186,8 @@ def _validate_qualification_payload(
         )
         shared_feature_claim_eligible = bool(
             shared_feature_claim_required
-            and cell.decision_map.get("data.dgp_step") != "shared_support"
+            and cell.decision_map.get("data.dgp_step")
+            not in {"shared_support", "support_only"}
             and cell.decision_map.get("data.site_presence_span") != "one"
         )
         if not isinstance(recovery, Mapping) or set(recovery) != {

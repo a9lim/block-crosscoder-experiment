@@ -423,7 +423,8 @@ def phase1_recovery_claim_metrics(cell: CellSpec) -> dict[str, object]:
     required = len(site_dims) > 1
     eligible = bool(
         required
-        and cell.decision_map["data.dgp_step"] != "shared_support"
+        and cell.decision_map["data.dgp_step"]
+        not in {"shared_support", "support_only"}
         and cell.decision_map["data.site_presence_span"] != "one"
     )
     return {
@@ -2888,7 +2889,7 @@ def test_phase1_decision_rejects_extra_nested_cell_evidence():
         Campaign.phase1_decision_from_manifest(payload)
 
 
-def test_phase1_false_positive_negative_control_forces_no_go(tmp_path):
+def test_phase1_false_positive_negative_control_is_semantically_rejected():
     payload = phase1_decision_for_phase2(smoke=False)
     set_phase1_variant_outcome(payload, "support_only", passed=True)
     payload.update(
@@ -2900,27 +2901,7 @@ def test_phase1_false_positive_negative_control_forces_no_go(tmp_path):
         }
     )
     rehash_phase1_decision(payload)
-    verified = Campaign.phase1_decision_from_manifest(payload)
-    assert verified["decision"] == "no_go"
-    blueprint = build_phase2_blueprint(
-        smoke=False,
-        phase1_decision=payload,
-    )
-    with pytest.raises(CampaignError, match="protocol-only"):
-        Campaign(tmp_path).register(
-            build_phase2_plan(
-                smoke=False,
-                phase1_decision=payload,
-            ),
-            blueprint_manifest=blueprint.to_manifest(),
-            phase1_decision_manifest=payload,
-        )
-    payload["authorization_mode"] = "scientific_go"
-    payload["decision"] = "go"
-    payload["authorizes_phase2_scientific"] = True
-    payload["authorizes_phase2_smoke"] = True
-    rehash_phase1_decision(payload)
-    with pytest.raises(CampaignError, match="authorization differs"):
+    with pytest.raises(CampaignError, match="scientific outcome disagrees"):
         Campaign.phase1_decision_from_manifest(payload)
 
 
@@ -5533,7 +5514,8 @@ def phase1_selection_metrics():
                 "shared_feature_claim_required": len(values["data.site_dims"]) > 1,
                 "shared_feature_claim_eligible": (
                     len(values["data.site_dims"]) > 1
-                    and values["data.dgp_step"] != "shared_support"
+                    and values["data.dgp_step"]
+                    not in {"shared_support", "support_only"}
                     and values["data.site_presence_span"] != "one"
                 ),
             }
