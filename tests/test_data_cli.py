@@ -931,6 +931,8 @@ def _mock_capture_runtime(monkeypatch):
 
     class GPT2Tokenizer:
         bos_token_id = 50_256
+        eos_token_id = 50_256
+        unk_token_id = 50_256
 
         def get_vocab(self):
             return fake_vocab
@@ -961,7 +963,8 @@ def _mock_capture_runtime(monkeypatch):
 
     class FakeModel:
         def __init__(self, explicit_tokenizer):
-            self.tokenizer = explicit_tokenizer
+            assert explicit_tokenizer is tokenizer
+            self.tokenizer = GPT2Tokenizer()
             self.cfg = SimpleNamespace(d_model=2)
             self.hook_dict = {
                 item["hook"]: object() for item in expected_source["sources"]
@@ -1075,6 +1078,27 @@ def _mock_capture_runtime(monkeypatch):
         )
 
     return expected_source, loader_calls, args
+
+
+def test_transformer_lens_tokenizer_copy_must_preserve_integer_contract():
+    class PinnedTokenizer:
+        bos_token_id = 7
+        eos_token_id = 8
+        unk_token_id = 9
+
+        def __init__(self, vocab):
+            self._vocab = vocab
+
+        def get_vocab(self):
+            return self._vocab
+
+    pinned = PinnedTokenizer({"unicode-é": 1, "token": 2})
+    compatible_copy = PinnedTokenizer(dict(pinned.get_vocab()))
+    data_module._validate_transformer_lens_tokenizer(pinned, compatible_copy)
+
+    incompatible_copy = PinnedTokenizer({"unicode-é": 1, "drift": 2})
+    with pytest.raises(ValueError, match="differs from the explicit pinned tokenizer"):
+        data_module._validate_transformer_lens_tokenizer(pinned, incompatible_copy)
 
 
 def test_capture_exact_source_contract_and_failure_resume_stream_identity(

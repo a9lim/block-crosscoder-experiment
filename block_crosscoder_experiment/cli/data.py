@@ -1215,6 +1215,53 @@ def load_pinned_tokenizer(model: str, revision: str, contract: str):
     return tokenizer
 
 
+def _validate_transformer_lens_tokenizer(
+    pinned_tokenizer: object,
+    model_tokenizer: object,
+) -> None:
+    """Require TL's tokenizer copy to remain compatible with pinned tensor input.
+
+    TransformerLens may copy the supplied tokenizer and add an existing token as
+    its padding token. Capture itself always packs rows with ``pinned_tokenizer``
+    and passes integer tensors to the model, so Python object identity and the
+    padding alias are not scientific semantics. The vocabulary and the special
+    token IDs that can change integer tokenization must nevertheless agree.
+    """
+
+    if model_tokenizer is None:
+        raise ValueError("TransformerLens model lacks a tokenizer")
+    try:
+        expected = {
+            "class": type(pinned_tokenizer).__name__,
+            "bos_token_id": pinned_tokenizer.bos_token_id,
+            "eos_token_id": pinned_tokenizer.eos_token_id,
+            "unk_token_id": pinned_tokenizer.unk_token_id,
+            "vocab_sha256": "sha256:"
+            + _canonical_hash(pinned_tokenizer.get_vocab()),
+        }
+        observed = {
+            "class": type(model_tokenizer).__name__,
+            "bos_token_id": model_tokenizer.bos_token_id,
+            "eos_token_id": model_tokenizer.eos_token_id,
+            "unk_token_id": model_tokenizer.unk_token_id,
+            "vocab_sha256": "sha256:" + _canonical_hash(model_tokenizer.get_vocab()),
+        }
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"TransformerLens tokenizer compatibility check failed: {exc}"
+        ) from exc
+    mismatches = {
+        key: {"expected": expected[key], "actual": observed[key]}
+        for key in expected
+        if expected[key] != observed[key]
+    }
+    if mismatches:
+        raise ValueError(
+            "TransformerLens tokenizer differs from the explicit pinned tokenizer: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+
+
 def tokenizer_contract_hash(
     model: str,
     revision: str,
@@ -2460,8 +2507,10 @@ def _capture_unlocked(
         tokenizer=tokenizer,
     ).to(args.device)
     model.eval()
-    if getattr(model, "tokenizer", None) is not tokenizer:
-        raise ValueError("TransformerLens did not retain the explicit pinned tokenizer")
+    _validate_transformer_lens_tokenizer(
+        tokenizer,
+        getattr(model, "tokenizer", None),
+    )
     hook_dict = getattr(model, "hook_dict", {})
     if hook_dict:
         missing_hooks = [hook for hook in hooks if hook not in hook_dict]
