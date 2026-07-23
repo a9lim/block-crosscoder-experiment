@@ -8578,7 +8578,7 @@ def _smoke_overrides(
         ablation="run the unchanged non-smoke cell before using scientific evidence",
     )
     smoke_width = (
-        smoke_factor_count * block_width
+        max(min(site_dims), smoke_factor_count * block_width)
         if values.get("data.factor_subspace_overlap") == "orthogonal"
         else 8
     )
@@ -8622,6 +8622,11 @@ def _smoke_overrides(
             "optimizer.batch_tokens",
             16,
             "four CPU batches are sufficient for lifecycle validation",
+        ),
+        scientific(
+            "optimizer.learning_rate",
+            min(3e-4, float(values["optimizer.learning_rate"])),
+            "cap the four-update smoke rate so constraint retraction remains a lifecycle check rather than a numerical stress",
         ),
         engineering(
             "optimizer.warmup_basis",

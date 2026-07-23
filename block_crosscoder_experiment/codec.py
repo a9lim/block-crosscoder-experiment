@@ -2257,6 +2257,15 @@ def _rd_evaluation_coroutine(
     bern = torch.tensor(rows_bits_bern, dtype=torch.float64)
     cnt = torch.tensor(rows_counts, dtype=torch.float64)
     generator = torch.Generator().manual_seed(spec.bootstrap_seed)
+    site_denominator = tot_site_t.sum(dim=0)
+    site_fvu_defined = site_denominator > 0
+
+    def site_fvu_payload(numerator: torch.Tensor) -> list[float | None]:
+        values = numerator / site_denominator.clamp_min(1e-30)
+        return [
+            float(value) if bool(defined) else None
+            for value, defined in zip(values, site_fvu_defined, strict=True)
+        ]
 
     def boot(num: torch.Tensor, den: torch.Tensor) -> tuple[float, float]:
         if spec.n_bootstrap <= 0:
@@ -2309,7 +2318,10 @@ def _rd_evaluation_coroutine(
         "zero_rate": {
             "reconstruction": "calibration_fit_per_site_mean",
             "fvu_pooled": 1.0,
-            "fvu_per_site": [1.0] * S,
+            "fvu_per_site": [
+                1.0 if bool(defined) else None for defined in site_fvu_defined
+            ],
+            "fvu_per_site_defined": site_fvu_defined.tolist(),
             "payload_bits_per_token": 0.0,
         },
         "points": {},
@@ -2326,7 +2338,8 @@ def _rd_evaluation_coroutine(
             "q": q,
             "fvu_pooled": float(err.sum() / tot.sum()),
             "fvu_ci95": [fvu_lo, fvu_hi],
-            "fvu_per_site": (err_site_t.sum(dim=0) / tot_site_t.sum(dim=0)).tolist(),
+            "fvu_per_site": site_fvu_payload(err_site_t.sum(dim=0)),
+            "fvu_per_site_defined": site_fvu_defined.tolist(),
             "amplitude_bits_per_token": amp_bits,
             "rate_bits_per_token": rate,
             "rate_bits_ci95": list(boot(rate_numerator, n_tok)),

@@ -3,6 +3,7 @@
 import copy
 from dataclasses import replace
 import gc
+import json
 import weakref
 
 from types import SimpleNamespace
@@ -108,6 +109,28 @@ def test_codec_fits_and_evaluates():
     assert res["zero_rate"]["fvu_pooled"] == 1.0
     assert p4["rate_bits_per_token"] >= p4["amplitude_bits_per_token"]
     assert len(p4["rate_bits_ci95"]) == 2
+
+
+def test_codec_marks_zero_variance_site_fvu_undefined_without_nonfinite_json():
+    torch.manual_seed(1)
+    model = calibrated(make_model(), torch.randn(512, S, D))
+    calibration = torch.randn(512, S, D)
+    calibration[:, 1] = 0
+    codec = fit_codec(
+        model,
+        batches_of(calibration),
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=8),
+    )
+    evaluation = torch.randn(256, S, D)
+    evaluation[:, 1] = 0
+
+    result = evaluate_rd(model, codec, batches_of(evaluation), row_len=64)
+    point = result["points"]["4"]
+    assert point["fvu_per_site"][1] is None
+    assert point["fvu_per_site_defined"] == [True, False, True]
+    assert result["zero_rate"]["fvu_per_site"][1] is None
+    assert result["zero_rate"]["fvu_per_site_defined"] == [True, False, True]
+    json.dumps(result, allow_nan=False)
 
 
 def test_row_length_one_fast_path_is_exact_across_batching():

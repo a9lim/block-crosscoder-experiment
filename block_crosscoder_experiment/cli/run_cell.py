@@ -7857,18 +7857,30 @@ def _phase1_threshold_sensitivity_payload(
     }
 
 
-def _finite_json(value: Any) -> bool:
+def _first_nonfinite_json_path(value: Any, *, path: str = "$") -> str | None:
     if isinstance(value, bool) or value is None or isinstance(value, str):
-        return True
+        return None
     if isinstance(value, (int, float)):
-        return math.isfinite(float(value))
+        return None if math.isfinite(float(value)) else path
     if isinstance(value, (list, tuple)):
-        return all(_finite_json(item) for item in value)
+        for index, item in enumerate(value):
+            invalid = _first_nonfinite_json_path(item, path=f"{path}[{index}]")
+            if invalid is not None:
+                return invalid
+        return None
     if isinstance(value, dict):
-        return all(
-            isinstance(key, str) and _finite_json(item) for key, item in value.items()
-        )
-    return False
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return path
+            invalid = _first_nonfinite_json_path(item, path=f"{path}.{key}")
+            if invalid is not None:
+                return invalid
+        return None
+    return path
+
+
+def _finite_json(value: Any) -> bool:
+    return _first_nonfinite_json_path(value) is None
 
 
 @torch.no_grad()
@@ -10684,8 +10696,12 @@ def _evaluate(
             "accepted_tokens": training_summary["accepted_tokens"],
         },
     }
-    if not _finite_json(payload):
-        raise CellExecutionError("evaluation contains a non-finite or non-JSON value")
+    invalid_json_path = _first_nonfinite_json_path(payload)
+    if invalid_json_path is not None:
+        raise CellExecutionError(
+            "evaluation contains a non-finite or non-JSON value at "
+            f"{invalid_json_path}"
+        )
     _write_immutable_json(ctx.evaluation, payload)
     return (
         ("deployment_schedules", ctx.deployment_schedules),

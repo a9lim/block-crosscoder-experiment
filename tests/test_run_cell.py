@@ -48,6 +48,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _expected_capture_allocation,
     _expected_real_source_contract,
     _fixed_rate_raw_score,
+    _first_nonfinite_json_path,
     _gather_event_factor_blocks,
     _gpu_lock_path,
     _host_gpu_execution_lock,
@@ -189,6 +190,16 @@ def _retained_cache_key() -> _RetainedArtifactKey:
         ),
         model_config_sha256="b" * 64,
     )
+
+
+def test_nonfinite_json_diagnostic_reports_the_first_exact_path() -> None:
+    assert (
+        _first_nonfinite_json_path(
+            {"valid": [1, None], "invalid": {"values": (0.0, float("nan"))}}
+        )
+        == "$.invalid.values[1]"
+    )
+    assert _first_nonfinite_json_path({"finite": [True, -3.5]}) is None
 
 
 def test_resolved_runtime_device_canonicalizes_implicit_cuda_index(
