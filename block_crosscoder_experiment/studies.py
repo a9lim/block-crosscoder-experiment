@@ -8623,11 +8623,6 @@ def _smoke_overrides(
             16,
             "four CPU batches are sufficient for lifecycle validation",
         ),
-        scientific(
-            "optimizer.learning_rate",
-            min(3e-4, float(values["optimizer.learning_rate"])),
-            "cap the four-update smoke rate so constraint retraction remains a lifecycle check rather than a numerical stress",
-        ),
         engineering(
             "optimizer.warmup_basis",
             "accepted_update_fraction",
@@ -8687,6 +8682,14 @@ def _smoke_overrides(
             rationale="log every one of the four smoke optimizer steps",
         ),
     ]
+    if phase is Phase.PHASE1:
+        result.append(
+            scientific(
+                "optimizer.learning_rate",
+                min(3e-4, float(values["optimizer.learning_rate"])),
+                "cap the four-update smoke rate so constraint retraction remains a lifecycle check rather than a numerical stress",
+            )
+        )
     if values.get("precision.preflight_contract") != "not_applicable":
         result.append(
             engineering(

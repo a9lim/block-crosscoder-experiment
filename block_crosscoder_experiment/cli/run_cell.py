@@ -7441,6 +7441,7 @@ def _synthetic_recovery(
     ]
     return {
         "selection_mode": selection_mode,
+        "shared_feature_claim_required": len(dataset.site_dims) > 1,
         "shared_feature_claim_eligible": shared_feature_claim_eligible,
         "shared_feature_claim_reason": shared_feature_claim_reason,
         "identification_metrics_eligible": subspace_eligible,
@@ -10272,6 +10273,8 @@ def _phase1_identification_outcome(
     phase: Phase,
     identification: Mapping[str, Any] | None,
     validation: Mapping[str, Any],
+    *,
+    recovery: Mapping[str, Any] | None = None,
 ) -> tuple[bool, dict[str, str]]:
     """Evaluate or explicitly neutralize the Phase-1 identification check."""
 
@@ -10280,6 +10283,13 @@ def _phase1_identification_outcome(
     if not isinstance(identification, Mapping):
         return False, {}
     endpoints = tuple(identification.get(name, {}) for name in ("native", "deployed"))
+    if isinstance(recovery, Mapping) and any(
+        recovery.get(name, {}).get("shared_feature_claim_required") is True
+        and recovery.get(name, {}).get("shared_feature_claim_eligible") is not True
+        for name in ("native", "deployed")
+        if isinstance(recovery.get(name), Mapping)
+    ):
+        return False, {}
     if all(endpoint.get("applicable") is False for endpoint in endpoints):
         reasons = {endpoint.get("ineligible_reason") for endpoint in endpoints}
         if len(reasons) == 1:
@@ -11345,6 +11355,7 @@ def _qualify(
             ctx.cell.phase,
             identification,
             evaluation.get("validation", {}),
+            recovery=recovery,
         )
     )
     scientific_outcome_checks = {

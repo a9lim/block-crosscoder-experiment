@@ -2406,6 +2406,44 @@ def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
     }
 
 
+def test_multisite_identification_requires_shared_feature_claim_eligibility() -> None:
+    identification = {
+        endpoint: {"applicable": True, "passed": True}
+        for endpoint in ("native", "deployed")
+    }
+    validation = {
+        "phase1_identification_applicable": True,
+        "phase1_identification_conjunction": True,
+    }
+    rejected, _ = _phase1_identification_outcome(
+        Phase.PHASE1,
+        identification,
+        validation,
+        recovery={
+            endpoint: {
+                "shared_feature_claim_required": True,
+                "shared_feature_claim_eligible": False,
+            }
+            for endpoint in ("native", "deployed")
+        },
+    )
+    assert rejected is False
+
+    single_site, _ = _phase1_identification_outcome(
+        Phase.PHASE1,
+        identification,
+        validation,
+        recovery={
+            endpoint: {
+                "shared_feature_claim_required": False,
+                "shared_feature_claim_eligible": False,
+            }
+            for endpoint in ("native", "deployed")
+        },
+    )
+    assert single_site is True
+
+
 def test_sasa_paper_persistent_worker_qualifies_inapplicable_identification(
     tmp_path: Path,
 ) -> None:
