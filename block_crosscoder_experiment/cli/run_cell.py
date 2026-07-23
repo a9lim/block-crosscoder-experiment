@@ -7556,6 +7556,7 @@ def _phase1_identification_evidence(
         return {
             "applicable": False,
             "ineligible_reason": reason,
+            "margin_normalization_contract": margin_normalization_contract,
             "thresholds": thresholds,
             "per_factor": [],
             "aggregate": {

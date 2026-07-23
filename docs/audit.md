@@ -466,11 +466,16 @@ exit is not evidence by itself.
   cell configuration. On 2026-07-23 the first MAP-nuclear Phase-1 anchor
   trained and calibrated at `f1efa31` but failed closed before evaluation when
   the retained-cache key compared its resolved coefficient with the declared
-  zero placeholder. The failed event and completed artifacts remain in the
-  campaign journal; a fresh same-commit worker can resume from the durable
-  calibrated state, while the corrected persistent path validates the report's
-  preparation/checkpoint binding, exact resolved field set, and reconstructible
-  model configuration before accepting the handoff.
+  zero placeholder. Fresh same-commit workers resumed all three seed artifacts
+  through evaluation, then exposed a second fail-closed defect: explicitly
+  inapplicable token-LayerNorm identification evidence omitted its already
+  declared margin-normalization contract, while qualification correctly
+  required that contract on every endpoint. The complete failed journal and
+  artifacts are preserved as an aborted campaign; they are not rewritten or
+  mixed with corrected code. The corrected persistent path validates the
+  report's preparation/checkpoint binding, exact resolved field set, and
+  reconstructible model configuration, while inapplicable identification
+  carries its named reason, null metrics, and margin-normalization contract.
 - Journal validation plus extension commit share one cross-process mutation
   lock, so selected evidence cannot fail between its final replay and the
   `plan_extension` append. The hot authority cursor retains and stat-revalidates

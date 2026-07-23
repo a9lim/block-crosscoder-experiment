@@ -795,7 +795,7 @@ def _validated_phase1_identification(
         "margin",
         "passed",
     }
-    inapplicable_keys = applicable_keys - {"margin_normalization_contract"}
+    inapplicable_keys = applicable_keys
     factor_keys = {
         "factor",
         "support_association",
@@ -853,6 +853,12 @@ def _validated_phase1_identification(
             raise ArtifactError(
                 f"Phase-1 {endpoint_name} identification thresholds differ from the cell"
             )
+        if endpoint.get("margin_normalization_contract") != cell.decision_map.get(
+            "evaluation.phase1_margin_normalization"
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} margin contract differs from the cell"
+            )
         if not applicable:
             if (
                 not isinstance(endpoint.get("ineligible_reason"), str)
@@ -875,12 +881,6 @@ def _validated_phase1_identification(
         if endpoint.get("ineligible_reason") is not None:
             raise ArtifactError(
                 f"Phase-1 {endpoint_name} applicable evidence names an ineligible reason"
-            )
-        if endpoint.get("margin_normalization_contract") != cell.decision_map.get(
-            "evaluation.phase1_margin_normalization"
-        ):
-            raise ArtifactError(
-                f"Phase-1 {endpoint_name} margin contract differs from the cell"
             )
         per_factor = endpoint.get("per_factor")
         expected_factor_count = cell.decision_map.get("data.n_factors")

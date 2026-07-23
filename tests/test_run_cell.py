@@ -1040,14 +1040,44 @@ def _campaign(tmp_path: Path, cell: CellSpec) -> Campaign:
         seeds=(cell.seed,), smoke=bool(cell.decision_map["runtime.smoke"])
     ).stages[-1]
     assert source_stage.selection_policy is not None
+    matching_selection_profile = (
+        cell.decision_map["evaluation.endpoint_profile"]
+        == source_stage.selection_policy.endpoint_profile
+    )
     selection_policy = replace(
         source_stage.selection_policy,
         eligible_recipe_names=(cell.recipe_name,),
     )
+    if matching_selection_profile:
+        stages = (StageSpec("test", (cell,), selection_policy=selection_policy),)
+    else:
+        fixture_base = next(
+            item
+            for item in source_stage.cells
+            if item.recipe_name
+            in source_stage.selection_policy.eligible_recipe_names
+        )
+        fixture = replace(
+            fixture_base,
+            name=f"phase1.test.selection_fixture.s{cell.seed}",
+            stage="selection_fixture",
+        )
+        fixture_policy = replace(
+            source_stage.selection_policy,
+            eligible_recipe_names=(fixture.recipe_name,),
+        )
+        stages = (
+            StageSpec("test", (cell,)),
+            StageSpec(
+                "selection_fixture",
+                (fixture,),
+                selection_policy=fixture_policy,
+            ),
+        )
     plan = StudyPlan(
         f"test_executor_{cell.phase.value}_{cell.seed}_{cell.recipe_name}",
         cell.phase,
-        (StageSpec("test", (cell,), selection_policy=selection_policy),),
+        stages,
     )
     blueprint = Phase1Blueprint(
         name="run_cell_test_blueprint",
@@ -2317,6 +2347,9 @@ def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
     assert native["ineligible_reason"] == (
         "token_layer_normalization_is_not_a_fixed_linear_factor_map"
     )
+    assert native["margin_normalization_contract"] == (
+        "piecewise_available_headroom_signed_margin_v2"
+    )
     assert native["aggregate"] == {
         "support_precision_diagnostic": 1.0,
         "support_recall_diagnostic": 1.0,
@@ -2342,6 +2375,43 @@ def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
             "token_layer_normalization_is_not_a_fixed_linear_factor_map"
         )
     }
+
+
+def test_sasa_paper_persistent_worker_qualifies_inapplicable_identification(
+    tmp_path: Path,
+) -> None:
+    base = next(
+        cell
+        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        if cell.recipe_name == "sasa_paper"
+    )
+    cell = replace(
+        base,
+        name="phase1.test.sasa_paper_persistent_worker.s0",
+        stage="test",
+    )
+    campaign = _campaign(tmp_path, cell)
+    summary = _runner(campaign).run(limit=1)
+    assert summary.completed_cells == 1
+    assert summary.failed_cells == 0
+    record = campaign.record(cell.cell_id)
+    assert record.state is RunState.QUALIFIED
+    evaluation = json.loads(
+        record.artifact_map["evaluation"].resolve(campaign.root).read_text()
+    )
+    for endpoint in ("native", "deployed"):
+        identification = evaluation["synthetic_identification"][endpoint]
+        assert identification["applicable"] is False
+        assert identification["margin_normalization_contract"] == (
+            cell.decision_map["evaluation.phase1_margin_normalization"]
+        )
+    qualification = json.loads(
+        record.artifact_map["qualification"].resolve(campaign.root).read_text()
+    )
+    assert qualification["checks"]["scientific_endpoint_complete"] is True
+    assert qualification["scientific_outcome"]["checks"][
+        "phase1_identification"
+    ] is True
 
 
 def test_scientific_prepare_requires_clean_committed_source(

@@ -289,6 +289,9 @@ def phase1_identification_metrics(
                 },
                 "checks": {},
                 "normalized_margins": {},
+                "margin_normalization_contract": cell.decision_map[
+                    "evaluation.phase1_margin_normalization"
+                ],
                 "margin": None,
                 "passed": None,
             }
@@ -5448,6 +5451,9 @@ def phase1_selection_metrics():
             },
             "checks": {},
             "normalized_margins": {},
+            "margin_normalization_contract": values[
+                "evaluation.phase1_margin_normalization"
+            ],
             "margin": None,
             "passed": None,
         }
