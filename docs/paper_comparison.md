@@ -169,7 +169,7 @@ contract rather than a paper-recipe or hyperparameter tournament.
 
 | Stage | Recipes/variants | Selection or gate |
 |---|---|---|
-| `single_site_learnability` | four orthogonal rank-two factors; exactly matched four-by-width-two learner; one active factor | all three seeds must pass before the multisite stage opens |
+| `single_site_learnability` | one rank-two factor; exactly matched one-by-width-two learner; one active factor | all three seeds must pass before the multisite stage opens |
 | `multisite_learnability` | the same shared coordinates rendered through four independent orthogonal site dictionaries | sole fixed selectable carrier; selection authenticates rather than tunes |
 | `truth_contract_confirmation` | baseline; support-only; one-site factor span | untouched confirmation stream; baseline must pass and both claim-negative controls must fail |
 

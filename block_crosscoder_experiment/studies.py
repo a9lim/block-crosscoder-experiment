@@ -6566,7 +6566,7 @@ def _phase1_learnability_recipe(
                 novel(
                     "data.site_dims",
                     site_dims,
-                    rationale="fit four orthogonal rank-two factors exactly into each tiny eight-dimensional site",
+                    rationale="fit one rank-two factor exactly into each two-dimensional site",
                     ablation="real-model width and hook geometry belong exclusively to Phase 2",
                 ),
                 novel(
@@ -6607,9 +6607,9 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "data.n_factors",
-                    4,
-                    rationale="make the truth small enough to inspect factor by factor",
-                    ablation="factor-count scaling is a diagnostic rather than a Phase-1 selection axis",
+                    1,
+                    rationale="remove hard support assignment from the universal shared-coordinate instrument",
+                    ablation="multi-feature sparse allocation belongs to Phase 2",
                 ),
                 novel(
                     "data.active_factors_per_example",
@@ -6655,7 +6655,7 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "model.groups",
-                    4,
+                    1,
                     rationale="match learner block count exactly to planted factor count",
                     ablation="overcomplete capacity is intentionally excluded from the truth gate",
                 ),
@@ -6734,11 +6734,11 @@ def _phase1_learnability_recipe(
 PHASE1_LEARNABILITY_RECIPES = (
     _phase1_learnability_recipe(
         name="phase1_learnability_single_site_orthogonal",
-        site_dims=(8,),
+        site_dims=(2,),
     ),
     _phase1_learnability_recipe(
         name="phase1_learnability_multisite_orthogonal",
-        site_dims=(8, 8, 8, 8),
+        site_dims=(2, 2, 2, 2),
     ),
 )
 

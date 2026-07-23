@@ -527,6 +527,26 @@ def test_ladder_orthogonal_truth_is_exact_and_marks_multisite_claims(n_sites: in
     )
 
 
+def test_ladder_one_factor_contract_has_empty_pair_diagnostics():
+    dataset = make_ladder_dataset(
+        _ladder_config(
+            n_sites=4,
+            d_model=2,
+            n_factors=1,
+            block_dim=2,
+            base_rank=2,
+            active_per_example=1,
+            factor_subspace_overlap="orthogonal",
+            site_map_rank_family="independent",
+        )
+    )
+    batch = dataset.sample(32)
+    assert batch.active.all()
+    assert dataset.factor_overlap_pairs.shape == (0, 2)
+    assert dataset.coactivation_group_probabilities.shape == (0,)
+    assert dataset.realized_pair_principal_angles_degrees.shape == (0, 2)
+
+
 def test_ladder_overlap_geometry_is_independent_of_coactivation_control():
     base = _ladder_config(factor_subspace_overlap="paired_30deg")
     independent = make_ladder_dataset(base)

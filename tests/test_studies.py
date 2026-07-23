@@ -398,10 +398,10 @@ def test_phase1_blueprint_is_a_fixed_tiny_learnability_contract():
         "site_span_one",
     }
     single, multisite = (stage.cells[0].decision_map for stage in prefix.stages)
-    assert single["data.site_dims"] == (8,)
-    assert multisite["data.site_dims"] == (8, 8, 8, 8)
+    assert single["data.site_dims"] == (2,)
+    assert multisite["data.site_dims"] == (2, 2, 2, 2)
     for values in (single, multisite):
-        assert values["data.n_factors"] == values["model.groups"] == 4
+        assert values["data.n_factors"] == values["model.groups"] == 1
         assert values["data.factor_coordinate_dim"] == values["model.block_width"] == 2
         assert (
             values["data.active_factors_per_example"]
@@ -2006,7 +2006,7 @@ def test_v17_estimator_prices_cholesky_qr1_training_workspace(
         and len(cell.decision_map["data.site_dims"]) > 1
     )
     original_dims = tuple(int(item) for item in cholesky.decision_map["data.site_dims"])
-    unequal_dims = tuple(value - index for index, value in enumerate(original_dims))
+    unequal_dims = tuple(value + index for index, value in enumerate(original_dims))
     assert len(set(unequal_dims)) > 1 and min(unequal_dims) > 0
     cholesky = _replace_decision(cholesky, "data.site_dims", unequal_dims)
     householder = _replace_decision(

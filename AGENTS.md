@@ -38,8 +38,8 @@ preview cannot authorize registration.
 - Paper, inspected release, and local adaptation are separate recipes.
 - Adapted or novel scientific choices require a rationale and named ablation.
 - Use one/few-factor conditional rounds, not an incoherent Cartesian product.
-- Phase 1 fixes four rank-two factors in eight dimensions, exactly four
-  width-two learner blocks, and one active factor/block. A one-site positive control
+- Phase 1 fixes one rank-two factor in two dimensions, exactly one width-two
+  learner block, and one active factor/block. A one-site positive control
   must pass before the four-site shared-coordinate carrier runs.
 - The four-site carrier renders the same coordinates through independent
   orthogonal site dictionaries. Confirmation reruns it beside support-only and

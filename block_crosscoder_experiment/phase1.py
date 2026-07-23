@@ -1313,7 +1313,7 @@ class LadderDataset(Phase1Dataset):
             pair_weights = sampling_weights[coactivation_groups].prod(dim=1)
             coactivation_group_probabilities = pair_weights / pair_weights.sum()
         else:
-            coactivation_group_probabilities = torch.empty(dtype=torch.float64)
+            coactivation_group_probabilities = torch.empty(0, dtype=torch.float64)
 
         base_inclusion = _conditional_bernoulli_marginals(
             sampling_weights, config.active_per_example

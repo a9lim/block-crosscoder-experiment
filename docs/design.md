@@ -193,9 +193,9 @@ uses stateless generators, fp32 reference training, independent
 structure/train/eval/confirmation seeds, and disjoint calibration,
 development, and confirmation identity ranges.
 
-The live contract is deliberately minuscule and identifiable. It plants four
-rank-two factors in an eight-dimensional site, activates exactly one factor per
-row, and fits exactly four width-two learner blocks with one active block. Each
+The live contract is deliberately minuscule and identifiable. It plants one
+rank-two factor in a two-dimensional site, activates that factor on every row,
+and fits exactly one width-two learner block with one active block. Each
 site receives a complete orthogonal factor dictionary. The multisite carrier
 uses four independently rotated orthogonal dictionaries with one shared signed
 coordinate vector, so factor identity is identifiable from sparse support and
@@ -208,7 +208,9 @@ optimizer, width, capacity, score, selector, or regularizer tournament. Those
 quantities are model- and scale-dependent and are reopened on real activations
 in Phase 2. The synthetic recipe exports only the shared signed-coordinate
 ontology and universal execution semantics, never its numeric dimensions or
-optimizer values.
+optimizer values. Multi-feature sparse allocation is deliberately absent:
+Phase 1 proves the shared-vector coordinate path, while Phase 2 owns whether
+real activations admit a useful sparse allocation.
 
 ### 5.2 Initial spine
 
