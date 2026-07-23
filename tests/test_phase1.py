@@ -493,6 +493,40 @@ def test_ladder_paired_overlap_has_realized_30_degree_principal_angles():
     )
 
 
+@pytest.mark.parametrize("n_sites", (1, 4))
+def test_ladder_orthogonal_truth_is_exact_and_marks_multisite_claims(n_sites: int):
+    dataset = make_ladder_dataset(
+        _ladder_config(
+            n_sites=n_sites,
+            d_model=24,
+            n_factors=6,
+            block_dim=4,
+            base_rank=2,
+            factor_subspace_overlap="orthogonal",
+            site_map_rank_family="independent",
+        )
+    )
+    for site in range(n_sites):
+        columns = dataset.site_map_bases[:, site].permute(1, 0, 2).reshape(24, 24)
+        assert torch.allclose(
+            columns.T @ columns,
+            torch.eye(24),
+            atol=2e-5,
+        )
+    expected = torch.full_like(
+        dataset.realized_pair_principal_angles_degrees, 90.0
+    )
+    assert torch.allclose(
+        dataset.realized_pair_principal_angles_degrees,
+        expected,
+        atol=2e-5,
+    )
+    assert dataset.ground_truth["target_pair_principal_angle_degrees"] == 90.0
+    assert bool(dataset.ground_truth["shared_feature_claim_eligible"]) is (
+        n_sites > 1
+    )
+
+
 def test_ladder_overlap_geometry_is_independent_of_coactivation_control():
     base = _ladder_config(factor_subspace_overlap="paired_30deg")
     independent = make_ladder_dataset(base)
@@ -520,6 +554,12 @@ def test_ladder_overlap_geometry_is_independent_of_coactivation_control():
         {"coactivation_probability": 0.25},
         {"coordinate_amplitude_law": "laplace"},
         {"factor_subspace_overlap": "paired_45deg"},
+        {
+            "factor_subspace_overlap": "orthogonal",
+            "n_factors": 4,
+            "block_dim": 3,
+            "d_model": 11,
+        },
         {
             "factor_subspace_overlap": "paired_30deg",
             "d_model": 5,

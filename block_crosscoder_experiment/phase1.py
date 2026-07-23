@@ -962,7 +962,9 @@ class LadderSyntheticConfig:
     feature_frequency: Literal["uniform", "zipf_alpha_1"] = "uniform"
     coactivation_probability: float = 0.0
     coordinate_amplitude_law: Literal["gaussian", "student_t_df3"] = "gaussian"
-    factor_subspace_overlap: Literal["uncontrolled", "paired_30deg"] = "uncontrolled"
+    factor_subspace_overlap: Literal[
+        "uncontrolled", "orthogonal", "paired_30deg"
+    ] = "uncontrolled"
     train_unique_examples: int = 100_000
     train_presentations: int = 100_000
     eval_unique_examples: int = 20_000
@@ -975,8 +977,8 @@ class LadderSyntheticConfig:
     def __post_init__(self) -> None:
         if self.step not in LADDER_STEPS:
             raise ValueError(f"step must be one of {LADDER_STEPS}")
-        if self.n_sites < 2:
-            raise ValueError("n_sites must be at least two")
+        if self.n_sites < 1:
+            raise ValueError("n_sites must be positive")
         if self.d_model <= 0 or self.block_dim <= 0:
             raise ValueError("dimensions must be positive")
         if self.block_dim > self.d_model:
@@ -1003,10 +1005,20 @@ class LadderSyntheticConfig:
             )
         if self.factor_subspace_overlap not in {
             "uncontrolled",
+            "orthogonal",
             "paired_30deg",
         }:
             raise ValueError(
-                "factor_subspace_overlap must be 'uncontrolled' or 'paired_30deg'"
+                "factor_subspace_overlap must be 'uncontrolled', 'orthogonal', "
+                "or 'paired_30deg'"
+            )
+        if (
+            self.factor_subspace_overlap == "orthogonal"
+            and self.n_factors * self.block_dim > self.d_model
+        ):
+            raise ValueError(
+                "orthogonal factor_subspace_overlap requires "
+                "n_factors * block_dim <= d_model"
             )
         if self.factor_subspace_overlap == "paired_30deg":
             if self.n_factors < 2:
@@ -1126,6 +1138,32 @@ class LadderDataset(Phase1Dataset):
                     for factor in range(config.n_factors)
                 ]
             )
+        elif config.factor_subspace_overlap == "orthogonal":
+            map_bases = torch.empty(
+                config.n_factors,
+                config.n_sites,
+                config.d_model,
+                config.block_dim,
+            )
+            for basis in range(config.n_sites):
+                joint_frame = _orthonormal(
+                    config.d_model,
+                    config.n_factors * config.block_dim,
+                    seed=(
+                        config.structure_seed
+                        + 92_000_071
+                        + 10_000_019 * basis
+                    ),
+                )
+                map_bases[:, basis] = (
+                    joint_frame.T.reshape(
+                        config.n_factors,
+                        config.block_dim,
+                        config.d_model,
+                    )
+                    .transpose(1, 2)
+                    .contiguous()
+                )
         else:
             map_bases = torch.empty(
                 config.n_factors,
@@ -1398,7 +1436,11 @@ class LadderDataset(Phase1Dataset):
             "factor_subspace_overlap": config.factor_subspace_overlap,
             "factor_overlap_pairs": self.factor_overlap_pairs,
             "target_pair_principal_angle_degrees": (
-                30.0 if config.factor_subspace_overlap == "paired_30deg" else None
+                90.0
+                if config.factor_subspace_overlap == "orthogonal"
+                else 30.0
+                if config.factor_subspace_overlap == "paired_30deg"
+                else None
             ),
             "principal_angle_reference": (
                 "full_block_dim_canonical_base_frames_before_rank_truncation"
@@ -1407,7 +1449,9 @@ class LadderDataset(Phase1Dataset):
                 self.realized_pair_principal_angles_degrees
             ),
             "shared_feature_claim_eligible": torch.tensor(
-                config.step != "shared_support" and config.site_presence_span != "one",
+                config.n_sites > 1
+                and config.step != "shared_support"
+                and config.site_presence_span != "one",
                 dtype=torch.bool,
             ),
         }
@@ -1519,7 +1563,11 @@ class LadderDataset(Phase1Dataset):
                     "structure_seed_plus_60000019_local_torch_randperm"
                 ),
                 "target_pair_principal_angle_degrees": (
-                    30.0 if config.factor_subspace_overlap == "paired_30deg" else None
+                    90.0
+                    if config.factor_subspace_overlap == "orthogonal"
+                    else 30.0
+                    if config.factor_subspace_overlap == "paired_30deg"
+                    else None
                 ),
                 "realized_pair_principal_angles_degrees": (
                     realized_pair_principal_angles_degrees.tolist()

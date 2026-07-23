@@ -336,7 +336,7 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
         studies_module._family_aux_variants("bsf_group_lasso")
     group_lasso = next(
         cell
-        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
         if cell.recipe_name == "bsf_group_lasso_primary"
     )
     invalid_group_lasso_aux = _replace_decision(
@@ -374,75 +374,43 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
     assert qualification["qualification.phase1_threshold_sensitivity"].value
 
 
-def test_phase1_blueprint_is_an_honest_conditional_one_factor_campaign():
+def test_phase1_blueprint_is_a_fixed_tiny_learnability_contract():
     blueprint = build_phase1_blueprint()
     prefix = build_phase1_plan()
-    assert blueprint.projected_cells == 195
-    assert len(prefix.cells) == 48
+    assert blueprint.projected_cells == 15
+    assert len(prefix.cells) == 6
     assert [(stage.name, len(stage.cells)) for stage in prefix.stages] == [
-        ("paper_anchors", 21),
-        ("representable_controls", 12),
-        ("fusion_identification", 6),
-        ("dgp_identification_screen", 9),
+        ("single_site_learnability", 3),
+        ("multisite_learnability", 3),
     ]
     assert [
         (round_spec.name, len(round_spec.variants)) for round_spec in blueprint.rounds
     ] == [
-        ("capacity_identification", 8),
-        ("retraction_identification", 2),
-        ("site_factorization_identification", 5),
-        ("site_mask_fusion_control_identification", 3),
-        ("site_masking_identification", 6),
-        ("selection_score_identification", 6),
-        ("selector_identification", 2),
-        ("robustness_confirmation", 17),
+        ("truth_contract_confirmation", 3),
     ]
-    capability_rounds = tuple(
-        round_spec
-        for round_spec in blueprint.rounds
-        if round_spec.role == "capability_panel"
-    )
-    assert {round_spec.name for round_spec in capability_rounds} == {
-        "capacity_identification",
-        "retraction_identification",
-        "site_factorization_identification",
-        "site_mask_fusion_control_identification",
-        "site_masking_identification",
-        "selection_score_identification",
-        "selector_identification",
-    }
-    for round_spec in capability_rounds:
-        assert round_spec.advancement == "fixed_carrier"
-        assert round_spec.fixed_carrier_variant is not None
-        for variant in round_spec.variants:
-            promotable = next(
-                (
-                    decision.value
-                    for decision in variant.decisions
-                    if decision.name == "qualification.promotable"
-                ),
-                None,
-            )
-            if variant.name == round_spec.fixed_carrier_variant:
-                assert promotable is not False
-            else:
-                assert promotable is False
-    score_round = next(
-        round_spec
-        for round_spec in blueprint.rounds
-        if round_spec.name == "selection_score_identification"
-    )
-    assert score_round.role == "capability_panel"
-    assert score_round.advancement == "fixed_carrier"
-    assert score_round.fixed_carrier_variant == "score_decoded_energy"
     confirmation = blueprint.rounds[-1]
     assert confirmation.role == "confirmation"
     assert confirmation.advancement == "none"
     assert confirmation.selection_policy is None
-    assert all(
-        stage.gate is None or stage.gate.basis == "integrity_complete"
-        for stage in prefix.stages[:-1]
-    )
+    assert {variant.name for variant in confirmation.variants} == {
+        "baseline",
+        "support_only",
+        "site_span_one",
+    }
+    single, multisite = (stage.cells[0].decision_map for stage in prefix.stages)
+    assert single["data.site_dims"] == (32,)
+    assert multisite["data.site_dims"] == (32, 32, 32, 32)
+    for values in (single, multisite):
+        assert values["data.n_factors"] == values["model.groups"] == 16
+        assert values["data.factor_coordinate_dim"] == values["model.block_width"] == 2
+        assert (
+            values["data.active_factors_per_example"]
+            == values["model.active_blocks"]
+            == 2
+        )
+        assert values["data.factor_subspace_overlap"] == "orthogonal"
+        assert values["protocol.hyperparameter_tuning"] is False
+    assert prefix.stages[-1].gate.basis == "qualified"
     restored = Phase1Blueprint.from_manifest(
         json.loads(json.dumps(blueprint.to_manifest()))
     )
@@ -483,7 +451,7 @@ def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
     phase1 = build_phase1_blueprint()
     phase2 = build_phase2_blueprint()
     assert phase1.seeds == (0, 1, 2)
-    assert phase1.projected_cells == 195
+    assert phase1.projected_cells == 15
     assert phase2.seeds == (0, 1)
     assert phase2.declared_cell_ceiling == 410
 
@@ -498,37 +466,19 @@ def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
 def test_phase1_selection_uses_qualified_truth_margin_and_untouched_confirmation():
     blueprint = build_phase1_blueprint(seeds=(0, 1), smoke=True)
     plan = _materialize_all(blueprint, build_phase1_plan(seeds=(0, 1), smoke=True))
-    assert len(plan.cells) == blueprint.projected_cells == 130
-    assert all(stage.selection_policy is not None for stage in plan.stages[3:-1])
+    assert len(plan.cells) == blueprint.projected_cells == 10
+    assert plan.stages[0].selection_policy is None
+    assert plan.stages[1].selection_policy is not None
     assert plan.stages[-1].selection_policy is None
-    for stage in plan.stages[3:-1]:
-        policy = stage.selection_policy
-        assert policy.metric_path == "validation.phase1_identification_margin"
-        assert policy.selection_score == "minimum_normalized_identification_margin"
-        assert policy.require_qualification is True
-        assert policy.require_scientific_outcome_pass is True
-    rounds_by_name = {round_spec.name: round_spec for round_spec in blueprint.rounds}
-    for stage in plan.stages:
-        round_spec = rounds_by_name.get(stage.name)
-        if round_spec is None or round_spec.role != "capability_panel":
-            continue
-        promotable = {
-            cell.recipe_name.removeprefix(f"derived_{stage.name}_"): cell.decision_map[
-                "qualification.promotable"
-            ]
-            for cell in stage.cells
-            if cell.seed == 0
-        }
-        assert promotable[round_spec.fixed_carrier_variant] is True
-        assert all(
-            value is False
-            for variant, value in promotable.items()
-            if variant != round_spec.fixed_carrier_variant
-        )
-        assert all(
-            cell.decision_map["protocol.hyperparameter_tuning"] is False
-            for cell in stage.cells
-        )
+    policy = plan.stages[1].selection_policy
+    assert policy.metric_path == "validation.phase1_identification_margin"
+    assert policy.selection_score == "minimum_normalized_identification_margin"
+    assert policy.require_qualification is True
+    assert policy.require_scientific_outcome_pass is True
+    assert all(
+        cell.decision_map["protocol.hyperparameter_tuning"] is False
+        for cell in plan.cells
+    )
     final = plan.stages[-1]
     assert {cell.decision_map["evaluation.split"] for cell in final.cells} == {
         "confirmation"
@@ -556,16 +506,9 @@ def test_phase1_selection_uses_qualified_truth_margin_and_untouched_confirmation
         for cell in final.cells
         if cell.seed == 0
     }
-    assert robustness["baseline"]["data.coordinate_amplitude_law"] == "gaussian"
-    assert robustness["baseline"]["data.factor_subspace_overlap"] == "uncontrolled"
-    assert (
-        robustness["student_t_df3_coordinates"]["data.coordinate_amplitude_law"]
-        == "student_t_df3"
-    )
-    assert (
-        robustness["paired_subspaces_30deg"]["data.factor_subspace_overlap"]
-        == "paired_30deg"
-    )
+    assert set(robustness) == {"baseline", "support_only", "site_span_one"}
+    assert robustness["baseline"]["data.factor_subspace_overlap"] == "orthogonal"
+    assert robustness["baseline"]["data.active_factors_per_example"] == 2
 
 
 def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
@@ -576,10 +519,10 @@ def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
         for role, start, stop in values["data.synthetic_split_ranges"]
     }
     expected = {
-        "factor_calibration": 50_000,
-        "calibration": 100_000,
-        "development": 100_000,
-        "confirmation": 100_000,
+        "factor_calibration": 20_000,
+        "calibration": 20_000,
+        "development": 20_000,
+        "confirmation": 20_000,
     }
     assert tuple(ranges) == tuple(expected)
     previous_stop = 0
@@ -589,8 +532,8 @@ def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
         assert stop - start == count
         assert values[f"data.synthetic_{role}_examples"] == count
         previous_stop = stop
-    assert values["data.unique_tokens"] == 300_000
-    assert previous_stop == 350_000
+    assert values["data.unique_tokens"] == 100_000
+    assert previous_stop == 80_000
 
 
 def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chains():
@@ -931,68 +874,11 @@ def test_family_revisit_rejects_aliases_of_one_resolved_configuration():
         )
 
 
-def test_coupled_geometry_and_decoder_weighted_bundles_are_complete():
+def test_phase1_is_fixed_and_phase2_score_selector_bundle_is_complete():
     phase1 = build_phase1_blueprint()
-    retraction_stage = next(
-        stage for stage in phase1.rounds if stage.name == "retraction_identification"
-    )
-    retractions = {
-        variant.name: {decision.name: decision.value for decision in variant.decisions}
-        for variant in retraction_stage.variants
-    }
-    assert retractions["qr_retraction"]["model.decoder"] == "concatenated_stiefel"
-    assert (
-        retractions["symmetric_polar_retraction"]["model.decoder"]
-        == "concatenated_stiefel_polar"
-    )
-    phase1_rounds = {round_spec.name: round_spec for round_spec in phase1.rounds}
-    fusion_controls = {
-        variant.name: {decision.name: decision.value for decision in variant.decisions}
-        for variant in phase1_rounds["site_mask_fusion_control_identification"].variants
-    }
-    assert set(fusion_controls) == {
-        "literal_sum_p0_parent",
-        "literal_sum_p010_diagnostic",
-        "availability_rescaled_sum_p010",
-    }
-    assert fusion_controls["literal_sum_p0_parent"]["model.encoder_fusion"] == "sum"
-    assert (
-        fusion_controls["literal_sum_p010_diagnostic"]["qualification.promotable"]
-        is False
-    )
-    assert (
-        fusion_controls["availability_rescaled_sum_p010"]["model.encoder_fusion"]
-        == "availability_rescaled_sum"
-    )
-    scores = {
-        decision.value
-        for variant in phase1_rounds["selection_score_identification"].variants
-        for decision in variant.decisions
-        if decision.name == "model.selection_score"
-    }
-    assert scores == {
-        "code_norm",
-        "decoded_energy",
-        "isolated_loss_decrease",
-    }
-    score_variants = {
-        variant.name: {decision.name: decision.value for decision in variant.decisions}
-        for variant in phase1_rounds["selection_score_identification"].variants
-    }
-    assert {name for name in score_variants if name.startswith("free_score_")} == {
-        "free_score_code_norm",
-        "free_score_decoded_energy",
-        "free_score_isolated_loss_decrease",
-    }
-    assert all(
-        values["model.decoder"] == "free_scale_controlled"
-        for name, values in score_variants.items()
-        if name.startswith("free_score_")
-    )
-    assert (
-        phase1_rounds["selection_score_identification"].fixed_carrier_variant
-        == "score_decoded_energy"
-    )
+    assert [round_spec.name for round_spec in phase1.rounds] == [
+        "truth_contract_confirmation"
+    ]
     assert all(
         cell.decision_map["data.missing_probability"] == 0.0
         for cell in build_phase1_plan().cells
@@ -1553,7 +1439,7 @@ def test_smoke_preserves_underlying_scientific_promotable_intent():
         cell.decision_map["qualification.promotable"]
         for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
     }
-    assert phase1_intent == {False, True}
+    assert phase1_intent == {True}
 
 
 def test_cell_validation_rejects_hidden_or_incoherent_resolved_values():
@@ -1907,7 +1793,7 @@ def test_phase_budgets_apply_every_ceiling_only_where_declared() -> None:
 def test_v20_prices_tied_encoder_execution_and_exposes_store_projection() -> None:
     cell = next(
         cell
-        for cell in build_phase1_plan().cells
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
         if cell.decision_map["model.encoder"].startswith("tied")
     )
     values = cell.decision_map
@@ -1920,8 +1806,8 @@ def test_v20_prices_tied_encoder_execution_and_exposes_store_projection() -> Non
         int(values["data.train_tokens"]) * 2 * operational_side * 6
     )
     store_bytes, store_key = estimate_activation_store(cell)
-    assert store_bytes == 0
-    assert store_key[0] == Phase.PHASE1.value
+    assert store_bytes > 0
+    assert store_key[0] == Phase.PHASE2.value
 
 
 def test_v20_prices_polar_and_map_regularizer_workspaces(
@@ -1930,7 +1816,7 @@ def test_v20_prices_polar_and_map_regularizer_workspaces(
     monkeypatch.setattr(studies_module, "_evaluation_workspace_bytes", lambda **_: 0)
     base = next(
         cell
-        for cell in build_phase1_plan().cells
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
         if cell.recipe_name == "bsf_grassmannian_primary"
     )
     polar = _replace_decision(base, "model.decoder", "concatenated_stiefel_polar")
@@ -1960,7 +1846,7 @@ def test_v20_prices_polar_and_map_regularizer_workspaces(
 
     nuclear = next(
         cell
-        for cell in build_phase1_plan().cells
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
         if cell.decision_map["objective.regularizer"] == "end_to_end_map_nuclear"
     )
     neutral_values = {
@@ -2042,22 +1928,23 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
             == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
         )
 
-    blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
-    plan = build_phase1_plan(seeds=(0,), smoke=True)
-    while not any(stage.name == "retraction_identification" for stage in plan.stages):
-        plan = materialize_child_plan(plan, blueprint, _freeze(plan.stages[-1]))
-    retraction_stage = next(
-        stage for stage in plan.stages if stage.name == "retraction_identification"
-    )
+    blueprint = build_phase2_blueprint(seeds=(0,), smoke=True)
+    plan = build_phase2_plan(seeds=(0,), smoke=True)
+    plan = materialize_child_plan(plan, blueprint, _freeze(plan.stages[-1]))
+    retraction_stage = plan.stages[-1]
     identities = {
-        cell.decision_map["factor.retraction"]: cell.decision_map[
+        cell.decision_map["model.decoder"]: cell.decision_map[
             "implementation.decoder_retraction_implementation"
         ]
         for cell in retraction_stage.cells
+        if cell.decision_map["model.decoder"]
+        in {"concatenated_stiefel", "concatenated_stiefel_polar"}
     }
     assert identities == {
-        "qr": DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
-        "symmetric_polar": DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
+        "concatenated_stiefel": DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
+        "concatenated_stiefel_polar": (
+            DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION
+        ),
     }
 
 
@@ -2116,6 +2003,7 @@ def test_v17_estimator_prices_cholesky_qr1_training_workspace(
         cell
         for cell in build_phase1_plan().cells
         if cell.decision_map["model.decoder"] == "concatenated_stiefel"
+        and len(cell.decision_map["data.site_dims"]) > 1
     )
     original_dims = tuple(int(item) for item in cholesky.decision_map["data.site_dims"])
     unequal_dims = tuple(value - index for index, value in enumerate(original_dims))
@@ -2310,20 +2198,28 @@ def test_v17_estimator_credits_only_the_explicit_fast_implementation() -> None:
 
 
 def test_isolated_loss_implementation_is_derived_from_the_final_carrier() -> None:
-    blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
-    plan = _materialize_all(
-        blueprint,
-        build_phase1_plan(seeds=(0,), smoke=True),
+    base = build_phase1_plan(seeds=(0,), smoke=True).stages[-1].cells[0]
+
+    def rebound(overrides):
+        decisions = tuple(
+            replace(decision, value=overrides[decision.name])
+            if decision.name in overrides
+            else decision
+            for decision in base.decisions
+        )
+        return replace(
+            base,
+            decisions=studies_module._bind_derived_score_implementations(decisions),
+        )
+
+    stiefel = rebound({"model.selection_score": "isolated_loss_decrease"})
+    free = rebound(
+        {
+            "model.selection_score": "isolated_loss_decrease",
+            "model.decoder": "free_scale_controlled",
+        }
     )
-    stage = next(
-        stage for stage in plan.stages if stage.name == "selection_score_identification"
-    )
-    isolated = tuple(
-        cell
-        for cell in stage.cells
-        if cell.decision_map["model.selection_score"] == "isolated_loss_decrease"
-    )
-    assert len(isolated) == 2
+    isolated = (stiefel, free)
     assert {
         (
             cell.decision_map["model.decoder"],
@@ -2347,6 +2243,9 @@ def _isolated_loss_estimator_cell(*, implementation: str, smoke: bool = True):
         "model.decoder": "free_scale_controlled",
         "model.decoder_bias": False,
         "objective.reconstruction": "squared_l2",
+        "implementation.decoded_energy_implementation": (
+            DECODED_ENERGY_EXACT_IMPLEMENTATION
+        ),
         "implementation.decoder_retraction_implementation": (
             DECODER_RETRACTION_NOT_APPLICABLE
         ),
@@ -2638,10 +2537,12 @@ def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():
 
 
 def test_factorization_prices_optimizer_savings_but_not_free_dense_compute():
-    blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
-    plan = _materialize_all(blueprint, build_phase1_plan(seeds=(0,), smoke=True))
+    blueprint = build_phase2_blueprint(seeds=(0,), smoke=True)
+    plan = build_phase2_plan(seeds=(0,), smoke=True)
+    while not any(stage.name == "site_factorization_4m" for stage in plan.stages):
+        plan = materialize_child_plan(plan, blueprint, _freeze(plan.stages[-1]))
     stage = next(
-        item for item in plan.stages if item.name == "site_factorization_identification"
+        item for item in plan.stages if item.name == "site_factorization_4m"
     )
     estimates = {
         cell.decision_map["model.site_rank"]: estimate_cell(cell)

@@ -193,70 +193,55 @@ uses stateless generators, fp32 reference training, independent
 structure/train/eval/confirmation seeds, and disjoint calibration,
 development, and confirmation identity ranges.
 
-The source-anchor generator follows the BSF manifold construction: ambient
-dimension 128, 128 factors, exactly four active factors per example, mixed
-one-dimensional and low-dimensional manifold families, independently
-calibrated/embedded factors, no primary observation noise, 300,000 unique
-training examples, 50,000 separate factor-calibration examples, and three
-disjoint 100,000-example roles for codec calibration, development, and
-confirmation. These five counts are independent manifest decisions; no
-evaluation role is inferred from `data.unique_tokens`. Adapted multi-site generators
-then plant common support, common coordinates, independent site rotations,
-scale imbalance, observation noise, and heterogeneous factor rank as explicit
-one-delta data-generating processes. Orthogonal truth-known axes additionally
-vary whether site maps share a rank-one or rank-two family or are independent,
-whether a factor spans one, two, or all sites, whether factor frequencies are
-uniform or Zipf-alpha-one, and whether planted factor pairs are forced with
-mixture probability `0`, `.5`, or `.9`. Fixed support cardinality is retained
-for the frequency and coactivation arms. Two further confirmation-only
-one-delta stresses replace Gaussian factor coordinates with a standardized
-elliptical Student-t law with three degrees of freedom, or pair planted factor
-subspaces at deterministic 30-degree principal angles. The mixture probability
-is not reported as a binary pairwise correlation. Real-model phases bind
-explicit `not_applicable` sentinels for these truth-only fields; they do not
-inherit a synthetic interpretation accidentally.
+The live contract is deliberately minuscule and identifiable. It plants 16
+rank-two factors in a 32-dimensional site, activates exactly two factors per
+row, and fits exactly 16 width-two learner blocks with two active blocks. Each
+site receives a complete orthogonal factor dictionary. The multisite carrier
+uses four independently rotated orthogonal dictionaries with one shared signed
+coordinate vector, so factor identity is identifiable from sparse support and
+there is no width, activity, or capacity slack.
+
+Every cell uses one fixed optimizer recipe, 100,000 unique training rows,
+2,000,000 presentations, and four disjoint 20,000-row factor-calibration,
+codec-calibration, development, and confirmation roles. Phase 1 contains no
+optimizer, width, capacity, score, selector, or regularizer tournament. Those
+quantities are model- and scale-dependent and are reopened on real activations
+in Phase 2. The synthetic recipe exports only the shared signed-coordinate
+ontology and universal execution semantics, never its numeric dimensions or
+optimizer values.
 
 ### 5.2 Initial spine
 
-The materialized prefix is ordered by integrity gates:
+The materialized prefix has two fixed stages:
 
-1. `paper_anchors`: six BSF primary/Appendix-Aux arms, SASA paper, and the
-   Anthropic architecture bridge;
-2. `representable_controls`: signed scalar, ReLU scalar BatchTopK, source-only
-   block, and source-only scalar controls;
-3. `fusion_identification`: non-promotable sum-versus-mean parity diagnostic on
-   the shared-coordinate carrier. With four always-observed sites and a
-   learnable untied linear encoder, the two are exact rescalings, not distinct
-   scientific designs;
-4. `dgp_identification_screen`: single-site, support-only, and shared-coordinate
-   BSC cells. The shared-coordinate cell is the sole eligible parent for the
-   conditional design rounds; the others are truth-known controls.
+1. `single_site_learnability`: the exact matched orthogonal contract at one
+   site. All three seeds must pass before the multisite stage opens. This is an
+   instrument check, not evidence for a cross-site feature claim.
+2. `multisite_learnability`: the same latent support and coordinates rendered
+   through four independent orthogonal site dictionaries. It is the sole
+   selectable Phase-1 carrier, so selection authenticates a fixed candidate
+   rather than choosing among synthetic hyperparameters.
 
-Integrity-complete negative results open the next audit stage, but only a
-qualified candidate whose scientific outcome passes can enter selection.
+The scientific gate uses qualification outcomes; an integrity-complete failed
+positive control does not open the next stage.
 
-### 5.3 Capability panels, provisional carriers, and confirmation
+### 5.3 Fixed carrier and confirmation
 
-After the DGP screen, every stage still derives from a content-bound parent,
-but Phase 1 deliberately separates two roles. A **capability panel** runs every
-option and records seed-complete truth-known pass/fail evidence while allowing
-only one preregistered carrier to advance. Its non-carrier arms are
-nonpromotable and cannot turn a synthetic optimum into a hidden pilot prior;
-their scientific outcome is diagnostic and cannot delete a Phase-2 option. A
-**confirmation** round cannot select.
+The selected multisite carrier is rerun on the untouched confirmation role.
+Two one-delta negative controls accompany it:
 
-| Stage | Role and live choices | Advancement |
-|---|---|---|
-| `capacity_identification` | capability: widths `1,2,4,8` at fixed 1,024 total coordinates/16 active coordinates; width-4 half/double capacity; width-4 half/double activity | fixed width-4 center `width_4` |
-| `retraction_identification` | capability: thin-QR and symmetric-polar concatenated-Stiefel retractions | fixed `qr_retraction` |
-| `site_factorization_identification` | capability: exact selected-parent carrier; unfactorized full free-site weights; factorized site ranks `1,2,4` | fixed `selected_parent_carrier`; the free/rank arms supply diagnostic capability evidence only |
-| `site_mask_fusion_control_identification` | capability: literal sum at `p=0`; literal sum at `p=.10`; availability-rescaled sum at `p=.10` | fixed `availability_rescaled_sum_p010`; literal positive masking is diagnostic |
-| `site_masking_identification` | capability: Bernoulli clean-target masking `0,.02,.05,.10`; exactly one hidden; exactly one retained | fixed `site_mask_0`; all clean sites remain targets and at least one observed site remains encoder-visible |
-| `selection_score_identification` | capability: code norm, exact isolated decoded energy, and exact isolated loss decrease on the Stiefel equality-control carrier; the same three scores on one common free decoder | fixed provisional Stiefel `score_decoded_energy` carrier; every free-decoder arm is nonpromotable and Phase 2 owns empirical score selection |
-| `selector_identification` | capability: token block-TopK and block BatchTopK | fixed `token_topk` |
-| `robustness_confirmation` | confirmation: baseline; support-only; rotations; scale ratio 2; noise `0.1`; rank heterogeneity; 2/8-factor event counts; rank-two/independent site maps; one/two-site spans; Zipf-alpha-one frequency; pair forcing `.5/.9`; standardized Student-t df=3 coordinates; paired 30-degree subspaces | none; independent confirmation stream |
+| Variant | Required outcome |
+|---|---|
+| `baseline` | pass the native and saved-codec identification conjunction on every seed |
+| `support_only` | fail the conjunction when sites share event presence but draw different coordinates |
+| `site_span_one` | fail the shared-feature conjunction when each planted factor exists at only one site |
 
-The isolated-loss-decrease score for block contribution
+The negative controls test the claim boundary. They are not alternative models,
+and no failed synthetic stress can delete an option from Phase 2.
+
+The score implementations below remain part of the shared engine and Phase-2
+real-model matrix; they are no longer synthetic selection arms. The
+isolated-loss-decrease score for block contribution
 $y_{g,O}=D_{g,O}^{\top}z_g$ on the actually observed sites $O$ is
 
 \[
@@ -311,7 +296,7 @@ relative drift at most `1e-4`, and maximum parameter-gradient relative drift at
 most `.06`.  Exact contribution, harmful-negative, observed-site, frozen-
 geometry binding, and configuration-refusal fixtures remain hard gates.
 
-On the Phase-1 campaign shape (`B=8192`, four width-128 sites, 256 groups,
+On the retired 2026-07-22 benchmark shape (`B=8192`, four width-128 sites, 256 groups,
 block width four, four active blocks, fp32), 31 post-warmup CUDA samples of the
 complete forward, squared-L2 loss, and backward measure `8.218 ms` for the
 reference and `2.476 ms` for the mapped implementation, a `69.9%` reduction.
@@ -326,29 +311,15 @@ boundary. The implementation computes one decoder-transpose-like projection
 and block Gram terms without materializing a
 `[batch, groups, sites, d_model]` contribution tensor.
 
-The robustness stage does not tune; each stress narrows or supports the claim
-made for the contract carrier. The support-only DGP and one-site factors are
-negative controls and are explicitly ineligible as evidence for a
-shared-coordinate cross-layer feature. Independent site maps retain shared
-support and coordinates but remove low-rank site-axis structure, so they stress
-factorization rather than feature existence and remain eligible when
-coordinates are shared across at least two sites.
-
 Scientific Phase 1 authorizes the pilot only when the baseline passes the full
 identification conjunction on every seed **and** both preregistered negative
 controls—`support_only` and `site_span_one`—fail that conjunction on every
-seed. Other failed stress cells do not silently veto the pilot, but each one
-must produce an explicit claim-scope narrowing in the frozen decision.
+seed.
 
-With seeds 0, 1, and 2, the serialized blueprint declares and executes **195
-cells**:
-21 paper anchors, 12 controls, 6 fusion-parity diagnostics, 9 DGP-screen cells,
-24 capacity, 6 retraction, 15 factorization, 9 fusion-control, 18 masking,
-18 score, 6 selector, and 51 confirmation cells. The score count is six arms
-per seed: three Stiefel equality controls plus the same three scores on the
-common free decoder. Synthetic learning-rate,
-no-op-native-regularizer, and Aux-tuning rounds do not exist; those choices
-depend on optimizer scale and real activation statistics and belong to Phase 2.
+With seeds 0, 1, and 2, the blueprint declares and executes **15 cells**: three
+single-site instrument cells, three multisite truth-contract cells, and nine
+confirmation cells. All architecture, capacity, optimizer, score, selector,
+regularizer, masking, and rate choices are owned by Phase 2.
 
 ### 5.4 Identification metric
 
@@ -1859,7 +1830,7 @@ identification/fixed-rate endpoints, and have a bounded declared role.
 The deferred candidates either require a measured trigger, introduce an
 unpriced second representation or alignment map, or change the ontology and
 evaluation contract. They are promising conditional follow-ups, not free
-degrees of freedom to add to the present 195-cell Phase 1, 410-cell Phase-2
+degrees of freedom to add to the present 15-cell Phase 1, 410-cell Phase-2
 pre-elision ceiling, and 48-cell Phase 3 (the last count is eight refusal-gate
 cells plus 40 final cells). Phase-2 execution-equivalent and conditionally
 vacuous cells are removed at materialization and recorded, so 410 is not an

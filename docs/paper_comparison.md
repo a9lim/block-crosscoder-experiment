@@ -164,31 +164,18 @@ bundle would require a separately declared selected-parent round.
 
 ## 4. Exact live Phase-1 matrix
 
-Default development seeds are 0, 1, and 2. Initial stages are materialized;
-later stages are exact selected-parent children.
+Default development seeds are 0, 1, and 2. Phase 1 is a fixed learnability
+contract rather than a paper-recipe or hyperparameter tournament.
 
 | Stage | Recipes/variants | Selection or gate |
 |---|---|---|
-| `paper_anchors` | BSF Vanilla/Grassmannian/Group-Lasso, each primary and Appendix Aux; SASA paper; Anthropic architecture | integrity-complete gate only |
-| `representable_controls` | signed scalar token-TopK; scalar ReLU decoder-weighted BatchTopK; source-only block; source-only scalar | opens after complete anchor evidence |
-| `fusion_identification` | shared-coordinate sum; shared-coordinate mean | non-promotable parity diagnostic after complete controls |
-| `dgp_identification_screen` | BSC single-site; support-only stress; shared coordinates | shared-coordinate arm is the sole eligible parent |
-| `capacity_identification` | widths `1,2,4,8` at fixed total/active coordinates; width-4 half/double capacity; width-4 half/double activity | capability only; fixed `width_4` carrier advances |
-| `retraction_identification` | QR concatenated Stiefel; symmetric-polar concatenated Stiefel | capability only; fixed `qr_retraction` carrier advances |
-| `site_factorization_identification` | exact selected parent; unfactorized full free-site weights; site ranks `1,2,4` | capability only; fixed `selected_parent_carrier` advances |
-| `site_mask_fusion_control_identification` | literal sum `p=0`; literal sum `p=.10`; availability-rescaled sum `p=.10` | capability only; fixed rescaled-sum `p=.10` carrier advances; literal positive masking is diagnostic |
-| `site_masking_identification` | Bernoulli clean-target masking `0,.02,.05,.10`; exactly one hidden; exactly one retained | capability only; fixed zero-mask carrier advances |
-| `selection_score_identification` | code norm, exact isolated decoded energy, and exact isolated squared-loss decrease on the Stiefel equality-control carrier; the same three scores on one common free decoder | capability only; every free-decoder arm is nonpromotable and the fixed Stiefel decoded-energy provisional carrier advances |
-| `selector_identification` | token block-TopK; block BatchTopK | capability only; fixed token-TopK carrier advances |
-| `robustness_confirmation` | baseline; support-only; site rotation; site-scale ratio 2; noise `0.1`; rank heterogeneity; two/eight active factors; rank-two/independent site maps; one/two-site spans; Zipf-alpha-one frequency; pair forcing `.5/.9`; standardized Student-t df=3 coordinates; paired 30-degree factor subspaces | confirmation stream, no selection; support-only and one-site spans are negative controls; independent maps retain shared coordinates and stress site-axis factorization |
+| `single_site_learnability` | 16 orthogonal rank-two factors; exactly matched 16-by-width-two learner; two active factors | all three seeds must pass before the multisite stage opens |
+| `multisite_learnability` | the same shared coordinates rendered through four independent orthogonal site dictionaries | sole fixed selectable carrier; selection authenticates rather than tunes |
+| `truth_contract_confirmation` | baseline; support-only; one-site factor span | untouched confirmation stream; baseline must pass and both claim-negative controls must fail |
 
-Every capability challenger still runs all seeds and contributes its
-qualification digest and pass/fail outcome, but it is nonpromotable and cannot
-replace the named carrier or prune a real-model option. No Phase-1 capability
-round chooses a model-specific winner. All advancing carriers require complete
-seeds and a passed scientific outcome; their metric is the minimum normalized margin
-across same-block support/subspace/code recovery and aggregate pathology
-guardrails.
+The fixed recipe uses 32-dimensional sites, 100,000 unique training examples,
+2,000,000 presentations, and four disjoint 20,000-row evaluation roles. No
+synthetic model or optimizer value is exported to Phase 2.
 
 For observed sites $O$, the new signed score is
 
@@ -208,11 +195,8 @@ one flattened decoder projection and mapped block-Gram products, with exact
 observed-site weighting for partial and source-only views. This optimization
 is a local adaptation, not a paper value or a distinct score arm.
 
-At seeds 0, 1, and 2 the serialized variants declare and execute **195 cells**:
-48 initial, 96 capability/contract cells, and 51 confirmation cells. The score
-panel contributes 18 cells: three Stiefel equality controls and the same three
-scores on a common free decoder, at all three seeds. Synthetic LR,
-native-regularizer, and Aux tuning rounds do not exist.
+At seeds 0, 1, and 2 the serialized blueprint declares and executes **15
+cells**: six initial learnability cells and nine confirmation cells.
 
 ### 4.1 Transfer to Phase 2
 

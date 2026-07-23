@@ -132,7 +132,6 @@ from block_crosscoder_experiment.store import (
     StoreReader,
 )
 from block_crosscoder_experiment.studies import (
-    BSC_FACTOR_CONTESTS,
     CellSpec,
     FrozenPanelDecision,
     FrozenPanelEntry,
@@ -142,6 +141,7 @@ from block_crosscoder_experiment.studies import (
     PHASE2_INELIGIBLE_SELECTION_SCORE,
     PHASE2_SELECTION_METRIC_KEY,
     PHASE2_SELECTION_METRIC_PATH,
+    PAPER_RECIPES,
     RELEASE_DIAGNOSTIC_RECIPES,
     StageSpec,
     StudyError,
@@ -161,6 +161,7 @@ import pytest
 import torch
 
 import block_crosscoder_experiment.cli.run_cell as run_cell_module
+import block_crosscoder_experiment.studies as studies_module
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -973,18 +974,35 @@ def _cell(
     seed: int = 0,
 ) -> CellSpec:
     if phase is Phase.PHASE1:
-        recipe_name = BSC_FACTOR_CONTESTS[recipe_index].name
-        base = next(
-            cell
-            for cell in build_phase1_plan(seeds=(seed,), smoke=True).cells
-            if cell.recipe_name == recipe_name
-        )
+        plan = build_phase1_plan(seeds=(seed,), smoke=True)
+        base = plan.stages[0 if recipe_index == 0 else 1].cells[0]
     else:
         base = build_phase2_plan(seeds=(seed,), smoke=True).cells[0]
+    base = replace(
+        base,
+        decisions=tuple(
+            replace(decision, value=DECODED_ENERGY_EXACT_IMPLEMENTATION)
+            if decision.name == "implementation.decoded_energy_implementation"
+            else decision
+            for decision in base.decisions
+        ),
+    )
     return replace(
         base,
         name=f"{phase.value}.test.executor{recipe_index}.s{seed}",
         stage="test",
+    )
+
+
+def _phase1_paper_fixture(recipe_name: str, *, seed: int = 0) -> CellSpec:
+    recipe = PAPER_RECIPES[recipe_name]
+    return studies_module._cell(
+        recipe,
+        phase=Phase.PHASE1,
+        stage="paper_fixture",
+        seed=seed,
+        overrides=studies_module._synthetic_bridge_overrides(recipe),
+        smoke=True,
     )
 
 
@@ -2380,11 +2398,7 @@ def test_token_layer_norm_identification_is_explicitly_inapplicable() -> None:
 def test_sasa_paper_persistent_worker_qualifies_inapplicable_identification(
     tmp_path: Path,
 ) -> None:
-    base = next(
-        cell
-        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
-        if cell.recipe_name == "sasa_paper"
-    )
+    base = _phase1_paper_fixture("sasa_paper")
     cell = replace(
         base,
         name="phase1.test.sasa_paper_persistent_worker.s0",
@@ -2921,11 +2935,7 @@ def test_every_materialized_prefix_cell_resolves_without_hidden_defaults() -> No
 
 
 def test_bsf_encoder_scale_fit_has_an_independent_declared_prefix() -> None:
-    cell = next(
-        cell
-        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
-        if cell.recipe_name == "bsf_vanilla_primary"
-    )
+    cell = _phase1_paper_fixture("bsf_vanilla_primary")
     values = cell.decision_map
     assert values["data.normalization"] == "none"
     assert values["data.normalization_fit_count"] == 0
@@ -2945,11 +2955,7 @@ def test_bsf_encoder_scale_fit_has_an_independent_declared_prefix() -> None:
 
 
 def test_group_lasso_encoder_scale_fit_remeasures_postactivation_norm() -> None:
-    cell = next(
-        cell
-        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
-        if cell.recipe_name == "bsf_group_lasso_primary"
-    )
+    cell = _phase1_paper_fixture("bsf_group_lasso_primary")
     values = cell.decision_map
     train = _synthetic_dataset(cell, "train")
     preparation = {
@@ -3431,7 +3437,7 @@ def test_synthetic_capture_contract_is_exact() -> None:
     cell = _cell()
     source = _synthetic_source_contract(cell.decision_map)["contract"]
     assert source["coordinate_amplitude_law"] == "gaussian"
-    assert source["factor_subspace_overlap"] == "uncontrolled"
+    assert source["factor_subspace_overlap"] == "orthogonal"
     changed = replace(
         cell,
         decisions=tuple(
@@ -4223,7 +4229,7 @@ def test_bsf_released_bridge_wires_shared_group_threshold() -> None:
 def test_anthropic_anchor_maps_only_the_minimal_dense_l1_method() -> None:
     cell = next(
         cell
-        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        for cell in build_phase2_plan(seeds=(0,), smoke=True).cells
         if cell.recipe_name == "anthropic_crosscoder_architecture_bridge"
     )
     config = _model_config(cell)

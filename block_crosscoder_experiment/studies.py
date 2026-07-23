@@ -1396,6 +1396,7 @@ class CellSpec:
                 raise StudyError("unknown Phase-1 coordinate-amplitude law")
             if values["data.factor_subspace_overlap"] not in {
                 "uncontrolled",
+                "orthogonal",
                 "paired_30deg",
             }:
                 raise StudyError("unknown Phase-1 factor-subspace overlap contract")
@@ -3583,13 +3584,7 @@ class Phase2Blueprint:
 
 @dataclass(frozen=True, slots=True)
 class Phase1Blueprint:
-    """Conditional synthetic campaign with independent diagnostics up front.
-
-    Paper anchors, representable controls, and DGP falsification screens are
-    never treated as tunable candidates.  The final materialized initial stage
-    is the DGP identification screen; every later round changes one named
-    factor bundle on the selected seed-complete parent.
-    """
+    """Tiny fixed truth-known contract followed by untouched confirmation."""
 
     name: str
     seeds: tuple[int, ...]
@@ -3616,7 +3611,7 @@ class Phase1Blueprint:
             raise StudyError("Phase-1 initial stages do not cover every blueprint seed")
         final_initial = self.initial_stages[-1]
         if final_initial.selection_policy is None:
-            raise StudyError("Phase-1 fusion stage must have a selection policy")
+            raise StudyError("Phase-1 truth-contract stage must have a selection policy")
         previous = final_initial.name
         previous_policy = final_initial.selection_policy.policy_id
         for index, round_spec in enumerate(self.rounds):
@@ -6548,6 +6543,206 @@ BSC_FACTOR_CONTESTS = (
 )
 
 
+def _phase1_learnability_recipe(
+    *,
+    name: str,
+    site_dims: tuple[int, ...],
+) -> Recipe:
+    """Fixed tiny truth-known contract; no synthetic choice is tuned or exported."""
+
+    return Recipe(
+        name=name,
+        source="novel-block-crosscoder",
+        variant=name.removeprefix("phase1_learnability_"),
+        decisions=merge_decisions(
+            BSC_FACTOR_CONTESTS[2].decisions,
+            (
+                novel(
+                    "data.dgp_step",
+                    "shared_coordinates",
+                    rationale="plant one shared signed coordinate vector at every site",
+                    ablation="the confirmation negative controls separately remove shared coordinates and shared site span",
+                ),
+                novel(
+                    "data.site_dims",
+                    site_dims,
+                    rationale="fit a complete set of sixteen orthogonal rank-two factors in each tiny 32-dimensional site",
+                    ablation="real-model width and hook geometry belong exclusively to Phase 2",
+                ),
+                novel(
+                    "data.train_tokens",
+                    2_000_000,
+                    rationale="give the tiny fixed contract roughly one thousand optimizer updates",
+                    ablation="the learning curve is diagnostic only and cannot export a token budget",
+                ),
+                novel(
+                    "data.unique_tokens",
+                    100_000,
+                    rationale="provide abundant independent support draws for every planted factor",
+                    ablation="fresh-versus-replayed data is outside the minimal learnability claim",
+                ),
+                novel(
+                    "data.synthetic_factor_calibration_examples",
+                    20_000,
+                    rationale="freeze factor matching on a small disjoint truth-known stream",
+                    ablation="repeat the evaluator fixture at larger counts without changing the gate",
+                ),
+                novel(
+                    "data.synthetic_calibration_examples",
+                    20_000,
+                    rationale="fit the deployment threshold on a small disjoint stream",
+                    ablation="report threshold stability without selecting a synthetic setting",
+                ),
+                novel(
+                    "data.synthetic_development_examples",
+                    20_000,
+                    rationale="score the fixed learnability contract on untouched generated rows",
+                    ablation="repeat on more rows without changing the method",
+                ),
+                novel(
+                    "data.synthetic_confirmation_examples",
+                    20_000,
+                    rationale="reserve a second untouched stream for the final truth contract",
+                    ablation="repeat on more rows without changing the authorization rule",
+                ),
+                novel(
+                    "data.n_factors",
+                    16,
+                    rationale="make the truth small enough to inspect factor by factor",
+                    ablation="factor-count scaling is a diagnostic rather than a Phase-1 selection axis",
+                ),
+                novel(
+                    "data.active_factors_per_example",
+                    2,
+                    rationale="retain genuine superposition while keeping the planted support easy to identify",
+                    ablation="single-factor rows are an optional evaluator sanity check, not a promoted carrier",
+                ),
+                novel(
+                    "data.factor_coordinate_dim",
+                    2,
+                    rationale="plant exactly rank-two vector features",
+                    ablation="Phase 2 reopens block width on real evidence",
+                ),
+                novel(
+                    "data.factor_rank_profile",
+                    "uniform_rank_2",
+                    rationale="match every planted factor to the learner block width",
+                    ablation="rank heterogeneity is outside the minimal learnability authorization",
+                ),
+                novel(
+                    "data.site_map_rank_family",
+                    "independent",
+                    rationale="render the same coordinates through a distinct orthogonal dictionary at each site",
+                    ablation="the one-site instrument isolates the cross-site requirement",
+                ),
+                novel(
+                    "data.factor_subspace_overlap",
+                    "orthogonal",
+                    rationale="remove dictionary coherence as a confound in the minimal truth contract",
+                    ablation="nonorthogonal geometry belongs to real-model development evidence",
+                ),
+                novel(
+                    "data.site_scale_ratio",
+                    1.0,
+                    rationale="keep every site on the same scale in the minimal contract",
+                    ablation="scale handling is retuned on Phase-2 activations",
+                ),
+                novel(
+                    "data.noise_std",
+                    0.0,
+                    rationale="make failure attributable to learning or evaluation rather than observation noise",
+                    ablation="noise robustness does not authorize the real-model phase",
+                ),
+                novel(
+                    "model.groups",
+                    16,
+                    rationale="match learner block count exactly to planted factor count",
+                    ablation="overcomplete capacity is intentionally excluded from the truth gate",
+                ),
+                novel(
+                    "model.block_width",
+                    2,
+                    rationale="match learner block width exactly to planted factor rank",
+                    ablation="Phase 2 owns the real-model width contest",
+                ),
+                novel(
+                    "model.active_blocks",
+                    2,
+                    rationale="match fitted support exactly to the two active planted factors",
+                    ablation="Phase 2 owns the real-model activity contest",
+                ),
+                novel(
+                    "model.encoder_fusion",
+                    "availability_rescaled_sum",
+                    rationale="use the universal missing-view-safe fusion contract even though all tiny sites are observed",
+                    ablation="Phase 2 tests observation topology on real activations",
+                ),
+                novel(
+                    "model.selection_score",
+                    "decoded_energy",
+                    rationale="bind the universal block score without selecting among synthetic scores",
+                    ablation="Phase 2 reopens the complete score-selector interaction",
+                ),
+                novel(
+                    "optimizer.batch_tokens",
+                    2_048,
+                    rationale="resolve the fixed tiny run to roughly one thousand accepted updates",
+                    ablation="batch size is tuned only in Phase 2",
+                ),
+                novel(
+                    "optimizer.learning_rate",
+                    3e-4,
+                    rationale="use one conservative fixed Adam rate for the tiny contract",
+                    ablation="learning rate is tuned only in Phase 2",
+                ),
+                novel(
+                    "optimizer.warmup_steps",
+                    100,
+                    rationale="use a short fixed warmup within the thousand-update run",
+                    ablation="warmup is tuned only in Phase 2",
+                ),
+                engineering(
+                    "runtime.checkpoint_tokens",
+                    500_000,
+                    rationale="bound interruption replay without making checkpoint cadence scientific",
+                ),
+                engineering(
+                    "protocol.hyperparameter_tuning",
+                    False,
+                    rationale="Phase 1 validates one fixed truth-known contract and exports no numeric winner",
+                ),
+                engineering(
+                    "qualification.promotable",
+                    True,
+                    rationale="the fixed contract may authorize the next gate only after all seeds pass",
+                ),
+                engineering(
+                    "contest.index",
+                    0 if len(site_dims) == 1 else 1,
+                    rationale="bind the one-site instrument and multisite truth contract distinctly",
+                ),
+                engineering(
+                    "contest.carrier",
+                    "phase1_learnability_multisite_orthogonal",
+                    rationale="name the sole multisite carrier that can authorize Phase 2",
+                ),
+            ),
+        ),
+    )
+
+
+PHASE1_LEARNABILITY_RECIPES = (
+    _phase1_learnability_recipe(
+        name="phase1_learnability_single_site_orthogonal",
+        site_dims=(32,),
+    ),
+    _phase1_learnability_recipe(
+        name="phase1_learnability_multisite_orthogonal",
+        site_dims=(32, 32, 32, 32),
+    ),
+)
+
+
 def _derived_recipe(
     name: str,
     variant: str,
@@ -6723,7 +6918,10 @@ CONTROL_RECIPES: Mapping[str, Recipe] = MappingProxyType(
     }
 )
 NOVEL_RECIPES: Mapping[str, Recipe] = MappingProxyType(
-    {recipe.name: recipe for recipe in BSC_FACTOR_CONTESTS}
+    {
+        recipe.name: recipe
+        for recipe in (*BSC_FACTOR_CONTESTS, *PHASE1_LEARNABILITY_RECIPES)
+    }
 )
 RECIPES: Mapping[str, Recipe] = MappingProxyType(
     {
@@ -8364,7 +8562,14 @@ def _smoke_overrides(
         rationale=rationale,
         ablation="run the unchanged non-smoke cell before using scientific evidence",
     )
-    smoke_dims = tuple(8 for _ in site_dims) if phase is Phase.PHASE1 else site_dims
+    smoke_width = (
+        16 if values.get("data.factor_subspace_overlap") == "orthogonal" else 8
+    )
+    smoke_dims = (
+        tuple(smoke_width for _ in site_dims)
+        if phase is Phase.PHASE1
+        else site_dims
+    )
     result: list[Decision] = [
         scientific(
             "data.site_dims",
@@ -9715,8 +9920,11 @@ def _phase1_selection_overrides(recipe: Recipe) -> tuple[Decision, ...]:
         ),
         engineering(
             "protocol.hyperparameter_tuning",
-            True,
-            rationale="only declared synthetic selection stages may promote a model choice",
+            False,
+            rationale=(
+                "Phase 1 authenticates one fixed truth-known carrier; all numeric "
+                "model tuning belongs to Phase 2"
+            ),
         ),
     )
 
@@ -10410,9 +10618,9 @@ def _phase1_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
                 ),
                 _factor(
                     "data.active_factors_per_example",
-                    4,
+                    2,
                     "retain baseline planted sparsity",
-                    "compare sparse and dense event regimes",
+                    "the minimal truth contract fixes two active factors",
                 ),
             ),
         ),
@@ -10863,175 +11071,69 @@ def build_phase1_blueprint(
             "scientific Phase 1 requires the exact preregistered seeds (0, 1, 2)"
         )
     phase = Phase.PHASE1
-    anchors = tuple(
+    single_recipe, multisite_recipe = PHASE1_LEARNABILITY_RECIPES
+    single_cells = tuple(
         _cell(
-            recipe,
+            single_recipe,
             phase=phase,
-            stage="paper_anchors",
+            stage="single_site_learnability",
             seed=seed,
-            overrides=()
-            if recipe.source == "bsf"
-            else _synthetic_bridge_overrides(recipe),
+            overrides=_phase1_selection_overrides(single_recipe),
             smoke=smoke,
         )
-        for recipe in PAPER_RECIPES.values()
         for seed in seed_tuple
     )
-    controls = tuple(
+    multisite_cells = tuple(
         _cell(
-            recipe,
+            multisite_recipe,
             phase=phase,
-            stage="representable_controls",
+            stage="multisite_learnability",
             seed=seed,
+            overrides=_phase1_selection_overrides(multisite_recipe),
             smoke=smoke,
         )
-        for recipe in CONTROL_RECIPES.values()
         for seed in seed_tuple
     )
-    dgp_cells = tuple(
-        _cell(
-            recipe,
-            phase=phase,
-            stage="dgp_identification_screen",
-            seed=seed,
-            overrides=_phase1_selection_overrides(recipe),
-            smoke=smoke,
-        )
-        for recipe in BSC_FACTOR_CONTESTS[:3]
-        for seed in seed_tuple
+    single_stage = StageSpec("single_site_learnability", single_cells)
+    truth_policy = _phase1_selection_policy(
+        eligible_recipe_names=(multisite_recipe.name,)
     )
-    fusion_recipes = (BSC_FACTOR_CONTESTS[2], BSC_FACTOR_CONTESTS[3])
-    fusion_cells = tuple(
-        _cell(
-            recipe,
-            phase=phase,
-            stage="fusion_identification",
-            seed=seed,
-            overrides=merge_decisions(
-                _phase1_selection_overrides(recipe),
-                (
-                    engineering(
-                        "qualification.promotable",
-                        False,
-                        rationale=(
-                            "fixed-site sum and mean fusion are an exact linear "
-                            "reparameterization diagnostic, not a design contest"
-                        ),
-                    ),
-                    engineering(
-                        "protocol.hyperparameter_tuning",
-                        False,
-                        rationale="fusion parity is reported without selecting a parent",
-                    ),
-                ),
-            ),
-            smoke=smoke,
-        )
-        for recipe in fusion_recipes
-        for seed in seed_tuple
-    )
-    anchor_stage = StageSpec("paper_anchors", anchors)
-    control_stage = _stage_after("representable_controls", controls, anchor_stage)
-    fusion_stage = StageSpec(
-        "fusion_identification",
-        fusion_cells,
-        depends_on=(control_stage.name,),
+    multisite_stage = StageSpec(
+        "multisite_learnability",
+        multisite_cells,
+        depends_on=(single_stage.name,),
         gate=GateCondition(
-            control_stage.name,
-            minimum_count=len(control_stage.cells),
-            basis="integrity_complete",
+            single_stage.name,
+            minimum_count=len(single_stage.cells),
+            basis="qualified",
+        ),
+        selection_policy=truth_policy,
+    )
+    confirmation_variants = tuple(
+        variant
+        for variant in dict(_phase1_round_variants())["robustness_confirmation"]
+        if variant.name in {"baseline", "support_only", "site_span_one"}
+    )
+    rounds = (
+        StageBlueprint(
+            name="truth_contract_confirmation",
+            source_stage=multisite_stage.name,
+            source_policy_id=truth_policy.policy_id,
+            train_tokens=2_000_000,
+            split="confirmation",
+            variants=confirmation_variants,
+            selection_policy=None,
+            role="confirmation",
+            advancement="none",
         ),
     )
-    dgp_policy = _phase1_selection_policy(
-        eligible_recipe_names=(BSC_FACTOR_CONTESTS[2].name,)
-    )
-    dgp_stage = StageSpec(
-        "dgp_identification_screen",
-        dgp_cells,
-        depends_on=(fusion_stage.name,),
-        gate=GateCondition(
-            fusion_stage.name,
-            minimum_count=len(fusion_stage.cells),
-            basis="integrity_complete",
-        ),
-        selection_policy=dgp_policy,
-    )
-    variant_map = dict(_phase1_round_variants())
-    specs = (
-        ("capacity_identification", "dgp_identification_screen", "synthetic_test"),
-        ("retraction_identification", "capacity_identification", "synthetic_test"),
-        (
-            "site_factorization_identification",
-            "retraction_identification",
-            "synthetic_test",
-        ),
-        (
-            "site_mask_fusion_control_identification",
-            "site_factorization_identification",
-            "synthetic_test",
-        ),
-        (
-            "site_masking_identification",
-            "site_mask_fusion_control_identification",
-            "synthetic_test",
-        ),
-        (
-            "selection_score_identification",
-            "site_masking_identification",
-            "synthetic_test",
-        ),
-        ("selector_identification", "selection_score_identification", "synthetic_test"),
-        ("robustness_confirmation", "selector_identification", "confirmation"),
-    )
-    fixed_carriers = {
-        "capacity_identification": "width_4",
-        "retraction_identification": "qr_retraction",
-        "site_factorization_identification": "selected_parent_carrier",
-        "site_mask_fusion_control_identification": ("availability_rescaled_sum_p010"),
-        "site_masking_identification": "site_mask_0",
-        "selection_score_identification": "score_decoded_energy",
-        "selector_identification": "token_topk",
-    }
-    rounds: list[StageBlueprint] = []
-    source_policy = dgp_policy
-    for name, source, split in specs:
-        policy = _phase1_selection_policy() if split == "synthetic_test" else None
-        fixed_carrier = fixed_carriers.get(name)
-        rounds.append(
-            StageBlueprint(
-                name=name,
-                source_stage=source,
-                source_policy_id=source_policy.policy_id,
-                train_tokens=30_000_000,
-                split=split,
-                variants=variant_map[name],
-                selection_policy=policy,
-                role=(
-                    "confirmation"
-                    if split == "confirmation"
-                    else "capability_panel"
-                    if fixed_carrier is not None
-                    else "contract_validation"
-                ),
-                advancement=(
-                    "none"
-                    if split == "confirmation"
-                    else "fixed_carrier"
-                    if fixed_carrier is not None
-                    else "empirical_selection"
-                ),
-                fixed_carrier_variant=fixed_carrier,
-            )
-        )
-        if policy is not None:
-            source_policy = policy
     return Phase1Blueprint(
-        name="phase1_synthetic_blueprint_smoke"
+        name="phase1_learnability_blueprint_smoke"
         if smoke
-        else "phase1_synthetic_blueprint",
+        else "phase1_learnability_blueprint",
         seeds=seed_tuple,
-        initial_stages=(anchor_stage, control_stage, fusion_stage, dgp_stage),
-        rounds=tuple(rounds),
+        initial_stages=(single_stage, multisite_stage),
+        rounds=rounds,
     )
 
 
@@ -11043,7 +11145,7 @@ def build_phase1_plan(
     blueprint = build_phase1_blueprint(seeds, smoke=smoke)
     return enforce_plan_resources(
         StudyPlan(
-            "phase1_synthetic_prefix_4_smoke" if smoke else "phase1_synthetic_prefix_4",
+            "phase1_synthetic_prefix_2_smoke" if smoke else "phase1_synthetic_prefix_2",
             Phase.PHASE1,
             blueprint.initial_stages,
         )
@@ -14334,6 +14436,7 @@ __all__ = [
     "Lineage",
     "NOVEL_RECIPES",
     "PAPER_RECIPES",
+    "PHASE1_LEARNABILITY_RECIPES",
     "PHASE1_SCIENTIFIC_SEEDS",
     "PHASE2_SCIENTIFIC_SEEDS",
     "PHASE2_CONFIRMATION_SCORE_DEGRADATION_MAX",

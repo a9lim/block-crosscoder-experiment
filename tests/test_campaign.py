@@ -2738,66 +2738,44 @@ def test_phase1_decision_labels_opaque_journal_commitment():
 
 
 @pytest.mark.parametrize("smoke", (False, True))
-def test_phase1_decision_rejects_selected_nonpromotable_capability_arm(smoke):
-    payload = phase1_decision_for_phase2(
-        smoke=smoke,
-        forge_nonpromotable_stage="capacity_identification",
-    )
-    selected = payload["phase1_campaign_manifest"]["selection_chain"][1]["selection"]
-    plan = StudyPlan.from_manifest(payload["phase1_campaign_manifest"]["plan"])
-    selected_cell = next(
-        cell for cell in plan.cells if cell.cell_id == selected["cell_ids"][0]
-    )
-    assert selected_cell.decision_map["qualification.promotable"] is False
-
-    with pytest.raises(CampaignError, match="qualification semantic replay"):
-        Campaign.phase1_decision_from_manifest(payload)
-
-
-def test_phase1_transfer_records_full_capability_identification_conjunction():
-    failed_stage = "capacity_identification"
-    failed_variant = "width_1"
-    failed_seed = 0
-    payload = phase1_decision_for_phase2(
-        smoke=False,
-        capability_failure=(failed_stage, failed_variant, failed_seed),
-    )
+def test_phase1_decision_has_one_fixed_non_tuning_selection(smoke):
+    payload = phase1_decision_for_phase2(smoke=smoke)
     manifest = payload["phase1_campaign_manifest"]
+    assert len(manifest["selection_chain"]) == 1
+    selected = manifest["selection_chain"][0]["selection"]
     plan = StudyPlan.from_manifest(manifest["plan"])
-    selected_ids = {
-        cell_id
-        for chain_item in manifest["selection_chain"]
-        for cell_id in chain_item["selection"]["cell_ids"]
-    }
-    diagnostic = next(
-        cell
-        for cell in plan.cells
-        if cell.stage == failed_stage
-        and cell.recipe_name == f"derived_{failed_stage}_{failed_variant}"
-        and cell.seed == failed_seed
+    selected_cells = [
+        cell for cell in plan.cells if cell.cell_id in selected["cell_ids"]
+    ]
+    assert {cell.stage for cell in selected_cells} == {"multisite_learnability"}
+    assert all(
+        cell.decision_map["qualification.promotable"] is True
+        and cell.decision_map["protocol.hyperparameter_tuning"] is False
+        for cell in selected_cells
     )
-    assert diagnostic.cell_id not in selected_ids
 
+
+def test_phase1_transfer_exports_semantics_without_synthetic_numeric_winners():
+    payload = phase1_decision_for_phase2(smoke=False)
     verified = Campaign.phase1_decision_from_manifest(payload)
-    capacity = next(
-        panel
-        for panel in verified["phase1_transfer"]["capability_evidence"]
-        if panel["stage"] == "capacity_identification"
+    transfer = verified["phase1_transfer"]
+    assert transfer["capability_evidence"] == []
+    exported_names = {
+        item["name"]
+        for key in ("method_contract", "provisional_carriers")
+        for item in transfer[key]
+    }
+    assert exported_names.isdisjoint(
+        {
+            "data.n_factors",
+            "data.site_dims",
+            "model.groups",
+            "model.block_width",
+            "model.active_blocks",
+            "optimizer.learning_rate",
+            "optimizer.batch_tokens",
+        }
     )
-    variant_name = diagnostic.recipe_name.removeprefix(
-        "derived_capacity_identification_"
-    )
-    variant = next(
-        item for item in capacity["variants"] if item["variant"] == variant_name
-    )
-    row = variant["per_seed"][0]
-    assert row["scientific_outcome_passed"] is False
-    assert row["native_passed"] is False
-    assert row["deployed_passed"] is True
-    assert row["validation_conjunction_passed"] is False
-    assert row["identification_authorization_passed"] is False
-    assert row["passed"] is False
-    assert variant["passed_all_seeds"] is False
 
 
 def test_phase1_authorization_uses_declared_aggregate_factor_fraction():
@@ -2920,18 +2898,16 @@ def test_phase1_false_positive_negative_control_forces_no_go(tmp_path):
         Campaign.phase1_decision_from_manifest(payload)
 
 
-def test_phase1_failed_stress_requires_explicit_scope_narrowing():
+def test_phase1_confirmation_has_no_open_ended_stress_scope():
     payload = phase1_decision_for_phase2(smoke=False)
-    set_phase1_variant_outcome(payload, "noise", passed=False)
     confirmation = payload["phase1_campaign_manifest"]["confirmation"]
-    confirmation["stress_failures"] = ["noise"]
-    rehash_phase1_decision(payload)
-    with pytest.raises(CampaignError, match="explicit scope narrowing"):
-        Campaign.phase1_decision_from_manifest(payload)
-    confirmation["scope_narrowing"] = {
-        "noise": "claims exclude observation noise at standard deviation 0.1"
+    assert confirmation["stress_failures"] == []
+    assert confirmation["scope_narrowing"] == {}
+    assert {item["variant"] for item in confirmation["results"]} == {
+        "baseline",
+        "support_only",
+        "site_span_one",
     }
-    rehash_phase1_decision(payload)
     assert Campaign.phase1_decision_from_manifest(payload)["decision"] == "go"
 
 
@@ -3751,7 +3727,7 @@ def test_closed_stage_cannot_be_bypassed_with_an_explicit_cell_id(tmp_path):
     assert campaign.runnable_cell_ids() == ()
 
 
-def test_frozen_selection_excludes_negative_outcomes_and_extends_exact_blueprint(
+def test_fixed_phase1_selection_extends_only_the_exact_blueprint(
     tmp_path,
 ):
     blueprint = build_phase1_blueprint(smoke=False)
@@ -3760,28 +3736,20 @@ def test_frozen_selection_excludes_negative_outcomes_and_extends_exact_blueprint
     campaign.register(plan, blueprint_manifest=blueprint.to_manifest())
     stage = plan.stages[-1]
     candidate_ids = sorted({cell.candidate_id for cell in stage.cells})
-    assert len(candidate_ids) >= 2
-    positive_candidate = next(
-        cell.candidate_id
-        for cell in stage.cells
-        if cell.recipe_name in stage.selection_policy.eligible_recipe_names
-    )
+    assert len(candidate_ids) == 1
+    positive_candidate = candidate_ids[0]
     for cell in stage.cells:
-        negative = cell.candidate_id != positive_candidate
         qualify_cell(
             campaign,
             cell.cell_id,
-            metric=10.0 if negative else 1.0,
-            scientific_passed=not negative,
+            metric=1.0,
+            scientific_passed=True,
         )
     selection_path = tmp_path / "selections" / f"{stage.name}.json"
     payload = campaign.select_stage(stage.name, out=selection_path)
     assert len(payload["selected"]) == 1
     assert payload["selected"][0]["candidate_id"] == positive_candidate
-    assert {item["reason"] for item in payload["excluded_candidates"]} <= {
-        "scientific_outcome_failed",
-        "recipe_not_eligible_under_frozen_policy",
-    }
+    assert payload["excluded_candidates"] == []
 
     selection = FrozenSelection.from_dict(payload["selected"][0])
     extended = materialize_child_plan(plan, blueprint, selection)
@@ -3986,7 +3954,16 @@ def test_selection_rejects_candidates_missing_a_declared_seed(tmp_path):
     candidates = [
         sorted(cells, key=lambda item: item.seed) for cells in by_candidate.values()
     ]
-    incomplete_cells = (candidates[0][0], candidates[1][1])
+    second_candidate = replace(
+        candidates[0][1],
+        decisions=tuple(
+            replace(decision, value=0.0002)
+            if decision.name == "optimizer.learning_rate"
+            else decision
+            for decision in candidates[0][1].decisions
+        ),
+    )
+    incomplete_cells = (candidates[0][0], second_candidate)
     stage = StageSpec(
         source.name,
         incomplete_cells,

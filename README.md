@@ -7,11 +7,9 @@ single language model.
 The scientific program has three phases:
 
 1. **Phase 1 — synthetic identification.** Establish factor recovery when the
-   true support, subspace, and coordinates are known; reproduce the relevant
-   BSF, SASA, and scalar-crosscoder mechanisms before composing them; export
-   only universal method semantics, a declared provisional carrier, and
-   seed-complete capability evidence—not synthetic numeric hyperparameter
-   winners.
+   true support, subspace, and coordinates are known using one tiny, exactly
+   matched orthogonal contract. Export only universal method semantics—not
+   synthetic numeric hyperparameter winners.
 2. **Phase 2 — small-model pilot.** Run a conditional GPT-2 Small campaign and
    own all model-, hook-, scale-, optimization-, and rate-dependent tuning,
    choosing among qualified candidates by raw-space FVU at exact total-bit
@@ -46,16 +44,12 @@ qualification and sharing on every seed and remain within `0.02` fixed-rate
 score of its exact development parent. This novel tolerance carries an
 executed `.01/.02/.05` sensitivity report and an ungated descriptive result.
 
-Phase 1 runs seven fixed-carrier capability panels for width/capacity/activity,
-QR versus polar retraction, site-axis rank, missing-site fusion, site masking,
-block score, and token versus BatchTopK selection. Challengers provide
-seed-complete truth-known evidence; they cannot tune the next synthetic stage
-and their full-recovery outcome never deletes a real-model option. Decoded
-energy on the Stiefel carrier is the provisional score. The score panel runs
-code norm, exact isolated decoded energy, and exact isolated squared-loss
-decrease both on that Stiefel equality control and on one common free decoder;
-all free-decoder arms are nonpromotable. Missing-site fusion is fixed to
-availability-rescaled sum, and hidden clean targets never enter a score.
+Phase 1 fixes 16 orthogonal rank-two factors in 32 dimensions, exactly 16
+width-two learner blocks, and two active factors/blocks. Three one-site
+instrument cells must pass before the same coordinates are rendered through
+four independent orthogonal site dictionaries. Confirmation reruns that
+carrier beside support-only and one-site-span negative controls. There is no
+synthetic capacity, optimizer, score, or selector tournament.
 
 Phase 2 inherits that content-addressed method contract but independently
 tunes real-model architecture, width/capacity/activity, site-axis rank,
@@ -63,14 +57,9 @@ masking, score, selector, optimizer, regularization, and Aux choices. It revisit
 site-axis rank after the selected masking intervention, then measures the full
 three-score by two-hard-selector interaction. Learned group thresholding is a
 separate complete-method comparison at three coefficients, not another value
-of the hard selector factor. The pilot retains a
-narrow QR/polar tied-architecture comparison because retraction behavior can
-depend on real activation conditioning, dimension, and numeric regime; the
-synthetic panel measured truth-known capability rather than choosing a winner.
-Phase-1
-confirmation also includes standardized Student-t df=3 coordinates and
-deterministically paired 30-degree factor subspaces as one-delta recovery
-stresses.
+of the hard selector factor. The pilot retains a narrow QR/polar
+tied-architecture comparison because retraction behavior can depend on real
+activation conditioning, dimension, and numeric regime.
 SASA's undisclosed absolute map-penalty coefficient is never guessed: its
 paper bridge and main map arm fit a declared initial penalty/reconstruction
 ratio on the content-bound first training batch, with independent targets
@@ -96,7 +85,7 @@ Phase 2 cells use their declared bf16 forward precision. The executable
 fp32/bf16 parity-and-short-run stability gate is a Phase-3-only preflight; the
 pilot does not claim to have passed that later production-shape gate.
 
-At the default seeds, Phase 1 declares and executes **195 cells**. Phase 2 has
+At the default seeds, Phase 1 declares and executes **15 cells**. Phase 2 has
 a **410-cell pre-elision ceiling**: 176 main-chain cells and 234 independently
 calibrated comparator-family cells. At materialization, execution-equivalent
 parent/center variants are deterministically elided and recorded. The rank
@@ -141,11 +130,10 @@ bsc matrix plan --root /data/runs/bsc-phase1 --phase phase1 --seeds 0 1 2
 bsc matrix run --root /data/runs/bsc-phase1
 bsc matrix status --root /data/runs/bsc-phase1
 bsc matrix select --root /data/runs/bsc-phase1 \
-  --stage dgp_identification_screen --out /data/runs/bsc-phase1/dgp-selection.json
+  --stage multisite_learnability --out /data/runs/bsc-phase1/truth-selection.json
 bsc matrix advance --root /data/runs/bsc-phase1 \
-  --selection /data/runs/bsc-phase1/dgp-selection.json
-# Repeat selection/advance through the complete blueprint, qualify the
-# robustness-confirmation stage, then freeze the authenticated go/no-go and
+  --selection /data/runs/bsc-phase1/truth-selection.json
+# Qualify the truth-contract confirmation stage, then freeze the authenticated go/no-go and
 # universal-method and provisional-carrier transfer contract.
 bsc matrix freeze-phase1 --root /data/runs/bsc-phase1 \
   --out /data/runs/bsc-phase1/decisions/phase2-authorization.json

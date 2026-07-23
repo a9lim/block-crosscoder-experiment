@@ -16,9 +16,9 @@ model-comparison project.
 
 ## Three phases
 
-1. Phase 1 uses truth-known synthetic factors to test identification,
-   paper/mechanism bridges, capability evidence, and the universal method
-   contract. It does not export synthetic numeric hyperparameter winners.
+1. Phase 1 uses a tiny exactly matched truth-known synthetic contract to test
+   identification and the universal method semantics. It is not a synthetic
+   tuning phase and exports no numeric model or optimizer winner.
 2. Phase 2 uses a pinned GPT-2 Small four-hook capture and owns model-, hook-,
    scale-, optimizer-, and rate-dependent tuning on development evidence,
    followed by confirmation.
@@ -38,16 +38,14 @@ preview cannot authorize registration.
 - Paper, inspected release, and local adaptation are separate recipes.
 - Adapted or novel scientific choices require a rationale and named ablation.
 - Use one/few-factor conditional rounds, not an incoherent Cartesian product.
-- Phase-1 width/capacity/activity, retraction, site-axis rank, missing-site
-  fusion, site masking, score, and selector rounds are capability panels. Only
-  their declared carriers advance; challenger outcomes are authenticated
-  diagnostics and never prune real-model options.
-- Decoded energy on the Stiefel carrier is the fixed provisional Phase-1 score.
-  The three scores—code norm, decoded energy, and isolated squared-loss
-  decrease—run both on the Stiefel equality control and on one common
-  nonpromotable free decoder. Isolated loss decrease may use only observed
-  sites, preserves signed negative gains, and requires a bias-free quadratic
-  reconstruction carrier.
+- Phase 1 fixes 16 rank-two factors in 32 dimensions, exactly 16 width-two
+  learner blocks, and two active factors/blocks. A one-site positive control
+  must pass before the four-site shared-coordinate carrier runs.
+- The four-site carrier renders the same coordinates through independent
+  orthogonal site dictionaries. Confirmation reruns it beside support-only and
+  one-site-span negative controls. Width, capacity, activity, architecture,
+  masking, score, selector, optimizer, regularizer, and rate choices belong to
+  Phase 2.
 - Phase 2 does not retune observation-site/evidence topology or missing-site
   fusion. It does retune model architecture, site-axis rank, and masking on
   real evidence, revisits rank after masking, evaluates the complete three-
@@ -55,8 +53,6 @@ preview cannot authorize registration.
   only as a bundled method at three coefficients. Its source-only model is a
   descriptive nonpromotable anchor, while the sharing guard compares all-view
   with partial-view inference on the same candidate.
-- Phase-1 confirmation includes standardized Student-t df=3 coordinate tails
-  and paired 30-degree factor-subspace overlap as separate one-delta stresses.
 - A candidate must have every declared seed; aggregate candidates by median,
   then worst seed, then content ID.
 - Phase 1 selection uses the worst normalized truth-identification margin. FVU
@@ -89,7 +85,9 @@ preview cannot authorize registration.
   aggregate reconstruction is not manifold recovery.
 - Development, confirmation, and final evaluation are disjoint. Never tune on
   confirmation or final evidence.
-- The default Phase-1 blueprint declares and executes 195 cells at seeds 0/1/2.
+- The default Phase-1 blueprint declares and executes 15 cells at seeds 0/1/2:
+  three one-site instruments, three multisite carriers, and nine confirmation
+  cells.
   The Phase-2 blueprint has a 410-cell pre-elision ceiling at seeds 0/1: 176
   main-chain plus 234 family-chain cells. Materialization deterministically
   records and elides execution-equivalent parent/center cells; if zero
