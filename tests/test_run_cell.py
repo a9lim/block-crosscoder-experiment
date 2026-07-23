@@ -3524,11 +3524,18 @@ def test_executor_maps_phase1_robustness_geometry_into_the_generator(
     protocol_key: str,
 ) -> None:
     base = _cell(recipe_index=2)
+    overrides = {decision_name: decision_value}
+    if decision_name == "data.factor_subspace_overlap":
+        # The current universal Phase-1 carrier intentionally plants one
+        # factor.  The paired-angle generator contract is still executable,
+        # but its geometry necessarily requires a valid two-factor fixture.
+        overrides["data.n_factors"] = 2
+        overrides["model.groups"] = 2
     cell = replace(
         base,
         decisions=tuple(
-            replace(decision, value=decision_value)
-            if decision.name == decision_name
+            replace(decision, value=overrides[decision.name])
+            if decision.name in overrides
             else decision
             for decision in base.decisions
         ),
