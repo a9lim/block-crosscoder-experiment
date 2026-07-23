@@ -2179,6 +2179,36 @@ def _validate_qualification_payload(
         native_identification, deployed_identification, phase1_validation = (
             _validated_phase1_identification(selection_metrics, cell=cell)
         )
+        recovery = selection_metrics.get("recovery")
+        site_dims = cell.decision_map.get("data.site_dims")
+        shared_feature_claim_required = bool(
+            isinstance(site_dims, (list, tuple)) and len(site_dims) > 1
+        )
+        shared_feature_claim_eligible = bool(
+            shared_feature_claim_required
+            and cell.decision_map.get("data.dgp_step") != "shared_support"
+            and cell.decision_map.get("data.site_presence_span") != "one"
+        )
+        if not isinstance(recovery, Mapping) or set(recovery) != {
+            "native",
+            "deployed",
+        }:
+            raise ArtifactError(
+                "Phase-1 selection metrics require exact native/deployed recovery"
+            )
+        for endpoint_name in ("native", "deployed"):
+            endpoint_recovery = recovery.get(endpoint_name)
+            if (
+                not isinstance(endpoint_recovery, Mapping)
+                or endpoint_recovery.get("shared_feature_claim_required")
+                is not shared_feature_claim_required
+                or endpoint_recovery.get("shared_feature_claim_eligible")
+                is not shared_feature_claim_eligible
+            ):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} recovery disagrees with the "
+                    "resolved shared-feature claim"
+                )
         expected_sensitivity = _expected_phase1_threshold_sensitivity(
             {
                 "native": native_identification,
@@ -2198,11 +2228,14 @@ def _validate_qualification_payload(
             and deployed_identification["applicable"] is False
         )
         expected_identification_outcome = bool(
-            both_inapplicable
-            or (
-                native_identification["passed"] is True
-                and deployed_identification["passed"] is True
-                and phase1_validation["phase1_identification_conjunction"] is True
+            (not shared_feature_claim_required or shared_feature_claim_eligible)
+            and (
+                both_inapplicable
+                or (
+                    native_identification["passed"] is True
+                    and deployed_identification["passed"] is True
+                    and phase1_validation["phase1_identification_conjunction"] is True
+                )
             )
         )
         if (

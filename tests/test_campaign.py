@@ -418,6 +418,23 @@ def phase1_identification_metrics(
     return identification, validation
 
 
+def phase1_recovery_claim_metrics(cell: CellSpec) -> dict[str, object]:
+    site_dims = cell.decision_map["data.site_dims"]
+    required = len(site_dims) > 1
+    eligible = bool(
+        required
+        and cell.decision_map["data.dgp_step"] != "shared_support"
+        and cell.decision_map["data.site_presence_span"] != "one"
+    )
+    return {
+        endpoint: {
+            "shared_feature_claim_required": required,
+            "shared_feature_claim_eligible": eligible,
+        }
+        for endpoint in ("native", "deployed")
+    }
+
+
 def phase1_decision_for_phase2(
     *,
     smoke: bool,
@@ -485,6 +502,7 @@ def phase1_decision_for_phase2(
         selection_metrics = {
             "validation": identification_validation,
             "identification": identification,
+            "recovery": phase1_recovery_claim_metrics(cell),
             "fixed_rate_raw_selection": {
                 "schema": "bsc-fixed-rate-raw-selection-v2",
                 "applicable": False,
@@ -1321,6 +1339,7 @@ def evaluation_payload(
     }
     if identification is not None:
         selection_metrics["identification"] = identification
+        selection_metrics["recovery"] = phase1_recovery_claim_metrics(cell)
         selection_metrics["phase1_threshold_sensitivity"] = (
             campaign_module._expected_phase1_threshold_sensitivity(
                 identification,
@@ -1356,7 +1375,11 @@ def evaluation_payload(
         "phase1_threshold_sensitivity": selection_metrics[
             "phase1_threshold_sensitivity"
         ],
-        "synthetic_recovery": {"deployed": {"shared_feature_claim_eligible": True}},
+        "synthetic_recovery": (
+            phase1_recovery_claim_metrics(cell)
+            if cell.phase is Phase.PHASE1
+            else None
+        ),
     }
 
 
@@ -1688,6 +1711,7 @@ def qualification_payload(
     }
     if identification is not None:
         selection_metrics["identification"] = identification
+        selection_metrics["recovery"] = phase1_recovery_claim_metrics(cell)
         selection_metrics["phase1_threshold_sensitivity"] = (
             campaign_module._expected_phase1_threshold_sensitivity(
                 identification,
@@ -2778,7 +2802,7 @@ def test_phase1_transfer_exports_semantics_without_synthetic_numeric_winners():
     )
 
 
-def test_phase1_authorization_uses_declared_aggregate_factor_fraction():
+def test_phase1_authorization_rejects_failure_of_the_only_truth_factor():
     payload = phase1_decision_for_phase2(smoke=False)
     manifest = payload["phase1_campaign_manifest"]
     plan = StudyPlan.from_manifest(manifest["plan"])
@@ -2803,7 +2827,7 @@ def test_phase1_authorization_uses_declared_aggregate_factor_fraction():
             endpoint["per_factor"]
         )
         endpoint["aggregate"]["recovered_factor_fraction"] = recovered_fraction
-        endpoint["checks"]["recovered_factor_fraction"] = True
+        endpoint["checks"]["recovered_factor_fraction"] = False
         endpoint["normalized_margins"]["worst_eligible_per_factor"] = -0.1
         endpoint["normalized_margins"]["recovered_factor_fraction"] = (
             campaign_module._phase1_min_margin(
@@ -2811,26 +2835,28 @@ def test_phase1_authorization_uses_declared_aggregate_factor_fraction():
                 endpoint["thresholds"]["aggregate.recovered_factor_fraction_min"],
             )
         )
-        endpoint["margin"] = -0.1
-        endpoint["passed"] = True
+        endpoint["margin"] = min(endpoint["normalized_margins"].values())
+        endpoint["passed"] = False
     validation = {
         "phase1_identification_applicable": True,
-        "phase1_identification_conjunction": True,
-        "phase1_identification_margin": -0.1,
+        "phase1_identification_conjunction": False,
+        "phase1_identification_margin": identification["native"]["margin"],
     }
     qualification["selection_metrics"]["validation"] = validation
     qualification["validation"] = validation
+    qualification["scientific_outcome"]["checks"]["phase1_identification"] = False
+    qualification["scientific_outcome"]["passed"] = False
     qualification["scientific_outcome"]["margins"].update(
         {
-            "phase1_native_identification": -0.1,
-            "phase1_deployed_identification": -0.1,
+            "phase1_native_identification": identification["native"]["margin"],
+            "phase1_deployed_identification": identification["deployed"]["margin"],
         }
     )
 
     claim = Campaign._phase1_claim_evidence(qualification, cell=baseline, smoke=False)
-    assert claim["native_passed"] is True
-    assert claim["deployed_passed"] is True
-    assert claim["conjunction_passed"] is True
+    assert claim["native_passed"] is False
+    assert claim["deployed_passed"] is False
+    assert claim["conjunction_passed"] is False
 
 
 def test_phase1_negative_control_failure_is_identification_specific():
@@ -5502,6 +5528,17 @@ def phase1_selection_metrics():
     metrics = {
         "validation": validation,
         "identification": {"native": endpoint, "deployed": endpoint},
+        "recovery": {
+            mode: {
+                "shared_feature_claim_required": len(values["data.site_dims"]) > 1,
+                "shared_feature_claim_eligible": (
+                    len(values["data.site_dims"]) > 1
+                    and values["data.dgp_step"] != "shared_support"
+                    and values["data.site_presence_span"] != "one"
+                ),
+            }
+            for mode in ("native", "deployed")
+        },
     }
     metrics["phase1_threshold_sensitivity"] = (
         _expected_phase1_threshold_sensitivity(metrics["identification"], cell_spec)
@@ -5670,9 +5707,7 @@ for kind in stage_kinds[a.stage]:
             "phase1_threshold_sensitivity": selection_metrics[
                 "phase1_threshold_sensitivity"
             ],
-            "synthetic_recovery": {
-                "deployed": {"shared_feature_claim_eligible": True}
-            },
+            "synthetic_recovery": selection_metrics["recovery"],
         }
     elif kind == "preparation":
         payload = {
