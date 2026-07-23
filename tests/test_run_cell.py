@@ -65,6 +65,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _phase1_identification_outcome,
     _production_precision_preflight,
     _resolve_real_store,
+    _resolved_runtime_device,
     _selection_validation_metrics,
     _selected_time_sharing_plans,
     _synthetic_batches,
@@ -187,6 +188,16 @@ def _retained_cache_key() -> _RetainedArtifactKey:
         ),
         model_config_sha256="b" * 64,
     )
+
+
+def test_resolved_runtime_device_canonicalizes_implicit_cuda_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    assert torch.device("cuda:2") != torch.device("cuda")
+    assert _resolved_runtime_device("cuda") == torch.device("cuda:2")
+    assert _resolved_runtime_device("cuda:1") == torch.device("cuda:1")
+    assert _resolved_runtime_device("cpu") == torch.device("cpu")
 
 
 @pytest.mark.parametrize(

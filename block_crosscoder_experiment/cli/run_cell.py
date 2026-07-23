@@ -1243,6 +1243,15 @@ def _device(ctx: _Context) -> torch.device:
     return device
 
 
+def _resolved_runtime_device(device: torch.device | str) -> torch.device:
+    """Resolve shorthand CUDA declarations for exact residency checks."""
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 def _declared_device(values: Mapping[str, Any]) -> str:
     """Validate a device declaration without requiring hardware at prepare time."""
 
@@ -6287,7 +6296,7 @@ def _calibrate(
             ) from exc
     else:
         model, metadata = retained_checkpoint
-        if next(model.parameters()).device != _device(ctx):
+        if next(model.parameters()).device != _resolved_runtime_device(_device(ctx)):
             raise CellExecutionError("retained checkpoint model is on the wrong device")
     checkpoint_after_load = ctx.prerequisite_fingerprint(
         checkpoint_path,
@@ -8758,7 +8767,10 @@ def _evaluate_rate_distortion_and_raw_space(
             if self._raw is not None or not torch.is_tensor(batch.context):
                 raise CellExecutionError("joint R-D observer batch state is invalid")
             x_raw = batch.context
-            if x_raw.shape != batch.transformed.shape or x_raw.device != device:
+            if (
+                x_raw.shape != batch.transformed.shape
+                or x_raw.device != _resolved_runtime_device(device)
+            ):
                 raise CellExecutionError("joint R-D paired raw tensor is misbound")
             centered = x_raw.double() - calibration_mean
             if coordinate_mask is not None:
@@ -10292,7 +10304,7 @@ def _evaluate(
         )
     else:
         deployment, model, codec, training_summary = retained_deployment
-        if next(model.parameters()).device != device:
+        if next(model.parameters()).device != _resolved_runtime_device(device):
             raise CellExecutionError("retained deployment model is on the wrong device")
         model.eval()
     deployment_after_load = ctx.prerequisite_fingerprint(
