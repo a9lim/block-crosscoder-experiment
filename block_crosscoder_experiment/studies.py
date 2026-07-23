@@ -6566,7 +6566,7 @@ def _phase1_learnability_recipe(
                 novel(
                     "data.site_dims",
                     site_dims,
-                    rationale="fit one rank-two factor exactly into each two-dimensional site",
+                    rationale="plant one rank-two factor in each four-dimensional site so the learner must recover a genuine low-rank subspace",
                     ablation="real-model width and hook geometry belong exclusively to Phase 2",
                 ),
                 novel(
@@ -6631,9 +6631,9 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "data.site_map_rank_family",
-                    "independent",
-                    rationale="render the same coordinates through a distinct orthogonal dictionary at each site",
-                    ablation="the one-site instrument isolates the cross-site requirement",
+                    "rank1",
+                    rationale="render the same coordinates through one aligned orthogonal frame at every site so Phase 1 isolates shared-coordinate learning from arbitrary site rotations",
+                    ablation="site-axis geometry is reopened on real activations in Phase 2",
                 ),
                 novel(
                     "data.factor_subspace_overlap",
@@ -6672,6 +6672,12 @@ def _phase1_learnability_recipe(
                     ablation="Phase 2 owns the real-model activity contest",
                 ),
                 novel(
+                    "model.identical_site_init",
+                    True,
+                    rationale="start the multisite learner in the aligned site-symmetry family while leaving the planted rank-two ambient subspace unknown",
+                    ablation="Phase 2 reopens site initialization on real activation geometry",
+                ),
+                novel(
                     "model.encoder_fusion",
                     "availability_rescaled_sum",
                     rationale="use the universal missing-view-safe fusion contract even though all tiny sites are observed",
@@ -6691,14 +6697,20 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "optimizer.learning_rate",
-                    3e-4,
-                    rationale="use one conservative fixed Adam rate for the tiny contract",
+                    3e-3,
+                    rationale="use one fixed Adam rate large enough to rotate a tiny Grassmannian carrier within roughly one thousand updates",
                     ablation="learning rate is tuned only in Phase 2",
                 ),
                 novel(
                     "optimizer.warmup_steps",
-                    100,
-                    rationale="use a short fixed warmup within the thousand-update run",
+                    20,
+                    rationale="use a brief fixed warmup within the thousand-update run",
+                    ablation="warmup is tuned only in Phase 2",
+                ),
+                novel(
+                    "optimizer.warmup_fraction",
+                    20 / 977,
+                    rationale="content-bind the twenty-update warmup against the resolved 977-step run",
                     ablation="warmup is tuned only in Phase 2",
                 ),
                 engineering(
@@ -6723,7 +6735,7 @@ def _phase1_learnability_recipe(
                 ),
                 engineering(
                     "contest.carrier",
-                    "phase1_learnability_multisite_orthogonal",
+                    "phase1_learnability_multisite_aligned",
                     rationale="name the sole multisite carrier that can authorize Phase 2",
                 ),
             ),
@@ -6733,12 +6745,12 @@ def _phase1_learnability_recipe(
 
 PHASE1_LEARNABILITY_RECIPES = (
     _phase1_learnability_recipe(
-        name="phase1_learnability_single_site_orthogonal",
-        site_dims=(2,),
+        name="phase1_learnability_single_site_low_rank",
+        site_dims=(4,),
     ),
     _phase1_learnability_recipe(
-        name="phase1_learnability_multisite_orthogonal",
-        site_dims=(2, 2, 2, 2),
+        name="phase1_learnability_multisite_aligned",
+        site_dims=(4, 4, 4, 4),
     ),
 )
 

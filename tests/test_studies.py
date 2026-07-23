@@ -398,8 +398,8 @@ def test_phase1_blueprint_is_a_fixed_tiny_learnability_contract():
         "site_span_one",
     }
     single, multisite = (stage.cells[0].decision_map for stage in prefix.stages)
-    assert single["data.site_dims"] == (2,)
-    assert multisite["data.site_dims"] == (2, 2, 2, 2)
+    assert single["data.site_dims"] == (4,)
+    assert multisite["data.site_dims"] == (4, 4, 4, 4)
     for values in (single, multisite):
         assert values["data.n_factors"] == values["model.groups"] == 1
         assert values["data.factor_coordinate_dim"] == values["model.block_width"] == 2
@@ -409,6 +409,10 @@ def test_phase1_blueprint_is_a_fixed_tiny_learnability_contract():
             == 1
         )
         assert values["data.factor_subspace_overlap"] == "orthogonal"
+        assert values["data.site_map_rank_family"] == "rank1"
+        assert values["model.identical_site_init"] is True
+        assert values["optimizer.learning_rate"] == 3e-3
+        assert values["optimizer.warmup_steps"] == 20
         assert values["protocol.hyperparameter_tuning"] is False
     assert prefix.stages[-1].gate.basis == "qualified"
     restored = Phase1Blueprint.from_manifest(

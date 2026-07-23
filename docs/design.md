@@ -194,12 +194,13 @@ structure/train/eval/confirmation seeds, and disjoint calibration,
 development, and confirmation identity ranges.
 
 The live contract is deliberately minuscule and identifiable. It plants one
-rank-two factor in a two-dimensional site, activates that factor on every row,
-and fits exactly one width-two learner block with one active block. Each
-site receives a complete orthogonal factor dictionary. The multisite carrier
-uses four independently rotated orthogonal dictionaries with one shared signed
-coordinate vector, so factor identity is identifiable from sparse support and
-there is no width, activity, or capacity slack.
+rank-two factor in a four-dimensional site, activates that factor on every row,
+and fits exactly one width-two learner block with one active block. Each site
+receives the same orthogonal factor dictionary. The multisite learner starts in
+the aligned site-symmetry family but does not know the planted two-dimensional
+ambient subspace. It must therefore solve a genuine low-rank recovery problem
+with one shared signed coordinate vector, without width, activity, capacity,
+or arbitrary site-rotation slack.
 
 Every cell uses one fixed optimizer recipe, 20,000 unique training rows,
 2,000,000 presentations, and four disjoint 5,000-row factor-calibration,
@@ -220,7 +221,7 @@ The materialized prefix has two fixed stages:
    site. All three seeds must pass before the multisite stage opens. This is an
    instrument check, not evidence for a cross-site feature claim.
 2. `multisite_learnability`: the same latent support and coordinates rendered
-   through four independent orthogonal site dictionaries. It is the sole
+   through four aligned orthogonal site dictionaries. It is the sole
    selectable Phase-1 carrier, so selection authenticates a fixed candidate
    rather than choosing among synthetic hyperparameters.
 

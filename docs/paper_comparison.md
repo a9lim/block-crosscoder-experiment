@@ -170,10 +170,10 @@ contract rather than a paper-recipe or hyperparameter tournament.
 | Stage | Recipes/variants | Selection or gate |
 |---|---|---|
 | `single_site_learnability` | one rank-two factor; exactly matched one-by-width-two learner; one active factor | all three seeds must pass before the multisite stage opens |
-| `multisite_learnability` | the same shared coordinates rendered through four independent orthogonal site dictionaries | sole fixed selectable carrier; selection authenticates rather than tunes |
+| `multisite_learnability` | the same shared coordinates rendered through four aligned orthogonal site dictionaries | sole fixed selectable carrier; selection authenticates rather than tunes |
 | `truth_contract_confirmation` | baseline; support-only; one-site factor span | untouched confirmation stream; baseline must pass and both claim-negative controls must fail |
 
-The fixed recipe uses eight-dimensional sites, 20,000 unique training examples,
+The fixed recipe uses four-dimensional sites, 20,000 unique training examples,
 2,000,000 presentations, and four disjoint 5,000-row evaluation roles. No
 synthetic model or optimizer value is exported to Phase 2.
 

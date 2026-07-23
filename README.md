@@ -44,10 +44,10 @@ qualification and sharing on every seed and remain within `0.02` fixed-rate
 score of its exact development parent. This novel tolerance carries an
 executed `.01/.02/.05` sensitivity report and an ungated descriptive result.
 
-Phase 1 fixes one rank-two factor in two dimensions, exactly one width-two
+Phase 1 fixes one rank-two factor in four dimensions, exactly one width-two
 learner block, and one active factor/block. Three one-site
 instrument cells must pass before the same coordinates are rendered through
-four independent orthogonal site dictionaries. Confirmation reruns that
+four aligned orthogonal site dictionaries. Confirmation reruns that
 carrier beside support-only and one-site-span negative controls. There is no
 synthetic capacity, optimizer, score, or selector tournament.
 
