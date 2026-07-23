@@ -47,7 +47,9 @@ from block_crosscoder_experiment.cli.run_cell import _expected_real_source_contr
 from block_crosscoder_experiment.store import ShardWriter, StoreReader, Whitener
 from block_crosscoder_experiment.studies import (
     FrozenSelection,
+    GPT2_VOCAB_HASH,
     Phase,
+    PHASE3_VOCAB_HASH,
     StudyError,
     build_phase2_blueprint,
     build_phase2_plan,
@@ -856,6 +858,19 @@ def test_unicode_vocab_hash_is_canonical_utf8_not_ascii_escaped():
         ).encode("utf-8")
     ).hexdigest()
     assert _canonical_hash(value) == expected
+
+
+def test_reviewed_vocab_preflights_match_utf8_plan_contracts():
+    assert data_module.TOKENIZER_PREFLIGHTS["openai-community/gpt2"][
+        "vocab_sha256"
+    ] == GPT2_VOCAB_HASH == (
+        "sha256:179cad62d906b7217f1c9431ece06e7a78a7721f9580960147a6c1ea0a53fc65"
+    )
+    assert data_module.TOKENIZER_PREFLIGHTS["google/gemma-3-4b-pt"][
+        "vocab_sha256"
+    ] == PHASE3_VOCAB_HASH == (
+        "sha256:4ab2b66fed16d7e79cfb30bd2168ee3da6d848a6ff9b0753cd62a5841c9328ad"
+    )
 
 
 def test_pinned_tokenizer_preflight_binds_revision_class_bos_and_vocab(

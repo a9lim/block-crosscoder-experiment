@@ -48,7 +48,7 @@ TOKENIZER_PREFLIGHTS = {
         "class": "GPT2Tokenizer",
         "bos_token_id": 50_256,
         "vocab_sha256": (
-            "sha256:e35d8b86ebd35ebd260d040aa455e09759f7e675f4dbb7f3d727516f27eca190"
+            "sha256:179cad62d906b7217f1c9431ece06e7a78a7721f9580960147a6c1ea0a53fc65"
         ),
     },
     "google/gemma-3-4b-pt": {
