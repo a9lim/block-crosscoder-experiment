@@ -460,6 +460,17 @@ exit is not evidence by itself.
   a second concurrent checkpoint/model load in the parent while preventing a
   caller-built byte-valid intermediate artifact from poisoning append-only
   state. Custom executors remain smoke-only.
+- Persistent-worker model handoffs bind the runtime-resolved model
+  configuration from the immutable training report, including fitted
+  regularizer coefficients, rather than reconstructing an unresolved static
+  cell configuration. On 2026-07-23 the first MAP-nuclear Phase-1 anchor
+  trained and calibrated at `f1efa31` but failed closed before evaluation when
+  the retained-cache key compared its resolved coefficient with the declared
+  zero placeholder. The failed event and completed artifacts remain in the
+  campaign journal; a fresh same-commit worker can resume from the durable
+  calibrated state, while the corrected persistent path validates the report's
+  preparation/checkpoint binding, exact resolved field set, and reconstructible
+  model configuration before accepting the handoff.
 - Journal validation plus extension commit share one cross-process mutation
   lock, so selected evidence cannot fail between its final replay and the
   `plan_extension` append. The hot authority cursor retains and stat-revalidates

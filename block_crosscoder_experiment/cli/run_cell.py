@@ -5606,6 +5606,44 @@ def _training_report_payload(
     }
 
 
+def _verified_training_report_model_cfg(
+    ctx: _Context,
+    prerequisites: Mapping[str, tuple[Path, str]],
+    *,
+    checkpoint_hash: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the exact runtime-resolved model config bound by training."""
+
+    training_report = _read_object(
+        prerequisites["training_report"][0], label="training report"
+    )
+    if (
+        training_report.get("schema") != TRAINING_REPORT_SCHEMA
+        or training_report.get("cell_id") != ctx.cell.cell_id
+        or training_report.get("checkpoint_sha256") != checkpoint_hash
+        or training_report.get("preparation_sha256")
+        != prerequisites["preparation"][1]
+    ):
+        raise CellExecutionError("training report/input binding mismatch")
+    model_cfg = training_report.get("model_cfg")
+    if not isinstance(model_cfg, dict):
+        raise CellExecutionError("training report lacks its resolved model config")
+    try:
+        resolved = BSCConfig(**model_cfg)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CellExecutionError(
+            f"training report has an invalid resolved model config: {exc}"
+        ) from exc
+    resolved_payload = asdict(resolved)
+    if set(model_cfg) != set(resolved_payload) or canonical_json(
+        model_cfg
+    ) != canonical_json(resolved_payload):
+        raise CellExecutionError(
+            "training report model config does not contain the exact resolved fields"
+        )
+    return training_report, dict(model_cfg)
+
+
 def _execution_rng_snapshot() -> tuple[Any, ...]:
     """Snapshot process RNGs to prove validation itself consumes none.
 
@@ -6262,15 +6300,11 @@ def _calibrate(
 ) -> tuple[tuple[str, Path], ...]:
     preparation = _load_preparation(prerequisites["preparation"][0], ctx)
     checkpoint_path, checkpoint_hash = prerequisites["checkpoint"]
-    training_report = _read_object(
-        prerequisites["training_report"][0], label="training report"
+    _, resolved_model_cfg = _verified_training_report_model_cfg(
+        ctx,
+        prerequisites,
+        checkpoint_hash=checkpoint_hash,
     )
-    if (
-        training_report.get("schema") != TRAINING_REPORT_SCHEMA
-        or training_report.get("cell_id") != ctx.cell.cell_id
-        or training_report.get("checkpoint_sha256") != checkpoint_hash
-    ):
-        raise CellExecutionError("training report/checkpoint binding mismatch")
     checkpoint_before_load = ctx.prerequisite_fingerprint(
         checkpoint_path,
         sha256=checkpoint_hash,
@@ -6287,7 +6321,7 @@ def _calibrate(
                 path=checkpoint_path,
                 sha256=checkpoint_hash,
                 fingerprint=checkpoint_before_load,
-                model_cfg=training_report["model_cfg"],
+                model_cfg=resolved_model_cfg,
             )
         )
     )
@@ -10277,7 +10311,11 @@ def _evaluate(
         deployment_path,
         sha256=deployment_hash,
     )
-    expected_model_cfg, _ = validate_cell_config(ctx.cell)
+    _, resolved_model_cfg = _verified_training_report_model_cfg(
+        ctx,
+        prerequisites,
+        checkpoint_hash=checkpoint_hash,
+    )
     retained_deployment = (
         None
         if execution_cache is None
@@ -10290,7 +10328,7 @@ def _evaluate(
                 path=deployment_path,
                 sha256=deployment_hash,
                 fingerprint=deployment_before_load,
-                model_cfg=asdict(expected_model_cfg),
+                model_cfg=resolved_model_cfg,
             )
         )
     )

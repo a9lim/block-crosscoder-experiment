@@ -2592,6 +2592,14 @@ def test_initial_loss_ratio_regularizer_is_resolved_once_and_resume_exact(
     }
     assert second["checkpoint"].sha256 == first["checkpoint"].sha256
     assert second["training_report"].sha256 == first["training_report"].sha256
+    if target_ratio:
+        lifecycle_campaign = _campaign(
+            tmp_path / f"ratio-{target_ratio}-persistent-worker",
+            cell,
+        )
+        lifecycle_runner = _runner(lifecycle_campaign)
+        assert lifecycle_runner.run(limit=1).completed_cells == 1
+        assert lifecycle_campaign.record(cell.cell_id).state is RunState.QUALIFIED
 
 
 def test_nonzero_ratio_regularizer_resumes_exactly_from_recovery_checkpoint(
