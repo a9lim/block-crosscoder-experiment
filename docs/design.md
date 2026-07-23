@@ -193,16 +193,16 @@ uses stateless generators, fp32 reference training, independent
 structure/train/eval/confirmation seeds, and disjoint calibration,
 development, and confirmation identity ranges.
 
-The live contract is deliberately minuscule and identifiable. It plants 16
-rank-two factors in a 32-dimensional site, activates exactly two factors per
-row, and fits exactly 16 width-two learner blocks with two active blocks. Each
+The live contract is deliberately minuscule and identifiable. It plants four
+rank-two factors in an eight-dimensional site, activates exactly one factor per
+row, and fits exactly four width-two learner blocks with one active block. Each
 site receives a complete orthogonal factor dictionary. The multisite carrier
 uses four independently rotated orthogonal dictionaries with one shared signed
 coordinate vector, so factor identity is identifiable from sparse support and
 there is no width, activity, or capacity slack.
 
-Every cell uses one fixed optimizer recipe, 100,000 unique training rows,
-2,000,000 presentations, and four disjoint 20,000-row factor-calibration,
+Every cell uses one fixed optimizer recipe, 20,000 unique training rows,
+2,000,000 presentations, and four disjoint 5,000-row factor-calibration,
 codec-calibration, development, and confirmation roles. Phase 1 contains no
 optimizer, width, capacity, score, selector, or regularizer tournament. Those
 quantities are model- and scale-dependent and are reopened on real activations

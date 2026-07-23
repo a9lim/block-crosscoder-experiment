@@ -6566,7 +6566,7 @@ def _phase1_learnability_recipe(
                 novel(
                     "data.site_dims",
                     site_dims,
-                    rationale="fit a complete set of sixteen orthogonal rank-two factors in each tiny 32-dimensional site",
+                    rationale="fit four orthogonal rank-two factors exactly into each tiny eight-dimensional site",
                     ablation="real-model width and hook geometry belong exclusively to Phase 2",
                 ),
                 novel(
@@ -6577,45 +6577,45 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "data.unique_tokens",
-                    100_000,
+                    20_000,
                     rationale="provide abundant independent support draws for every planted factor",
                     ablation="fresh-versus-replayed data is outside the minimal learnability claim",
                 ),
                 novel(
                     "data.synthetic_factor_calibration_examples",
-                    20_000,
+                    5_000,
                     rationale="freeze factor matching on a small disjoint truth-known stream",
                     ablation="repeat the evaluator fixture at larger counts without changing the gate",
                 ),
                 novel(
                     "data.synthetic_calibration_examples",
-                    20_000,
+                    5_000,
                     rationale="fit the deployment threshold on a small disjoint stream",
                     ablation="report threshold stability without selecting a synthetic setting",
                 ),
                 novel(
                     "data.synthetic_development_examples",
-                    20_000,
+                    5_000,
                     rationale="score the fixed learnability contract on untouched generated rows",
                     ablation="repeat on more rows without changing the method",
                 ),
                 novel(
                     "data.synthetic_confirmation_examples",
-                    20_000,
+                    5_000,
                     rationale="reserve a second untouched stream for the final truth contract",
                     ablation="repeat on more rows without changing the authorization rule",
                 ),
                 novel(
                     "data.n_factors",
-                    16,
+                    4,
                     rationale="make the truth small enough to inspect factor by factor",
                     ablation="factor-count scaling is a diagnostic rather than a Phase-1 selection axis",
                 ),
                 novel(
                     "data.active_factors_per_example",
-                    2,
-                    rationale="retain genuine superposition while keeping the planted support easy to identify",
-                    ablation="single-factor rows are an optional evaluator sanity check, not a promoted carrier",
+                    1,
+                    rationale="make each training row belong to exactly one planted factor subspace",
+                    ablation="superposition is deliberately deferred to real-model development evidence",
                 ),
                 novel(
                     "data.factor_coordinate_dim",
@@ -6655,7 +6655,7 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "model.groups",
-                    16,
+                    4,
                     rationale="match learner block count exactly to planted factor count",
                     ablation="overcomplete capacity is intentionally excluded from the truth gate",
                 ),
@@ -6667,8 +6667,8 @@ def _phase1_learnability_recipe(
                 ),
                 novel(
                     "model.active_blocks",
-                    2,
-                    rationale="match fitted support exactly to the two active planted factors",
+                    1,
+                    rationale="match fitted support exactly to the one active planted factor",
                     ablation="Phase 2 owns the real-model activity contest",
                 ),
                 novel(
@@ -6734,11 +6734,11 @@ def _phase1_learnability_recipe(
 PHASE1_LEARNABILITY_RECIPES = (
     _phase1_learnability_recipe(
         name="phase1_learnability_single_site_orthogonal",
-        site_dims=(32,),
+        site_dims=(8,),
     ),
     _phase1_learnability_recipe(
         name="phase1_learnability_multisite_orthogonal",
-        site_dims=(32, 32, 32, 32),
+        site_dims=(8, 8, 8, 8),
     ),
 )
 
@@ -8555,6 +8555,9 @@ def _smoke_overrides(
     values = {decision.name: decision.value for decision in decisions}
     site_dims = tuple(int(item) for item in values["data.site_dims"])
     block_width = min(2, int(values["model.block_width"]))
+    smoke_factor_count = min(8, int(values.get("data.n_factors", 8)))
+    smoke_group_count = min(16, int(values["model.groups"]))
+    smoke_active_count = min(2, int(values["model.active_blocks"]))
     scientific = lambda name, value, rationale: _scientific_cell_decision(  # noqa: E731
         recipe,
         name,
@@ -8563,7 +8566,9 @@ def _smoke_overrides(
         ablation="run the unchanged non-smoke cell before using scientific evidence",
     )
     smoke_width = (
-        16 if values.get("data.factor_subspace_overlap") == "orthogonal" else 8
+        smoke_factor_count * block_width
+        if values.get("data.factor_subspace_overlap") == "orthogonal"
+        else 8
     )
     smoke_dims = (
         tuple(smoke_width for _ in site_dims)
@@ -8586,7 +8591,11 @@ def _smoke_overrides(
         scientific(
             "data.unique_tokens", 64, "the smoke stream is fresh and deterministic"
         ),
-        scientific("model.groups", 16, "sixteen groups exercise selection on CPU"),
+        scientific(
+            "model.groups",
+            smoke_group_count,
+            "retain the smaller of the scientific and generic smoke group counts",
+        ),
         scientific(
             "model.block_width",
             block_width,
@@ -8594,8 +8603,8 @@ def _smoke_overrides(
         ),
         scientific(
             "model.active_blocks",
-            2,
-            "two active groups exercise sparse selection cheaply",
+            smoke_active_count,
+            "retain the smaller of the scientific and generic smoke supports",
         ),
         scientific(
             "optimizer.batch_tokens",
@@ -8697,8 +8706,8 @@ def _smoke_overrides(
         result.append(
             scientific(
                 "data.n_factors",
-                8,
-                "eight factors remain identifiable inside sixteen groups",
+                smoke_factor_count,
+                "retain the smaller of the scientific and generic smoke factor counts",
             )
         )
         for name in (
@@ -8735,8 +8744,8 @@ def _smoke_overrides(
                 ),
                 scientific(
                     "data.active_factors_per_example",
-                    2,
-                    "two planted events keep the smoke DGP sparse",
+                    smoke_active_count,
+                    "retain the scientific support when it is already smaller than the generic smoke support",
                 ),
             )
         )
@@ -10618,9 +10627,9 @@ def _phase1_round_variants() -> tuple[tuple[str, tuple[ChildVariant, ...]], ...]
                 ),
                 _factor(
                     "data.active_factors_per_example",
-                    2,
+                    1,
                     "retain baseline planted sparsity",
-                    "the minimal truth contract fixes two active factors",
+                    "the minimal truth contract fixes one active factor",
                 ),
             ),
         ),

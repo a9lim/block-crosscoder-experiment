@@ -398,15 +398,15 @@ def test_phase1_blueprint_is_a_fixed_tiny_learnability_contract():
         "site_span_one",
     }
     single, multisite = (stage.cells[0].decision_map for stage in prefix.stages)
-    assert single["data.site_dims"] == (32,)
-    assert multisite["data.site_dims"] == (32, 32, 32, 32)
+    assert single["data.site_dims"] == (8,)
+    assert multisite["data.site_dims"] == (8, 8, 8, 8)
     for values in (single, multisite):
-        assert values["data.n_factors"] == values["model.groups"] == 16
+        assert values["data.n_factors"] == values["model.groups"] == 4
         assert values["data.factor_coordinate_dim"] == values["model.block_width"] == 2
         assert (
             values["data.active_factors_per_example"]
             == values["model.active_blocks"]
-            == 2
+            == 1
         )
         assert values["data.factor_subspace_overlap"] == "orthogonal"
         assert values["protocol.hyperparameter_tuning"] is False
@@ -508,7 +508,7 @@ def test_phase1_selection_uses_qualified_truth_margin_and_untouched_confirmation
     }
     assert set(robustness) == {"baseline", "support_only", "site_span_one"}
     assert robustness["baseline"]["data.factor_subspace_overlap"] == "orthogonal"
-    assert robustness["baseline"]["data.active_factors_per_example"] == 2
+    assert robustness["baseline"]["data.active_factors_per_example"] == 1
 
 
 def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
@@ -519,10 +519,10 @@ def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
         for role, start, stop in values["data.synthetic_split_ranges"]
     }
     expected = {
-        "factor_calibration": 20_000,
-        "calibration": 20_000,
-        "development": 20_000,
-        "confirmation": 20_000,
+        "factor_calibration": 5_000,
+        "calibration": 5_000,
+        "development": 5_000,
+        "confirmation": 5_000,
     }
     assert tuple(ranges) == tuple(expected)
     previous_stop = 0
@@ -532,8 +532,8 @@ def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
         assert stop - start == count
         assert values[f"data.synthetic_{role}_examples"] == count
         previous_stop = stop
-    assert values["data.unique_tokens"] == 100_000
-    assert previous_stop == 80_000
+    assert values["data.unique_tokens"] == 20_000
+    assert previous_stop == 20_000
 
 
 def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chains():
