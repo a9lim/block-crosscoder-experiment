@@ -4,6 +4,8 @@ step -> retract loop on tiny synthetic data."""
 
 import ast
 import copy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -128,10 +130,7 @@ def test_decoder_retraction_identity_resolves_explicitly(constraint, expected):
 
 def test_code_norm_implementation_identity_is_explicit_and_fails_closed():
     common = dict(n_blocks=4, block_dim=4, n_sites=2, d_model=5, k=2)
-    assert (
-        BSCConfig(**common).code_norm_implementation
-        == CODE_NORM_CUDA_IMPLEMENTATION
-    )
+    assert BSCConfig(**common).code_norm_implementation == CODE_NORM_CUDA_IMPLEMENTATION
     assert (
         BSCConfig(
             **common,
@@ -720,11 +719,15 @@ def test_unfactorized_untied_encoder_is_stored_in_gemm_layout():
     assert model.E.is_contiguous()
 
     logical = model.encoder_tensor()
-    repacked = logical.reshape(
-        config.n_sites,
-        config.n_latents,
-        config.d_model,
-    ).transpose(1, 2).reshape(config.n_sites * config.d_model, config.n_latents)
+    repacked = (
+        logical.reshape(
+            config.n_sites,
+            config.n_latents,
+            config.d_model,
+        )
+        .transpose(1, 2)
+        .reshape(config.n_sites * config.d_model, config.n_latents)
+    )
     assert repacked.untyped_storage().data_ptr() == model.E.untyped_storage().data_ptr()
     assert torch.equal(repacked, model.E)
 
@@ -1366,9 +1369,7 @@ def test_factorized_nuclear_regularizer_v4_avoids_materialization_and_matches_or
         )
     ).to(device)
     reference.load_state_dict(direct.state_dict())
-    x = torch.randn(19, 4, 7, generator=torch.Generator().manual_seed(5102)).to(
-        device
-    )
+    x = torch.randn(19, 4, 7, generator=torch.Generator().manual_seed(5102)).to(device)
 
     def refuse_materialization():
         raise AssertionError("v4 factorized nuclear regularizer materialized SGBD")
@@ -1628,17 +1629,13 @@ def test_projection_reports_exact_mutated_parameter_set(
 ):
     model = make_model(device, **overrides)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
-    versions = {
-        id(parameter): parameter._version for parameter in model.parameters()
-    }
+    versions = {id(parameter): parameter._version for parameter in model.parameters()}
     count, mutated = model._project_decoder_with_state_()
     assert count.shape == ()
     assert count.dtype == torch.int64
     assert count.device == next(model.parameters()).device
     assert tuple(names[id(parameter)] for parameter in mutated) == expected_mutated
-    assert all(
-        parameter._version > versions[id(parameter)] for parameter in mutated
-    )
+    assert all(parameter._version > versions[id(parameter)] for parameter in mutated)
     assert isinstance(model.project_decoder_(), int)
 
 
@@ -1675,6 +1672,40 @@ def test_token_topk_exact_per_token_count(device):
     scores = torch.rand(64, CFG.n_blocks, device=device)
     mask = token_topk_mask(scores, 3)
     assert torch.equal(mask.sum(dim=1), torch.full((64,), 3, device=device))
+
+
+@pytest.mark.parametrize("selector,k", [(token_topk_mask, 2), (batch_topk_mask, 1.0)])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_topk_refuses_nonfinite_scores(selector, k, bad):
+    scores = torch.ones(3, 4)
+    scores[1, 2] = bad
+    with pytest.raises(ValueError, match="selector scores must be finite"):
+        selector(scores, k)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_topk_nonfinite_refusal_is_process_isolated():
+    source_root = Path(__file__).resolve().parents[1]
+    program = """
+import torch
+from block_crosscoder_experiment.model import token_topk_mask
+
+scores = torch.ones(3, 4, device="cuda")
+scores[1, 2] = float("nan")
+token_topk_mask(scores, 2)
+torch.cuda.synchronize()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=source_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "selector scores must be finite" in completed.stderr
 
 
 def test_topk_exact_ties_use_lowest_declared_candidate_index(device):
@@ -1725,12 +1756,6 @@ def test_compiled_cuda_selectors_match_eager_over_adversarial_surfaces(dtype):
     )
     repeated_signed = torch.arange(batch * groups, device=device) % 17 - 8
     repeated_signed = repeated_signed.reshape(batch, groups).to(dtype)
-    nonfinite = random_scores.clone()
-    nonfinite[0, :3] = torch.tensor(
-        (float("nan"), float("inf"), float("-inf")),
-        device=device,
-        dtype=dtype,
-    )
     noncontiguous = (
         torch.randn(groups, batch, generator=generator)
         .to(
@@ -1744,7 +1769,6 @@ def test_compiled_cuda_selectors_match_eager_over_adversarial_surfaces(dtype):
         "random": random_scores,
         "all_equal": torch.ones_like(random_scores),
         "repeated_signed": repeated_signed,
-        "nonfinite": nonfinite,
         "noncontiguous": noncontiguous,
     }
 

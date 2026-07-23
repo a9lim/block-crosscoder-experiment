@@ -81,9 +81,7 @@ def rotate_blocks_(model, seed):
             )
             rotation = (q * torch.sign(torch.diagonal(r))).to(model.D.device)
             model.D[:, block] = torch.einsum("bc,scd->sbd", rotation, model.D[:, block])
-            encoder[:, block] = torch.einsum(
-                "bc,scd->sbd", rotation, encoder[:, block]
-            )
+            encoder[:, block] = torch.einsum("bc,scd->sbd", rotation, encoder[:, block])
 
 
 def test_codec_fits_and_evaluates():
@@ -417,9 +415,7 @@ def test_exactly_degenerate_codec_frame_is_gauge_equivariant():
             model.c.zero_()
             model.theta.fill_(0.5)
 
-    axes = torch.tensor(
-        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
-    )
+    axes = torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
     calibration = axes.repeat(64, 1).view(-1, 1, 2)
     evaluation = axes.repeat(32, 1).view(-1, 1, 2)
     with torch.no_grad():
@@ -473,9 +469,7 @@ def test_near_degenerate_second_moment_uses_ordered_event_frame():
         dtype=torch.float64,
     )
     rotated_codes = torch.einsum("ij,nj->ni", gauge, codes)
-    rotated_moment = torch.einsum(
-        "ij,gjk,lk->gil", gauge, moment, gauge
-    )
+    rotated_moment = torch.einsum("ij,gjk,lk->gil", gauge, moment, gauge)
     second, second_null, second_meta = codec_module._canonical_second_moment_frames(
         rotated_moment,
         torch.einsum("ij,gj->gi", gauge, mean),
@@ -524,9 +518,11 @@ def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
     # a data-defined frame. Evaluation deliberately exercises that direction.
     calibration = torch.tensor([[1.0, 0.0], [-1.0, 0.0]]).repeat(64, 1)
     calibration = calibration.view(-1, 1, 2)
-    evaluation = torch.tensor(
-        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
-    ).repeat(32, 1).view(-1, 1, 2)
+    evaluation = (
+        torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
+        .repeat(32, 1)
+        .view(-1, 1, 2)
+    )
     spec = CodecSpec(qs=(2, 4), floor=1, n_bootstrap=8)
     first = fit_codec(original, [calibration], spec)
     second = fit_codec(rotated, [calibration], spec)
@@ -608,9 +604,7 @@ def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
     forged = copy.deepcopy(first.to_payload())
     forged["lo"][0, -1] = 1.0
     forged["hi"][0, -1] = 1.0
-    unsigned = {
-        key: value for key, value in forged.items() if key != "artifact_sha256"
-    }
+    unsigned = {key: value for key, value in forged.items() if key != "artifact_sha256"}
     forged["artifact_sha256"] = _artifact_digest(unsigned)
     with pytest.raises(ValueError, match="null-space clip bounds"):
         Codec.from_payload(forged)
@@ -695,6 +689,48 @@ def test_codec_serialization_roundtrip(tmp_path):
         "calib_mean",
     ):
         assert torch.equal(getattr(loaded, name), getattr(codec, name))
+
+
+def test_codec_save_never_clobbers_an_existing_artifact(tmp_path):
+    torch.manual_seed(45)
+    model = calibrated(make_model(), torch.randn(128, S, D))
+    codec = fit_codec(
+        model,
+        [torch.randn(128, S, D)],
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=2),
+    )
+    path = tmp_path / "codec.pt"
+    path.write_bytes(b"concurrent immutable publisher")
+    before = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        codec.save(path)
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob(".codec.pt.*.tmp"))
+
+
+def test_codec_artifact_digest_separates_old_unframed_collisions():
+    # The retired codec digest concatenated scalar JSON without lengths, so
+    # these two payloads both contributed the bytes ``12`` after the key.
+    assert _artifact_digest({"value": [1, 2]}) != _artifact_digest({"value": [12]})
+    assert _artifact_digest({"value": [1, 2]}) != _artifact_digest({"value": (1, 2)})
+
+
+def test_codec_rejects_the_retired_untyped_digest_format():
+    torch.manual_seed(46)
+    model = calibrated(make_model(), torch.randn(128, S, D))
+    codec = fit_codec(
+        model,
+        [torch.randn(128, S, D)],
+        CodecSpec(qs=(4,), floor=1, n_bootstrap=2),
+    )
+    payload = codec.to_payload()
+    payload["format_version"] = 2
+    unsigned = {
+        key: value for key, value in payload.items() if key != "artifact_sha256"
+    }
+    payload["artifact_sha256"] = _artifact_digest(unsigned)
+    with pytest.raises(ValueError, match="unsupported codec format"):
+        Codec.from_payload(payload)
 
 
 def test_rehashed_codec_bytes_still_require_semantic_validity():

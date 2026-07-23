@@ -17,6 +17,7 @@ from block_crosscoder_experiment.cli.data import (
     _overlap_cuda_capture_copies,
     _canonical_hash,
     _producer_lock,
+    _producer_lock_path,
     capture,
     derive_views,
     estimate_capture_pipeline_residency_bytes,
@@ -109,9 +110,43 @@ def test_capture_cli_requires_profile_and_complete_profile_roles(tmp_path):
 def _raw_store(root, *, offset=0.0, authenticated_profile="phase2"):
     root.mkdir(parents=True, exist_ok=True)
     source = {
+        "format_version": 2,
+        "sources": [
+            {
+                "model": "test/model",
+                "revision": "a" * 40,
+                "hook": "blocks.0.hook_resid_pre",
+            },
+            {
+                "model": "test/model",
+                "revision": "a" * 40,
+                "hook": "blocks.1.hook_resid_pre",
+            },
+        ],
+        "corpus": "test/corpus",
+        "corpus_config": "default",
+        "corpus_revision": "b" * 40,
+        "corpus_split": "train",
+        "text_field": "text",
+        "context": 2,
+        "drop_positions": 1,
+        "tokenizer_class": "TestTokenizer",
+        "tokenizer_vocab_sha256": "sha256:" + "c" * 64,
+        "add_special_tokens": False,
+        "bos_token_id": 0,
+        "packing_algorithm": "bos_prefixed_greedy_document_stream_v1",
+        "sequence_allocation": "whole_packed_contexts_v1",
+        "tokenizer_hashes": ["sha256:" + "d" * 64],
+        "tokenizer_contract": "gpt2-byte-bpe-files-v1",
         "store_contract_version": "activation-store-v3-single-view",
-        "site_dims": [5, 5],
-        "drop_positions": 0,
+        "alignment_version": "identical-tokenizer-row-identity-v1",
+        "alignment_audit": "not_applicable:single-model-identical-tokenizer",
+        "row_identity_columns": ["sequence", "position", "token_id"],
+        "capture_mode": "raw_once",
+        "model_loader": "transformer_lens_from_pretrained_no_processing_v1",
+        "transformer_lens_model_names": ["test/model"],
+        "model_forward_dtype": "bfloat16",
+        "store_dtype": "bfloat16",
     }
     source_hash = hashlib.sha256(
         json.dumps(source, sort_keys=True, separators=(",", ":")).encode()
@@ -124,21 +159,23 @@ def _raw_store(root, *, offset=0.0, authenticated_profile="phase2"):
         "train": 80,
     }
     split_plan = whole_sequence_split_plan(split_sizes, 1)
-    capture_payload = {
-        "source": source,
-        "source_hash": source_hash,
-        "split_order": list(split_sizes),
-        "split_plan": split_plan,
-        "splits": split_plan,
-    }
+    capture_payload = None
     binding_sha256 = None
     if authenticated_profile is not None:
         implementation = {
             "schema": "bsc-capture-implementation-v1",
-            "test": "unrelated",
+            "python": "3.12.0",
+            "dependencies": {"torch": "test"},
+            "data_module_sha256": "e" * 64,
+            "store_module_sha256": "f" * 64,
+            "runtime": {
+                "requested_device": "cpu",
+                "torch_cuda_version": None,
+                "cuda_device_name": None,
+            },
         }
         binding = {
-            "schema": "bsc-capture-binding-v1",
+            "schema": data_module.CAPTURE_BINDING_SCHEMA,
             "campaign_profile": authenticated_profile,
             "source_hash": source_hash,
             "split_order": list(split_sizes),
@@ -151,21 +188,30 @@ def _raw_store(root, *, offset=0.0, authenticated_profile="phase2"):
             "batch_rows": 1,
             "write_batch_tokens": 1,
             "tokens_per_shard": 17,
-            "writer_pipeline": {"contract": "test"},
-            "capture_transfer_pipeline": {"contract": "test"},
+            "writer_pipeline": {
+                "contract": "one_pending_shard_v1",
+                "bytes_per_token": 44,
+                "shard_payload_bytes": 748,
+                "pending_shard_bytes": 748,
+                "staging_shard_bytes": 748,
+                "writer_residency_bytes": 1496,
+                "max_writer_residency_bytes": 4096,
+            },
+            "capture_transfer_pipeline": {
+                "contract": "synchronous_cpu_capture_v1",
+                "activation_batch_bytes": 20,
+                "row_identity_batch_bytes": 24,
+                "pinned_activation_buffer_count": 0,
+                "pinned_activation_host_bytes": 0,
+                "retained_row_identity_host_bytes": 0,
+                "retained_cuda_source_bytes": 0,
+                "peak_host_pipeline_bytes": 1496,
+                "peak_cuda_capture_lookahead_bytes": 0,
+            },
         }
         binding_sha256 = hashlib.sha256(
             json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        capture_payload.update(
-            {
-                "schema": "bsc-capture-manifest-v1",
-                "capture_implementation": implementation,
-                "capture_binding": binding,
-                "capture_binding_sha256": binding_sha256,
-            }
-        )
-    (root / "capture.json").write_text(json.dumps(capture_payload) + "\n")
     gen = torch.Generator().manual_seed(4)
     for split, n in split_sizes.items():
         allocation = split_plan[split]
@@ -200,12 +246,45 @@ def _raw_store(root, *, offset=0.0, authenticated_profile="phase2"):
         ids = torch.stack(
             (
                 torch.arange(n) + allocation["sequence_start"],
-                torch.zeros(n, dtype=torch.int64),
+                torch.ones(n, dtype=torch.int64),
+                torch.arange(n, dtype=torch.int64),
             ),
             dim=1,
         )
         writer.add(x, ids)
         writer.close()
+    if authenticated_profile is not None:
+        capture_payload = {
+            "schema": data_module.CAPTURE_MANIFEST_SCHEMA,
+            "source": source,
+            "source_hash": source_hash,
+            "split_order": list(split_sizes),
+            "split_plan": split_plan,
+            "splits": {
+                split: data_module._capture_split_record(
+                    root,
+                    split,
+                    StoreReader(root, split),
+                    split_plan[split],
+                )
+                for split in split_sizes
+            },
+            "capture_implementation": implementation,
+            "capture_binding": binding,
+            "capture_binding_sha256": binding_sha256,
+        }
+        capture_payload["capture_content_sha256"] = data_module._canonical_hash(
+            capture_payload
+        )
+    else:
+        capture_payload = {
+            "source": source,
+            "source_hash": source_hash,
+            "split_order": list(split_sizes),
+            "split_plan": split_plan,
+            "splits": split_plan,
+        }
+    (root / "capture.json").write_text(json.dumps(capture_payload) + "\n")
 
 
 def test_derive_views_preserves_row_identity(tmp_path):
@@ -241,6 +320,13 @@ def test_transform_producers_require_authenticated_capture_manifest(tmp_path, pr
     capture_path = raw / "capture.json"
     capture_payload = json.loads(capture_path.read_text())
     capture_payload["capture_binding"]["d_model"] = 4
+    capture_payload["capture_content_sha256"] = data_module._canonical_hash(
+        {
+            key: value
+            for key, value in capture_payload.items()
+            if key != "capture_content_sha256"
+        }
+    )
     capture_path.write_text(json.dumps(capture_payload) + "\n")
     output = tmp_path / "output"
     with pytest.raises(ValueError, match="capture binding digest mismatch"):
@@ -261,7 +347,7 @@ def test_derived_view_root_manifest_detects_missing_or_divergent_members(tmp_pat
     unsigned.pop("view_manifest_sha256")
     manifest["view_manifest_sha256"] = data_module._canonical_hash(unsigned)
     manifest_path.write_text(json.dumps(manifest) + "\n")
-    with pytest.raises(ValueError, match="train.*root manifest"):
+    with pytest.raises(ValueError, match="split record 'train'.*source capture"):
         verify_store_root(view)
 
     derive_views(raw, tmp_path / "fresh", ("none",))
@@ -276,6 +362,15 @@ def test_derived_view_root_manifest_detects_missing_or_divergent_members(tmp_pat
     evidence_manifest_path = evidence_view / data_module.VIEW_MANIFEST_NAME
     evidence_manifest = json.loads(evidence_manifest_path.read_text())
     evidence_manifest["source_capture"]["capture_binding"]["d_model"] = 4
+    evidence_manifest["source_capture"]["capture_content_sha256"] = (
+        data_module._canonical_hash(
+            {
+                key: value
+                for key, value in evidence_manifest["source_capture"].items()
+                if key != "capture_content_sha256"
+            }
+        )
+    )
     evidence_unsigned = dict(evidence_manifest)
     evidence_unsigned.pop("view_manifest_sha256")
     evidence_manifest["view_manifest_sha256"] = data_module._canonical_hash(
@@ -284,6 +379,76 @@ def test_derived_view_root_manifest_detects_missing_or_divergent_members(tmp_pat
     evidence_manifest_path.write_text(json.dumps(evidence_manifest) + "\n")
     with pytest.raises(ValueError, match="capture binding digest mismatch"):
         verify_store_root(evidence_view)
+
+
+def test_current_data_manifests_reject_extra_fields_even_when_rehashed(tmp_path):
+    raw = tmp_path / "raw"
+    _raw_store(raw)
+    capture = json.loads((raw / "capture.json").read_text())
+    capture["ignored_future_field"] = True
+    capture["capture_content_sha256"] = data_module._canonical_hash(
+        {
+            key: value
+            for key, value in capture.items()
+            if key != "capture_content_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="capture manifest keys mismatch"):
+        validate_capture_manifest(capture)
+
+    views = tmp_path / "views"
+    derive_views(raw, views, ("none",))
+    view_manifest = json.loads((views / "none" / "view.json").read_text())
+    view_manifest["splits"]["train"]["ignored_future_field"] = True
+    unsigned_view = dict(view_manifest)
+    unsigned_view.pop("view_manifest_sha256")
+    view_manifest["view_manifest_sha256"] = data_module._canonical_hash(unsigned_view)
+    with pytest.raises(ValueError, match="derived-view split record.*keys mismatch"):
+        data_module.validate_derived_view_manifest(view_manifest)
+
+    transforms = tmp_path / "transforms"
+    record = fit_transform_artifacts(raw, transforms, ("none",))["none"]
+    transform_manifest = json.loads(Path(record["manifest"]).read_text())
+    transform_manifest["ignored_future_field"] = True
+    unsigned_transform = dict(transform_manifest)
+    unsigned_transform.pop("transform_manifest_sha256")
+    transform_manifest["transform_manifest_sha256"] = data_module._canonical_hash(
+        unsigned_transform
+    )
+    with pytest.raises(ValueError, match="transform manifest keys mismatch"):
+        data_module.validate_transform_artifact_manifest(transform_manifest)
+
+
+def test_standalone_view_rejects_self_rehashed_source_manifest_forgery(tmp_path):
+    raw = tmp_path / "raw"
+    views = tmp_path / "views"
+    _raw_store(raw)
+    derive_views(raw, views, ("none",))
+    view = views / "none"
+
+    split_path = view / "train" / "split.json"
+    split_manifest = json.loads(split_path.read_text())
+    split_manifest["meta"]["source_split_manifest_sha256"] = "0" * 64
+    unsigned_split = dict(split_manifest)
+    unsigned_split.pop("manifest_sha256")
+    split_manifest["manifest_sha256"] = data_module._canonical_hash(unsigned_split)
+    split_path.write_text(json.dumps(split_manifest) + "\n")
+
+    view_path = view / "view.json"
+    view_manifest = json.loads(view_path.read_text())
+    view_manifest["splits"]["train"]["manifest_sha256"] = split_manifest[
+        "manifest_sha256"
+    ]
+    unsigned_view = dict(view_manifest)
+    unsigned_view.pop("view_manifest_sha256")
+    view_manifest["view_manifest_sha256"] = data_module._canonical_hash(unsigned_view)
+    view_path.write_text(json.dumps(view_manifest) + "\n")
+
+    with pytest.raises(
+        ValueError,
+        match="shard header mismatch|divergent source/geometry binding",
+    ):
+        verify_store_root(view)
 
 
 def test_derive_resume_reuses_complete_prefix_and_continues_missing_splits(tmp_path):
@@ -366,9 +531,39 @@ def test_data_producer_lock_refuses_a_concurrent_writer(tmp_path):
             with _producer_lock(output, operation="inner"):
                 raise AssertionError("concurrent producer unexpectedly acquired lock")
     assert not output.exists()
-    lock_payload = json.loads((tmp_path / ".capture.bsc-producer.lock").read_text())
+    lock_payload = json.loads(_producer_lock_path(output).read_text())
     assert lock_payload["schema"] == "bsc-data-producer-lock-v1"
     assert lock_payload["pid"] > 0
+
+
+def test_data_producer_lock_refuses_a_symlink_file(tmp_path):
+    output = tmp_path / "symlinked-lock-output"
+    lock_path = _producer_lock_path(output)
+    assert not lock_path.exists()
+    target = tmp_path / "target"
+    target.write_text("must remain unchanged\n")
+    lock_path.symlink_to(target)
+    try:
+        with pytest.raises(ValueError, match="safe data-producer lock file"):
+            with _producer_lock(output, operation="capture"):
+                raise AssertionError("symlinked lock unexpectedly opened")
+        assert target.read_text() == "must remain unchanged\n"
+    finally:
+        lock_path.unlink()
+
+
+def test_immutable_json_publication_never_clobbers_a_racing_name(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_text('{"publisher":"other"}\n')
+    before = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        data_module._atomic_json(
+            path,
+            {"publisher": "ours"},
+            overwrite=False,
+        )
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob(".manifest.json.*.tmp"))
 
 
 def test_fit_transform_artifact_binds_capture_and_fit_stream_without_shards(
@@ -472,9 +667,19 @@ def test_split_parser_and_estimate():
     splits = parse_split_sizes(
         ["normalization_fit=2", "calibration=3", "eval=5", "train=7"]
     )
-    assert estimate_store_bytes(splits, (4, 6), n_views=2) == 17 * 48 * 2
+    metadata = (
+        data_module.DEFAULT_PREWRITE_METADATA_RESERVE_BYTES
+        + len(splits) * data_module.DEFAULT_SPLIT_MANIFEST_RESERVE_BYTES
+        + len(splits)
+        * (
+            data_module.DEFAULT_SHARD_HEADER_RESERVE_BYTES
+            + data_module.DEFAULT_SHARD_MANIFEST_RECORD_RESERVE_BYTES
+        )
+    )
+    assert estimate_store_bytes(splits, (4, 6), n_views=2) == (17 * 48 + metadata) * 2
     assert (
-        estimate_store_bytes(splits, (4, 6), n_views=2, row_id_width=5) == 17 * 64 * 2
+        estimate_store_bytes(splits, (4, 6), n_views=2, row_id_width=5)
+        == (17 * 64 + metadata) * 2
     )
     writer = estimate_writer_residency_bytes(
         (4, 6), tokens_per_shard=10, row_id_width=3
@@ -517,6 +722,23 @@ def test_split_parser_and_estimate():
         ]
     )
     assert phase3["final"] == 5
+
+
+def test_store_prewrite_estimate_covers_actual_small_sharded_store(tmp_path):
+    root = tmp_path / "raw"
+    _raw_store(root)
+    split_sizes = {
+        split: StoreReader(root, split).n_tokens
+        for split in data_module.CAPTURE_PROFILE_SPLITS["phase2"]
+    }
+    estimate = estimate_store_bytes(
+        split_sizes,
+        (5, 5),
+        row_id_width=3,
+        tokens_per_shard=17,
+    )
+    actual = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    assert estimate >= actual
 
 
 def test_capture_split_profiles_require_exact_complete_role_sets():
@@ -796,7 +1018,10 @@ def _mock_capture_runtime(monkeypatch):
         "capture_implementation_contract",
         lambda: {
             "schema": "bsc-capture-implementation-v1",
-            "test_runtime": "exact",
+            "python": "3.12.0",
+            "dependencies": {"test-runtime": "exact"},
+            "data_module_sha256": "a" * 64,
+            "store_module_sha256": "b" * 64,
         },
     )
 
@@ -852,20 +1077,36 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
         "confirmation",
         "train",
     ]
-    assert uninterrupted["capture_implementation"]["test_runtime"] == "exact"
+    assert uninterrupted["capture_implementation"]["dependencies"] == {
+        "test-runtime": "exact"
+    }
     assert (
         uninterrupted["capture_binding"]["capture_implementation"]
         == uninterrupted["capture_implementation"]
     )
     validate_capture_manifest(uninterrupted)
     tampered_capture = json.loads(json.dumps(uninterrupted))
-    tampered_capture["capture_binding"]["capture_implementation"]["test_runtime"] = (
-        "forged"
+    tampered_capture["capture_binding"]["capture_implementation"]["dependencies"] = {
+        "test-runtime": "forged"
+    }
+    tampered_capture["capture_content_sha256"] = data_module._canonical_hash(
+        {
+            key: value
+            for key, value in tampered_capture.items()
+            if key != "capture_content_sha256"
+        }
     )
-    with pytest.raises(ValueError, match="binding digest mismatch"):
+    with pytest.raises(ValueError, match="implementation differs"):
         validate_capture_manifest(tampered_capture)
     zero_digest_capture = json.loads(json.dumps(uninterrupted))
     zero_digest_capture["capture_binding_sha256"] = "0" * 64
+    zero_digest_capture["capture_content_sha256"] = data_module._canonical_hash(
+        {
+            key: value
+            for key, value in zero_digest_capture.items()
+            if key != "capture_content_sha256"
+        }
+    )
     with pytest.raises(ValueError, match="binding digest mismatch"):
         validate_capture_manifest(zero_digest_capture)
     arbitrary_implementation = json.loads(json.dumps(uninterrupted))
@@ -878,7 +1119,14 @@ def test_capture_exact_source_contract_and_failure_resume_stream_identity(
     arbitrary_implementation["capture_binding_sha256"] = data_module._canonical_hash(
         arbitrary_implementation["capture_binding"]
     )
-    with pytest.raises(ValueError, match="implementation contract is malformed"):
+    arbitrary_implementation["capture_content_sha256"] = data_module._canonical_hash(
+        {
+            key: value
+            for key, value in arbitrary_implementation.items()
+            if key != "capture_content_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="capture implementation keys mismatch"):
         validate_capture_manifest(arbitrary_implementation)
     assert uninterrupted["source"]["transformer_lens_model_names"] == ["gpt2"]
     assert loader_calls[0][0] == "gpt2"
@@ -1682,17 +1930,54 @@ def test_phase2_view_dispatch_is_per_cell_and_fails_closed_on_manifests(
         ("confirmation", 32),
         ("train", 80),
     )
+    source = json.loads((raw / "capture.json").read_text())["source"]
+    base_source_keys = {
+        "sources",
+        "corpus",
+        "corpus_config",
+        "corpus_revision",
+        "corpus_split",
+        "context",
+        "drop_positions",
+        "tokenizer_hashes",
+        "tokenizer_contract",
+        "store_contract_version",
+        "alignment_version",
+        "alignment_audit",
+    }
+    common_values = {
+        "data.split_sizes": split_sizes,
+        "data.context_drop_policy": "drop_bos_position_0",
+        "data.context_length": source["context"],
+        "data.store_sites": tuple(item["hook"] for item in source["sources"]),
+        "data.source_models": tuple(item["model"] for item in source["sources"]),
+        "data.source_model_revisions": tuple(
+            item["revision"] for item in source["sources"]
+        ),
+        "data.corpus": (source["corpus"],),
+        "data.corpus_config": (source["corpus_config"],),
+        "data.corpus_revision": (source["corpus_revision"],),
+        "data.corpus_split": (source["corpus_split"],),
+        "data.tokenizer_hashes": tuple(source["tokenizer_hashes"]),
+        "data.tokenizer_contract": source["tokenizer_contract"],
+        "data.store_contract_version": source["store_contract_version"],
+        "data.alignment_version": source["alignment_version"],
+        "data.alignment_audit": source["alignment_audit"],
+        "data.capture_contract": tuple(
+            (key, value) for key, value in source.items() if key not in base_source_keys
+        ),
+    }
     cells = {
         "none-cell": SimpleNamespace(
             decision_map={
+                **common_values,
                 "data.normalization": "none",
-                "data.split_sizes": split_sizes,
             }
         ),
         "scalar-cell": SimpleNamespace(
             decision_map={
+                **common_values,
                 "data.normalization": "scalar_rms",
-                "data.split_sizes": split_sizes,
             }
         ),
     }

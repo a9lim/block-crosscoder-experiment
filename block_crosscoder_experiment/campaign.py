@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import os
+import copy
 import signal
 import socket
 import subprocess
@@ -46,13 +47,26 @@ import time
 import uuid
 import fcntl
 from statistics import median
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .durability import durable_replace, fsync_directory
+from .activation_identity import (
+    ACTIVATION_CONTENT_IDENTITY_SCHEMA,
+    activation_content_identity,
+)
+from .durability import (
+    durable_create,
+    durable_mkdir,
+    durable_replace,
+    fsync_directory,
+)
+from .implementation import (
+    implementation_identity,
+    validate_implementation_identity,
+)
 from .studies import (
     CellSpec,
     FrozenPanelDecision,
@@ -66,6 +80,8 @@ from .studies import (
     PHASE2_CONFIRMATION_SCORE_DEGRADATION_MAX,
     PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY,
     PHASE2_CONFIRMATION_THRESHOLD_BASIS,
+    PHASE2_INELIGIBLE_SELECTION_SCORE,
+    PHASE2_SELECTION_METRIC_KEY,
     PHASE2_SHARING_FVU_ABSOLUTE_MAX,
     PHASE2_SHARING_INTERSECTION_ENERGY_COVERAGE_MIN,
     PHASE2_SHARING_INTERSECTION_RECALL_MIN,
@@ -91,14 +107,12 @@ from .studies import (
 
 CAMPAIGN_SCHEMA = "bsc-campaign-v1"
 ARTIFACT_SCHEMA = "bsc-stage-artifacts-v2"
-QUALIFICATION_SCHEMA = "bsc-qualification-v3"
-PREPARATION_SCHEMA = "bsc-preparation-v3"
-EVALUATION_SCHEMA = "bsc-evaluation-v2"
+QUALIFICATION_SCHEMA = "bsc-qualification-v4"
+PREPARATION_SCHEMA = "bsc-preparation-v4"
+EVALUATION_SCHEMA = "bsc-evaluation-v3"
 EVALUATION_EXECUTION_IMPLEMENTATION = "fused_deployable_full_view_packet_v2"
 CANONICAL_CELL_MODULE = "block_crosscoder_experiment.cli.run_cell"
-CANONICAL_EXECUTOR_SCHEMA = "bsc-cell-executor-v12"
-CANONICAL_EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
-CAMPAIGN_IMPLEMENTATION_SCHEMA = "bsc-campaign-implementation-v1"
+CAMPAIGN_IMPLEMENTATION_SCHEMA = "bsc-campaign-implementation-v2"
 PROMOTION_SCHEMA = "bsc-promotion-v1"
 SELECTION_SCHEMA = "bsc-stage-selection-v2"
 FAMILY_NOMINATION_SCHEMA = "bsc-family-revisit-nomination-v3"
@@ -188,31 +202,6 @@ REQUIRED_SCIENTIFIC_MARGIN_KEYS = frozenset(
         "production_fixed_rate_nonzero_endpoints",
     }
 )
-IMPLEMENTATION_IDENTITY_KEYS = frozenset(
-    {
-        "executor_schema",
-        "executor_process_model",
-        "python_source_sha256",
-        "python_source_files",
-        "git_commit",
-        "git_dirty",
-        "python",
-        "torch",
-        "torch_cuda_build",
-        "dependencies",
-    }
-)
-IMPLEMENTATION_DEPENDENCY_KEYS = frozenset(
-    {
-        "datasets",
-        "huggingface-hub",
-        "numpy",
-        "sae-lens",
-        "safetensors",
-        "torch",
-        "transformers",
-    }
-)
 QUALIFICATION_KEYS = frozenset(
     {
         "schema",
@@ -230,6 +219,7 @@ QUALIFICATION_KEYS = frozenset(
         "selection_metrics",
         "selection_metrics_sha256",
         "selection_metrics_evaluation_sha256",
+        "fixed_rate_operating_policy",
         "promotion_eligible",
         "promotion_ineligible_reasons",
         "selection_eligible_for_protocol_test",
@@ -394,6 +384,9 @@ EXPECTED_STAGE_ARTIFACTS: Mapping[str, frozenset[str]] = {
     ),
     "qualify": frozenset({"qualification"}),
 }
+TARGET_STAGES: Mapping[RunState, str] = {
+    target: stage for stage, target in STAGE_TARGETS.items()
+}
 
 
 TRANSITION_ARTIFACT_KINDS: Mapping[RunState, frozenset[str]] = {
@@ -491,6 +484,19 @@ def _process_matches(pid: int, identity: Any) -> bool:
     return isinstance(identity, str) and _process_identity(pid) == identity
 
 
+def _process_matches_for_termination(pid: int, identity: Any) -> bool:
+    """Return true only for a live process with an exact birth identity."""
+
+    if not isinstance(identity, str) or not identity:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    observed = _process_identity(pid)
+    return observed is not None and observed == identity
+
+
 def _qualification_thresholds(cell: CellSpec) -> dict[str, Any]:
     values = cell.decision_map
     return {
@@ -508,9 +514,7 @@ def _qualification_thresholds(cell: CellSpec) -> dict[str, Any]:
         "phase1_margin_normalization_contract": values[
             "evaluation.phase1_margin_normalization"
         ],
-        "phase1_rank_mismatch_contract": values[
-            "evaluation.rank_mismatch_contract"
-        ],
+        "phase1_rank_mismatch_contract": values["evaluation.rank_mismatch_contract"],
         "phase1_pathology_association_contract": values[
             "evaluation.pathology_association_contract"
         ],
@@ -522,18 +526,12 @@ def _qualification_thresholds(cell: CellSpec) -> dict[str, Any]:
         ],
         "phase1_pathology_association_cutoff_sensitivity": [
             list(item)
-            for item in values[
-                "evaluation.pathology_association_cutoff_sensitivity"
-            ]
+            for item in values["evaluation.pathology_association_cutoff_sensitivity"]
         ],
-        "encoder_scale_fit_statistic": values[
-            "model.encoder_scale_fit_statistic"
-        ],
+        "encoder_scale_fit_statistic": values["model.encoder_scale_fit_statistic"],
         "encoder_scale_fit_solver": values["model.encoder_scale_fit_solver"],
         "encoder_scale_fit_target": values["model.encoder_scale_fit_target"],
-        "encoder_scale_fit_tolerance": values[
-            "model.encoder_scale_fit_tolerance"
-        ],
+        "encoder_scale_fit_tolerance": values["model.encoder_scale_fit_tolerance"],
         "encoder_scale_fit_max_iterations": values[
             "model.encoder_scale_fit_max_iterations"
         ],
@@ -554,56 +552,10 @@ def _validate_implementation_identity(
     *,
     scientific: bool,
 ) -> str:
-    if set(identity) != set(IMPLEMENTATION_IDENTITY_KEYS):
-        raise ArtifactError(
-            "implementation identity does not have the exact versioned field set"
-        )
-    executor_schema = identity.get("executor_schema")
-    process_model = identity.get("executor_process_model")
-    dependencies = identity.get("dependencies")
-    if (
-        not isinstance(executor_schema, str)
-        or not executor_schema
-        or not isinstance(process_model, str)
-        or not process_model
-        or not _is_sha256_hex(identity.get("python_source_sha256"))
-        or not isinstance(identity.get("python_source_files"), int)
-        or isinstance(identity.get("python_source_files"), bool)
-        or int(identity["python_source_files"]) <= 0
-        or not isinstance(identity.get("python"), str)
-        or not identity["python"]
-        or not isinstance(identity.get("torch"), str)
-        or not identity["torch"]
-        or identity.get("torch_cuda_build") is not None
-        and not isinstance(identity.get("torch_cuda_build"), str)
-        or not isinstance(dependencies, Mapping)
-        or set(dependencies) != set(IMPLEMENTATION_DEPENDENCY_KEYS)
-        or any(
-            value is not None and not isinstance(value, str)
-            for value in dependencies.values()
-        )
-    ):
-        raise ArtifactError("implementation identity has malformed versioned fields")
-    git_commit = identity.get("git_commit")
-    git_dirty = identity.get("git_dirty")
-    if git_commit is not None and not (
-        isinstance(git_commit, str)
-        and len(git_commit) == 40
-        and all(character in "0123456789abcdef" for character in git_commit)
-    ):
-        raise ArtifactError("implementation git commit must be a canonical 40-hex ID")
-    if git_dirty is not None and not isinstance(git_dirty, bool):
-        raise ArtifactError("implementation git-dirty state must be boolean or null")
-    if scientific and (
-        executor_schema != CANONICAL_EXECUTOR_SCHEMA
-        or process_model != CANONICAL_EXECUTOR_PROCESS_MODEL
-        or git_commit is None
-        or git_dirty is not False
-    ):
-        raise ArtifactError(
-            "scientific cells require the canonical executor and a clean committed identity"
-        )
-    return _sha256_canonical_payload(identity)
+    try:
+        return validate_implementation_identity(identity, scientific=scientific)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError(str(exc)) from exc
 
 
 def _promotion_reasons_from_evidence(
@@ -622,9 +574,13 @@ def _promotion_reasons_from_evidence(
         and evaluation.get("fixed_rate_raw_selection", {}).get("eligible") is not True
     ):
         reasons.append("fixed_rate_budget_ineligible")
-    if cell.phase is Phase.PHASE1 and evaluation.get("synthetic_recovery", {}).get(
-        "deployed", {}
-    ).get("shared_feature_claim_eligible") is not True:
+    if (
+        cell.phase is Phase.PHASE1
+        and evaluation.get("synthetic_recovery", {})
+        .get("deployed", {})
+        .get("shared_feature_claim_eligible")
+        is not True
+    ):
         reasons.append("synthetic_shared_feature_claim_ineligible")
     if cell.decision_map["qualification.promotable"] is not True:
         reasons.append("resolved_nonpromotable_cell")
@@ -678,7 +634,9 @@ def _validate_panel_entry_seed_coverage(
 ) -> None:
     for entry in entries:
         if tuple(cell.seed for cell in entry.source_cells) != expected_seeds:
-            raise CampaignError("panel entry does not exactly cover the blueprint seeds")
+            raise CampaignError(
+                "panel entry does not exactly cover the blueprint seeds"
+            )
 
 
 def _validate_exact_confirmation_guard(
@@ -689,6 +647,1292 @@ def _validate_exact_confirmation_guard(
         raise CampaignError(
             "confirmation does not reuse the exact authenticated sharing guard"
         )
+
+
+def _confirmation_score_sensitivity_payload(
+    rows: Sequence[Mapping[str, Any]],
+    thresholds: Sequence[float],
+    *,
+    smoke: bool,
+) -> dict[str, Any]:
+    """Vary only the score cutoff while holding every center gate fixed."""
+
+    sensitivity_rows = []
+    for threshold in thresholds:
+        passing_seeds = (
+            None
+            if smoke
+            else [
+                row["seed"]
+                for row in rows
+                if row.get("qualification_passed") is True
+                and row.get("sharing_guard_passed") is True
+                and Campaign._meets_upper_bound(
+                    float(row["score_degradation"]), float(threshold)
+                )
+            ]
+        )
+        sensitivity_rows.append(
+            {
+                "threshold": threshold,
+                "passing_seeds": passing_seeds,
+                "passed_all_seeds": (
+                    None if smoke else len(passing_seeds) == len(rows)
+                ),
+            }
+        )
+    return {
+        "mode": "marginal_counterfactuals_center_policy_not_retuned",
+        "rows": sensitivity_rows,
+        "ungated_passed_all_seeds": (
+            None
+            if smoke
+            else all(
+                row.get("qualification_passed") is True
+                and row.get("sharing_guard_passed") is True
+                for row in rows
+            )
+        ),
+    }
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _phase1_min_margin(value: float, threshold: float) -> float:
+    denominator = (
+        max(1.0 - threshold, 1.0e-12)
+        if value >= threshold
+        else max(abs(threshold), 1.0e-12)
+    )
+    return (value - threshold) / denominator
+
+
+def _phase1_max_margin(value: float, threshold: float) -> float:
+    denominator = (
+        max(abs(threshold), 1.0e-12)
+        if value <= threshold
+        else max(1.0 - threshold, 1.0e-12)
+    )
+    return (threshold - value) / denominator
+
+
+def _float_mapping_matches(
+    observed: Mapping[str, Any], expected: Mapping[str, float]
+) -> bool:
+    return set(observed) == set(expected) and all(
+        _finite_number(observed.get(name))
+        and math.isclose(float(observed[name]), value, rel_tol=0.0, abs_tol=1e-12)
+        for name, value in expected.items()
+    )
+
+
+def _validated_phase1_identification(
+    selection_metrics: Mapping[str, Any], *, cell: CellSpec
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Replay the Phase-1 identification reducer consumed by authorization.
+
+    In particular, an endpoint passes its declared aggregate conjunction.  Its
+    headline margin may still be negative when the preregistered recovered-
+    factor fraction permits a minority of factors to fail; authorization must
+    not silently strengthen that policy to a 100% per-factor requirement.
+    """
+
+    identification = selection_metrics.get("identification")
+    validation = selection_metrics.get("validation")
+    if not isinstance(identification, Mapping) or set(identification) != {
+        "native",
+        "deployed",
+    }:
+        raise ArtifactError(
+            "Phase-1 selection metrics require exact native/deployed identification"
+        )
+    if not isinstance(validation, Mapping) or set(validation) != {
+        "phase1_identification_applicable",
+        "phase1_identification_conjunction",
+        "phase1_identification_margin",
+    }:
+        raise ArtifactError("Phase-1 validation uses a noncanonical field set")
+
+    threshold_items = cell.decision_map.get(
+        "qualification.phase1_identification_thresholds"
+    )
+    try:
+        expected_thresholds = {str(item[0]): float(item[1]) for item in threshold_items}
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ArtifactError(
+            "resolved Phase-1 cell has malformed identification thresholds"
+        ) from exc
+    required_thresholds = {
+        "per_factor.support_association_min",
+        "per_factor.subspace_overlap_min_when_eligible",
+        "per_factor.global_isolated_input_r2_min",
+        "per_factor.aligned_code_r2_min",
+        "aggregate.recovered_factor_fraction_min",
+        "aggregate.support_precision_min",
+        "aggregate.support_recall_min",
+        "pathology.duplicate_block_fraction_max",
+        "pathology.cross_factor_mixing_fraction_max",
+        "pathology.nonfinite_count_max",
+    }
+    if set(expected_thresholds) != required_thresholds:
+        raise ArtifactError("resolved Phase-1 identification thresholds are incomplete")
+
+    applicable_keys = {
+        "applicable",
+        "ineligible_reason",
+        "thresholds",
+        "per_factor",
+        "aggregate",
+        "checks",
+        "normalized_margins",
+        "margin_normalization_contract",
+        "margin",
+        "passed",
+    }
+    inapplicable_keys = applicable_keys - {"margin_normalization_contract"}
+    factor_keys = {
+        "factor",
+        "support_association",
+        "subspace_overlap",
+        "global_isolated_input_r2",
+        "aligned_code_r2",
+        "rank_mismatch",
+        "component_margins",
+        "margin",
+        "identified",
+        "same_block_gate_has_positive_headroom",
+    }
+    aggregate_keys = {
+        "recovered_factor_fraction",
+        "support_precision",
+        "support_recall",
+        "inactive_dictionary_fraction_diagnostic",
+        "duplicate_block_fraction",
+        "cross_factor_mixing_fraction",
+        "nonfinite_count",
+    }
+    check_keys = {
+        "recovered_factor_fraction",
+        "support_precision",
+        "support_recall",
+        "duplicate_block_fraction",
+        "cross_factor_mixing_fraction",
+        "nonfinite_count",
+    }
+    normalized_margin_keys = {
+        "worst_eligible_per_factor",
+        "recovered_factor_fraction",
+        "support_precision",
+        "support_recall",
+        "duplicate_block_fraction",
+        "cross_factor_mixing_fraction",
+    }
+
+    parsed: list[Mapping[str, Any]] = []
+    for endpoint_name in ("native", "deployed"):
+        endpoint = identification.get(endpoint_name)
+        if not isinstance(endpoint, Mapping) or endpoint.get("applicable") not in {
+            True,
+            False,
+        }:
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} identification evidence is malformed"
+            )
+        applicable = endpoint["applicable"] is True
+        if set(endpoint) != (applicable_keys if applicable else inapplicable_keys):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} identification uses a noncanonical field set"
+            )
+        if endpoint.get("thresholds") != expected_thresholds:
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} identification thresholds differ from the cell"
+            )
+        if not applicable:
+            if (
+                not isinstance(endpoint.get("ineligible_reason"), str)
+                or not endpoint["ineligible_reason"]
+                or endpoint.get("per_factor") != []
+                or not isinstance(endpoint.get("aggregate"), Mapping)
+                or set(endpoint["aggregate"])
+                != {"support_precision_diagnostic", "support_recall_diagnostic"}
+                or endpoint.get("checks") != {}
+                or endpoint.get("normalized_margins") != {}
+                or endpoint.get("margin") is not None
+                or endpoint.get("passed") is not None
+            ):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} inapplicable evidence is malformed"
+                )
+            parsed.append(endpoint)
+            continue
+
+        if endpoint.get("ineligible_reason") is not None:
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} applicable evidence names an ineligible reason"
+            )
+        if endpoint.get("margin_normalization_contract") != cell.decision_map.get(
+            "evaluation.phase1_margin_normalization"
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} margin contract differs from the cell"
+            )
+        per_factor = endpoint.get("per_factor")
+        expected_factor_count = cell.decision_map.get("data.n_factors")
+        if (
+            not isinstance(per_factor, list)
+            or not isinstance(expected_factor_count, int)
+            or isinstance(expected_factor_count, bool)
+            or len(per_factor) != expected_factor_count
+            or not per_factor
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} factor evidence is incomplete"
+            )
+        identified_count = 0
+        factor_margins: list[float] = []
+        for factor_index, factor in enumerate(per_factor):
+            if not isinstance(factor, Mapping) or set(factor) != factor_keys:
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} factor evidence is noncanonical"
+                )
+            subspace = factor.get("subspace_overlap")
+            components = factor.get("component_margins")
+            expected_component_keys = {
+                "support_association",
+                "global_isolated_input_r2",
+                "aligned_code_r2",
+                *(() if subspace is None else ("subspace_overlap",)),
+            }
+            if (
+                factor.get("factor") != factor_index
+                or not all(
+                    _finite_number(factor.get(name))
+                    for name in (
+                        "support_association",
+                        "global_isolated_input_r2",
+                        "aligned_code_r2",
+                        "margin",
+                    )
+                )
+                or (subspace is not None and not _finite_number(subspace))
+                or not isinstance(factor.get("rank_mismatch"), Mapping)
+                or not isinstance(components, Mapping)
+                or set(components) != expected_component_keys
+                or not all(_finite_number(value) for value in components.values())
+                or not isinstance(factor.get("identified"), bool)
+                or factor["identified"] is not (float(factor["margin"]) >= 0.0)
+                or not isinstance(
+                    factor.get("same_block_gate_has_positive_headroom"), bool
+                )
+                or not 0.0 <= float(factor["support_association"]) <= 1.0
+                or (subspace is not None and not 0.0 <= float(subspace) <= 1.0 + 1e-9)
+                or float(factor["global_isolated_input_r2"]) > 1.0 + 1e-9
+                or float(factor["aligned_code_r2"]) > 1.0 + 1e-9
+            ):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} factor evidence has invalid types or values"
+                )
+            expected_components = {
+                "support_association": _phase1_min_margin(
+                    float(factor["support_association"]),
+                    expected_thresholds["per_factor.support_association_min"],
+                ),
+                "global_isolated_input_r2": _phase1_min_margin(
+                    float(factor["global_isolated_input_r2"]),
+                    expected_thresholds["per_factor.global_isolated_input_r2_min"],
+                ),
+                "aligned_code_r2": _phase1_min_margin(
+                    float(factor["aligned_code_r2"]),
+                    expected_thresholds["per_factor.aligned_code_r2_min"],
+                ),
+            }
+            if subspace is not None:
+                expected_components["subspace_overlap"] = _phase1_min_margin(
+                    float(subspace),
+                    expected_thresholds[
+                        "per_factor.subspace_overlap_min_when_eligible"
+                    ],
+                )
+            if not _float_mapping_matches(components, expected_components):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} component margins are inconsistent"
+                )
+            factor_margin = min(expected_components.values())
+            if not math.isclose(
+                float(factor["margin"]), factor_margin, rel_tol=0.0, abs_tol=1e-12
+            ) or factor["identified"] is not (factor_margin >= 0.0):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} factor margin is inconsistent"
+                )
+            factor_margins.append(factor_margin)
+            identified_count += int(factor["identified"])
+
+        aggregate = endpoint.get("aggregate")
+        checks = endpoint.get("checks")
+        normalized = endpoint.get("normalized_margins")
+        if (
+            not isinstance(aggregate, Mapping)
+            or set(aggregate) != aggregate_keys
+            or not all(
+                _finite_number(aggregate.get(name))
+                for name in aggregate_keys - {"nonfinite_count"}
+            )
+            or not isinstance(aggregate.get("nonfinite_count"), int)
+            or isinstance(aggregate.get("nonfinite_count"), bool)
+            or aggregate["nonfinite_count"] < 0
+            or not isinstance(checks, Mapping)
+            or set(checks) != check_keys
+            or not all(isinstance(value, bool) for value in checks.values())
+            or not isinstance(normalized, Mapping)
+            or set(normalized) != normalized_margin_keys
+            or not all(_finite_number(value) for value in normalized.values())
+            or not _finite_number(endpoint.get("margin"))
+            or not isinstance(endpoint.get("passed"), bool)
+            or any(
+                not 0.0 <= float(aggregate[name]) <= 1.0
+                for name in (
+                    "recovered_factor_fraction",
+                    "support_precision",
+                    "support_recall",
+                    "inactive_dictionary_fraction_diagnostic",
+                    "duplicate_block_fraction",
+                    "cross_factor_mixing_fraction",
+                )
+            )
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} aggregate identification evidence is malformed"
+            )
+        recovered_fraction = identified_count / len(per_factor)
+        if not math.isclose(
+            float(aggregate["recovered_factor_fraction"]),
+            recovered_fraction,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} recovered-factor fraction is inconsistent"
+            )
+        expected_checks = {
+            "recovered_factor_fraction": recovered_fraction
+            >= expected_thresholds["aggregate.recovered_factor_fraction_min"],
+            "support_precision": float(aggregate["support_precision"])
+            >= expected_thresholds["aggregate.support_precision_min"],
+            "support_recall": float(aggregate["support_recall"])
+            >= expected_thresholds["aggregate.support_recall_min"],
+            "duplicate_block_fraction": float(aggregate["duplicate_block_fraction"])
+            <= expected_thresholds["pathology.duplicate_block_fraction_max"],
+            "cross_factor_mixing_fraction": float(
+                aggregate["cross_factor_mixing_fraction"]
+            )
+            <= expected_thresholds["pathology.cross_factor_mixing_fraction_max"],
+            "nonfinite_count": aggregate["nonfinite_count"]
+            <= expected_thresholds["pathology.nonfinite_count_max"],
+        }
+        expected_normalized = {
+            "worst_eligible_per_factor": min(factor_margins),
+            "recovered_factor_fraction": _phase1_min_margin(
+                recovered_fraction,
+                expected_thresholds["aggregate.recovered_factor_fraction_min"],
+            ),
+            "support_precision": _phase1_min_margin(
+                float(aggregate["support_precision"]),
+                expected_thresholds["aggregate.support_precision_min"],
+            ),
+            "support_recall": _phase1_min_margin(
+                float(aggregate["support_recall"]),
+                expected_thresholds["aggregate.support_recall_min"],
+            ),
+            "duplicate_block_fraction": _phase1_max_margin(
+                float(aggregate["duplicate_block_fraction"]),
+                expected_thresholds["pathology.duplicate_block_fraction_max"],
+            ),
+            "cross_factor_mixing_fraction": _phase1_max_margin(
+                float(aggregate["cross_factor_mixing_fraction"]),
+                expected_thresholds["pathology.cross_factor_mixing_fraction_max"],
+            ),
+        }
+        if dict(checks) != expected_checks or endpoint["passed"] is not all(
+            expected_checks.values()
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} identification conjunction is inconsistent"
+            )
+        if not _float_mapping_matches(
+            normalized, expected_normalized
+        ) or not math.isclose(
+            float(endpoint["margin"]),
+            min(expected_normalized.values()),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ArtifactError(
+                f"Phase-1 {endpoint_name} normalized margin is inconsistent"
+            )
+        parsed.append(endpoint)
+
+    native, deployed = parsed
+    applicable = native["applicable"] is True and deployed["applicable"] is True
+    both_inapplicable = (
+        native["applicable"] is False and deployed["applicable"] is False
+    )
+    if not applicable and not both_inapplicable:
+        raise ArtifactError(
+            "Phase-1 identification endpoints disagree on applicability"
+        )
+    if both_inapplicable:
+        reasons = {native.get("ineligible_reason"), deployed.get("ineligible_reason")}
+        if cell.decision_map.get("data.normalization") != "layer" or reasons != {
+            "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+        }:
+            raise ArtifactError(
+                "Phase-1 identification inapplicability is unauthorized"
+            )
+        expected_validation = {
+            "phase1_identification_applicable": False,
+            "phase1_identification_conjunction": False,
+            "phase1_identification_margin": None,
+        }
+    else:
+        if cell.decision_map.get("data.normalization") == "layer":
+            raise ArtifactError(
+                "Layer-normalized Phase-1 identification must be inapplicable"
+            )
+        for endpoint_name, endpoint in (
+            ("native", native),
+            ("deployed", deployed),
+        ):
+            center_replay = _phase1_counterfactual_endpoint(
+                endpoint, expected_thresholds
+            )
+            if center_replay["passed"] is not endpoint["passed"] or not math.isclose(
+                float(center_replay["recovered_factor_fraction"]),
+                float(endpoint["aggregate"]["recovered_factor_fraction"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ArtifactError(
+                    f"Phase-1 {endpoint_name} center sensitivity contradicts "
+                    "its identification gate"
+                )
+        expected_validation = {
+            "phase1_identification_applicable": True,
+            "phase1_identification_conjunction": bool(
+                native["passed"] and deployed["passed"]
+            ),
+            "phase1_identification_margin": min(
+                float(native["margin"]), float(deployed["margin"])
+            ),
+        }
+    expected_margin = expected_validation["phase1_identification_margin"]
+    observed_margin = validation.get("phase1_identification_margin")
+    if (
+        validation.get("phase1_identification_applicable")
+        is not expected_validation["phase1_identification_applicable"]
+        or validation.get("phase1_identification_conjunction")
+        is not expected_validation["phase1_identification_conjunction"]
+        or (
+            (expected_margin is None) != (observed_margin is None)
+            or expected_margin is not None
+            and (
+                not _finite_number(observed_margin)
+                or not math.isclose(
+                    float(observed_margin),
+                    float(expected_margin),
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            )
+        )
+    ):
+        raise ArtifactError("Phase-1 validation disagrees with identification evidence")
+    return native, deployed, validation
+
+
+def _phase1_counterfactual_endpoint(
+    endpoint: Mapping[str, Any],
+    thresholds: Mapping[str, float],
+) -> dict[str, Any]:
+    if endpoint.get("applicable") is not True:
+        return {"passed": None, "recovered_factor_fraction": None}
+    factors = endpoint["per_factor"]
+    identified = 0
+    for factor in factors:
+        component_passes = [
+            float(factor["support_association"])
+            >= thresholds["per_factor.support_association_min"],
+            float(factor["global_isolated_input_r2"])
+            >= thresholds["per_factor.global_isolated_input_r2_min"],
+            float(factor["aligned_code_r2"])
+            >= thresholds["per_factor.aligned_code_r2_min"],
+        ]
+        if factor["subspace_overlap"] is not None:
+            component_passes.append(
+                float(factor["subspace_overlap"])
+                >= thresholds["per_factor.subspace_overlap_min_when_eligible"]
+            )
+        identified += int(all(component_passes))
+    recovered_fraction = identified / len(factors)
+    aggregate = endpoint["aggregate"]
+    passed = all(
+        (
+            recovered_fraction >= thresholds["aggregate.recovered_factor_fraction_min"],
+            float(aggregate["support_precision"])
+            >= thresholds["aggregate.support_precision_min"],
+            float(aggregate["support_recall"])
+            >= thresholds["aggregate.support_recall_min"],
+            float(aggregate["duplicate_block_fraction"])
+            <= thresholds["pathology.duplicate_block_fraction_max"],
+            float(aggregate["cross_factor_mixing_fraction"])
+            <= thresholds["pathology.cross_factor_mixing_fraction_max"],
+            int(aggregate["nonfinite_count"])
+            <= thresholds["pathology.nonfinite_count_max"],
+        )
+    )
+    return {"passed": passed, "recovered_factor_fraction": recovered_fraction}
+
+
+def _expected_phase1_threshold_sensitivity(
+    identification: Mapping[str, Any],
+    cell: CellSpec,
+) -> dict[str, Any]:
+    center = {
+        str(name): float(value)
+        for name, value in identification["native"]["thresholds"].items()
+    }
+    sensitivity = cell.decision_map.get("qualification.phase1_threshold_sensitivity")
+    if not isinstance(sensitivity, (list, tuple)) or {
+        str(item[0]) for item in sensitivity
+    } != set(center):
+        raise ArtifactError("Phase-1 threshold sensitivity grid is incomplete")
+    rows: list[dict[str, Any]] = []
+    for name, values in sensitivity:
+        name = str(name)
+        value_rows: list[dict[str, Any]] = []
+        for value in values:
+            varied = dict(center)
+            varied[name] = float(value)
+            native = _phase1_counterfactual_endpoint(identification["native"], varied)
+            deployed = _phase1_counterfactual_endpoint(
+                identification["deployed"], varied
+            )
+            value_rows.append(
+                {
+                    "value": float(value),
+                    "native": native,
+                    "deployed": deployed,
+                    "conjunction_passed": (
+                        None
+                        if native["passed"] is None and deployed["passed"] is None
+                        else bool(native["passed"] and deployed["passed"])
+                    ),
+                }
+            )
+        rows.append({"threshold": name, "values": value_rows})
+    return {
+        "schema": "bsc-phase1-identification-threshold-sensitivity-v1",
+        "mode": "marginal_counterfactuals_center_policy_not_retuned",
+        "center_thresholds": center,
+        "rows": rows,
+        "changes_primary_gate": False,
+    }
+
+
+def _validate_fixed_rate_operating_policy(
+    policy: Any,
+    *,
+    cell: CellSpec,
+) -> None:
+    if policy is None:
+        return
+    expected_keys = {
+        "schema",
+        "source_cell_id",
+        "source_evidence_sha256",
+        "aggregation",
+        "rows",
+        "content_sha256",
+    }
+    if not isinstance(policy, Mapping) or set(policy) != expected_keys:
+        raise ArtifactError("fixed-rate operating policy is noncanonical")
+    content = dict(policy)
+    content_digest = content.pop("content_sha256")
+    if (
+        policy.get("schema") != "bsc-fixed-rate-operating-policy-v1"
+        or not isinstance(policy.get("source_cell_id"), str)
+        or not policy["source_cell_id"]
+        or not _is_sha256_hex(policy.get("source_evidence_sha256"))
+        or content_digest != _sha256_canonical_payload(content)
+    ):
+        raise ArtifactError("fixed-rate operating policy content binding is invalid")
+    expected_aggregation = (
+        "worst_seed_frozen_parent"
+        if cell.phase is Phase.PHASE3
+        or cell.decision_map.get("evaluation.split") == "confirmation"
+        else "development_cell"
+    )
+    if policy.get("aggregation") != expected_aggregation:
+        raise ArtifactError("fixed-rate operating policy has the wrong evidence role")
+    if (
+        expected_aggregation == "development_cell"
+        and policy.get("source_cell_id") != cell.cell_id
+    ):
+        raise ArtifactError("development operating policy names another cell")
+    if expected_aggregation == "worst_seed_frozen_parent" and policy.get(
+        "source_cell_id"
+    ) not in set(cell.decision_map.get("selection.parent_cell_ids", ())):
+        raise ArtifactError("frozen operating policy names a non-parent cell")
+    rows = policy.get("rows")
+    expected_budgets = tuple(
+        float(value)
+        for value in cell.decision_map.get(
+            "evaluation.fixed_rate_budgets_bits_per_token", ()
+        )
+    )
+    if not isinstance(rows, list) or len(rows) != len(expected_budgets):
+        raise ArtifactError("fixed-rate operating policy does not cover exact budgets")
+    observed_budgets: list[float] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {
+            "budget_bits_per_token",
+            "lower_name",
+            "lower_q",
+            "upper_name",
+            "upper_q",
+        }:
+            raise ArtifactError("fixed-rate operating-policy row is noncanonical")
+        budget = row.get("budget_bits_per_token")
+        if not _finite_number(budget):
+            raise ArtifactError("fixed-rate operating-policy budget is invalid")
+        observed_budgets.append(float(budget))
+        for side in ("lower", "upper"):
+            name = row.get(f"{side}_name")
+            q = row.get(f"{side}_q")
+            if name == "zero_event_calibration_mean":
+                valid = q is None
+            else:
+                valid = (
+                    isinstance(name, str)
+                    and name.startswith("q")
+                    and name[1:].isdigit()
+                    and type(q) is int
+                    and q == int(name[1:])
+                )
+            if not valid:
+                raise ArtifactError(
+                    "fixed-rate operating-policy endpoint identity is invalid"
+                )
+    if tuple(observed_budgets) != expected_budgets:
+        raise ArtifactError(
+            "fixed-rate operating-policy budget order differs from cell"
+        )
+
+
+def _fixed_rate_lower_envelope(
+    points: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replay the executor's operational lower convex envelope exactly."""
+
+    best_at_rate: dict[float, dict[str, Any]] = {}
+    for raw in points:
+        rate = float(raw["total_bits_per_token"])
+        fvu = float(raw["raw_space_fvu"])
+        candidate = dict(raw)
+        current = best_at_rate.get(rate)
+        if current is None or fvu < float(current["raw_space_fvu"]):
+            best_at_rate[rate] = candidate
+    ordered = [best_at_rate[rate] for rate in sorted(best_at_rate)]
+    pareto: list[dict[str, Any]] = []
+    best_fvu = math.inf
+    for point in ordered:
+        fvu = float(point["raw_space_fvu"])
+        if fvu < best_fvu:
+            pareto.append(point)
+            best_fvu = fvu
+    hull: list[dict[str, Any]] = []
+    for point in pareto:
+        while len(hull) >= 2:
+            a, b = hull[-2], hull[-1]
+            slope_ab = (float(b["raw_space_fvu"]) - float(a["raw_space_fvu"])) / (
+                float(b["total_bits_per_token"]) - float(a["total_bits_per_token"])
+            )
+            slope_bc = (float(point["raw_space_fvu"]) - float(b["raw_space_fvu"])) / (
+                float(point["total_bits_per_token"]) - float(b["total_bits_per_token"])
+            )
+            if slope_ab < slope_bc:
+                break
+            hull.pop()
+        hull.append(point)
+    return hull
+
+
+def _validate_fixed_rate_evidence(
+    fixed_rate: Any,
+    *,
+    cell: CellSpec,
+    validation: Any,
+    inputs: Mapping[str, str],
+) -> None:
+    """Replay the complete fixed-rate score consumed by Phase-2/3 selection."""
+
+    if cell.phase is Phase.PHASE1:
+        expected = {
+            "schema": "bsc-fixed-rate-raw-selection-v2",
+            "applicable": False,
+            "eligible": False,
+            "operating_policy": None,
+            "reason": "phase1_uses_truth_known_identification",
+        }
+        if fixed_rate != expected:
+            raise ArtifactError("Phase-1 fixed-rate evidence is noncanonical")
+        return
+
+    expected_keys = {
+        "schema",
+        "applicable",
+        "cell_id",
+        "deployment_codec_sha256",
+        "calibration_sha256",
+        "side_information",
+        "packet_formula",
+        "rate_axis",
+        "interpolation",
+        "out_of_range",
+        "zero_rate_reconstruction",
+        "measured_points",
+        "lower_convex_envelope",
+        "fixed_budgets",
+        "selection_score_name",
+        "selection_score",
+        "operating_policy",
+        "eligible",
+        "reason",
+        "content_sha256",
+    }
+    if (
+        not isinstance(fixed_rate, Mapping)
+        or set(fixed_rate) != expected_keys
+        or fixed_rate.get("schema") != "bsc-fixed-rate-raw-selection-v2"
+        or fixed_rate.get("applicable") is not True
+        or fixed_rate.get("cell_id") != cell.cell_id
+    ):
+        raise ArtifactError("fixed-rate evidence is missing or noncanonical")
+    content = dict(fixed_rate)
+    content_sha256 = content.pop("content_sha256")
+    if content_sha256 != _sha256_canonical_payload(content):
+        raise ArtifactError("fixed-rate evidence content hash mismatch")
+    if (
+        fixed_rate.get("deployment_codec_sha256") != inputs["deployment_codec"]
+        or fixed_rate.get("calibration_sha256") != inputs["calibration"]
+    ):
+        raise ArtifactError("fixed-rate evidence input binding mismatch")
+
+    values = cell.decision_map
+    expected_contract = {
+        "rate_axis": values["evaluation.rate_axis"],
+        "interpolation": values["evaluation.rate_interpolation"],
+        "out_of_range": values["evaluation.rate_out_of_range"],
+        "zero_rate_reconstruction": values["evaluation.zero_rate_reconstruction"],
+        "selection_score_name": values["evaluation.selection_score"],
+    }
+    if any(fixed_rate.get(name) != value for name, value in expected_contract.items()):
+        raise ArtifactError("fixed-rate evidence differs from the resolved cell policy")
+
+    side = fixed_rate.get("side_information")
+    side_keys = {
+        "artifact",
+        "artifact_size_bytes",
+        "amortization_tokens",
+        "bits_per_token",
+        "includes_optimizer_checkpoint",
+        "time_sharing_schedule_contract",
+        "operating_record_bytes_per_budget",
+        "deployment_schedule_bundle_sha256",
+        "deployment_schedule_bundle_size_bytes",
+        "deployment_schedule_record_count",
+    }
+    horizon = values["evaluation.side_information_amortization_tokens"]
+    if (
+        not isinstance(side, Mapping)
+        or set(side) != side_keys
+        or side.get("artifact") != "deployable_codec"
+        or type(side.get("artifact_size_bytes")) is not int
+        or side["artifact_size_bytes"] <= 0
+        or side.get("amortization_tokens") != horizon
+        or side.get("includes_optimizer_checkpoint") is not False
+        or side.get("time_sharing_schedule_contract")
+        != values["codec.time_sharing_schedule_contract"]
+        or side.get("operating_record_bytes_per_budget") != 32
+        or not _is_sha256_hex(side.get("deployment_schedule_bundle_sha256"))
+        or side.get("deployment_schedule_bundle_sha256")
+        != inputs["deployment_schedules"]
+        or type(side.get("deployment_schedule_bundle_size_bytes")) is not int
+        or type(side.get("deployment_schedule_record_count")) is not int
+        or not _finite_number(side.get("bits_per_token"))
+        or not math.isclose(
+            float(side["bits_per_token"]),
+            8.0 * side["artifact_size_bytes"] / horizon,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ArtifactError("fixed-rate side-information accounting is invalid")
+    record_count = side["deployment_schedule_record_count"]
+    if (
+        record_count < 0
+        or side["deployment_schedule_bundle_size_bytes"] != 32 * record_count
+    ):
+        raise ArtifactError("fixed-rate operating-record bundle accounting is invalid")
+
+    packet = fixed_rate.get("packet_formula")
+    if (
+        not isinstance(packet, Mapping)
+        or set(packet)
+        != {
+            "rate_model",
+            "count_width_bits",
+            "block_id_width_bits",
+            "included_block_alphabet",
+            "sparse_amplitude_bits",
+        }
+        or packet.get("rate_model") != "fixed_width_decodable_payload_bits_v1"
+        or any(
+            type(packet.get(name)) is not int or packet[name] <= 0
+            for name in (
+                "count_width_bits",
+                "block_id_width_bits",
+                "included_block_alphabet",
+            )
+        )
+        or packet["count_width_bits"]
+        != max(1, math.ceil(math.log2(packet["included_block_alphabet"] + 1)))
+        or packet["block_id_width_bits"]
+        != max(1, math.ceil(math.log2(packet["included_block_alphabet"])))
+        or packet.get("sparse_amplitude_bits") != ("q * block_width * selected_events")
+    ):
+        raise ArtifactError("fixed-rate packet formula is invalid")
+
+    point_keys = {
+        "name",
+        "q",
+        "packet_bits_per_token",
+        "side_information_bits_per_token",
+        "total_bits_per_token",
+        "raw_space_fvu",
+    }
+    measured = fixed_rate.get("measured_points")
+    expected_qs = tuple(sorted(int(item) for item in values["codec.quantizer_bits"]))
+    expected_names = ("zero_event_calibration_mean", *(f"q{q}" for q in expected_qs))
+    if (
+        not isinstance(measured, list)
+        or len(measured) != len(expected_names)
+        or tuple(
+            point.get("name") if isinstance(point, Mapping) else None
+            for point in measured
+        )
+        != expected_names
+    ):
+        raise ArtifactError("fixed-rate measured endpoint set is incomplete")
+    point_by_name: dict[str, Mapping[str, Any]] = {}
+    for index, point in enumerate(measured):
+        expected_q = None if index == 0 else expected_qs[index - 1]
+        if (
+            not isinstance(point, Mapping)
+            or set(point) != point_keys
+            or point.get("q") != expected_q
+            or not all(
+                _finite_number(point.get(name)) and float(point[name]) >= 0.0
+                for name in (
+                    "packet_bits_per_token",
+                    "side_information_bits_per_token",
+                    "total_bits_per_token",
+                    "raw_space_fvu",
+                )
+            )
+            or not math.isclose(
+                float(point["side_information_bits_per_token"]),
+                float(side["bits_per_token"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(point["total_bits_per_token"]),
+                float(point["packet_bits_per_token"])
+                + float(point["side_information_bits_per_token"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or (index == 0 and point["packet_bits_per_token"] != 0.0)
+            or (index == 0 and point["raw_space_fvu"] != 1.0)
+            or (index > 0 and point["packet_bits_per_token"] <= 0.0)
+            or (
+                index > 1
+                and float(point["packet_bits_per_token"])
+                < float(measured[index - 1]["packet_bits_per_token"])
+            )
+        ):
+            raise ArtifactError("fixed-rate measured endpoint is invalid")
+        point_by_name[str(point["name"])] = point
+    expected_hull = _fixed_rate_lower_envelope(measured)
+    if fixed_rate.get("lower_convex_envelope") != expected_hull:
+        raise ArtifactError("fixed-rate lower convex envelope is inconsistent")
+
+    budgets = tuple(
+        float(item) for item in values["evaluation.fixed_rate_budgets_bits_per_token"]
+    )
+    rows = fixed_rate.get("fixed_budgets")
+    row_keys = {
+        "budget_bits_per_token",
+        "eligible",
+        "raw_space_fvu",
+        "bracket",
+        "upper_mixture_weight",
+        "achieved_total_bits_per_token",
+        "operating_record",
+        "reason",
+    }
+    if (
+        not isinstance(rows, list)
+        or len(rows) != len(budgets)
+        or any(
+            not isinstance(row, Mapping)
+            or set(row) != row_keys
+            or row.get("budget_bits_per_token") != budget
+            or not isinstance(row.get("eligible"), bool)
+            for row, budget in zip(rows, budgets, strict=True)
+        )
+    ):
+        raise ArtifactError("fixed-rate budget evidence is noncanonical")
+
+    policy = fixed_rate.get("operating_policy")
+    _validate_fixed_rate_operating_policy(policy, cell=cell)
+    aggregation = None if policy is None else policy["aggregation"]
+    policy_rows = (
+        {}
+        if policy is None
+        else {float(row["budget_bits_per_token"]): row for row in policy["rows"]}
+    )
+    eligible_rows = 0
+    record_indices: set[int] = set()
+    for row, budget in zip(rows, budgets, strict=True):
+        if row["eligible"] is not True:
+            if any(
+                row.get(name) is not None
+                for name in (
+                    "raw_space_fvu",
+                    "bracket",
+                    "upper_mixture_weight",
+                    "achieved_total_bits_per_token",
+                    "operating_record",
+                )
+            ) or row.get("reason") not in {
+                "raw_space_decoder_requires_unpriced_oracle_information",
+                "budget_outside_frozen_operating_policy",
+            }:
+                raise ArtifactError("ineligible fixed-rate budget row is malformed")
+            continue
+        eligible_rows += 1
+        bracket = row.get("bracket")
+        record = row.get("operating_record")
+        if (
+            not isinstance(bracket, list)
+            or len(bracket) != 2
+            or any(name not in point_by_name for name in bracket)
+            or not _finite_number(row.get("raw_space_fvu"))
+            or float(row["raw_space_fvu"]) < 0.0
+            or not _finite_number(row.get("upper_mixture_weight"))
+            or not _finite_number(row.get("achieved_total_bits_per_token"))
+            or not isinstance(record, Mapping)
+        ):
+            raise ArtifactError("eligible fixed-rate budget row is malformed")
+        record_keys = {
+            "contract",
+            "header_bytes",
+            "header_layout",
+            "artifact_sha256",
+            "record_index",
+            "record_offset_bytes",
+            "record_sha256",
+            "binding_magic_u64",
+            "horizon_tokens",
+            "upper_tokens",
+            "rule",
+            "per_token_mode_bits",
+            "header_bits_per_token",
+            "evaluation_tokens",
+            "evaluation_upper_tokens",
+            "distortion_measurement",
+        }
+        if set(record) != record_keys:
+            raise ArtifactError("fixed-rate operating record is noncanonical")
+        upper_tokens = record.get("upper_tokens")
+        record_index = record.get("record_index")
+        evaluation_tokens = record.get("evaluation_tokens")
+        if (
+            record.get("contract") != values["codec.time_sharing_schedule_contract"]
+            or record.get("header_bytes") != 32
+            or record.get("header_layout")
+            != "binding_magic_u64,horizon_u64,upper_count_u64,lower_mode_u32,upper_mode_u32"
+            or record.get("artifact_sha256")
+            != side["deployment_schedule_bundle_sha256"]
+            or not _is_sha256_hex(record.get("record_sha256"))
+            or type(record_index) is not int
+            or record_index < 0
+            or record_index in record_indices
+            or record.get("record_offset_bytes") != 32 * record_index
+            or type(record.get("binding_magic_u64")) is not int
+            or not 0 <= record["binding_magic_u64"] < 2**64
+            or record.get("horizon_tokens") != horizon
+            or type(upper_tokens) is not int
+            or not 0 <= upper_tokens < horizon
+            or record.get("per_token_mode_bits") != 0
+            or not math.isclose(
+                float(record.get("header_bits_per_token", math.nan)),
+                256.0 / horizon,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or type(evaluation_tokens) is not int
+            or not 0 < evaluation_tokens <= horizon
+            or record.get("evaluation_upper_tokens")
+            != evaluation_tokens * upper_tokens // horizon
+            or record.get("rule")
+            != (
+                "upper iff floor((i+1)*upper_tokens/horizon) > "
+                "floor(i*upper_tokens/horizon)"
+            )
+        ):
+            raise ArtifactError("fixed-rate operating record binding is invalid")
+        record_indices.add(record_index)
+        weight = upper_tokens / horizon
+        lower = point_by_name[str(bracket[0])]
+        upper = point_by_name[str(bracket[1])]
+        distortion_measurement = record.get("distortion_measurement")
+        expected_executed_measurement = (
+            "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+        )
+        retained_lower_measurement = (
+            "retained_lower_endpoint_from_paired_raw_evaluation_rows"
+        )
+        achieved = (
+            (1.0 - weight) * float(lower["total_bits_per_token"])
+            + weight * float(upper["total_bits_per_token"])
+            + 256.0 / horizon
+        )
+        if (
+            not math.isclose(
+                float(row["upper_mixture_weight"]),
+                weight,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                float(row["achieved_total_bits_per_token"]),
+                achieved,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or achieved > budget + 1e-12
+            or ((bracket[0] == bracket[1]) != (upper_tokens == 0))
+            or row.get("reason")
+            != (
+                "frozen_parent_operating_policy_replayed"
+                if aggregation == "worst_seed_frozen_parent"
+                else "development_envelope_operating_policy_selected"
+            )
+        ):
+            raise ArtifactError("fixed-rate executed schedule arithmetic is invalid")
+
+        schedule_rate = 256.0 / horizon
+        if aggregation == "worst_seed_frozen_parent":
+            if distortion_measurement != expected_executed_measurement:
+                raise ArtifactError(
+                    "frozen fixed-rate evidence has an invalid measurement contract"
+                )
+            if bracket[0] != bracket[1]:
+                lower_rate = float(lower["total_bits_per_token"])
+                upper_rate = float(upper["total_bits_per_token"])
+                if upper_rate <= lower_rate:
+                    raise ArtifactError(
+                        "frozen fixed-rate mixture has nonincreasing endpoint rates"
+                    )
+                expected_upper_tokens = math.floor(
+                    ((budget - schedule_rate - lower_rate) / (upper_rate - lower_rate))
+                    * horizon
+                )
+                if upper_tokens != expected_upper_tokens or not (
+                    0 < expected_upper_tokens < horizon
+                ):
+                    raise ArtifactError(
+                        "frozen fixed-rate mixture is not the maximal fitting schedule"
+                    )
+        else:
+            available_rate = budget - schedule_rate
+            if available_rate < float(expected_hull[0]["total_bits_per_token"]):
+                raise ArtifactError(
+                    "development fixed-rate row is eligible below its envelope"
+                )
+            if available_rate >= float(expected_hull[-1]["total_bits_per_token"]):
+                planned_lower = planned_upper = expected_hull[-1]
+                planned_upper_tokens = 0
+            else:
+                upper_index = next(
+                    index
+                    for index, point in enumerate(expected_hull)
+                    if float(point["total_bits_per_token"]) >= available_rate
+                )
+                exact_endpoint = expected_hull[upper_index]
+                if math.isclose(
+                    float(exact_endpoint["total_bits_per_token"]),
+                    available_rate,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    planned_lower = planned_upper = exact_endpoint
+                    planned_upper_tokens = 0
+                else:
+                    planned_lower = expected_hull[max(0, upper_index - 1)]
+                    planned_upper = exact_endpoint
+                    planned_upper_tokens = math.floor(
+                        (
+                            (
+                                available_rate
+                                - float(planned_lower["total_bits_per_token"])
+                            )
+                            / (
+                                float(planned_upper["total_bits_per_token"])
+                                - float(planned_lower["total_bits_per_token"])
+                            )
+                        )
+                        * horizon
+                    )
+                    if planned_upper_tokens <= 0:
+                        planned_upper = planned_lower
+                        planned_upper_tokens = 0
+            planned_names = [planned_lower["name"], planned_upper["name"]]
+            if bracket == planned_names and upper_tokens == planned_upper_tokens:
+                if distortion_measurement != expected_executed_measurement:
+                    raise ArtifactError(
+                        "development fixed-rate schedule has an invalid measurement contract"
+                    )
+                if bracket[0] != bracket[1] and not (
+                    float(row["raw_space_fvu"]) < float(lower["raw_space_fvu"])
+                ):
+                    raise ArtifactError(
+                        "development mixture failed to improve on its lower endpoint"
+                    )
+            elif (
+                planned_lower["name"] != planned_upper["name"]
+                and bracket == [planned_lower["name"], planned_lower["name"]]
+                and upper_tokens == 0
+            ):
+                if (
+                    distortion_measurement != retained_lower_measurement
+                    or not math.isclose(
+                        float(row["raw_space_fvu"]),
+                        float(planned_lower["raw_space_fvu"]),
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                ):
+                    raise ArtifactError(
+                        "development lower-endpoint fallback is inconsistent"
+                    )
+            else:
+                raise ArtifactError(
+                    "development fixed-rate schedule was not selected from the envelope"
+                )
+        if bracket[0] == bracket[1] and not math.isclose(
+            float(row["raw_space_fvu"]),
+            float(lower["raw_space_fvu"]),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ArtifactError(
+                "pure fixed-rate schedule differs from its measured endpoint"
+            )
+        policy_row = policy_rows.get(budget)
+        expected_policy_row = {
+            "budget_bits_per_token": budget,
+            "lower_name": bracket[0],
+            "lower_q": lower["q"],
+            "upper_name": bracket[1],
+            "upper_q": upper["q"],
+        }
+        if policy is not None and policy_row != expected_policy_row:
+            raise ArtifactError("fixed-rate policy row differs from executed evidence")
+
+    eligible = bool(rows) and eligible_rows == len(rows)
+    if fixed_rate.get("eligible") is not eligible:
+        raise ArtifactError(
+            "fixed-rate eligibility disagrees with exact budget coverage"
+        )
+    expects_frozen_policy = (
+        cell.phase is Phase.PHASE3
+        or cell.decision_map.get("evaluation.split") == "confirmation"
+    )
+    if expects_frozen_policy:
+        if policy is None or aggregation != "worst_seed_frozen_parent":
+            raise ArtifactError("frozen fixed-rate evidence lacks its parent policy")
+    elif (policy is not None) is not eligible:
+        raise ArtifactError("development policy presence disagrees with eligibility")
+    if record_count != eligible_rows or record_indices != set(range(record_count)):
+        raise ArtifactError("fixed-rate record count/index coverage is inconsistent")
+    expected_reason = (
+        "eligible"
+        if eligible
+        else (
+            "raw_space_decoder_requires_unpriced_oracle_information"
+            if rows
+            and all(
+                row.get("reason")
+                == "raw_space_decoder_requires_unpriced_oracle_information"
+                for row in rows
+            )
+            else "one_or_more_budgets_outside_measured_envelope"
+        )
+    )
+    if fixed_rate.get("reason") != expected_reason:
+        raise ArtifactError("fixed-rate aggregate reason is inconsistent")
+    expected_score = (
+        -sum(float(row["raw_space_fvu"]) for row in rows) / len(rows)
+        if eligible
+        else None
+    )
+    if (expected_score is None and fixed_rate.get("selection_score") is not None) or (
+        expected_score is not None
+        and (
+            not _finite_number(fixed_rate.get("selection_score"))
+            or not math.isclose(
+                float(fixed_rate["selection_score"]),
+                expected_score,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+    ):
+        raise ArtifactError("fixed-rate selection score is inconsistent")
+    expected_validation_score = (
+        PHASE2_INELIGIBLE_SELECTION_SCORE if expected_score is None else expected_score
+    )
+    if (
+        not isinstance(validation, Mapping)
+        or set(validation) != {PHASE2_SELECTION_METRIC_KEY}
+        or not _finite_number(validation.get(PHASE2_SELECTION_METRIC_KEY))
+        or not math.isclose(
+            float(validation[PHASE2_SELECTION_METRIC_KEY]),
+            expected_validation_score,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ArtifactError("selection validation differs from fixed-rate score")
 
 
 def _validate_qualification_payload(
@@ -755,15 +1999,12 @@ def _validate_qualification_payload(
     if outcome_passed is not all(outcome_checks.values()):
         raise ArtifactError("scientific_outcome passed disagrees with its checks")
     inapplicable_checks = scientific_outcome.get("inapplicable_checks", {})
-    if (
-        not isinstance(inapplicable_checks, Mapping)
-        or any(
-            check not in outcome_checks
-            or outcome_checks[check] is not True
-            or not isinstance(reason, str)
-            or not reason
-            for check, reason in inapplicable_checks.items()
-        )
+    if not isinstance(inapplicable_checks, Mapping) or any(
+        check not in outcome_checks
+        or outcome_checks[check] is not True
+        or not isinstance(reason, str)
+        or not reason
+        for check, reason in inapplicable_checks.items()
     ):
         raise ArtifactError("scientific_outcome inapplicable checks are malformed")
     expected_inapplicable_checks = (
@@ -794,9 +2035,7 @@ def _validate_qualification_payload(
             for value in margins.values()
         )
     ):
-        raise ArtifactError(
-            "scientific_outcome margins must be finite numbers or null"
-        )
+        raise ArtifactError("scientific_outcome margins must be finite numbers or null")
 
     promotion_eligible = payload.get("promotion_eligible")
     if not isinstance(promotion_eligible, bool):
@@ -860,9 +2099,7 @@ def _validate_qualification_payload(
 
     inputs = payload.get("inputs")
     if not isinstance(inputs, Mapping) or set(inputs) != set(QUALIFICATION_INPUT_KINDS):
-        raise ArtifactError(
-            "qualification artifact must bind its exact input-hash set"
-        )
+        raise ArtifactError("qualification artifact must bind its exact input-hash set")
     if not all(_is_sha256_hex(value) for value in inputs.values()):
         raise ArtifactError(
             "qualification input hashes must be 64 lowercase hex characters"
@@ -891,10 +2128,9 @@ def _validate_qualification_payload(
     )
     if implementation_identity_sha256 != observed_implementation_sha256:
         raise ArtifactError("qualification implementation-identity hash mismatch")
-    if (
-        expected_implementation_identity is not None
-        and dict(implementation_identity) != dict(expected_implementation_identity)
-    ):
+    if expected_implementation_identity is not None and dict(
+        implementation_identity
+    ) != dict(expected_implementation_identity):
         raise ArtifactError(
             "qualification implementation identity differs from preparation"
         )
@@ -914,6 +2150,75 @@ def _validate_qualification_payload(
     if payload.get("validation") != selection_metrics.get("validation"):
         raise ArtifactError(
             "qualification validation differs from bound selection metrics"
+        )
+    fixed_rate_policy = payload.get("fixed_rate_operating_policy")
+    _validate_fixed_rate_operating_policy(fixed_rate_policy, cell=cell)
+    bound_fixed_rate = selection_metrics.get("fixed_rate_raw_selection")
+    if not isinstance(bound_fixed_rate, Mapping):
+        raise ArtifactError("selection metrics lack fixed-rate evidence")
+    _validate_fixed_rate_evidence(
+        bound_fixed_rate,
+        cell=cell,
+        validation=selection_metrics.get("validation"),
+        inputs=inputs,
+    )
+    expected_policy = bound_fixed_rate.get("operating_policy")
+    if fixed_rate_policy != expected_policy:
+        raise ArtifactError(
+            "qualification operating policy differs from bound selection metrics"
+        )
+    if cell.phase is Phase.PHASE1 and fixed_rate_policy is not None:
+        raise ArtifactError("Phase-1 qualification cannot carry an operating policy")
+    if (
+        cell.phase is not Phase.PHASE1
+        and bound_fixed_rate.get("eligible") is True
+        and fixed_rate_policy is None
+    ):
+        raise ArtifactError("eligible real-data evidence lacks an operating policy")
+    if cell.phase is Phase.PHASE1:
+        native_identification, deployed_identification, phase1_validation = (
+            _validated_phase1_identification(selection_metrics, cell=cell)
+        )
+        expected_sensitivity = _expected_phase1_threshold_sensitivity(
+            {
+                "native": native_identification,
+                "deployed": deployed_identification,
+            },
+            cell,
+        )
+        if (
+            selection_metrics.get("phase1_threshold_sensitivity")
+            != expected_sensitivity
+        ):
+            raise ArtifactError(
+                "Phase-1 threshold sensitivity does not execute the declared grid"
+            )
+        both_inapplicable = (
+            native_identification["applicable"] is False
+            and deployed_identification["applicable"] is False
+        )
+        expected_identification_outcome = bool(
+            both_inapplicable
+            or (
+                native_identification["passed"] is True
+                and deployed_identification["passed"] is True
+                and phase1_validation["phase1_identification_conjunction"] is True
+            )
+        )
+        if (
+            outcome_checks.get("phase1_identification")
+            is not expected_identification_outcome
+            or margins.get("phase1_native_identification")
+            != native_identification.get("margin")
+            or margins.get("phase1_deployed_identification")
+            != deployed_identification.get("margin")
+        ):
+            raise ArtifactError(
+                "Phase-1 scientific outcome disagrees with identification evidence"
+            )
+    elif selection_metrics.get("phase1_threshold_sensitivity") is not None:
+        raise ArtifactError(
+            "real-data selection metrics cannot carry Phase-1 sensitivity"
         )
 
     if evaluation is not None:
@@ -954,6 +2259,16 @@ def _validate_qualification_payload(
         if evaluation.get("validation") != evaluation_metrics.get("validation"):
             raise ArtifactError(
                 "evaluation validation differs from bound selection metrics"
+            )
+        if evaluation.get("phase1_threshold_sensitivity") != evaluation_metrics.get(
+            "phase1_threshold_sensitivity"
+        ):
+            raise ArtifactError(
+                "evaluation threshold sensitivity differs from bound selection metrics"
+            )
+        if evaluation.get("fixed_rate_raw_selection") != bound_fixed_rate:
+            raise ArtifactError(
+                "evaluation fixed-rate evidence differs from bound selection metrics"
             )
         expected_reasons = _promotion_reasons_from_evidence(
             cell,
@@ -997,7 +2312,7 @@ def _validate_qualification_payload(
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -1029,14 +2344,62 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
-    if path.exists():
-        existing = _read_json(path)
-        if canonical_json(existing) != canonical_json(payload):
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            durable_create(temporary, path, file_already_synced=True)
+            temporary = None
+        except FileExistsError:
+            existing = _read_json(path)
+            if canonical_json(existing) != canonical_json(payload):
+                raise CampaignError(
+                    f"immutable decision already exists with different content: {path}"
+                )
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _campaign_output_path(
+    root: Path,
+    requested: str | Path | None,
+    default: Path,
+) -> Path:
+    if requested is None:
+        destination = default
+    else:
+        destination = Path(requested)
+        if not destination.is_absolute():
+            destination = root / destination
+    root_resolved = root.resolve()
+    try:
+        destination.parent.resolve().relative_to(root_resolved)
+    except ValueError as exc:
+        raise CampaignError(
+            "campaign decisions must be written inside campaign root"
+        ) from exc
+    if destination.exists():
+        try:
+            destination.resolve().relative_to(root_resolved)
+        except ValueError as exc:
             raise CampaignError(
-                f"immutable decision already exists with different content: {path}"
-            )
-        return
-    _atomic_json(path, payload)
+                "campaign decision path resolves outside campaign root"
+            ) from exc
+    return destination
 
 
 @dataclass(frozen=True, slots=True)
@@ -1066,6 +2429,9 @@ class _ArtifactVerification:
     issuer: object
     key: tuple[str, str, int]
     fingerprint: _ArtifactFingerprint
+    executor_cell_id: str | None = None
+    executor_stage: str | None = None
+    canonical_executor: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1097,8 +2463,10 @@ class ArtifactRef:
             raise ArtifactError(f"artifact does not exist or is not a file: {path}")
         try:
             stored_path = str(resolved.relative_to(root.resolve()))
-        except ValueError:
-            stored_path = str(resolved)
+        except ValueError as exc:
+            raise ArtifactError(
+                "campaign artifact is outside the campaign root"
+            ) from exc
         return cls(kind, stored_path, _sha256(resolved), resolved.stat().st_size)
 
     @classmethod
@@ -1112,7 +2480,16 @@ class ArtifactRef:
 
     def resolve(self, root: Path) -> Path:
         path = Path(self.path)
-        return path if path.is_absolute() else root / path
+        if path.is_absolute():
+            raise ArtifactError("campaign artifact paths must be root-relative")
+        resolved = (root / path).resolve()
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ArtifactError(
+                "campaign artifact path escapes the campaign root"
+            ) from exc
+        return resolved
 
     def verify(self, root: Path) -> None:
         path = self.resolve(root)
@@ -1217,7 +2594,7 @@ class CellLock(AbstractContextManager["CellLock"]):
         self._publish(self._acquired_at)
 
     def __enter__(self) -> "CellLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.path.parent, parents=True, exist_ok=True)
         acquired_at = float(self.campaign.clock())
         self._acquired_at = acquired_at
         guard_handle = self.guard_path.open("a+", encoding="utf-8")
@@ -1232,9 +2609,7 @@ class CellLock(AbstractContextManager["CellLock"]):
         if self.path.exists():
             fcntl.flock(guard_handle.fileno(), fcntl.LOCK_UN)
             guard_handle.close()
-            raise CampaignLocked(
-                f"cell has an unreconciled lock lease: {self.cell_id}"
-            )
+            raise CampaignLocked(f"cell has an unreconciled lock lease: {self.cell_id}")
         self._guard_handle = guard_handle
         try:
             self._publish(acquired_at)
@@ -1295,12 +2670,31 @@ class Campaign:
         self.panel_decision_path = self.root / "panel-decision.json"
         self.implementation_identity_path = self.root / "implementation-identity.json"
         self.implementation_identity_lock_path = self.root / ".implementation.lock"
+        self.mutation_lock_path = self.root / ".mutation.lock"
+        self.activation_identity_path = self.root / "activation-identity.json"
         self._events_cache: tuple[dict[str, Any], ...] | None = None
         self._events_by_cell_cache: dict[str, tuple[dict[str, Any], ...]] = {}
         self._events_cache_signature: tuple[int, int, int, int] | None = None
         self._events_cache_lock = threading.RLock()
-        self._plan_cache: StudyPlan | None = None
-        self._plan_cache_signature: tuple[int, int, int, int] | None = None
+        self._mutation_thread_lock = threading.RLock()
+        self._mutation_local = threading.local()
+        self._authority_lock = threading.RLock()
+        self._activation_projection_lock = threading.RLock()
+        self._history_plan_cache: dict[
+            str, tuple[_ArtifactFingerprint, StudyPlan]
+        ] = {}
+        self._authority_cursor = 0
+        self._authority_last_event_id: str | None = None
+        self._authority_active_plan_id: str | None = None
+        self._authority_registration_plan_ids: dict[str, str] = {}
+        self._authority_extension_evidence: list[ArtifactRef] = []
+        self._cell_projection_cache: dict[
+            str, tuple[_ArtifactFingerprint, CellSpec]
+        ] = {}
+        self._activation_projection_cursor = 0
+        self._activation_projection_last_event_id: str | None = None
+        self._activation_projection_raw_digest: str | None = None
+        self._activation_projection_views: dict[str, str] = {}
         # Verification receipts are intentionally process-local.  They are
         # never journaled, and their opaque issuer prevents a new Campaign
         # instance from accepting a token inherited from an older runner.
@@ -1324,7 +2718,14 @@ class Campaign:
         A before/after fingerprint also refuses files changed during hashing.
         """
 
+        campaign_root = self.root.resolve()
         path = artifact.resolve(self.root).resolve()
+        try:
+            path.relative_to(campaign_root)
+        except ValueError as exc:
+            raise ArtifactError(
+                f"artifact resolves outside campaign root: {path}"
+            ) from exc
         if not path.is_file():
             raise ArtifactError(f"artifact disappeared: {path}")
         try:
@@ -1364,8 +2765,7 @@ class Campaign:
             raise ArtifactError(f"artifact changed while hashing: {path}")
         if actual_hash != artifact.sha256:
             raise ArtifactError(
-                f"artifact hash mismatch for {path}: "
-                f"{actual_hash} != {artifact.sha256}"
+                f"artifact hash mismatch for {path}: {actual_hash} != {artifact.sha256}"
             )
         self._artifact_verification_cache[key] = after
         return replace(
@@ -1391,8 +2791,10 @@ class Campaign:
             raise ArtifactError(f"artifact changed while hashing: {resolved}")
         try:
             stored_path = str(resolved.relative_to(self.root.resolve()))
-        except ValueError:
-            stored_path = str(resolved)
+        except ValueError as exc:
+            raise ArtifactError(
+                "campaign artifact is outside the campaign root"
+            ) from exc
         ref = ArtifactRef(kind, stored_path, digest, after.size_bytes)
         key = self._artifact_cache_key(ref, resolved)
         self._artifact_verification_cache[key] = after
@@ -1405,35 +2807,264 @@ class Campaign:
             ),
         )
 
+    def _authorize_executor_stage_artifacts(
+        self,
+        cell_id: str,
+        stage: str,
+        artifacts: Iterable[ArtifactRef],
+        *,
+        canonical_executor: bool,
+    ) -> tuple[ArtifactRef, ...]:
+        """Attach an unjournaled receipt for one completed executor stage.
+
+        The canonical child validates its own durable outputs before emitting
+        the stage manifest.  This receipt lets Campaign admission reuse that
+        validation without loading a second checkpoint/model concurrently.
+        """
+
+        expected = EXPECTED_STAGE_ARTIFACTS.get(stage)
+        if expected is None:
+            raise ArtifactError(f"unknown executor stage {stage!r}")
+        verified = tuple(self._verify_artifact(item) for item in artifacts)
+        observed = {item.kind for item in verified}
+        if observed != {*expected, f"{stage}_manifest"}:
+            raise ArtifactError(
+                f"executor receipt for {stage} has wrong artifact kinds: "
+                f"{sorted(observed)}"
+            )
+        authorized: list[ArtifactRef] = []
+        for artifact in verified:
+            path = artifact.resolve(self.root).resolve()
+            fingerprint = _ArtifactFingerprint.from_path(path)
+            key = self._artifact_cache_key(artifact, path)
+            token = artifact._verification
+            if (
+                token is None
+                or token.issuer is not self._artifact_verification_issuer
+                or token.key != key
+                or token.fingerprint != fingerprint
+            ):
+                raise ArtifactError(
+                    f"executor artifact changed before admission: {path}"
+                )
+            authorized.append(
+                replace(
+                    artifact,
+                    _verification=_ArtifactVerification(
+                        self._artifact_verification_issuer,
+                        key,
+                        fingerprint,
+                        executor_cell_id=cell_id,
+                        executor_stage=stage,
+                        canonical_executor=canonical_executor,
+                    ),
+                )
+            )
+        return tuple(authorized)
+
+    @contextmanager
+    def _campaign_mutation(self):
+        """Serialize journal-dependent validation and its commit across processes."""
+
+        with self._mutation_thread_lock:
+            depth = int(getattr(self._mutation_local, "depth", 0))
+            if depth:
+                self._mutation_local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._mutation_local.depth = depth
+                return
+            durable_mkdir(self.root, parents=True, exist_ok=True)
+            with self.mutation_lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._mutation_local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._mutation_local.depth = 0
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _registration_mutation(self):
+        """Acquire campaign-wide locks in their single canonical order."""
+
+        durable_mkdir(self.root, parents=True, exist_ok=True)
+        registration_lock = self.root / ".registration.lock"
+        with registration_lock.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            with self._campaign_mutation():
+                yield
+
+    def _history_plan(self, plan_id: str) -> StudyPlan:
+        if not plan_id:
+            raise CampaignError("journal plan identity is empty")
+        path = self.plans_dir / f"{_slug(plan_id)}.json"
+        if not path.is_file():
+            raise CampaignError(
+                f"journal-bound plan lacks immutable history {plan_id}"
+            )
+        try:
+            before = _ArtifactFingerprint.from_path(path)
+            cached = self._history_plan_cache.get(plan_id)
+            if cached is not None and cached[0] == before:
+                return cached[1]
+            payload = _read_json(path)
+            plan = StudyPlan.from_manifest(payload)
+            after = _ArtifactFingerprint.from_path(path)
+        except (KeyError, OSError, TypeError, ValueError, StudyError) as exc:
+            raise CampaignError(
+                f"invalid immutable plan history for {plan_id}: {exc}"
+            ) from exc
+        if before != after:
+            raise CampaignError(
+                f"immutable plan history changed while reading {plan_id}"
+            )
+        if plan.plan_id != plan_id or canonical_json(payload) != canonical_json(
+            plan.to_manifest()
+        ):
+            raise CampaignError(
+                f"immutable plan history content mismatch for {plan_id}"
+            )
+        self._history_plan_cache[plan_id] = (after, plan)
+        return plan
+
+    def _validate_plan_extension_event(
+        self,
+        current: StudyPlan,
+        event: Mapping[str, Any],
+    ) -> tuple[StudyPlan, ArtifactRef]:
+        metadata = event.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise CampaignError("plan-extension metadata must be an object")
+        if metadata.get("previous_plan_id") != current.plan_id:
+            raise CampaignError(
+                "plan-extension journal does not form one ordered plan chain"
+            )
+        target_plan_id = metadata.get("plan_id")
+        if not isinstance(target_plan_id, str) or not target_plan_id:
+            raise CampaignError("plan-extension event lacks its target plan ID")
+        target = self._history_plan(target_plan_id)
+        if (
+            target.phase is not current.phase
+            or len(target.stages) != len(current.stages) + 1
+            or target.stages[:-1] != current.stages
+            or metadata.get("stage") != target.stages[-1].name
+        ):
+            raise CampaignError(
+                "committed plan extension differs from immutable plan history"
+            )
+        raw_artifacts = event.get("artifacts")
+        if not isinstance(raw_artifacts, list) or len(raw_artifacts) != 1:
+            raise CampaignError(
+                "committed plan extension must bind exactly one selection artifact"
+            )
+        try:
+            evidence = self._verify_artifact(ArtifactRef.from_dict(raw_artifacts[0]))
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            raise CampaignError(
+                f"committed plan extension has invalid artifact evidence: {exc}"
+            ) from exc
+        return target, evidence
+
+    def _journal_authority(self) -> tuple[StudyPlan, Mapping[str, str]]:
+        """Return journal-derived active plan and registered-cell provenance.
+
+        The cursor processes normal appends once.  If the observed prefix ever
+        changes, authority is rebuilt from the complete journal.
+        """
+
+        with self._authority_lock:
+            return self._journal_authority_locked()
+
+    def _journal_authority_locked(self) -> tuple[StudyPlan, Mapping[str, str]]:
+
+        events = self._events_cached()
+        prefix_valid = (
+            self._authority_cursor == 0
+            or (
+                len(events) >= self._authority_cursor
+                and events[self._authority_cursor - 1].get("event_id")
+                == self._authority_last_event_id
+            )
+        )
+        if not prefix_valid:
+            self._authority_cursor = 0
+            self._authority_last_event_id = None
+            self._authority_active_plan_id = None
+            self._authority_registration_plan_ids = {}
+            self._authority_extension_evidence = []
+        active = (
+            None
+            if self._authority_active_plan_id is None
+            else self._history_plan(self._authority_active_plan_id)
+        )
+        for evidence in self._authority_extension_evidence:
+            self._verify_artifact(evidence)
+        for event in events[self._authority_cursor :]:
+            event_type = event.get("event")
+            if event_type == "transition" and event.get("previous") is None:
+                if event.get("target") != RunState.PLANNED.value:
+                    raise CampaignError(
+                        "cell registration must enter the planned state"
+                    )
+                cell_id = event.get("cell_id")
+                metadata = event.get("metadata")
+                plan_id = (
+                    metadata.get("plan_id")
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(cell_id, str)
+                    or not cell_id
+                    or not isinstance(plan_id, str)
+                    or not plan_id
+                ):
+                    raise CampaignError(
+                        "cell registration lacks journal-bound plan provenance"
+                    )
+                prior = self._authority_registration_plan_ids.get(cell_id)
+                if prior is not None and prior != plan_id:
+                    raise CampaignError(
+                        f"cell {cell_id} is registered to conflicting plans"
+                    )
+                history = self._history_plan(plan_id)
+                if not any(cell.cell_id == cell_id for cell in history.cells):
+                    raise CampaignError(
+                        f"registered cell {cell_id} is absent from plan {plan_id}"
+                    )
+                self._authority_registration_plan_ids[cell_id] = plan_id
+                if active is None:
+                    active = history
+            elif event_type == "plan_extension":
+                if active is None:
+                    raise CampaignError("plan extension precedes initial registration")
+                active, evidence = self._validate_plan_extension_event(active, event)
+                self._authority_extension_evidence.append(evidence)
+        self._authority_cursor = len(events)
+        self._authority_last_event_id = (
+            None if not events else str(events[-1].get("event_id"))
+        )
+        self._authority_active_plan_id = None if active is None else active.plan_id
+        if active is None:
+            raise CampaignError("campaign journal has no registered plan")
+        return active, dict(self._authority_registration_plan_ids)
+
     @property
     def plan(self) -> StudyPlan:
+        if self._events_cached():
+            return self._journal_authority()[0]
         if not self.plan_path.exists():
             raise CampaignError(f"campaign has no plan: {self.plan_path}")
-        stat = self.plan_path.stat()
-        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-        if self._plan_cache is not None and self._plan_cache_signature == signature:
-            return self._plan_cache
-        for _attempt in range(3):
-            before = self.plan_path.stat()
-            before_signature = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            )
-            plan = StudyPlan.from_manifest(_read_json(self.plan_path))
-            after = self.plan_path.stat()
-            after_signature = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            )
-            if before_signature == after_signature:
-                self._plan_cache = plan
-                self._plan_cache_signature = after_signature
-                return plan
-        raise CampaignError("active plan changed repeatedly while being read")
+        try:
+            payload = _read_json(self.plan_path)
+            plan = StudyPlan.from_manifest(payload)
+        except (KeyError, OSError, TypeError, ValueError, StudyError) as exc:
+            raise CampaignError(f"active plan projection is invalid: {exc}") from exc
+        if canonical_json(payload) != canonical_json(plan.to_manifest()):
+            raise CampaignError("active plan projection is noncanonical")
+        return plan
 
     def cell_dir(self, cell_id: str) -> Path:
         return self.root / "cells" / _slug(cell_id)
@@ -1451,7 +3082,7 @@ class Campaign:
         return self.root / ".locks" / f"{_slug(cell_id)}.guard"
 
     def lock(self, cell_id: str) -> CellLock:
-        self._require_cell(cell_id)
+        self._require_active_cell(cell_id)
         return CellLock(self, cell_id)
 
     def register(
@@ -1464,16 +3095,17 @@ class Campaign:
     ) -> None:
         """Register a plan idempotently; a different plan fails closed."""
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
         registration_lock = self.root / ".registration.lock"
         with registration_lock.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            self._register_locked(
-                plan,
-                blueprint_manifest=blueprint_manifest,
-                phase1_decision_manifest=phase1_decision_manifest,
-                panel_decision_manifest=panel_decision_manifest,
-            )
+            with self._campaign_mutation():
+                self._register_locked(
+                    plan,
+                    blueprint_manifest=blueprint_manifest,
+                    phase1_decision_manifest=phase1_decision_manifest,
+                    panel_decision_manifest=panel_decision_manifest,
+                )
 
     def _register_locked(
         self,
@@ -1609,7 +3241,73 @@ class Campaign:
             raise CampaignError(
                 "campaign already contains a different frozen blueprint"
             )
-        if self.plan_path.exists():
+        current_identity = implementation_identity()
+        current_digest = _validate_implementation_identity(
+            current_identity,
+            scientific=False,
+        )
+        if self.implementation_identity_path.exists():
+            pin = _read_json(self.implementation_identity_path)
+            if (
+                set(pin)
+                != {
+                    "schema",
+                    "implementation_identity",
+                    "implementation_identity_sha256",
+                }
+                or pin.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
+            ):
+                raise CampaignError("campaign implementation pin is noncanonical")
+            pinned_identity = pin.get("implementation_identity")
+            if not isinstance(pinned_identity, Mapping):
+                raise CampaignError("campaign implementation pin lacks its identity")
+            pinned_digest = _validate_implementation_identity(
+                pinned_identity,
+                scientific=False,
+            )
+            if (
+                pin.get("implementation_identity_sha256") != pinned_digest
+                or pinned_digest != current_digest
+            ):
+                raise CampaignError(
+                    "registered campaign implementation differs from current execution"
+                )
+        else:
+            _write_immutable_json(
+                self.implementation_identity_path,
+                {
+                    "schema": CAMPAIGN_IMPLEMENTATION_SCHEMA,
+                    "implementation_identity": current_identity,
+                    "implementation_identity_sha256": current_digest,
+                },
+            )
+        if self._events_cached():
+            existing = self.plan
+            if existing.plan_id != plan.plan_id:
+                raise CampaignError(
+                    f"campaign already contains plan {existing.plan_id}, not {plan.plan_id}"
+                )
+            try:
+                projected_payload = _read_json(self.plan_path)
+                projected = StudyPlan.from_manifest(projected_payload)
+            except (
+                CampaignError,
+                FileNotFoundError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                StudyError,
+            ):
+                projected = None
+                projected_payload = None
+            if (
+                projected != existing
+                or canonical_json(projected_payload)
+                != canonical_json(existing.to_manifest())
+            ):
+                _atomic_json(self.plan_path, existing.to_manifest())
+        elif self.plan_path.exists():
             existing = StudyPlan.from_manifest(_read_json(self.plan_path))
             if existing.plan_id != plan.plan_id:
                 raise CampaignError(
@@ -1629,13 +3327,20 @@ class Campaign:
 
     @staticmethod
     def _phase1_claim_evidence(
-        qualification: Mapping[str, Any], *, smoke: bool
+        qualification: Mapping[str, Any], *, cell: CellSpec, smoke: bool
     ) -> dict[str, Any]:
         """Extract the exact Phase-1 conjunction used by the go/no-go gate."""
 
         outcome = qualification.get("scientific_outcome")
         metrics = qualification.get("selection_metrics")
-        validation = metrics.get("validation") if isinstance(metrics, Mapping) else None
+        if not isinstance(metrics, Mapping):
+            raise CampaignError("Phase-1 qualification lacks selection metrics")
+        try:
+            native, deployed, validation = _validated_phase1_identification(
+                metrics, cell=cell
+            )
+        except ArtifactError as exc:
+            raise CampaignError(str(exc)) from exc
         if smoke:
             protocol_passed = bool(
                 qualification.get("selection_eligibility_mode") == "smoke_protocol_only"
@@ -1648,37 +3353,14 @@ class Campaign:
                 "conjunction_passed": protocol_passed,
             }
         checks = outcome.get("checks") if isinstance(outcome, Mapping) else None
-        margins = outcome.get("margins") if isinstance(outcome, Mapping) else None
-        native_margin = (
-            margins.get("phase1_native_identification")
-            if isinstance(margins, Mapping)
-            else None
-        )
-        deployed_margin = (
-            margins.get("phase1_deployed_identification")
-            if isinstance(margins, Mapping)
-            else None
-        )
-        native_passed = bool(
-            isinstance(native_margin, (int, float))
-            and not isinstance(native_margin, bool)
-            and math_isfinite(native_margin)
-            and float(native_margin) >= 0.0
-        )
-        deployed_passed = bool(
-            isinstance(deployed_margin, (int, float))
-            and not isinstance(deployed_margin, bool)
-            and math_isfinite(deployed_margin)
-            and float(deployed_margin) >= 0.0
-        )
+        native_passed = native["passed"] is True
+        deployed_passed = deployed["passed"] is True
         scientific_passed = bool(
             isinstance(outcome, Mapping) and outcome.get("passed") is True
         )
         conjunction_passed = bool(
-            scientific_passed
-            and isinstance(checks, Mapping)
+            isinstance(checks, Mapping)
             and checks.get("phase1_identification") is True
-            and isinstance(validation, Mapping)
             and validation.get("phase1_identification_conjunction") is True
             and native_passed
             and deployed_passed
@@ -1772,11 +3454,10 @@ class Campaign:
             blueprint.to_manifest()
         ):
             raise CampaignError("Phase-1 decision embeds noncanonical plan evidence")
-        if (
-            manifest.get("plan_sha256")
-            != _run_cell_json_sha256(plan.to_manifest())
-            or manifest.get("blueprint_sha256")
-            != _run_cell_json_sha256(blueprint.to_manifest())
+        if manifest.get("plan_sha256") != _run_cell_json_sha256(
+            plan.to_manifest()
+        ) or manifest.get("blueprint_sha256") != _run_cell_json_sha256(
+            blueprint.to_manifest()
         ):
             raise CampaignError("Phase-1 plan/blueprint file hash is stale")
         if (
@@ -1846,13 +3527,30 @@ class Campaign:
         cells_by_id: dict[str, Mapping[str, Any]] = {}
         implementation_sha256s: set[str] = set()
         plan_cells_by_id = {cell.cell_id: cell for cell in plan.cells}
+        phase1_cell_evidence_keys = {
+            "cell_id",
+            "candidate_id",
+            "stage",
+            "seed",
+            "recipe_name",
+            "recipe_id",
+            "cell",
+            "state",
+            "qualification_sha256",
+            "qualification",
+        }
         for evidence in cells:
-            if not isinstance(evidence, Mapping):
+            if (
+                not isinstance(evidence, Mapping)
+                or set(evidence) != phase1_cell_evidence_keys
+            ):
                 raise CampaignError("Phase-1 cell evidence must be an object")
             cell_id = str(evidence.get("cell_id", ""))
             if cell_id in cells_by_id or cell_id not in plan_cells_by_id:
                 raise CampaignError("Phase-1 cell evidence is repeated or unknown")
             cell = plan_cells_by_id[cell_id]
+            if evidence.get("cell") != cell.to_manifest():
+                raise CampaignError("Phase-1 embedded cell differs from its plan")
             if evidence.get("state") not in {
                 RunState.QUALIFIED.value,
                 RunState.PROMOTED.value,
@@ -1913,15 +3611,11 @@ class Campaign:
                 "selection",
             }:
                 raise CampaignError("Phase-1 selection-chain item is noncanonical")
-            selection_artifact_sha256 = chain_item.get(
-                "selection_artifact_sha256"
-            )
+            selection_artifact_sha256 = chain_item.get("selection_artifact_sha256")
             if (
                 not isinstance(selection_artifact_sha256, str)
                 or not selection_artifact_sha256.startswith("sha256:")
-                or not _is_sha256_hex(
-                    selection_artifact_sha256.removeprefix("sha256:")
-                )
+                or not _is_sha256_hex(selection_artifact_sha256.removeprefix("sha256:"))
                 or chain_item.get("selection_artifact_sha256_semantics")
                 != "opaque_historical_commitment_requires_trusted_origin"
             ):
@@ -2075,9 +3769,9 @@ class Campaign:
                             "Phase-1 selection includes a nonpromotable candidate"
                         )
                     if (
-                        cls._phase1_claim_evidence(qualification, smoke=False).get(
-                            "conjunction_passed"
-                        )
+                        cls._phase1_claim_evidence(
+                            qualification, cell=cell, smoke=False
+                        ).get("conjunction_passed")
                         is not True
                     ):
                         raise CampaignError(
@@ -2115,11 +3809,8 @@ class Campaign:
                 not isinstance(item, Mapping)
                 or set(item) != {"plan_id", "sha256"}
                 or item.get("plan_id") != replayed.plan_id
-                or item.get("sha256")
-                != _run_cell_json_sha256(replayed.to_manifest())
-                for item, replayed in zip(
-                    plan_history, replayed_plans, strict=True
-                )
+                or item.get("sha256") != _run_cell_json_sha256(replayed.to_manifest())
+                for item, replayed in zip(plan_history, replayed_plans, strict=True)
             )
         ):
             raise CampaignError("Phase-1 plan-history evidence is incomplete")
@@ -2156,7 +3847,7 @@ class Campaign:
             per_seed = []
             for cell, evidence in ordered:
                 claim = cls._phase1_claim_evidence(
-                    evidence["qualification"], smoke=smoke
+                    evidence["qualification"], cell=cell, smoke=smoke
                 )
                 per_seed.append(
                     {
@@ -2188,6 +3879,12 @@ class Campaign:
         confirmation = manifest.get("confirmation")
         if (
             not isinstance(confirmation, Mapping)
+            or set(confirmation)
+            != {
+                "results",
+                "stress_failures",
+                "scope_narrowing",
+            }
             or confirmation.get("results") != results
         ):
             raise CampaignError(
@@ -2436,13 +4133,40 @@ class Campaign:
             raise CampaignError("campaign manifest has malformed cell evidence")
         embedded_cells_by_id: dict[str, CellSpec] = {}
         implementation_sha256s: set[str] = set()
+        phase2_cell_evidence_keys = {
+            "cell_id",
+            "candidate_id",
+            "stage",
+            "seed",
+            "recipe_name",
+            "recipe_id",
+            "cell",
+            "state",
+            "qualification",
+            "artifacts",
+        }
         for cell_id, evidence in cells_by_id.items():
+            if set(evidence) != phase2_cell_evidence_keys:
+                raise CampaignError(
+                    "Phase-2 cell evidence uses a noncanonical field set"
+                )
             try:
                 embedded_cell = CellSpec.from_manifest(evidence["cell"])
             except (KeyError, TypeError, ValueError, StudyError) as exc:
                 raise CampaignError(f"invalid embedded Phase-2 cell: {exc}") from exc
             if embedded_cell.cell_id != cell_id:
                 raise CampaignError("embedded Phase-2 cell identity mismatch")
+            if evidence.get("cell") != embedded_cell.to_manifest():
+                raise CampaignError("embedded Phase-2 cell manifest is noncanonical")
+            for field_name, observed in (
+                ("candidate_id", embedded_cell.candidate_id),
+                ("stage", embedded_cell.stage),
+                ("seed", embedded_cell.seed),
+                ("recipe_name", embedded_cell.recipe_name),
+                ("recipe_id", embedded_cell.recipe_id),
+            ):
+                if evidence.get(field_name) != observed:
+                    raise CampaignError("Phase-2 cell evidence identity mismatch")
             if embedded_cell.decision_map.get(
                 "runtime.smoke"
             ) is not campaign_manifest.get("smoke"):
@@ -2558,7 +4282,21 @@ class Campaign:
                     )
 
         confirmation = campaign_manifest.get("confirmation_noninferiority")
-        if not isinstance(confirmation, Mapping):
+        confirmation_keys = {
+            "mode",
+            "metric_path",
+            "direction",
+            "score_degradation_max",
+            "score_degradation_threshold_basis",
+            "score_degradation_sensitivity",
+            "policy",
+            "per_seed",
+            "passed",
+        }
+        if (
+            not isinstance(confirmation, Mapping)
+            or set(confirmation) != confirmation_keys
+        ):
             raise CampaignError("panel lacks confirmation noninferiority evidence")
         try:
             confirmation_policy = SelectionPolicy.from_dict(confirmation["policy"])
@@ -2610,9 +4348,31 @@ class Campaign:
         rows = confirmation.get("per_seed")
         if not isinstance(rows, list) or len(rows) != len(finalist.source_cells):
             raise CampaignError("confirmation evidence is not seed-complete")
+        confirmation_row_keys = {
+            "seed",
+            "cell_id",
+            "parent_cell_id",
+            "qualification_sha256",
+            "parent_qualification_sha256",
+            "confirmation_score",
+            "parent_score",
+            "score_degradation",
+            "sharing_guard",
+            "qualification_passed",
+            "score_noninferiority_passed",
+            "sharing_guard_passed",
+            "passed",
+        }
+        if any(
+            not isinstance(row, Mapping) or set(row) != confirmation_row_keys
+            for row in rows
+        ):
+            raise CampaignError("confirmation rows use a noncanonical field set")
         rows_by_seed = {
             row.get("seed"): row for row in rows if isinstance(row, Mapping)
         }
+        if set(rows_by_seed) != {cell.seed for cell in finalist.source_cells}:
+            raise CampaignError("confirmation rows repeat or omit a finalist seed")
         if len(rows_by_seed) != len(rows):
             raise CampaignError("confirmation evidence repeats or malforms a seed")
 
@@ -2752,9 +4512,7 @@ class Campaign:
             parent_evidence = cells_by_id.get(str(parent_cell_id))
             if parent_evidence is None:
                 raise CampaignError("confirmation parent lacks campaign evidence")
-            declared_parent_ids = cell.decision_map.get(
-                "selection.parent_cell_ids", ()
-            )
+            declared_parent_ids = cell.decision_map.get("selection.parent_cell_ids", ())
             if not isinstance(declared_parent_ids, (tuple, list)):
                 raise CampaignError("confirmation cell has malformed parent binding")
             same_seed_declared_parents = [
@@ -3028,45 +4786,11 @@ class Campaign:
                 is not (qualification_passed and score_passed and sharing_passed)
             ):
                 raise CampaignError("confirmation noninferiority evidence is forged")
-        expected_sensitivity = {
-            "mode": "marginal_counterfactuals_center_policy_not_retuned",
-            "rows": [
-                {
-                    "threshold": threshold,
-                    "passing_seeds": (
-                        None
-                        if smoke
-                        else [
-                            row["seed"]
-                            for row in rows
-                            if Campaign._meets_upper_bound(
-                                float(row["score_degradation"]), threshold
-                            )
-                        ]
-                    ),
-                    "passed_all_seeds": (
-                        None
-                        if smoke
-                        else all(
-                            Campaign._meets_upper_bound(
-                                float(row["score_degradation"]), threshold
-                            )
-                            for row in rows
-                        )
-                    ),
-                }
-                for threshold in PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY
-            ],
-            "ungated_passed_all_seeds": (
-                None
-                if smoke
-                else all(
-                    row["qualification_passed"] is True
-                    and row["sharing_guard_passed"] is True
-                    for row in rows
-                )
-            ),
-        }
+        expected_sensitivity = _confirmation_score_sensitivity_payload(
+            rows,
+            PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY,
+            smoke=smoke,
+        )
         if confirmation.get("score_degradation_sensitivity") != expected_sensitivity:
             raise CampaignError("confirmation score sensitivity evidence is forged")
         if confirmation.get("passed") is not True or any(
@@ -3678,15 +5402,11 @@ class Campaign:
             }
             if set(chain_item) != expected_chain_keys:
                 raise CampaignError("panel selection-chain item is noncanonical")
-            selection_artifact_sha256 = chain_item.get(
-                "selection_artifact_sha256"
-            )
+            selection_artifact_sha256 = chain_item.get("selection_artifact_sha256")
             if selection_artifact_sha256 is not None and (
                 not isinstance(selection_artifact_sha256, str)
                 or not selection_artifact_sha256.startswith("sha256:")
-                or not _is_sha256_hex(
-                    selection_artifact_sha256.removeprefix("sha256:")
-                )
+                or not _is_sha256_hex(selection_artifact_sha256.removeprefix("sha256:"))
             ):
                 raise CampaignError("panel selection commitment is malformed")
             if chain_item.get("selection_artifact_sha256_semantics") != (
@@ -3910,8 +5630,7 @@ class Campaign:
                 )
             }
             if (
-                str(chain_item.get("candidate_id", ""))
-                not in retained_candidate_ids
+                str(chain_item.get("candidate_id", "")) not in retained_candidate_ids
                 and not is_validated_duplicate_substitution
             ):
                 raise CampaignError(
@@ -4332,14 +6051,19 @@ class Campaign:
     ) -> None:
         known = {
             str(event["cell_id"])
-            for event in self.events()
+            for event in self._events_cached()
             if event.get("event") == "transition" and event.get("previous") is None
         }
         for cell in cells:
             path = self.cell_manifest_path(cell.cell_id)
             if path.exists():
-                existing_cell = CellSpec.from_manifest(_read_json(path))
-                if existing_cell.cell_id != cell.cell_id:
+                existing_payload = _read_json(path)
+                existing_cell = CellSpec.from_manifest(existing_payload)
+                if (
+                    existing_cell != cell
+                    or canonical_json(existing_payload)
+                    != canonical_json(cell.to_manifest())
+                ):
                     raise CampaignError(f"cell manifest mismatch at {path}")
             else:
                 _atomic_json(path, cell.to_manifest())
@@ -4355,7 +6079,74 @@ class Campaign:
                 )
                 self._append_event(event)
                 known.add(cell.cell_id)
-            self._write_snapshot(self.record(cell.cell_id))
+            try:
+                self._write_snapshot(self.record(cell.cell_id))
+            except (CampaignError, OSError):
+                # Registration is committed by the journal.  Disposable
+                # snapshots are repaired by the runner/reconcile path.
+                pass
+
+    def _commit_plan_extension(
+        self,
+        *,
+        current: StudyPlan,
+        plan: StudyPlan,
+        child_stage: Any,
+        evidence_ref: ArtifactRef,
+        frozen_evidence: Mapping[str, Any],
+        live_evidence: Callable[[], Mapping[str, Any]],
+        journal_sha256: str | None,
+        message: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Atomically revalidate and commit one plan extension."""
+
+        with self._campaign_mutation():
+            if self.plan != current:
+                raise CampaignError(
+                    "active plan changed during plan-extension validation"
+                )
+            observed = (
+                _sha256(self.journal_path) if self.journal_path.is_file() else None
+            )
+            if observed != journal_sha256:
+                raise CampaignError(
+                    "campaign journal changed while validating the plan extension"
+                )
+            self._verify_artifact(evidence_ref)
+            if canonical_json(live_evidence()) != canonical_json(frozen_evidence):
+                raise CampaignError(
+                    "selection evidence changed during plan-extension validation"
+                )
+            if (
+                _sha256(self.journal_path) if self.journal_path.is_file() else None
+            ) != journal_sha256:
+                raise CampaignError(
+                    "campaign journal changed during final extension validation"
+                )
+            _write_immutable_json(
+                self.plans_dir / f"{_slug(current.plan_id)}.json",
+                current.to_manifest(),
+            )
+            _write_immutable_json(
+                self.plans_dir / f"{_slug(plan.plan_id)}.json",
+                plan.to_manifest(),
+            )
+            self._register_cells(child_stage.cells, plan_id=plan.plan_id)
+            event = self._event(
+                "plan_extension",
+                "__campaign__",
+                message=message,
+                metadata=metadata,
+                artifacts=(evidence_ref,),
+            )
+            self._append_event(event)
+            try:
+                _atomic_json(self.plan_path, plan.to_manifest())
+            except (CampaignError, OSError):
+                # The journal event is authoritative and makes an identical
+                # retry observe the new plan rather than duplicating it.
+                pass
 
     def extend(
         self,
@@ -4373,7 +6164,7 @@ class Campaign:
         pointer is advanced.
         """
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
         registration_lock = self.root / ".registration.lock"
         with registration_lock.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
@@ -4597,42 +6388,6 @@ class Campaign:
                         + canonical_json(mismatched)
                     )
 
-            observed_journal_sha256 = (
-                _sha256(self.journal_path) if self.journal_path.is_file() else None
-            )
-            if observed_journal_sha256 != journal_sha256:
-                raise CampaignError(
-                    "campaign journal changed while validating the plan extension"
-                )
-            selection_ref.verify(self.root)
-            if canonical_json(
-                self._selection_payload(
-                    source_stage.name,
-                    policy_override=(
-                        source_policy
-                        if source_policy is not source_stage.selection_policy
-                        else None
-                    ),
-                )
-            ) != canonical_json(selection_payload):
-                raise CampaignError(
-                    "stage selection changed during plan-extension validation"
-                )
-            if (
-                _sha256(self.journal_path) if self.journal_path.is_file() else None
-            ) != journal_sha256:
-                raise CampaignError(
-                    "campaign journal changed during final extension validation"
-                )
-
-            _write_immutable_json(
-                self.plans_dir / f"{_slug(current.plan_id)}.json",
-                current.to_manifest(),
-            )
-            _write_immutable_json(
-                self.plans_dir / f"{_slug(plan.plan_id)}.json", plan.to_manifest()
-            )
-            self._register_cells(child_stage.cells, plan_id=plan.plan_id)
             event_metadata = {
                 "previous_plan_id": current.plan_id,
                 "plan_id": plan.plan_id,
@@ -4646,18 +6401,24 @@ class Campaign:
                         "family_name": family_name,
                     }
                 )
-            event = self._event(
-                "plan_extension",
-                "__campaign__",
+            self._commit_plan_extension(
+                current=current,
+                plan=plan,
+                child_stage=child_stage,
+                evidence_ref=selection_ref,
+                frozen_evidence=selection_payload,
+                live_evidence=lambda: self._selection_payload(
+                    source_stage.name,
+                    policy_override=(
+                        source_policy
+                        if source_policy is not source_stage.selection_policy
+                        else None
+                    ),
+                ),
+                journal_sha256=journal_sha256,
                 message=f"appended stage {child_stage.name}",
                 metadata=event_metadata,
-                artifacts=(selection_ref,),
             )
-            self._append_event(event)
-            # The append-only journal is the commit point.  plan.json is only
-            # a projection and reconcile() can republish it after a crash in
-            # this deliberately narrow post-commit window.
-            _atomic_json(self.plan_path, plan.to_manifest())
 
     def extend_family(
         self,
@@ -4685,7 +6446,7 @@ class Campaign:
     ) -> None:
         """Append a family's fresh 16M top-two revisit from its union nomination."""
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
         registration_lock = self.root / ".registration.lock"
         with registration_lock.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
@@ -4774,28 +6535,14 @@ class Campaign:
                     raise CampaignError(
                         "family revisit child lacks frozen nomination lineage"
                     )
-            nomination_ref.verify(self.root)
-            if canonical_json(
-                self._family_nomination_payload(family_name)
-            ) != canonical_json(nomination_payload):
-                raise CampaignError("family nomination changed during validation")
-            if (
-                _sha256(self.journal_path) if self.journal_path.is_file() else None
-            ) != journal_sha256:
-                raise CampaignError(
-                    "campaign journal changed during family revisit validation"
-                )
-            _write_immutable_json(
-                self.plans_dir / f"{_slug(current.plan_id)}.json",
-                current.to_manifest(),
-            )
-            _write_immutable_json(
-                self.plans_dir / f"{_slug(plan.plan_id)}.json", plan.to_manifest()
-            )
-            self._register_cells(child_stage.cells, plan_id=plan.plan_id)
-            event = self._event(
-                "plan_extension",
-                "__campaign__",
+            self._commit_plan_extension(
+                current=current,
+                plan=plan,
+                child_stage=child_stage,
+                evidence_ref=nomination_ref,
+                frozen_evidence=nomination_payload,
+                live_evidence=lambda: self._family_nomination_payload(family_name),
+                journal_sha256=journal_sha256,
                 message=f"appended family revisit {child_stage.name}",
                 metadata={
                     "previous_plan_id": current.plan_id,
@@ -4808,18 +6555,66 @@ class Campaign:
                         selection.selection_id for selection in selections
                     ],
                 },
-                artifacts=(nomination_ref,),
             )
-            self._append_event(event)
-            # Journal append commits the revisit; the active pointer remains
-            # a recoverable projection of that authoritative event chain.
-            _atomic_json(self.plan_path, plan.to_manifest())
 
     def _require_cell(self, cell_id: str) -> CellSpec:
-        path = self.cell_manifest_path(cell_id)
-        if not path.exists():
+        _active, registrations = self._journal_authority()
+        plan_id = registrations.get(cell_id)
+        if plan_id is None:
             raise CampaignError(f"unknown cell {cell_id}")
-        return CellSpec.from_manifest(_read_json(path))
+        history = self._history_plan(plan_id)
+        matches = tuple(cell for cell in history.cells if cell.cell_id == cell_id)
+        if len(matches) != 1:
+            raise CampaignError(
+                f"journal-bound plan {plan_id} does not define cell {cell_id} exactly once"
+            )
+        authoritative = matches[0]
+        path = self.cell_manifest_path(cell_id)
+        if not path.is_file():
+            raise ArtifactError(f"registered cell projection is missing: {path}")
+        try:
+            before = _ArtifactFingerprint.from_path(path)
+            cached = self._cell_projection_cache.get(cell_id)
+            if cached is not None and cached[0] == before:
+                projected = cached[1]
+            else:
+                payload = _read_json(path)
+                projected = CellSpec.from_manifest(payload)
+                after = _ArtifactFingerprint.from_path(path)
+                if after != before:
+                    raise ArtifactError(
+                        f"cell projection changed while reading {cell_id}"
+                    )
+                if canonical_json(payload) != canonical_json(projected.to_manifest()):
+                    raise ArtifactError(
+                        f"registered cell projection is noncanonical: {cell_id}"
+                    )
+                self._cell_projection_cache[cell_id] = (after, projected)
+        except (KeyError, OSError, TypeError, ValueError, StudyError) as exc:
+            raise ArtifactError(
+                f"registered cell projection is invalid for {cell_id}: {exc}"
+            ) from exc
+        if projected != authoritative:
+            raise ArtifactError(
+                f"registered cell projection differs from journal-bound plan: {cell_id}"
+            )
+        return authoritative
+
+    def _require_active_cell(self, cell_id: str) -> CellSpec:
+        active, registrations = self._journal_authority()
+        missing = {item.cell_id for item in active.cells}.difference(registrations)
+        if missing:
+            raise CampaignError(
+                "active plan registration is incomplete; missing cells: "
+                + ", ".join(sorted(missing))
+            )
+        cell = self._require_cell(cell_id)
+        matches = tuple(item for item in active.cells if item.cell_id == cell_id)
+        if len(matches) != 1 or matches[0] != cell:
+            raise CampaignError(
+                f"cell {cell_id} is not a member of the committed active plan"
+            )
+        return cell
 
     def _event(
         self,
@@ -4850,16 +6645,71 @@ class Campaign:
         return event
 
     def _append_event(self, event: Mapping[str, Any]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        with self._campaign_mutation():
+            self._append_event_locked(event)
+
+    def _append_event_locked(self, event: Mapping[str, Any]) -> None:
+        durable_mkdir(self.root, parents=True, exist_ok=True)
         journal_existed = self.journal_path.exists()
         body = (canonical_json(event) + "\n").encode("utf-8")
         fd = os.open(
             self.journal_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            os.O_RDWR | os.O_CREAT | os.O_APPEND,
             0o600,
         )
+        recovered_tail = False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            initial_size = os.fstat(fd).st_size
+            if initial_size and os.pread(fd, 1, initial_size - 1) != b"\n":
+                position = initial_size
+                complete_end = 0
+                while position > 0:
+                    start = max(0, position - 65_536)
+                    chunk = os.pread(fd, position - start, start)
+                    newline = chunk.rfind(b"\n")
+                    if newline >= 0:
+                        complete_end = start + newline + 1
+                        break
+                    position = start
+                torn_hasher = hashlib.sha256()
+                offset = complete_end
+                while offset < initial_size:
+                    chunk = os.pread(fd, min(1 << 20, initial_size - offset), offset)
+                    if not chunk:
+                        raise CampaignError("short read while recovering journal tail")
+                    torn_hasher.update(chunk)
+                    offset += len(chunk)
+                tail_length = initial_size - complete_end
+                complete_tail = False
+                if tail_length <= 16 << 20:
+                    try:
+                        tail_event = json.loads(
+                            os.pread(fd, tail_length, complete_end).decode("utf-8")
+                        )
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        tail_event = None
+                    complete_tail = bool(
+                        isinstance(tail_event, Mapping)
+                        and tail_event.get("schema") == CAMPAIGN_SCHEMA
+                    )
+                if complete_tail:
+                    if os.write(fd, b"\n") != 1:
+                        raise CampaignError("short newline repair in campaign journal")
+                else:
+                    os.ftruncate(fd, complete_end)
+                    recovery = self._event(
+                        "journal_tail_recovered",
+                        "__campaign__",
+                        message="discarded one incomplete final journal record",
+                        metadata={
+                            "discarded_bytes": tail_length,
+                            "discarded_sha256": torn_hasher.hexdigest(),
+                        },
+                        artifacts=(),
+                    )
+                    body = (canonical_json(recovery) + "\n").encode("utf-8") + body
+                recovered_tail = True
             before_stat = os.fstat(fd)
             before_signature = (
                 before_stat.st_dev,
@@ -4888,10 +6738,11 @@ class Campaign:
             # additional fsync only when this call may have created the entry;
             # racing first writers may both flush the directory harmlessly.
             fsync_directory(self.root)
-        cached_event = dict(event)
+        cached_event = copy.deepcopy(dict(event))
         with self._events_cache_lock:
             if (
-                self._events_cache is not None
+                not recovered_tail
+                and self._events_cache is not None
                 and self._events_cache_signature == before_signature
             ):
                 self._events_cache = (*self._events_cache, cached_event)
@@ -4906,7 +6757,9 @@ class Campaign:
                 self._events_by_cell_cache = {}
                 self._events_cache_signature = None
 
-    def events(self, cell_id: str | None = None) -> tuple[dict[str, Any], ...]:
+    def _events_cached(
+        self, cell_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
         if not self.journal_path.exists():
             return ()
         stat = self.journal_path.stat()
@@ -4931,6 +6784,8 @@ class Campaign:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError as exc:
+                    if not line.endswith("\n"):
+                        break
                     raise CampaignError(
                         f"corrupt journal line {line_number}: {exc}"
                     ) from exc
@@ -4953,6 +6808,11 @@ class Campaign:
             self._events_cache_signature = locked_signature
         return frozen if cell_id is None else frozen_by_cell.get(cell_id, ())
 
+    def events(self, cell_id: str | None = None) -> tuple[dict[str, Any], ...]:
+        """Return detached journal events; callers cannot poison live caches."""
+
+        return copy.deepcopy(self._events_cached(cell_id))
+
     def record(self, cell_id: str) -> CampaignRecord:
         self._require_cell(cell_id)
         state: RunState | None = None
@@ -4960,7 +6820,7 @@ class Campaign:
         artifacts: dict[str, ArtifactRef] = {}
         transition_count = 0
         updated_at: float | None = None
-        for event in self.events(cell_id):
+        for event in self._events_cached(cell_id):
             if event.get("event") != "transition":
                 continue
             previous_raw = event.get("previous")
@@ -5081,12 +6941,26 @@ class Campaign:
         )
 
     def records(self) -> tuple[CampaignRecord, ...]:
-        if not self.plan_path.exists():
+        if not self._events_cached() and not self.plan_path.exists():
             return ()
         return tuple(self.record(cell.cell_id) for cell in self.plan.cells)
 
     def _write_snapshot(self, record: CampaignRecord) -> None:
         _atomic_json(self.state_path(record.cell_id), record.to_dict())
+
+    def _ensure_snapshot(self, record: CampaignRecord) -> bool:
+        """Repair one disposable state projection from the authoritative journal."""
+
+        path = self.state_path(record.cell_id)
+        try:
+            current = _read_json(path)
+        except (CampaignError, FileNotFoundError, OSError):
+            current = None
+        expected = record.to_dict()
+        if current == expected:
+            return False
+        self._write_snapshot(record)
+        return True
 
     @staticmethod
     def _resume_target(previous: RunState) -> RunState:
@@ -5134,18 +7008,19 @@ class Campaign:
         metadata: Mapping[str, Any] | None,
     ) -> CampaignRecord:
         if target is RunState.PREPARED:
-            self.root.mkdir(parents=True, exist_ok=True)
-            with self.implementation_identity_lock_path.open(
-                "a+", encoding="utf-8"
-            ) as lock_handle:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-                return self._transition_locked_commit(
-                    cell_id,
-                    target,
-                    artifacts=artifacts,
-                    message=message,
-                    metadata=metadata,
-                )
+            durable_mkdir(self.root, parents=True, exist_ok=True)
+            with self._campaign_mutation():
+                with self.implementation_identity_lock_path.open(
+                    "a+", encoding="utf-8"
+                ) as lock_handle:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    return self._transition_locked_commit_mutation(
+                        cell_id,
+                        target,
+                        artifacts=artifacts,
+                        message=message,
+                        metadata=metadata,
+                    )
         return self._transition_locked_commit(
             cell_id,
             target,
@@ -5163,6 +7038,25 @@ class Campaign:
         message: str,
         metadata: Mapping[str, Any] | None,
     ) -> CampaignRecord:
+        with self._campaign_mutation():
+            return self._transition_locked_commit_mutation(
+                cell_id,
+                target,
+                artifacts=artifacts,
+                message=message,
+                metadata=metadata,
+            )
+
+    def _transition_locked_commit_mutation(
+        self,
+        cell_id: str,
+        target: RunState,
+        *,
+        artifacts: tuple[ArtifactRef, ...],
+        message: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> CampaignRecord:
+        cell = self._require_active_cell(cell_id)
         record = self.record(cell_id)
         if target not in LEGAL_TRANSITIONS[record.state]:
             raise InvalidTransition(
@@ -5172,6 +7066,11 @@ class Campaign:
         new_kinds: set[str] = set()
         authenticated: list[ArtifactRef] = []
         for unverified in artifacts:
+            self._require_executor_stage_receipt(
+                cell,
+                target,
+                unverified,
+            )
             artifact = self._verify_artifact(unverified)
             authenticated.append(artifact)
             existing = merged.get(artifact.kind)
@@ -5192,6 +7091,24 @@ class Campaign:
             )
         self._validate_artifact_gate(cell_id, target, merged)
         event_metadata = dict(metadata or {})
+        if target is RunState.PREPARED:
+            preparation = _read_json(merged["preparation"].resolve(self.root))
+            identity = preparation.get("data_identity")
+            if identity is not None:
+                if "activation_content_identity" in event_metadata:
+                    raise ArtifactError(
+                        "caller cannot supply reserved activation identity metadata"
+                    )
+                event_metadata["activation_content_identity"] = {
+                    "schema": ACTIVATION_CONTENT_IDENTITY_SCHEMA,
+                    "raw_content_identity_sha256": identity[
+                        "raw_content_identity_sha256"
+                    ],
+                    "view_key": identity["view_key"],
+                    "view_content_identity_sha256": identity[
+                        "view_content_identity_sha256"
+                    ],
+                }
         if target is RunState.FAILED:
             event_metadata["resume_state"] = self._resume_target(record.state).value
         event = self._event(
@@ -5205,31 +7122,82 @@ class Campaign:
         )
         self._append_event(event)
         updated = self.record(cell_id)
-        self._write_snapshot(updated)
+        try:
+            self._write_snapshot(updated)
+            if (
+                target is RunState.PREPARED
+                and preparation.get("data_identity") is not None
+            ):
+                self._write_activation_identity_projection()
+        except (CampaignError, OSError):
+            # Journal append is the commit point; projections are repairable
+            # and must never create a contradictory FAILED transition.
+            pass
         return updated
+
+    def _require_executor_stage_receipt(
+        self,
+        cell: CellSpec,
+        target: RunState,
+        artifact: ArtifactRef,
+    ) -> None:
+        stage = TARGET_STAGES.get(target)
+        if stage not in {"train", "calibrate", "evaluate"}:
+            return
+        token = artifact._verification
+        path = artifact.resolve(self.root).resolve()
+        try:
+            fingerprint = _ArtifactFingerprint.from_path(path)
+        except OSError as exc:
+            raise ArtifactError(f"cannot stat executor artifact {path}: {exc}") from exc
+        key = self._artifact_cache_key(artifact, path)
+        if (
+            token is None
+            or token.issuer is not self._artifact_verification_issuer
+            or token.key != key
+            or token.fingerprint != fingerprint
+            or token.executor_cell_id != cell.cell_id
+            or token.executor_stage != stage
+        ):
+            raise ArtifactError(
+                f"transition to {target.value} requires an authenticated "
+                f"executor-stage receipt for {artifact.kind}"
+            )
+        if (
+            cell.decision_map.get("runtime.smoke") is False
+            and token.canonical_executor is not True
+        ):
+            raise ArtifactError(
+                "scientific stage admission requires the canonical executor"
+            )
 
     def retry(self, cell_id: str, *, assume_locked: bool = False) -> CampaignRecord:
         if not assume_locked:
             with self.lock(cell_id):
                 return self.retry(cell_id, assume_locked=True)
-        record = self.record(cell_id)
-        if record.state is not RunState.FAILED or record.resume_state is None:
-            raise InvalidTransition(
-                "only a failed cell with a durable resume point can retry"
+        with self._campaign_mutation():
+            self._require_active_cell(cell_id)
+            record = self.record(cell_id)
+            if record.state is not RunState.FAILED or record.resume_state is None:
+                raise InvalidTransition(
+                    "only a failed cell with a durable resume point can retry"
+                )
+            event = self._event(
+                "transition",
+                cell_id,
+                previous=RunState.FAILED,
+                target=record.resume_state,
+                message="explicit resume",
+                metadata={"retry": True},
+                artifacts=(),
             )
-        event = self._event(
-            "transition",
-            cell_id,
-            previous=RunState.FAILED,
-            target=record.resume_state,
-            message="explicit resume",
-            metadata={"retry": True},
-            artifacts=(),
-        )
-        self._append_event(event)
-        updated = self.record(cell_id)
-        self._write_snapshot(updated)
-        return updated
+            self._append_event(event)
+            updated = self.record(cell_id)
+            try:
+                self._write_snapshot(updated)
+            except (CampaignError, OSError):
+                pass
+            return updated
 
     def _validate_artifact_gate(
         self,
@@ -5246,6 +7214,8 @@ class Campaign:
             )
         for kind in required:
             self._verify_artifact(artifacts[kind])
+        if target in TARGET_STAGES:
+            self._validate_stage_manifest(cell_id, target, artifacts)
         if target is RunState.PREPARED:
             self._validate_preparation_implementation(cell_id, artifacts)
         elif target is RunState.QUALIFIED:
@@ -5253,27 +7223,88 @@ class Campaign:
         elif target is RunState.PROMOTED:
             self._validate_promotion(cell_id, artifacts)
 
+    def _validate_stage_manifest(
+        self,
+        cell_id: str,
+        target: RunState,
+        artifacts: Mapping[str, ArtifactRef],
+    ) -> None:
+        """Authenticate direct transitions as strictly as CampaignRunner ones."""
+
+        stage = TARGET_STAGES[target]
+        manifest_kind = f"{stage}_manifest"
+        payload = _read_json(artifacts[manifest_kind].resolve(self.root))
+        if (
+            set(payload) != {"schema", "cell_id", "stage", "artifacts"}
+            or payload.get("schema") != ARTIFACT_SCHEMA
+            or payload.get("cell_id") != cell_id
+            or payload.get("stage") != stage
+            or not isinstance(payload.get("artifacts"), list)
+        ):
+            raise ArtifactError(f"{stage} stage manifest is noncanonical")
+        entries: dict[str, Mapping[str, Any]] = {}
+        for item in payload["artifacts"]:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"kind", "path", "sha256", "size_bytes"}
+                or not isinstance(item.get("kind"), str)
+                or not isinstance(item.get("path"), str)
+                or not isinstance(item.get("sha256"), str)
+                or not isinstance(item.get("size_bytes"), int)
+                or isinstance(item.get("size_bytes"), bool)
+                or item["kind"] in entries
+            ):
+                raise ArtifactError(
+                    f"{stage} stage manifest has a malformed artifact entry"
+                )
+            entries[item["kind"]] = item
+        expected_kinds = EXPECTED_STAGE_ARTIFACTS[stage]
+        if set(entries) != expected_kinds:
+            raise ArtifactError(
+                f"{stage} stage manifest artifact kinds must be exactly "
+                f"{sorted(expected_kinds)}"
+            )
+        for kind in expected_kinds:
+            ref = artifacts[kind]
+            entry = entries[kind]
+            reported_path = Path(entry["path"])
+            if not reported_path.is_absolute():
+                reported_path = self.root / reported_path
+            if (
+                reported_path.resolve() != ref.resolve(self.root).resolve()
+                or entry["sha256"] != ref.sha256
+                or entry["size_bytes"] != ref.size_bytes
+            ):
+                raise ArtifactError(
+                    f"{stage} stage manifest differs from committed {kind} artifact"
+                )
+
     def _validate_preparation_implementation(
         self,
         cell_id: str,
         artifacts: Mapping[str, ArtifactRef],
     ) -> None:
-        """Atomically pin and audit the exact campaign implementation identity."""
+        """Audit the pre-registered implementation and activation identities."""
 
         payload = _read_json(artifacts["preparation"].resolve(self.root))
         implementation = payload.get("implementation")
-        # Minimal state-machine fixtures and custom executors may not implement
-        # the production preparation contract.  They cannot later pass the v2
-        # qualification gate; when an identity is present, bind it immediately.
-        if implementation is None:
-            return
         cell = self._require_cell(cell_id)
+        cell_manifest_path = self.cell_manifest_path(cell_id)
+        try:
+            cell_manifest = _read_json(cell_manifest_path)
+            parsed_cell = CellSpec.from_manifest(cell_manifest)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactError(
+                f"registered cell projection is invalid: {exc}"
+            ) from exc
+        if parsed_cell != cell or cell_manifest != cell.to_manifest():
+            raise ArtifactError(
+                "registered cell projection differs from the authoritative plan"
+            )
         if (
             payload.get("schema") != PREPARATION_SCHEMA
             or payload.get("cell_id") != cell_id
             or not isinstance(implementation, Mapping)
-            or payload.get("implementation_sha256")
-            != _sha256_canonical_payload(implementation)
         ):
             raise ArtifactError(
                 "preparation artifact lacks its schema/cell/implementation binding"
@@ -5282,72 +7313,219 @@ class Campaign:
             implementation,
             scientific=cell.decision_map["runtime.smoke"] is False,
         )
-        prior_digests: set[str] = set()
-        for planned_cell in self.plan.cells:
-            record = self.record(planned_cell.cell_id)
-            if record.cell_id == cell_id:
-                continue
-            other_ref = record.artifact_map.get("preparation")
-            if other_ref is None:
-                continue
-            other_ref.verify(self.root)
-            other_payload = _read_json(other_ref.resolve(self.root))
-            other_implementation = other_payload.get("implementation")
-            if other_implementation is None:
-                continue
-            if not isinstance(other_implementation, Mapping):
-                raise ArtifactError(
-                    "prepared campaign cell has malformed implementation identity"
-                )
-            other_digest = _validate_implementation_identity(
-                other_implementation,
-                scientific=planned_cell.decision_map["runtime.smoke"] is False,
-            )
-            if other_payload.get("implementation_sha256") != other_digest:
-                raise ArtifactError(
-                    f"prepared campaign cell {record.cell_id} has a stale identity hash"
-                )
-            prior_digests.add(other_digest)
-        if prior_digests.difference({observed_digest}):
+        if payload.get("implementation_sha256") != observed_digest:
+            raise ArtifactError("preparation implementation digest is stale")
+        if not self.implementation_identity_path.exists():
             raise ArtifactError(
-                "preparation implementation identity differs from an already "
-                "prepared campaign cell"
+                "campaign lacks its registration-time implementation pin"
             )
-
-        if self.implementation_identity_path.exists():
-            pinned = _read_json(self.implementation_identity_path)
-            if set(pinned) != {
+        pinned = _read_json(self.implementation_identity_path)
+        if (
+            set(pinned)
+            != {
                 "schema",
                 "implementation_identity",
                 "implementation_identity_sha256",
-            } or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA:
-                raise ArtifactError("campaign implementation pin is noncanonical")
-            pinned_identity = pinned.get("implementation_identity")
-            if not isinstance(pinned_identity, Mapping):
-                raise ArtifactError("campaign implementation pin lacks its identity")
-            pinned_digest = _validate_implementation_identity(
-                pinned_identity,
-                scientific=any(
-                    item.decision_map["runtime.smoke"] is False
-                    for item in self.plan.cells
-                ),
+            }
+            or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
+        ):
+            raise ArtifactError("campaign implementation pin is noncanonical")
+        pinned_identity = pinned.get("implementation_identity")
+        if not isinstance(pinned_identity, Mapping):
+            raise ArtifactError("campaign implementation pin lacks its identity")
+        pinned_digest = _validate_implementation_identity(
+            pinned_identity,
+            scientific=False,
+        )
+        if (
+            pinned.get("implementation_identity_sha256") != pinned_digest
+            or pinned_digest != observed_digest
+        ):
+            raise ArtifactError(
+                "preparation implementation identity differs from the campaign pin"
             )
+        # Import lazily: the canonical executor imports Campaign for artifact
+        # schemas, while Campaign must replay that same executor contract before
+        # PREPARED becomes an authoritative journal event.
+        from .cli.run_cell import (  # noqa: PLC0415
+            CellExecutionError,
+            _validate_preparation_contract,
+        )
+
+        try:
+            _validate_preparation_contract(
+                cell,
+                payload,
+                cell_manifest_sha256=_sha256(cell_manifest_path),
+                verification_campaign_root=self.root,
+            )
+        except (CellExecutionError, OSError, ValueError) as exc:
+            raise ArtifactError(
+                f"preparation contract is invalid: {exc}"
+            ) from exc
+        self._validate_preparation_data_identity(cell, payload)
+
+    def _validate_preparation_data_identity(
+        self,
+        cell: CellSpec,
+        preparation: Mapping[str, Any],
+    ) -> None:
+        identity = preparation.get("data_identity")
+        if cell.phase is Phase.PHASE1:
+            if identity is not None:
+                raise ArtifactError("synthetic preparation cannot bind activation data")
+            return
+        if (
+            not isinstance(identity, Mapping)
+            or set(identity)
+            != {
+                "schema",
+                "raw_content_identity_sha256",
+                "view_key",
+                "view_content_identity_sha256",
+                "raw_contract",
+                "view_contract",
+            }
+            or identity.get("schema") != ACTIVATION_CONTENT_IDENTITY_SCHEMA
+        ):
+            raise ArtifactError(
+                "real-data preparation has a noncanonical data identity"
+            )
+        data = preparation.get("data")
+        if not isinstance(data, Mapping):
+            raise ArtifactError(
+                "real-data preparation lacks the data behind its content identity"
+            )
+        try:
+            expected_identity = activation_content_identity(data)
+        except ValueError as exc:
+            raise ArtifactError(str(exc)) from exc
+        if dict(identity) != expected_identity:
+            raise ArtifactError(
+                "real-data preparation data identity differs from its data payload"
+            )
+        raw_contract = identity.get("raw_contract")
+        view_contract = identity.get("view_contract")
+        raw_digest = identity.get("raw_content_identity_sha256")
+        view_digest = identity.get("view_content_identity_sha256")
+        view_key = identity.get("view_key")
+        if (
+            not isinstance(raw_contract, Mapping)
+            or not isinstance(view_contract, Mapping)
+            or not isinstance(view_key, str)
+            or not view_key
+            or not _is_sha256_hex(raw_digest)
+            or not _is_sha256_hex(view_digest)
+            or raw_digest != _sha256_canonical_payload(raw_contract)
+            or view_digest != _sha256_canonical_payload(view_contract)
+            or view_contract.get("raw_content_identity_sha256") != raw_digest
+        ):
+            raise ArtifactError("real-data preparation data identity is inconsistent")
+        committed = self._committed_activation_identity_projection()
+        if committed is None:
+            return
+        if committed["raw_content_identity_sha256"] != raw_digest:
+            raise ArtifactError("campaign preparations use different raw captures")
+        views = committed["views"]
+        if view_key in views and views[view_key] != view_digest:
+            raise ArtifactError(
+                f"campaign preparations disagree on activation view {view_key!r}"
+            )
+
+    def _committed_activation_identity_projection(self) -> dict[str, Any] | None:
+        with self._activation_projection_lock:
+            return self._committed_activation_identity_projection_locked()
+
+    def _committed_activation_identity_projection_locked(
+        self,
+    ) -> dict[str, Any] | None:
+        events = self._events_cached()
+        prefix_valid = (
+            self._activation_projection_cursor == 0
+            or (
+                len(events) >= self._activation_projection_cursor
+                and events[self._activation_projection_cursor - 1].get("event_id")
+                == self._activation_projection_last_event_id
+            )
+        )
+        if not prefix_valid:
+            self._activation_projection_cursor = 0
+            self._activation_projection_last_event_id = None
+            self._activation_projection_raw_digest = None
+            self._activation_projection_views = {}
+        raw_digest = self._activation_projection_raw_digest
+        views = dict(self._activation_projection_views)
+        summary_keys = {
+            "schema",
+            "raw_content_identity_sha256",
+            "view_key",
+            "view_content_identity_sha256",
+        }
+        for event in events[self._activation_projection_cursor :]:
+            if event.get("event") != "transition" or event.get("target") != "prepared":
+                continue
+            metadata = event.get("metadata")
+            summary = (
+                metadata.get("activation_content_identity")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            event_cell = self._require_cell(str(event.get("cell_id", "")))
+            if summary is None:
+                if event_cell.phase is not Phase.PHASE1:
+                    raise ArtifactError(
+                        "real-data prepared transition lacks activation identity metadata"
+                    )
+                continue
+            if event_cell.phase is Phase.PHASE1:
+                raise ArtifactError(
+                    "synthetic prepared transition carries activation identity metadata"
+                )
             if (
-                pinned.get("implementation_identity_sha256") != pinned_digest
-                or pinned_digest != observed_digest
+                not isinstance(summary, Mapping)
+                or set(summary) != summary_keys
+                or summary.get("schema") != ACTIVATION_CONTENT_IDENTITY_SCHEMA
+                or not _is_sha256_hex(summary.get("raw_content_identity_sha256"))
+                or not isinstance(summary.get("view_key"), str)
+                or not summary["view_key"]
+                or not _is_sha256_hex(summary.get("view_content_identity_sha256"))
             ):
                 raise ArtifactError(
-                    "preparation implementation identity differs from the campaign pin"
+                    "journal contains malformed activation identity metadata"
                 )
-        else:
-            _write_immutable_json(
-                self.implementation_identity_path,
-                {
-                    "schema": CAMPAIGN_IMPLEMENTATION_SCHEMA,
-                    "implementation_identity": dict(implementation),
-                    "implementation_identity_sha256": observed_digest,
-                },
-            )
+            candidate_raw = str(summary["raw_content_identity_sha256"])
+            view_key = str(summary["view_key"])
+            view_digest = str(summary["view_content_identity_sha256"])
+            if raw_digest is None:
+                raw_digest = candidate_raw
+            elif raw_digest != candidate_raw:
+                raise ArtifactError(
+                    "journal commits preparations from different raw captures"
+                )
+            if view_key in views and views[view_key] != view_digest:
+                raise ArtifactError(
+                    f"journal commits conflicting activation view {view_key!r}"
+                )
+            views[view_key] = view_digest
+        self._activation_projection_cursor = len(events)
+        self._activation_projection_last_event_id = (
+            None if not events else str(events[-1].get("event_id"))
+        )
+        self._activation_projection_raw_digest = raw_digest
+        self._activation_projection_views = dict(views)
+        if raw_digest is None:
+            return None
+        return {
+            "schema": "bsc-campaign-activation-identity-v1",
+            "raw_content_identity_sha256": raw_digest,
+            "views": views,
+        }
+
+    def _write_activation_identity_projection(self) -> None:
+        projection = self._committed_activation_identity_projection()
+        if projection is None:
+            return
+        _atomic_json(self.activation_identity_path, projection)
 
     def _validate_qualification(
         self,
@@ -5356,7 +7534,7 @@ class Campaign:
     ) -> None:
         """Validate a qualification decision, not merely a metrics report.
 
-        The qualification JSON must have schema ``bsc-qualification-v3``, the
+        The qualification JSON must have schema ``bsc-qualification-v4``, the
         matching cell ID, ``qualified: true``, the complete all-true evidence
         integrity check set, a separately reported scientific outcome, an
         explicit boolean promotion-eligibility decision, and an ``inputs``
@@ -5369,17 +7547,8 @@ class Campaign:
 
         cell = self._require_cell(cell_id)
         payload = _read_json(artifacts["qualification"].resolve(self.root))
+        self._validate_preparation_implementation(cell_id, artifacts)
         preparation = _read_json(artifacts["preparation"].resolve(self.root))
-        if (
-            preparation.get("schema") != PREPARATION_SCHEMA
-            or preparation.get("cell_id") != cell_id
-            or not isinstance(preparation.get("implementation"), Mapping)
-            or preparation.get("implementation_sha256")
-            != _sha256_canonical_payload(preparation["implementation"])
-        ):
-            raise ArtifactError(
-                "preparation artifact lacks its schema/cell/implementation binding"
-            )
         evaluation = _read_json(artifacts["evaluation"].resolve(self.root))
         _validate_qualification_payload(
             payload,
@@ -6305,47 +8474,88 @@ class Campaign:
             ),
             "sharing_fvu_absolute_max": policy.sharing_fvu_absolute_max,
         }
-        sharing_contract = {
+        sharing_contract: dict[
+            str, tuple[str, tuple[tuple[str, float | None], ...]]
+        ] = {
             "sharing_fvu_degradation_max": (
                 "upper",
                 (
-                    "site_only_fvu_degradation",
-                    "leave_one_out_fvu_degradation",
-                    "root_site_only_fvu_degradation",
-                    "root_leave_one_out_fvu_degradation",
+                    (
+                        "site_only_fvu_degradation",
+                        policy.sharing_site_only_fvu_degradation_max,
+                    ),
+                    (
+                        "leave_one_out_fvu_degradation",
+                        policy.sharing_leave_one_out_fvu_degradation_max,
+                    ),
+                    (
+                        "root_site_only_fvu_degradation",
+                        policy.sharing_root_site_only_fvu_degradation_max,
+                    ),
+                    (
+                        "root_leave_one_out_fvu_degradation",
+                        policy.sharing_root_leave_one_out_fvu_degradation_max,
+                    ),
                 ),
             ),
             "sharing_support_iou_drop_max": (
                 "upper",
                 (
-                    "site_only_support_iou_drop",
-                    "leave_one_out_support_iou_drop",
+                    (
+                        "site_only_support_iou_drop",
+                        policy.sharing_support_iou_drop_max,
+                    ),
+                    (
+                        "leave_one_out_support_iou_drop",
+                        policy.sharing_support_iou_drop_max,
+                    ),
                 ),
             ),
             "sharing_coordinate_concordance_min": (
                 "lower",
                 (
-                    "site_only_coordinate_concordance",
-                    "leave_one_out_coordinate_concordance",
+                    (
+                        "site_only_coordinate_concordance",
+                        policy.sharing_coordinate_concordance_min,
+                    ),
+                    (
+                        "leave_one_out_coordinate_concordance",
+                        policy.sharing_coordinate_concordance_min,
+                    ),
                 ),
             ),
             "sharing_intersection_recall_min": (
                 "lower",
                 (
-                    "site_only_intersection_recall",
-                    "leave_one_out_intersection_recall",
+                    (
+                        "site_only_intersection_recall",
+                        policy.sharing_intersection_recall_min,
+                    ),
+                    (
+                        "leave_one_out_intersection_recall",
+                        policy.sharing_intersection_recall_min,
+                    ),
                 ),
             ),
             "sharing_intersection_energy_coverage_min": (
                 "lower",
                 (
-                    "site_only_intersection_energy_coverage",
-                    "leave_one_out_intersection_energy_coverage",
+                    (
+                        "site_only_intersection_energy_coverage",
+                        policy.sharing_intersection_energy_coverage_min,
+                    ),
+                    (
+                        "leave_one_out_intersection_energy_coverage",
+                        policy.sharing_intersection_energy_coverage_min,
+                    ),
                 ),
             ),
             "sharing_fvu_absolute_max": (
                 "upper",
-                ("site_only_fvu_absolute", "leave_one_out_fvu_absolute"),
+                (
+                    ("site_only_fvu_absolute", policy.sharing_fvu_absolute_max),
+                    ("leave_one_out_fvu_absolute", policy.sharing_fvu_absolute_max),
+                ),
             ),
         }
         surfaces: list[dict[str, Any]] = []
@@ -6461,7 +8671,6 @@ class Campaign:
                 )
                 continue
 
-            direction, measurement_names = sharing_contract[name]
             rows = []
             for threshold in thresholds:
                 passed_candidates: list[str] = []
@@ -6475,17 +8684,32 @@ class Campaign:
                     if not guards:
                         continue
                     evaluated_candidates.append(candidate_id)
-                    values = [
-                        float(guard["measurements"][measurement_name])
-                        for guard in guards
-                        for measurement_name in measurement_names
-                    ]
-                    predicate = (
-                        Campaign._meets_upper_bound
-                        if direction == "upper"
-                        else Campaign._meets_lower_bound
-                    )
-                    if all(predicate(value, threshold) for value in values):
+                    passes_complete_policy = True
+                    for contract_name, (
+                        direction,
+                        measurement_contracts,
+                    ) in sharing_contract.items():
+                        predicate = (
+                            Campaign._meets_upper_bound
+                            if direction == "upper"
+                            else Campaign._meets_lower_bound
+                        )
+                        for measurement_name, center_threshold in measurement_contracts:
+                            effective_threshold = (
+                                threshold if contract_name == name else center_threshold
+                            )
+                            if effective_threshold is None or not all(
+                                predicate(
+                                    float(guard["measurements"][measurement_name]),
+                                    float(effective_threshold),
+                                )
+                                for guard in guards
+                            ):
+                                passes_complete_policy = False
+                                break
+                        if not passes_complete_policy:
+                            break
+                    if passes_complete_policy:
                         passed_candidates.append(candidate_id)
                 rows.append(
                     {
@@ -6925,13 +9149,11 @@ class Campaign:
         """Freeze the stage's immutable seed-aggregated selection policy."""
 
         payload = self._selection_payload(stage_name)
-        destination = (
-            Path(out)
-            if out is not None
-            else self.root / "selections" / f"{stage_name}.json"
+        destination = _campaign_output_path(
+            self.root,
+            out,
+            self.root / "selections" / f"{stage_name}.json",
         )
-        if not destination.is_absolute():
-            destination = self.root / destination
         _write_immutable_json(destination, payload)
         return payload
 
@@ -6973,13 +9195,11 @@ class Campaign:
             blueprint.initial_stage.name,
             policy_override=family.root_selection_policy,
         )
-        destination = (
-            Path(out)
-            if out is not None
-            else self.root / "selections" / f"family_{family.name}_root.json"
+        destination = _campaign_output_path(
+            self.root,
+            out,
+            self.root / "selections" / f"family_{family.name}_root.json",
         )
-        if not destination.is_absolute():
-            destination = self.root / destination
         _write_immutable_json(destination, payload)
         return payload
 
@@ -7214,15 +9434,11 @@ class Campaign:
         """Freeze a family's complete cross-round top-two nomination."""
 
         payload = self._family_nomination_payload(family_name)
-        destination = (
-            Path(out)
-            if out is not None
-            else self.root
-            / "selections"
-            / f"family_{family_name}_revisit_nomination.json"
+        destination = _campaign_output_path(
+            self.root,
+            out,
+            self.root / "selections" / f"family_{family_name}_revisit_nomination.json",
         )
-        if not destination.is_absolute():
-            destination = self.root / destination
         _write_immutable_json(destination, payload)
         return payload
 
@@ -7241,10 +9457,9 @@ class Campaign:
         """
 
         declared_scope = dict(scope_narrowing or {})
-        self.root.mkdir(parents=True, exist_ok=True)
-        registration_lock = self.root / ".registration.lock"
-        with registration_lock.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
+        with self._registration_mutation():
+            self._reconcile_plan_projection()
             if not self.plan_path.is_file() or not self.blueprint_path.is_file():
                 raise CampaignError(
                     "Phase-1 freeze requires a registered plan and blueprint"
@@ -7290,7 +9505,7 @@ class Campaign:
                 raise CampaignError("Phase-1 plan mixes smoke and scientific cells")
             smoke = smoke_values == {True}
 
-            all_events = self.events()
+            all_events = self._events_cached()
             known_cell_ids = {cell.cell_id for cell in plan.cells}
             unknown_transition_cells = {
                 str(event.get("cell_id"))
@@ -7502,7 +9717,7 @@ class Campaign:
                             "cell_id": cell.cell_id,
                             "qualification_sha256": evidence["qualification_sha256"],
                             **self._phase1_claim_evidence(
-                                evidence["qualification"], smoke=smoke
+                                evidence["qualification"], cell=cell, smoke=smoke
                             ),
                         }
                     )
@@ -7630,13 +9845,11 @@ class Campaign:
                 path = self.plans_dir / f"{_slug(item['plan_id'])}.json"
                 if "sha256:" + _sha256(path) != item["sha256"]:
                     raise CampaignError("Phase-1 plan history changed during freeze")
-            destination = (
-                self.root / "decisions" / "phase2-authorization.json"
-                if out is None
-                else Path(out)
+            destination = _campaign_output_path(
+                self.root,
+                out,
+                self.root / "decisions" / "phase2-authorization.json",
             )
-            if not destination.is_absolute():
-                destination = self.root / destination
             _write_immutable_json(destination, payload)
             return payload
 
@@ -7784,52 +9997,17 @@ class Campaign:
                     "passed": qualification_passed and score_passed and sharing_passed,
                 }
             )
-        sensitivity_rows = [
-            {
-                "threshold": threshold,
-                "passing_seeds": (
-                    None
-                    if smoke
-                    else [
-                        row["seed"]
-                        for row in per_seed
-                        if Campaign._meets_upper_bound(
-                            float(row["score_degradation"]), threshold
-                        )
-                    ]
-                ),
-                "passed_all_seeds": (
-                    None
-                    if smoke
-                    else all(
-                        Campaign._meets_upper_bound(
-                            float(row["score_degradation"]), threshold
-                        )
-                        for row in per_seed
-                    )
-                ),
-            }
-            for threshold in score_sensitivity
-        ]
         return {
             "mode": "smoke_protocol_only" if smoke else "scientific_confirmation",
             "metric_path": policy.metric_path,
             "direction": policy.direction,
             "score_degradation_max": score_degradation_max,
             "score_degradation_threshold_basis": threshold_basis,
-            "score_degradation_sensitivity": {
-                "mode": "marginal_counterfactuals_center_policy_not_retuned",
-                "rows": sensitivity_rows,
-                "ungated_passed_all_seeds": (
-                    None
-                    if smoke
-                    else all(
-                        row["qualification_passed"] is True
-                        and row["sharing_guard_passed"] is True
-                        for row in per_seed
-                    )
-                ),
-            },
+            "score_degradation_sensitivity": (
+                _confirmation_score_sensitivity_payload(
+                    per_seed, score_sensitivity, smoke=smoke
+                )
+            ),
             "policy": policy.to_dict(),
             "per_seed": per_seed,
             "passed": all(item["passed"] is True for item in per_seed),
@@ -7923,10 +10101,9 @@ class Campaign:
         revisits, never from uncalibrated development anchors.
         """
 
-        self.root.mkdir(parents=True, exist_ok=True)
-        registration_lock = self.root / ".registration.lock"
-        with registration_lock.open("a+", encoding="utf-8") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
+        with self._registration_mutation():
+            self._reconcile_plan_projection()
             if not self.plan_path.is_file() or not self.blueprint_path.is_file():
                 raise CampaignError(
                     "panel freeze requires a registered Phase-2 plan and blueprint"
@@ -8001,7 +10178,7 @@ class Campaign:
                 )
             if plan.stages[0] != blueprint.initial_stage:
                 raise CampaignError("Phase-2 initial stage differs from its blueprint")
-            all_events = self.events()
+            all_events = self._events_cached()
             known_cell_ids = {cell.cell_id for cell in plan.cells}
             unknown_transition_cells = {
                 str(event.get("cell_id"))
@@ -8913,13 +11090,11 @@ class Campaign:
                 raise CampaignError(
                     "Phase-2 campaign changed during final panel validation"
                 )
-            destination = (
-                self.root / "decisions" / "phase3-panel.json"
-                if out is None
-                else Path(out)
+            destination = _campaign_output_path(
+                self.root,
+                out,
+                self.root / "decisions" / "phase3-panel.json",
             )
-            if not destination.is_absolute():
-                destination = self.root / destination
             _write_immutable_json(destination, payload)
             return payload
 
@@ -9060,6 +11235,11 @@ class Campaign:
         lock_root = self.root / ".locks"
         if not lock_root.exists():
             return ()
+        try:
+            _active, registrations = self._journal_authority()
+            cell_ids_by_slug = {_slug(cell_id): cell_id for cell_id in registrations}
+        except CampaignError:
+            cell_ids_by_slug = {}
         now = float(self.clock())
         for path in sorted(lock_root.glob("*.lock")):
             guard_path = path.with_suffix(".guard")
@@ -9072,6 +11252,7 @@ class Campaign:
                     )
                 except BlockingIOError:
                     continue
+                malformed_fingerprint: _ArtifactFingerprint | None = None
                 try:
                     payload = _read_json(path)
                     heartbeat = float(
@@ -9081,9 +11262,10 @@ class Campaign:
                 except (CampaignError, KeyError, TypeError, ValueError):
                     try:
                         heartbeat = path.stat().st_mtime
+                        malformed_fingerprint = _ArtifactFingerprint.from_path(path)
                     except FileNotFoundError:
                         continue
-                    cell_id = path.stem
+                    cell_id = cell_ids_by_slug.get(path.stem, path.stem)
                     payload = {}
                 if now - heartbeat <= max_age_seconds:
                     continue
@@ -9109,7 +11291,9 @@ class Campaign:
                         and worker_pgid > 0
                         and isinstance(worker_identity, str)
                         and worker_pgid != os.getpgrp()
-                        and _process_matches(worker_pid, worker_identity)
+                        and _process_matches_for_termination(
+                            worker_pid, worker_identity
+                        )
                     ):
                         try:
                             observed_pgid = os.getpgid(worker_pid)
@@ -9122,7 +11306,9 @@ class Campaign:
                             except ProcessLookupError:
                                 pass
                             for _ in range(20):
-                                if not _process_matches(worker_pid, worker_identity):
+                                if not _process_matches_for_termination(
+                                    worker_pid, worker_identity
+                                ):
                                     break
                                 time.sleep(0.05)
                             else:
@@ -9130,12 +11316,20 @@ class Campaign:
                                     os.killpg(worker_pgid, signal.SIGKILL)
                                 except ProcessLookupError:
                                     pass
-                try:
-                    current = _read_json(path)
-                except (CampaignError, FileNotFoundError):
-                    continue
-                if payload and current.get("attempt_id") != payload.get("attempt_id"):
-                    continue
+                if payload:
+                    try:
+                        current = _read_json(path)
+                    except (CampaignError, FileNotFoundError):
+                        continue
+                    if current.get("attempt_id") != payload.get("attempt_id"):
+                        continue
+                else:
+                    try:
+                        current_fingerprint = _ArtifactFingerprint.from_path(path)
+                    except FileNotFoundError:
+                        continue
+                    if current_fingerprint != malformed_fingerprint:
+                        continue
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -9162,100 +11356,77 @@ class Campaign:
         return tuple(reconciled)
 
     def _reconcile_plan_projection(self) -> str | None:
-        """Republish ``plan.json`` from the authoritative extension journal.
+        """Republish ``plan.json`` from the complete journal-derived plan chain."""
 
-        Immutable plan-history files are written before the journal commit.
-        Therefore a committed extension whose active pointer was not published
-        is recoverable without inventing or rewriting any journal evidence.
-        """
-
-        extension_events = tuple(
-            event for event in self.events() if event.get("event") == "plan_extension"
-        )
-        if not extension_events:
-            return None
-
-        def history_plan(plan_id: str) -> StudyPlan:
-            path = self.plans_dir / f"{_slug(plan_id)}.json"
-            if not path.is_file():
-                raise CampaignError(
-                    f"committed plan extension lacks immutable history {plan_id}"
-                )
-            payload = _read_json(path)
-            try:
-                plan = StudyPlan.from_manifest(payload)
-            except (KeyError, TypeError, ValueError, StudyError) as exc:
-                raise CampaignError(
-                    f"invalid immutable plan history for {plan_id}: {exc}"
-                ) from exc
-            if plan.plan_id != plan_id or canonical_json(payload) != canonical_json(
-                plan.to_manifest()
-            ):
-                raise CampaignError(
-                    f"immutable plan history content mismatch for {plan_id}"
-                )
-            return plan
-
-        first_metadata = extension_events[0].get("metadata")
-        if not isinstance(first_metadata, Mapping):
-            raise CampaignError("plan-extension metadata must be an object")
-        previous_plan_id = str(first_metadata.get("previous_plan_id", ""))
-        committed = history_plan(previous_plan_id)
-        committed_ids = {committed.plan_id}
-        for event in extension_events:
-            metadata = event.get("metadata")
-            if not isinstance(metadata, Mapping):
-                raise CampaignError("plan-extension metadata must be an object")
-            target_plan_id = str(metadata.get("plan_id", ""))
-            if metadata.get("previous_plan_id") != committed.plan_id:
-                raise CampaignError(
-                    "plan-extension journal does not form one ordered plan chain"
-                )
-            target = history_plan(target_plan_id)
-            if (
-                target.phase is not committed.phase
-                or len(target.stages) != len(committed.stages) + 1
-                or target.stages[:-1] != committed.stages
-                or metadata.get("stage") != target.stages[-1].name
-            ):
-                raise CampaignError(
-                    "committed plan extension differs from immutable plan history"
-                )
-            try:
-                refs = tuple(
-                    ArtifactRef.from_dict(item) for item in event.get("artifacts", ())
-                )
-            except (ArtifactError, KeyError, TypeError, ValueError) as exc:
-                raise CampaignError(
-                    f"committed plan extension has invalid artifact evidence: {exc}"
-                ) from exc
-            if len(refs) != 1:
-                raise CampaignError(
-                    "committed plan extension must bind exactly one selection artifact"
-                )
-            refs[0].verify(self.root)
-            if target.plan_id in committed_ids:
-                raise CampaignError("plan-extension journal contains a cycle")
-            committed_ids.add(target.plan_id)
-            committed = target
-
-        if not self.plan_path.is_file():
-            active = None
-        else:
-            try:
-                active = StudyPlan.from_manifest(_read_json(self.plan_path))
-            except (KeyError, TypeError, ValueError, StudyError) as exc:
-                raise CampaignError(
-                    f"active plan projection is invalid: {exc}"
-                ) from exc
-            if active.plan_id not in committed_ids:
-                raise CampaignError(
-                    "active plan projection is not on the authoritative journal chain"
-                )
-        if active is not None and active.plan_id == committed.plan_id:
+        committed = self.plan
+        try:
+            payload = _read_json(self.plan_path)
+            active = StudyPlan.from_manifest(payload)
+            exact = (
+                active == committed
+                and canonical_json(payload) == canonical_json(committed.to_manifest())
+            )
+        except (
+            CampaignError,
+            FileNotFoundError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            StudyError,
+        ):
+            exact = False
+        if exact:
             return None
         _atomic_json(self.plan_path, committed.to_manifest())
         return committed.plan_id
+
+    def _repair_journal_tail_for_reconcile(self) -> bool:
+        if not self.journal_path.is_file():
+            return False
+        try:
+            size = self.journal_path.stat().st_size
+            if size == 0:
+                return False
+            with self.journal_path.open("rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) == b"\n":
+                    return False
+        except OSError as exc:
+            raise CampaignError(f"cannot inspect campaign journal tail: {exc}") from exc
+        self._append_event(
+            self._event(
+                "journal_reconciled",
+                "__campaign__",
+                message="normalized an unterminated final journal record",
+                metadata={},
+                artifacts=(),
+            )
+        )
+        return True
+
+    @contextmanager
+    def _reconciliation_cell_guards(self, cell_ids: Iterable[str]):
+        durable_mkdir(self.root / ".locks", parents=True, exist_ok=True)
+        handles: list[Any] = []
+        try:
+            for cell_id in sorted(set(cell_ids)):
+                handle = self.lock_guard_path(cell_id).open("a+", encoding="utf-8")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    handle.close()
+                    raise CampaignLocked(
+                        f"cannot reconcile while cell {cell_id} is active"
+                    ) from exc
+                handles.append(handle)
+            yield
+        finally:
+            for handle in reversed(handles):
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
 
     def reconcile(self, max_age_seconds: float | None = None) -> dict[str, Any]:
         locks = (
@@ -9263,19 +11434,49 @@ class Campaign:
             if max_age_seconds is not None
             else ()
         )
-        self.root.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.root, parents=True, exist_ok=True)
         registration_lock = self.root / ".registration.lock"
         with registration_lock.open("a+", encoding="utf-8") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            republished = self._reconcile_plan_projection()
-            rebuilt = 0
-            for record in self.records():
-                self._write_snapshot(record)
-                rebuilt += 1
+            with self._campaign_mutation():
+                tail_repaired = self._repair_journal_tail_for_reconcile()
+                plan = self.plan
+                _active, registrations = self._journal_authority()
+                missing = {cell.cell_id for cell in plan.cells}.difference(registrations)
+                if missing:
+                    raise CampaignError(
+                        "active plan has unregistered cells: "
+                        + ", ".join(sorted(missing))
+                    )
+                with self.implementation_identity_lock_path.open(
+                    "a+", encoding="utf-8"
+                ) as implementation_handle:
+                    fcntl.flock(implementation_handle.fileno(), fcntl.LOCK_EX)
+                    with self._reconciliation_cell_guards(
+                        cell.cell_id for cell in plan.cells
+                    ):
+                        republished = self._reconcile_plan_projection()
+                        rebuilt = 0
+                        for cell in plan.cells:
+                            _atomic_json(
+                                self.cell_manifest_path(cell.cell_id),
+                                cell.to_manifest(),
+                            )
+                            self._cell_projection_cache.pop(cell.cell_id, None)
+                            self._write_snapshot(self.record(cell.cell_id))
+                            rebuilt += 1
+                        with self._activation_projection_lock:
+                            self._activation_projection_cursor = 0
+                            self._activation_projection_last_event_id = None
+                            self._activation_projection_raw_digest = None
+                            self._activation_projection_views = {}
+                            self._write_activation_identity_projection()
         result: dict[str, Any] = {
             "stale_locks": list(locks),
             "snapshots_rebuilt": rebuilt,
         }
+        if tail_repaired:
+            result["journal_tail_repaired"] = True
         if republished is not None:
             result["plan_republished"] = republished
         return result
@@ -9554,6 +11755,9 @@ class CampaignRunner:
     ) -> RunState:
         with self.campaign.lock(cell_id) as cell_lock:
             record = self.campaign.record(cell_id)
+            # A power loss after the journal fsync but before the disposable
+            # snapshot rename must not feed stale prerequisites to run_cell.
+            self.campaign._ensure_snapshot(record)
             if record.state is RunState.FAILED:
                 if not resume:
                     return record.state
@@ -9691,7 +11895,7 @@ class CampaignRunner:
             / "stage-artifacts"
             / f"{stage}-{attempt}.json"
         )
-        artifacts_out.parent.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(artifacts_out.parent, parents=True, exist_ok=True)
         if worker is None:
             command = [
                 self.python,
@@ -9741,7 +11945,12 @@ class CampaignRunner:
         ):
             raise ArtifactError("stage-artifact manifest changed while loading")
         refs.append(manifest_ref)
-        return tuple(refs)
+        return self.campaign._authorize_executor_stage_artifacts(
+            cell_id,
+            stage,
+            refs,
+            canonical_executor=(self.module == CANONICAL_CELL_MODULE),
+        )
 
     def _load_artifact_manifest(
         self,
@@ -9774,9 +11983,7 @@ class CampaignRunner:
             if not isinstance(claimed_hash, str):
                 raise ArtifactError(f"child-reported hash is not a string for {kind}")
             if not isinstance(claimed_size, int) or isinstance(claimed_size, bool):
-                raise ArtifactError(
-                    f"child-reported size is not an integer for {kind}"
-                )
+                raise ArtifactError(f"child-reported size is not an integer for {kind}")
             resolved = artifact_path.resolve()
             try:
                 stored_path = str(resolved.relative_to(self.campaign.root.resolve()))

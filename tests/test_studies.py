@@ -22,10 +22,23 @@ from block_crosscoder_experiment.runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    ESTIMATOR_ACTIVATION_SHARD_TOKENS,
+    ESTIMATOR_CHECKPOINT_PARAMETER_BYTES,
+    ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES,
+    ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS,
+    ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES,
+    ESTIMATOR_SERIALIZATION_FIXED_BYTES,
+    ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR,
+    ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR,
+    ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES,
+    GRAM_BLOCK_CHUNK,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    RD_EVALUATION_TOKEN_CHUNK,
+    RETRACTION_UNCHUNKED_MAX_GROUPS,
+    SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     TRUSTED_DECODE_Q_CHUNK,
 )
@@ -1235,15 +1248,18 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
                 assert cell.decision_map[
                     "implementation.factorized_execution_implementation"
                 ] == _expected_factorized_implementation(cell.decision_map)
-                assert cell.decision_map[
-                    "implementation.code_norm_implementation"
-                ] == CODE_NORM_CUDA_IMPLEMENTATION
-                assert cell.decision_map[
-                    "implementation.sparse_decode_implementation"
-                ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
-                assert cell.decision_map[
-                    "implementation.map_nuclear_implementation"
-                ] == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+                assert (
+                    cell.decision_map["implementation.code_norm_implementation"]
+                    == CODE_NORM_CUDA_IMPLEMENTATION
+                )
+                assert (
+                    cell.decision_map["implementation.sparse_decode_implementation"]
+                    == SPARSE_DECODE_CUDA_IMPLEMENTATION
+                )
+                assert (
+                    cell.decision_map["implementation.map_nuclear_implementation"]
+                    == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+                )
                 validate_cell_config(cell)
         return plan
 
@@ -1563,28 +1579,29 @@ def test_manifests_are_deterministic_round_trip_and_tamper_evident():
 def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     phase1_cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     phase1_estimate = estimate_cell(phase1_cell)
-    assert phase1_estimate.estimator == (
-        "dense-linear-memory-v18"
-        f"-q{TRUSTED_DECODE_Q_CHUNK}"
-        f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
-        f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
-        f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
+    assert phase1_estimate.estimator == ESTIMATOR_VERSION
+    checkpoint_bytes = studies_module._checkpoint_artifact_bytes(
+        phase1_estimate.parameters,
+        0,
     )
+    deployment_bytes = studies_module._deployment_artifact_bytes(
+        phase1_estimate.parameters
+    )
+    remaining_bytes = studies_module._persisted_cell_artifact_overhead(phase1_cell)
     assert phase1_estimate.storage_bytes == (
-        phase1_estimate.parameters * 16
-        + studies_module._persisted_cell_artifact_overhead(phase1_cell)
+        checkpoint_bytes
+        + deployment_bytes
+        + remaining_bytes
+        + max(checkpoint_bytes, deployment_bytes, remaining_bytes)
     )
     assert phase1_estimate.checkpoint_write_count == 2
     assert phase1_estimate.cumulative_checkpoint_write_bytes == (
-        phase1_estimate.checkpoint_write_count * phase1_estimate.parameters * 16
+        phase1_estimate.checkpoint_write_count * checkpoint_bytes
     )
     assert phase1_estimate.peak_vram_bytes > phase1_estimate.parameters * 28
     assert phase1_estimate.peak_host_ram_bytes >= 8 * 1024**3
     phase2 = build_phase2_plan(seeds=(0,), smoke=True)
-    per_cell_store = sum(
-        estimate_cell(cell).storage_bytes - estimate_cell(cell).parameters * 16
-        for cell in phase2.cells
-    )
+    per_cell_store = sum(estimate_cell(cell).storage_bytes for cell in phase2.cells)
     estimate = estimate_plan(phase2)
     assert estimate.checkpoint_write_count == sum(
         estimate_cell(cell).checkpoint_write_count for cell in phase2.cells
@@ -1592,18 +1609,31 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     assert estimate.cumulative_checkpoint_write_bytes == sum(
         estimate_cell(cell).cumulative_checkpoint_write_bytes for cell in phase2.cells
     )
-    plan_store = estimate.storage_bytes - sum(
-        estimate_cell(cell).parameters * 16 for cell in phase2.cells
+    components = [studies_module._estimate_components(cell) for cell in phase2.cells]
+    persisted_cell_artifacts = sum(
+        sum(
+            studies_module._cell_persisted_artifact_bytes(
+                cell,
+                parameters=item[1],
+                tracker_checkpoint_bytes=item[6],
+            )
+        )
+        for cell, item in zip(phase2.cells, components)
     )
-    artifact_overhead = sum(
-        studies_module._persisted_cell_artifact_overhead(cell) for cell in phase2.cells
+    transient_publication = max(
+        studies_module._cell_transient_publication_bytes(
+            cell,
+            parameters=item[1],
+            tracker_checkpoint_bytes=item[6],
+            activation_publication_bytes=item[8],
+        )
+        for cell, item in zip(phase2.cells, components)
+    )
+    plan_store = (
+        estimate.storage_bytes - persisted_cell_artifacts - transient_publication
     )
     assert 0 < plan_store < per_cell_store
-    one_derived_view = (
-        estimate_cell(phase2.cells[0]).storage_bytes
-        - estimate_cell(phase2.cells[0]).parameters * 16
-        - studies_module._persisted_cell_artifact_overhead(phase2.cells[0])
-    )
+    one_derived_view = estimate_activation_store(phase2.cells[0])[0]
     sasa = next(
         cell
         for cell in phase2.cells
@@ -1614,7 +1644,7 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         * sasa.decision_map["model.active_blocks"]
         * 4
     )
-    assert plan_store == artifact_overhead + 2 * one_derived_view + sasa_tracker_bytes
+    assert plan_store == 2 * one_derived_view
     Budget(max_training_tokens=estimate.training_tokens).enforce(estimate)
     with pytest.raises(BudgetExceeded, match="training_tokens"):
         Budget(max_training_tokens=estimate.training_tokens - 1).enforce(estimate)
@@ -1672,7 +1702,8 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     expected_sparse_delta = (64 - 32) * active * 4
     assert (
         estimate_cell(larger_window).storage_bytes - estimate_cell(sasa).storage_bytes
-        == expected_sparse_delta
+        # The final checkpoint and its atomic-replacement temporary coexist.
+        == 2 * expected_sparse_delta
     )
     # The explicitly priced joint transformed/raw evaluator is the peak for
     # this tiny smoke cell, so increasing training-only tracker residency does
@@ -1683,17 +1714,9 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
     )
     batch_sasa = _replace_decision(sasa, "model.selector", "block_batchtopk")
     dense_sasa = _replace_decision(sasa, "model.selector", "learned_group_threshold")
-    token_aux_storage = (
-        estimate_cell(sasa).storage_bytes - estimate_cell(sasa).parameters * 16
-    )
-    batch_aux_storage = (
-        estimate_cell(batch_sasa).storage_bytes
-        - estimate_cell(batch_sasa).parameters * 16
-    )
-    dense_aux_storage = (
-        estimate_cell(dense_sasa).storage_bytes
-        - estimate_cell(dense_sasa).parameters * 16
-    )
+    token_aux_storage = estimate_cell(sasa).storage_bytes
+    batch_aux_storage = estimate_cell(batch_sasa).storage_bytes
+    dense_aux_storage = estimate_cell(dense_sasa).storage_bytes
     batch_tracker_bytes = (
         (
             sasa.decision_map["auxiliary.dead_window_tokens"]
@@ -1707,11 +1730,131 @@ def test_resource_estimator_reuses_real_capture_and_budget_refuses_overrun():
         (sasa.decision_map["model.groups"] + 7) // 8
     )
     assert batch_aux_storage - token_aux_storage == (
-        batch_tracker_bytes - sasa_tracker_bytes
+        2 * (batch_tracker_bytes - sasa_tracker_bytes)
+    )
+    dense_parameter_delta = dense_sasa.decision_map["model.groups"]
+    assert (
+        dense_parameter_delta * ESTIMATOR_CHECKPOINT_PARAMETER_BYTES
+        + dense_tracker_bytes
+        - sasa_tracker_bytes
+        == 0
     )
     assert dense_aux_storage - token_aux_storage == (
-        dense_tracker_bytes - sasa_tracker_bytes
+        dense_parameter_delta * ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES
     )
+
+
+def test_v20_serialization_and_activation_shard_ladders_are_fail_closed() -> None:
+    small_payload = 1024
+    assert studies_module._serialized_payload_bytes(small_payload) == (
+        small_payload + ESTIMATOR_SERIALIZATION_FIXED_BYTES
+    )
+    large_payload = (
+        ESTIMATOR_SERIALIZATION_FIXED_BYTES
+        * ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR
+        * 2
+    )
+    assert studies_module._serialized_payload_bytes(large_payload) == (
+        large_payload
+        + large_payload
+        * ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR
+        // ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR
+    )
+
+    bytes_per_row = 97
+    at_boundary, boundary_temp = studies_module._activation_store_storage_bytes(
+        rows_by_split=(ESTIMATOR_ACTIVATION_SHARD_TOKENS,),
+        bytes_per_row=bytes_per_row,
+    )
+    above_boundary, above_temp = studies_module._activation_store_storage_bytes(
+        rows_by_split=(ESTIMATOR_ACTIVATION_SHARD_TOKENS + 1,),
+        bytes_per_row=bytes_per_row,
+    )
+    assert above_boundary - at_boundary == (
+        bytes_per_row
+        + ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES
+        + ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES
+    )
+    assert above_temp == boundary_temp
+
+
+def test_v20_polar_workspace_ladder_prices_chunked_site_scratch() -> None:
+    block_width = 4
+    site_dim = 2560
+    for groups in (
+        RETRACTION_UNCHUNKED_MAX_GROUPS - 1,
+        RETRACTION_UNCHUNKED_MAX_GROUPS,
+        RETRACTION_UNCHUNKED_MAX_GROUPS + 1,
+        2 * RETRACTION_UNCHUNKED_MAX_GROUPS,
+    ):
+        chunk = (
+            groups if groups <= RETRACTION_UNCHUNKED_MAX_GROUPS else GRAM_BLOCK_CHUNK
+        )
+        expected = (
+            4
+            * (
+                ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS * chunk * block_width**2
+                + 4 * chunk * block_width
+                + chunk * block_width * site_dim
+            )
+            + chunk * SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES
+        )
+        actual = studies_module._symmetric_polar_workspace_bytes(
+            groups=groups,
+            block_width=block_width,
+            site_dim=site_dim,
+        )
+        assert actual == expected
+        assert actual >= 4 * chunk * block_width * site_dim
+
+    assert studies_module._symmetric_polar_workspace_bytes(
+        groups=RETRACTION_UNCHUNKED_MAX_GROUPS + 1,
+        block_width=block_width,
+        site_dim=site_dim,
+    ) == studies_module._symmetric_polar_workspace_bytes(
+        groups=2 * RETRACTION_UNCHUNKED_MAX_GROUPS,
+        block_width=block_width,
+        site_dim=site_dim,
+    )
+
+
+def test_panel_freeze_refuses_phase2_candidate_that_fails_phase3_projection() -> None:
+    decision = _panel_decision(build_phase3_blueprint())
+    entry = decision.entries[0]
+    batch_tokens = 12_288
+    replacements = {
+        "optimizer.batch_tokens": batch_tokens,
+        "optimizer.warmup_steps": studies_module._fractional_warmup_steps(
+            1_000_000,
+            batch_tokens,
+            0.05,
+        ),
+    }
+    source_cells = tuple(
+        replace(
+            cell,
+            decisions=tuple(
+                replace(item, value=replacements[item.name])
+                if item.name in replacements
+                else item
+                for item in cell.decisions
+            ),
+        )
+        for cell in entry.source_cells
+    )
+    assert max(estimate_cell(cell).peak_vram_bytes for cell in source_cells) < (
+        PHASE3_VRAM_CEILING_BYTES
+    )
+    projected_entry = replace(entry, source_cells=source_cells)
+
+    with pytest.raises(BudgetExceeded, match="peak_vram_bytes"):
+        replace(
+            decision,
+            entries=tuple(
+                projected_entry if item.panel_slot == entry.panel_slot else item
+                for item in decision.entries
+            ),
+        )
 
 
 def test_phase_budgets_apply_every_ceiling_only_where_declared() -> None:
@@ -1733,7 +1876,7 @@ def test_phase_budgets_apply_every_ceiling_only_where_declared() -> None:
     )
 
 
-def test_v18_prices_tied_encoder_execution_and_exposes_store_projection() -> None:
+def test_v20_prices_tied_encoder_execution_and_exposes_store_projection() -> None:
     cell = next(
         cell
         for cell in build_phase1_plan().cells
@@ -1753,7 +1896,7 @@ def test_v18_prices_tied_encoder_execution_and_exposes_store_projection() -> Non
     assert store_key[0] == Phase.PHASE1.value
 
 
-def test_v18_prices_polar_and_map_regularizer_workspaces(
+def test_v20_prices_polar_and_map_regularizer_workspaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(studies_module, "_evaluation_workspace_bytes", lambda **_: 0)
@@ -1777,15 +1920,15 @@ def test_v18_prices_polar_and_map_regularizer_workspaces(
     values = polar.decision_map
     groups = int(values["model.groups"])
     width = int(values["model.block_width"])
-    total_dim = sum(int(item) for item in values["data.site_dims"])
-    expected_polar = (
-        groups * width * total_dim * 4
-        + 4 * (6 * groups * width**2 + width * max(values["data.site_dims"]))
-        + groups * 256 * 1024
+    expected_polar = studies_module._symmetric_polar_workspace_bytes(
+        groups=groups,
+        block_width=width,
+        site_dim=max(values["data.site_dims"]),
     )
-    assert estimate_cell(polar).peak_vram_bytes - estimate_cell(
-        free
-    ).peak_vram_bytes == expected_polar
+    assert (
+        estimate_cell(polar).peak_vram_bytes - estimate_cell(free).peak_vram_bytes
+        == expected_polar
+    )
 
     nuclear = next(
         cell
@@ -1810,15 +1953,13 @@ def test_v18_prices_polar_and_map_regularizer_workspaces(
     )
     values = nuclear.decision_map
     expected_regularizer = (
-        12
-        * int(values["model.groups"])
-        * int(values["model.block_width"]) ** 2
-        * 4
+        12 * int(values["model.groups"]) * int(values["model.block_width"]) ** 2 * 4
         + int(values["model.groups"]) * 256 * 1024
     )
-    assert estimate_cell(nuclear).peak_vram_bytes - estimate_cell(
-        neutral
-    ).peak_vram_bytes == expected_regularizer
+    assert (
+        estimate_cell(nuclear).peak_vram_bytes - estimate_cell(neutral).peak_vram_bytes
+        == expected_regularizer
+    )
 
 
 def _expected_retraction_implementation(decoder: str) -> str:
@@ -1860,15 +2001,18 @@ def test_decoder_retraction_implementation_is_rederived_for_roots_smoke_and_chil
         assert cell.decision_map[
             "implementation.factorized_execution_implementation"
         ] == _expected_factorized_implementation(cell.decision_map)
-        assert cell.decision_map[
-            "implementation.code_norm_implementation"
-        ] == CODE_NORM_CUDA_IMPLEMENTATION
-        assert cell.decision_map[
-            "implementation.sparse_decode_implementation"
-        ] == SPARSE_DECODE_CUDA_IMPLEMENTATION
-        assert cell.decision_map[
-            "implementation.map_nuclear_implementation"
-        ] == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+        assert (
+            cell.decision_map["implementation.code_norm_implementation"]
+            == CODE_NORM_CUDA_IMPLEMENTATION
+        )
+        assert (
+            cell.decision_map["implementation.sparse_decode_implementation"]
+            == SPARSE_DECODE_CUDA_IMPLEMENTATION
+        )
+        assert (
+            cell.decision_map["implementation.map_nuclear_implementation"]
+            == MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION
+        )
 
     blueprint = build_phase1_blueprint(seeds=(0,), smoke=True)
     plan = build_phase1_plan(seeds=(0,), smoke=True)
@@ -2344,6 +2488,50 @@ def test_evaluation_workspace_prices_dense_support_and_all_q_raw_errors():
     assert by_score["decoder_weighted"] - base == groups * 4
     assert by_score["decoded_energy"] - base == groups * 2**2 * 4
     assert by_score["isolated_loss_decrease"] - base == 3 * groups * 2**2 * 4
+
+
+def test_evaluation_workspace_adds_irreducible_threshold_consumer_carrier() -> None:
+    # Keep the shared branch below R-D while crossing the consumer chunk so
+    # both the bounded packet workspace and full outer z/scores/mask lifetime
+    # are directly observable without allocating any tensors.
+    common = {
+        "batch_tokens": 8192,
+        "groups": 1,
+        "block_width": 2,
+        "total_dim": 96,
+        "operational_decoder_elements": 2 * 96,
+        "quantizer_count": 50,
+        "sites": 3,
+        "site_dim": 32,
+        "selection_score": "code_norm",
+    }
+    actual = _evaluation_workspace_bytes(**common)
+    expected_carrier = common["batch_tokens"] * common["groups"] * (2 * 4 + 4 + 1)
+
+    # The full outer payload stays live, but packet/decode work is bounded to
+    # the separately content-bound consumer chunk.
+    assert expected_carrier == 106_496
+    assert RD_EVALUATION_TOKEN_CHUNK == 4096
+    assert actual == 29_374_272 + expected_carrier
+
+
+def test_phase3_rd_chunk_preserves_scalar_training_batch_and_restores_headroom() -> None:
+    recipe = {
+        name: item for name, _, item in studies_module._phase3_comparator_recipes()
+    }["scalar_relu_batchtopk"]
+    cell = studies_module._cell(
+        recipe,
+        phase=Phase.PHASE3,
+        stage="frozen_panel",
+        seed=0,
+        overrides=studies_module._production_overrides(recipe),
+        label="rd_chunk_projection",
+    )
+    estimate = estimate_cell(cell)
+
+    assert cell.decision_map["optimizer.batch_tokens"] == 8192
+    assert estimate.peak_vram_bytes == 19_212_206_256
+    Budget(max_peak_vram_bytes=PHASE3_VRAM_CEILING_BYTES).enforce(estimate)
 
 
 def test_evaluation_workspace_prices_both_frozen_encoder_site_tensors():

@@ -432,6 +432,11 @@ def _decode_selected_for_evaluation(
     cfg = model.cfg
     if event_count:
         counts = mask.sum(dim=1, dtype=torch.long)
+        if selected_count is not None:
+            torch._assert_async(
+                counts.sum() == event_count,
+                "analytic sparse support count differs from the selector mask",
+            )
         prediction = torch.empty(
             selected.shape[0],
             cfg.n_sites,
@@ -723,8 +728,7 @@ def _evaluate_code_modes(
                 materialized_decoder,
                 selected_count=(
                     model._hard_topk_selected_count(value.shape[0])
-                    if mode == "topk"
-                    and cfg.selection in {"batch_topk", "token_topk"}
+                    if mode == "topk" and cfg.selection in {"batch_topk", "token_topk"}
                     else None
                 ),
             )
@@ -824,6 +828,12 @@ def _evaluate_code_modes(
                 )
                 del selector_residual, selector_counts, selector_state
             full.xhat = None
+        # Do not let the final loop binding keep one complete selector output
+        # alive beyond the shared-endpoint reductions below.  In particular,
+        # the threshold packet consumer must overlap only with the three
+        # tensors it actually consumes, never an incidental prediction/SSE
+        # carrier selected by dictionary insertion order.
+        del full, state
         full_mask_count64 = full_mode_masks.sum(dim=1).double()
         full_support_total64 = full_mask_count64.sum(dim=1)
         all_full_energy64 = torch.zeros(
@@ -977,9 +987,7 @@ def _evaluate_code_modes(
                     )
                 del intersection, reductions, loo_reductions
             union_totals = (
-                full_support_total64_for_batch
-                + partial_totals
-                - intersection_totals
+                full_support_total64_for_batch + partial_totals - intersection_totals
             )
             for mode_index, state in enumerate(mode_states):
                 state[support_intersection_key][index] += intersection_totals[
@@ -1059,25 +1067,38 @@ def _evaluate_code_modes(
                 missing_outputs,
                 missing_mode_masks,
             )
+        threshold_payload = None
         if threshold_batch_consumer is not None:
             threshold_output = full_outputs["threshold"]
-            threshold_batch_consumer(
-                x,
+            threshold_payload = (
                 threshold_output.z,
                 threshold_output.scores,
                 threshold_output.mask,
             )
             del threshold_output
+        # The packet/R-D consumer allocates the largest threshold-path
+        # workspace in the campaign.  Release every shared-endpoint carrier
+        # before entering it, retaining only x and the exact threshold
+        # z/scores/mask payload.  Same-stream CUDA reuse remains ordered by the
+        # allocator, so no device synchronization or empty_cache call is
+        # needed here.
         del (
             encoder_sites,
             null_outputs,
+            zero_x,
             full_outputs,
             full_mode_masks,
             full_mask_count64,
             full_support_total64,
             all_full_energy64,
             raw_full_code,
+            observed_all,
+            only_observed,
+            missing_observed,
         )
+        if threshold_payload is not None:
+            threshold_batch_consumer(x, *threshold_payload)
+            del threshold_payload
         n_tokens += x.shape[0]
 
     if n_tokens == 0:

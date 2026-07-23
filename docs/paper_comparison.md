@@ -408,7 +408,7 @@ distinct nonzero frontier endpoints. Phase 3 therefore contains
 eight preflight cells plus 40 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
-`dense-linear-memory-v18-q2-c512-t256-s32`. Its guarded
+`dense-linear-memory-v20-e8cd28faf7b38d6e64f0426000de174679f4c01413ec6647fa6b997219978e55`. Its guarded
 `stiefel_code_norm_bounded_v1` implementation is an engineering specialization,
 not a paper result or a different scientific score. It uses the algebraic
 decoded-energy/code-norm equality only for an unfactorized Gram/QR Stiefel
@@ -437,7 +437,7 @@ changes only the fp32 site-summation schedule of the same SASA objective and
 falls back wholesale around low-rank or ill-conditioned boundaries; the
 former site-reduced einsum remains its oracle rather than a scientific
 comparator.
-Estimator v18 conservatively retains the prior operational compute and
+Estimator v20 conservatively retains the prior operational compute and
 workspace price.
 
 Deployment evaluation binds the engineering identity
@@ -448,11 +448,22 @@ the public codec result, raw evidence contract, and independent source-free
 packet validation remain unchanged. The deployable carrier canonically
 resolves formerly distinct factorized, mapped-score, and persisted-view full
 paths; this is an execution-identity change, not a paper-method adaptation or
-experimental condition. Evaluation schema v2, the campaign gate, and estimator
-v17 bind and price the fused implementation.
-Executor v6 overlaps one ordered device transfer with the current CUDA batch
+experimental condition. Evaluation schema v3, the campaign gate, and estimator
+v20 bind and price the fused implementation.
+The shared-view carriers are released before packet/R-D consumption; the
+remaining full threshold carrier is priced additively with an exact ordered
+4,096-token R-D microbatch while the scientific outer batch remains unchanged.
+Executor v13 overlaps one ordered device transfer with the current CUDA batch
 and applies the same explicitly closed pipeline to all calibration traversals;
 this does not alter the data stream or scientific method.
+
+The operational fixed-rate choice is also frozen across evidence roles.
+Development selects and content-binds one endpoint pair at each exact budget;
+confirmation and Phase 3 replay the deterministic worst-source-seed policy
+without consulting their own distortion to choose endpoints. A pure endpoint
+still carries the same fixed 32-byte operating record as a mixture. This is a
+novel preregistered deployment policy, not a procedure attributed to any
+comparator paper.
 
 QR versus symmetric-polar retraction remains a scientific architecture choice.
 Canonical QR cells derive `cholesky_qr1_positive_diagonal_cond64_v1`, polar

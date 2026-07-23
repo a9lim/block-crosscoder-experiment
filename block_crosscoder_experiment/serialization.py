@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import math
 import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
@@ -13,54 +13,107 @@ import torch
 
 
 MODEL_STATE_DIGEST_CONTRACT = "sha256_merkle_16m_v1"
+TYPED_PAYLOAD_DIGEST_CONTRACT = "sha256_typed_frames_v1"
 _MODEL_STATE_DIGEST_CHUNK_BYTES = 16 << 20
 _MODEL_STATE_DIGEST_MAX_WORKERS = 16
 
 
-def tensor_payload_digest(value: Any) -> str:
-    """Hash nested JSON scalars and dense tensors without copying host bytes."""
+def _update_frame(
+    digest: Any,
+    type_name: str,
+    payload: bytes | bytearray | memoryview,
+) -> None:
+    """Append one unambiguous typed, length-prefixed byte frame."""
+
+    type_bytes = type_name.encode("ascii")
+    digest.update(struct.pack(">I", len(type_bytes)))
+    digest.update(type_bytes)
+    view = memoryview(payload)
+    if not view.c_contiguous:
+        raise TypeError("typed digest frames require contiguous bytes")
+    byte_view = view.cast("B")
+    digest.update(struct.pack(">Q", byte_view.nbytes))
+    digest.update(byte_view)
+
+
+def typed_payload_digest(value: Any) -> str:
+    """Hash JSON-like values and dense tensors with injective typed framing.
+
+    Container kinds and lengths are authenticated, mappings require string
+    keys and are ordered by their UTF-8 bytes, and tensor storage is streamed
+    through a ``memoryview``.  Unsupported Python objects fail closed instead
+    of being collapsed through ``str()``.
+    """
 
     digest = hashlib.sha256()
-
-    def canonical_json(payload: Any) -> str:
-        return json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+    _update_frame(
+        digest,
+        "contract",
+        TYPED_PAYLOAD_DIGEST_CONTRACT.encode("ascii"),
+    )
 
     def add(item: Any) -> None:
         if torch.is_tensor(item):
-            tensor = item.detach().cpu().contiguous()
-            digest.update(b"tensor\0")
-            digest.update(str(tensor.dtype).encode("ascii"))
-            digest.update(canonical_json(list(tensor.shape)).encode("ascii"))
+            if item.layout != torch.strided:
+                raise TypeError("typed payload digest requires dense strided tensors")
+            tensor = item.detach().cpu().resolve_conj().resolve_neg().contiguous()
+            _update_frame(digest, "value-type", b"tensor")
+            _update_frame(digest, "tensor-dtype", str(tensor.dtype).encode("ascii"))
+            _update_frame(digest, "tensor-rank", struct.pack(">Q", tensor.ndim))
+            for dimension in tensor.shape:
+                _update_frame(
+                    digest,
+                    "tensor-dimension",
+                    struct.pack(">Q", int(dimension)),
+                )
             byte_array = tensor.reshape(-1).view(torch.uint8).numpy()
-            digest.update(memoryview(byte_array))
-        elif isinstance(item, dict):
-            digest.update(b"dict\0")
-            for key in sorted(item):
-                digest.update(str(key).encode("utf-8") + b"\0")
+            _update_frame(digest, "tensor-bytes", memoryview(byte_array))
+        elif isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise TypeError("typed payload digest mappings require string keys")
+            _update_frame(digest, "value-type", b"mapping")
+            _update_frame(digest, "container-length", struct.pack(">Q", len(item)))
+            for key in sorted(item, key=lambda candidate: candidate.encode("utf-8")):
+                _update_frame(digest, "mapping-key", key.encode("utf-8"))
                 add(item[key])
-        elif isinstance(item, (list, tuple)):
-            digest.update(b"seq\0")
+        elif isinstance(item, list):
+            _update_frame(digest, "value-type", b"list")
+            _update_frame(digest, "container-length", struct.pack(">Q", len(item)))
             for child in item:
                 add(child)
+        elif isinstance(item, tuple):
+            _update_frame(digest, "value-type", b"tuple")
+            _update_frame(digest, "container-length", struct.pack(">Q", len(item)))
+            for child in item:
+                add(child)
+        elif item is None:
+            _update_frame(digest, "none", b"")
+        elif isinstance(item, bool):
+            _update_frame(digest, "bool", b"\x01" if item else b"\x00")
+        elif isinstance(item, int):
+            _update_frame(digest, "int", str(item).encode("ascii"))
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("typed payload digest refuses non-finite floats")
+            _update_frame(digest, "float64", struct.pack(">d", item))
+        elif isinstance(item, str):
+            _update_frame(digest, "string", item.encode("utf-8"))
+        elif isinstance(item, (bytes, bytearray, memoryview)):
+            _update_frame(digest, "bytes", memoryview(item))
         else:
-            digest.update(
-                json.dumps(
-                    item,
-                    sort_keys=True,
-                    allow_nan=False,
-                    default=str,
-                ).encode("utf-8")
+            raise TypeError(
+                "typed payload digest does not support "
+                f"{type(item).__module__}.{type(item).__qualname__}"
             )
-            digest.update(b"\0")
 
     add(value)
     return digest.hexdigest()
+
+
+def tensor_payload_digest(value: Any) -> str:
+    """Hash a nested tensor payload under the current typed-frame contract."""
+
+    return typed_payload_digest(value)
 
 
 def model_state_digest(
@@ -82,9 +135,7 @@ def model_state_digest(
         raise ValueError("model state digest requires nonempty string field names")
     arrays: list[Any] = []
     metadata: list[tuple[int, bytes, bytes, tuple[int, ...], int, int]] = []
-    jobs: list[
-        tuple[int, bytes, bytes, tuple[int, ...], int, int, memoryview]
-    ] = []
+    jobs: list[tuple[int, bytes, bytes, tuple[int, ...], int, int, memoryview]] = []
     for field_index, (name, tensor) in enumerate(state.items()):
         if not torch.is_tensor(tensor):
             raise ValueError("model state digest requires named tensors")
@@ -199,6 +250,8 @@ def model_state_digest(
 
 __all__ = [
     "MODEL_STATE_DIGEST_CONTRACT",
+    "TYPED_PAYLOAD_DIGEST_CONTRACT",
     "model_state_digest",
     "tensor_payload_digest",
+    "typed_payload_digest",
 ]

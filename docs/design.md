@@ -485,6 +485,13 @@ check every duplicated source/allocation/implementation field, and match the
 producer implementation against the currently reviewed capture code. A
 well-shaped digest string is not authentication. Scientific capture additionally
 requires a recorded CUDA device request.
+Capture-manifest v2, capture-binding v2, derived-view v2, and transform v2 are
+the only accepted prelaunch shapes. Their content identities use typed,
+length-prefixed streaming fields and bind each split's manifest bytes, physical
+file stream, logical content stream, row-identity stream, geometry, and exact
+allocation. A campaign pins one raw-content digest plus one digest per named
+view; standalone split directories without the authenticated root envelope are
+neither executable inputs nor storage-preflight credit.
 Physical store schema v3 requires `int64` row identities in the manifest,
 every shard record, metadata header, and tensor payload. It records an
 incomplete self-hashed manifest after each durable shard; resume reconstructs
@@ -805,6 +812,15 @@ fixed budget consists of the exact deployable codec plus that budget's one
 record and the bundle hash, while rate accounting charges only the record that
 the consumer actually needs.
 
+Development freezes the endpoint identities selected at all three budgets in
+one content-addressed operating policy. Scalar-RMS confirmation and Phase 3 do
+not rebuild a hull from their own distortions: they replay the policy from the
+deterministic worst-scoring source seed, recomputing only the largest integer
+mixture that fits the current serialized rates. The 32-byte record is present
+and charged even when both endpoints are identical. A missing endpoint,
+changed quantizer identity, incomplete budget grid, or mixture that no longer
+fits fails rather than selecting a replacement from holdout/final evidence.
+
 The cell score is negative mean raw-space FVU over the three frozen budgets.
 Candidates need every seed and a passed scientific outcome. Rank by descending
 median score, then descending worst-seed score, then candidate ID. Transformed
@@ -906,7 +922,7 @@ Method-valid secondary endpoints remain unchanged. Recovery checkpoints every
 they are not an invitation to choose an endpoint after seeing final
 performance.
 
-Resource-estimator schema `dense-linear-memory-v18-q2-c512-t256-s32` reports aggregate optimizer
+Resource-estimator schema `dense-linear-memory-v20-e8cd28faf7b38d6e64f0426000de174679f4c01413ec6647fa6b997219978e55` reports aggregate optimizer
 tokens and FLOPs, maximum parameters per cell, deduplicated persistent storage,
 peak training VRAM, and peak streamed-host RAM. It prices fp32 masters,
 optimizer/gradient state, forward copies, dense code/score workspaces,
@@ -916,7 +932,7 @@ whole-sequence-rounded split allocation and physical max-width site padding.
 The 16-byte parameter price is explicitly checkpoint model plus Adam moments
 plus the separately persisted deployment model; a schema-derived per-cell
 envelope prices codec tensors, reports, manifests, nontrainable buffers, and
-container metadata. Estimator v18 additionally
+container metadata. Estimator v20 additionally
 prices the one-batch CUDA copy-stream lookahead at each phase's exact input
 precision and paired-stream topology; the existing host-prefetch queues remain
 inside the separately declared streamed-host headroom. It prices tied-encoder
@@ -930,7 +946,7 @@ storage, and dense-compute ceilings at all three boundaries.
 Site-axis factorization reduces trainable parameters, optimizer state, and
 checkpoint bytes. Canonical factorized execution contracts the site basis and
 rank core directly and does not materialize full encoder or decoder site
-tensors. Estimator v18 nevertheless retains the previous unfactorized FLOP and
+tensors. Estimator v20 nevertheless retains the previous unfactorized FLOP and
 operational-workspace prices: the measured speed and memory reduction are not
 planning credit until a separately audited estimator version prices every
 direct-rank lifetime.
@@ -1234,6 +1250,15 @@ weight decay, and immutable Adam controls. This is necessary because PyTorch's
 optimizer loader otherwise permits serialized group flags to replace the
 constructor's kernel choice silently.
 
+Registration freezes implementation identity v2 before publishing plan or
+worker state. Its execution digest covers the exact Python package bytes,
+dependency versions, Python/platform/Torch/CUDA build, numerical backend flags
+and environment, driver/cuDNN, and physical CUDA device identities. Git
+commit/dirty state remains authenticated provenance and a clean-commit gate for
+scientific work, but does not perturb the execution digest when identical bytes
+are committed. Every preparation compares this pin in O(1); there is no
+first-preparation adoption or legacy identity shape.
+
 On jobe, isolated optimizer steps are `2.10x` faster for Adam and `2.37x` for
 AdamW. In the final wired AdamW gate, complete Phase-2-shaped QR Trainer steps
 improve from `101.296` to `99.214 ms` (`2.06%`), while polar-carrier steps
@@ -1407,7 +1432,7 @@ prediction relative L2 drift at most `3e-7`, and per-site squared-error relative
 drift at most `1e-9`. Repeated CSR execution is bounded, not claimed bitwise
 deterministic, with maximum absolute disagreement at most `1e-6`. Zero support,
 the exact density boundary, the first event above it, bias, padding, and dtype
-fallbacks are release fixtures. Estimator `dense-linear-memory-v18-...-s32`
+fallbacks are release fixtures. Estimator `dense-linear-memory-v20-e8cd28fa...`
 content-binds and prices the capped coordinates, values, columns, row pointer,
 and one live site output. Any kernel, density, or bound change requires a new
 clean implementation identity and fresh audit before launch.
@@ -1457,11 +1482,15 @@ block width four, 512 pinned-host tokens, a 201,338,880-byte model), five
 alternating end-to-end in-memory passes measured `116.836 ms` for the separate
 selector/shared plus R-D traversals and `116.156 ms` for the fused traversal:
 `1.0059x`, saving `0.680 ms` per batch before counting the eliminated second
-store read. Peak CUDA allocation rose from `4,795,438,080` to
-`4,896,102,400` bytes (`+96.001 MiB`) because endpoint reducers now remain
-resident during packet decodes; estimator v18 prices this overlap. Direct
-packet-event comparison proved counts, block IDs, original IDs, and canonical
-codes bit-identical when gathering raw `z` at the selected positions.
+store read. Direct packet-event comparison proved counts, block IDs, original
+IDs, and canonical codes bit-identical when gathering raw `z` at the selected
+positions. The final v20 lifetime releases encoder-site, partial-view, and
+shared reducer carriers before packet/R-D consumption. It retains only the
+full threshold `z`/score/mask carrier and streams the R-D consumer in exact
+ordered 4,096-token microbatches without changing the declared 8,192-token
+scientific batch. The estimator prices that irreducible threshold carrier
+additively with the bounded R-D workspace. The largest current Phase-3 scalar
+comparator projects `19,212,206,256` bytes against the 22 GB gate.
 The executor composes ordered pinned-host prefetch with a one-batch-ahead
 dedicated CUDA copy stream for training, ordinary metric evaluation, and the
 paired rate-distortion stream. Threshold fitting, achieved-rate preflight, and
@@ -1508,7 +1537,7 @@ p95 for the former separate transformed/raw traversals and `25.707 ms` /
 execution gives maximum transformed-FVU relative disagreement `4.99e-11` and
 raw aggregate disagreement `1.25e-11`. On the same activation shape, compiled
 persisted-view validation measures `0.326 ms` versus `0.695 ms` eager (`2.13x`)
-and saves `96.0 MiB` peak. Estimator v18 explicitly prices paired raw and
+and saves `96.0 MiB` peak. Estimator v20 explicitly prices paired raw and
 transformed targets, both metric lifetimes, all-q raw errors, cached forward and
 inverse normalization operators, and the persisted-validation peak; it grants
 no speculative memory credit for the removed second traversal.
@@ -1562,7 +1591,7 @@ paired steps, combined model-plus-optimizer state drift is `.02535`, accumulated
 support disagreement is `7.31e-5`, and support IoU is `.981462`. Initial and
 terminal fp32/bf16 Gram residuals remain within their declared gates.
 
-Estimator v18 conservatively credits only four fp32
+Estimator v20 conservatively credits only four fp32
 `[batch_tokens, groups, block_width]` selector work buffers plus the omitted
 fp32 score Gram when the explicit bounded identity and its full predicate both
 hold. An otherwise eligible exact implementation receives no credit. Sparse
@@ -1630,8 +1659,9 @@ The qualification artifact separately records:
 - `selection_metrics`: the hash-bound metrics consumed by the frozen policy.
 
 Study manifests use `bsc-study-v3`, blueprints use `bsc-blueprint-v5`,
-preparations use `bsc-preparation-v3`, and qualifications use
-`bsc-qualification-v3`. The v3 qualification binds the preparation plus every
+preparations use `bsc-preparation-v4`, evaluations use `bsc-evaluation-v3`, and
+qualifications use `bsc-qualification-v4`. The v4 qualification binds the
+preparation plus every
 downstream input hash and repeats the preparation's complete implementation
 identity. Detached Phase-1 and Phase-2 decision replay reruns the same semantic
 qualification contract, including outcome/eligibility consistency, rather than

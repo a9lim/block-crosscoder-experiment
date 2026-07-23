@@ -30,27 +30,22 @@ from .runtime_limits import (
     CHOLESKY_QR_RECONSTRUCTION_RELATIVE_RESIDUAL_MAX,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
+    GRAM_BLOCK_CHUNK,
     MAP_NUCLEAR_DECODER_CHOLESKY_DIAGONAL_RATIO_MIN,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     MAP_NUCLEAR_SPECTRUM_RATIO_MIN,
+    RETRACTION_UNCHUNKED_MAX_GROUPS,
+    SMALL_MATRIX_EIGH_MAX_BATCH,
+    SPECTRUM_CPU_GRAM_BLOCK_CHUNK,
+    SPECTRUM_CUDA_GRAM_BLOCK_CHUNK,
+    SPECTRUM_UNCHUNKED_MAX_GROUPS,
     SYMMETRIC_POLAR_FAST_FLOOR_MULTIPLIER,
     SYMMETRIC_POLAR_FAST_MIN_GROUPS,
     SYMMETRIC_POLAR_FAST_MIN_SITE_BLOCK_WIDTH,
     SYMMETRIC_POLAR_FAST_SPECTRUM_RATIO_MIN,
 )
 
-# Safe batch count for cusolver's batched symmetric eigensolvers
-# (empirical ceiling sits between 24576 and 32768 on CUDA 12.8).
-_EIGH_MAX_BATCH = 16384
-# G8192/b4 fits the 4090 for forward/backward but the unconstrained einsum
-# planner requests an additional ~2.5 GiB workspace during retraction. Chunk
-# over blocks so temporary memory scales with this constant, not the dictionary.
-_GRAM_BLOCK_CHUNK = 512
-_RETRACT_UNCHUNKED_MAX = 4096
-_SPECTRUM_BLOCK_CHUNK = 256
-_SPECTRUM_CUDA_BLOCK_CHUNK = 256
-_SPECTRUM_UNCHUNKED_MAX = 4096
 _CUDA_FINITE_FUSION_MIN_ELEMENTS = 1 << 20
 
 __all__ = [
@@ -115,16 +110,16 @@ def block_gram(D: torch.Tensor) -> torch.Tensor:
 
     D: [S, G, b, d]  ->  M: [G, b, b]
     """
-    if D.shape[1] <= _GRAM_BLOCK_CHUNK:
+    if D.shape[1] <= GRAM_BLOCK_CHUNK:
         return torch.einsum("sgbd,sgcd->gbc", D, D)
     return torch.cat(
         [
             torch.einsum(
                 "sgbd,sgcd->gbc",
-                D[:, start : start + _GRAM_BLOCK_CHUNK],
-                D[:, start : start + _GRAM_BLOCK_CHUNK],
+                D[:, start : start + GRAM_BLOCK_CHUNK],
+                D[:, start : start + GRAM_BLOCK_CHUNK],
             )
-            for start in range(0, D.shape[1], _GRAM_BLOCK_CHUNK)
+            for start in range(0, D.shape[1], GRAM_BLOCK_CHUNK)
         ],
         dim=0,
     )
@@ -184,7 +179,9 @@ def _retract_count_tensor_(
         raise TypeError(f"retraction operates on fp32 master weights, got {D.dtype}")
     floor_hits = torch.zeros((), dtype=torch.int64, device=D.device)
     chunk_size = (
-        D.shape[1] if D.shape[1] <= _RETRACT_UNCHUNKED_MAX else _GRAM_BLOCK_CHUNK
+        D.shape[1]
+        if D.shape[1] <= RETRACTION_UNCHUNKED_MAX_GROUPS
+        else GRAM_BLOCK_CHUNK
     )
     fast_shape = (
         D.device.type == "cuda"
@@ -442,22 +439,22 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
 
     D: [S, G, b, d]  ->  [S, G, b]
     """
-    if D.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
+    if D.shape[1] > SPECTRUM_UNCHUNKED_MAX_GROUPS:
         if D.is_cuda:
             # cuSOLVER reserves substantial workspace per tiny matrix.  A
             # fixed 256-block slice bounds that workspace while keeping both
             # the eigensolve and its backward pass on device; the former CPU
             # fallback paid a full synchronization and PCIe round-trip.
             chunks = []
-            for start in range(0, D.shape[1], _SPECTRUM_CUDA_BLOCK_CHUNK):
-                block = D[:, start : start + _SPECTRUM_CUDA_BLOCK_CHUNK].float()
+            for start in range(0, D.shape[1], SPECTRUM_CUDA_GRAM_BLOCK_CHUNK):
+                block = D[:, start : start + SPECTRUM_CUDA_GRAM_BLOCK_CHUNK].float()
                 gram = torch.einsum("sgbd,sgcd->sgbc", block, block)
                 flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
                 chunks.append(torch.linalg.eigvalsh(flat).reshape(gram.shape[:-1]))
             return (torch.cat(chunks, dim=1).clamp_min(0.0) + eps).sqrt()
         gram_chunks = []
-        for start in range(0, D.shape[1], _SPECTRUM_BLOCK_CHUNK):
-            block = D[:, start : start + _SPECTRUM_BLOCK_CHUNK].float()
+        for start in range(0, D.shape[1], SPECTRUM_CPU_GRAM_BLOCK_CHUNK):
+            block = D[:, start : start + SPECTRUM_CPU_GRAM_BLOCK_CHUNK].float()
             gram_chunks.append(torch.einsum("sgbd,sgcd->sgbc", block, block))
         gram = torch.cat(gram_chunks, dim=1)
         flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
@@ -476,11 +473,11 @@ def site_singular_values(D: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     # CUSOLVER_STATUS_INVALID_VALUE on finite input), so chunk the flat
     # batch; hit at G=8192, S=6.
     flat = gram_s.reshape(-1, gram_s.shape[-2], gram_s.shape[-1])
-    if flat.shape[0] > _EIGH_MAX_BATCH:
+    if flat.shape[0] > SMALL_MATRIX_EIGH_MAX_BATCH:
         evals = torch.cat(
             [
-                torch.linalg.eigvalsh(flat[i : i + _EIGH_MAX_BATCH])
-                for i in range(0, flat.shape[0], _EIGH_MAX_BATCH)
+                torch.linalg.eigvalsh(flat[i : i + SMALL_MATRIX_EIGH_MAX_BATCH])
+                for i in range(0, flat.shape[0], SMALL_MATRIX_EIGH_MAX_BATCH)
             ]
         ).reshape(gram_s.shape[:-1])
     else:
@@ -563,9 +560,7 @@ def map_nuclear_penalty(
                 block_dim=E.shape[2],
                 eps=eps,
             )
-        squared_singular_values = torch.linalg.eigvalsh(
-            ld.transpose(-1, -2) @ me @ ld
-        )
+        squared_singular_values = torch.linalg.eigvalsh(ld.transpose(-1, -2) @ me @ ld)
         spectral_max = squared_singular_values.amax(dim=-1)
         spectral_safe = (
             torch.isfinite(squared_singular_values).all(dim=-1)
@@ -661,11 +656,11 @@ def _factorized_decoder_gram_eigenvalues(
         pair_gram,
     )
     flat = gram.reshape(-1, gram.shape[-2], gram.shape[-1])
-    if flat.shape[0] > _EIGH_MAX_BATCH:
+    if flat.shape[0] > SMALL_MATRIX_EIGH_MAX_BATCH:
         evals = torch.cat(
             [
-                torch.linalg.eigvalsh(flat[i : i + _EIGH_MAX_BATCH])
-                for i in range(0, flat.shape[0], _EIGH_MAX_BATCH)
+                torch.linalg.eigvalsh(flat[i : i + SMALL_MATRIX_EIGH_MAX_BATCH])
+                for i in range(0, flat.shape[0], SMALL_MATRIX_EIGH_MAX_BATCH)
             ]
         )
     else:
@@ -684,16 +679,16 @@ def factorized_decoder_nuclear_penalty(
     _validate_factorized_regularizer_inputs(D_site, D_core)
     if eps < 0:
         raise ValueError("eps must be nonnegative")
-    if D_core.shape[1] > _SPECTRUM_UNCHUNKED_MAX:
+    if D_core.shape[1] > SPECTRUM_UNCHUNKED_MAX_GROUPS:
         chunks = [
             _factorized_decoder_gram_eigenvalues(
                 D_site,
-                D_core[:, start : start + _SPECTRUM_CUDA_BLOCK_CHUNK],
+                D_core[:, start : start + SPECTRUM_CUDA_GRAM_BLOCK_CHUNK],
             )
             for start in range(
                 0,
                 D_core.shape[1],
-                _SPECTRUM_CUDA_BLOCK_CHUNK,
+                SPECTRUM_CUDA_GRAM_BLOCK_CHUNK,
             )
         ]
         eigenvalues = torch.cat(chunks, dim=1)

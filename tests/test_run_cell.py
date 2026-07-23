@@ -8,6 +8,7 @@ import json
 import hashlib
 import io
 import inspect
+import math
 import os
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from block_crosscoder_experiment.campaign import (
 from block_crosscoder_experiment.cli.run_cell import (
     CellExecutionError,
     _Context,
+    _consume_chunked_rd_evaluation_batch,
     _FileFingerprint,
     _RawEndpointErrorCache,
     _RetainedArtifactKey,
@@ -40,6 +42,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _apply_encoder_scale_calibration,
     _encoder_scale_fit_batches,
     _execution_rng_snapshot,
+    _finalize_development_time_sharing,
     _evaluate_cached_time_sharing,
     _balanced_schedule_uses_upper,
     _expected_capture_allocation,
@@ -63,6 +66,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _production_precision_preflight,
     _resolve_real_store,
     _selection_validation_metrics,
+    _selected_time_sharing_plans,
     _synthetic_batches,
     _synthetic_dataset,
     _synthetic_source_contract,
@@ -74,20 +78,34 @@ from block_crosscoder_experiment.cli.run_cell import (
     _transform_on_cuda,
     _training_batches,
     _validate_final_checkpoint,
+    _validate_preparation_contract,
     _verify_real_source_contract,
     _verify_store_reader_once,
     _write_deployment_schedule_bundle,
     validate_cell_config,
+)
+from block_crosscoder_experiment.codec import (
+    Codec,
+    CodecSpec,
+    _RDEvaluationInput,
+    _RDEvaluationSelection,
+    _RDEvaluationSession,
+    fit_codec,
 )
 from block_crosscoder_experiment.serialization import (
     MODEL_STATE_DIGEST_CONTRACT,
     model_state_digest,
 )
 from block_crosscoder_experiment.cli.data import (
+    CAPTURE_BINDING_SCHEMA,
+    CAPTURE_MANIFEST_SCHEMA,
     capture_implementation_contract,
+    estimate_capture_pipeline_residency_bytes,
+    estimate_writer_residency_bytes,
     fit_transform_artifacts,
+    validate_capture_manifest,
 )
-from block_crosscoder_experiment.codec import Codec
+import block_crosscoder_experiment.implementation as implementation_module
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
 from block_crosscoder_experiment.runtime_limits import (
     CODE_NORM_CUDA_IMPLEMENTATION,
@@ -104,6 +122,7 @@ from block_crosscoder_experiment.runtime_limits import (
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    RD_EVALUATION_TOKEN_CHUNK,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
 )
 from block_crosscoder_experiment.store import (
@@ -764,6 +783,94 @@ def test_evaluate_uses_one_common_selector_and_shared_stream() -> None:
     assert "encode_batch(" not in source
 
 
+def test_rd_consumer_chunk_preserves_complete_ordered_outer_payload() -> None:
+    batch_tokens = RD_EVALUATION_TOKEN_CHUNK + 17
+    transformed = torch.arange(batch_tokens * 6, dtype=torch.float32).reshape(
+        batch_tokens, 2, 3
+    )
+    row_ids = torch.arange(batch_tokens * 3).reshape(batch_tokens, 3)
+    context = transformed + 0.5
+    z = torch.arange(batch_tokens * 8, dtype=torch.float32).reshape(batch_tokens, 4, 2)
+    scores = torch.arange(batch_tokens * 4, dtype=torch.float32).reshape(
+        batch_tokens, 4
+    )
+    mask = scores.remainder(3) == 0
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def consume(self, item, *, threshold_selection) -> None:
+            self.calls.append((item, threshold_selection))
+
+    session = RecordingSession()
+    _consume_chunked_rd_evaluation_batch(
+        session,
+        _RDEvaluationInput(transformed, row_ids, context),
+        _RDEvaluationSelection(z, scores, mask),
+    )
+
+    assert [len(item.transformed) for item, _ in session.calls] == [
+        RD_EVALUATION_TOKEN_CHUNK,
+        17,
+    ]
+    assert torch.equal(
+        torch.cat([item.transformed for item, _ in session.calls]), transformed
+    )
+    assert torch.equal(torch.cat([item.row_ids for item, _ in session.calls]), row_ids)
+    assert torch.equal(torch.cat([item.context for item, _ in session.calls]), context)
+    for field, expected in (("z", z), ("scores", scores), ("mask", mask)):
+        assert torch.equal(
+            torch.cat([getattr(selection, field) for _, selection in session.calls]),
+            expected,
+        )
+
+
+def test_rd_consumer_chunk_is_bit_exact_to_one_full_session_batch() -> None:
+    generator = torch.Generator().manual_seed(3901)
+    model = BlockCrosscoder(
+        BSCConfig(
+            n_blocks=4,
+            block_dim=2,
+            n_sites=2,
+            d_model=3,
+            k=1,
+            selection="batch_topk",
+        )
+    )
+    calibration = torch.randn(64, 2, 3, generator=generator)
+    model.fit_threshold_([calibration], target_avg_blocks=1)
+    codec = fit_codec(
+        model,
+        [calibration],
+        CodecSpec(qs=(2, 4), floor=1, n_bootstrap=8),
+    )
+    batch_tokens = RD_EVALUATION_TOKEN_CHUNK + 17
+    transformed = torch.randn(batch_tokens, 2, 3, generator=generator)
+    row_ids = torch.stack(
+        (torch.arange(batch_tokens), torch.arange(batch_tokens)),
+        dim=1,
+    )
+    selected, _, _ = model.select_with_materialized(transformed, mode="threshold")
+    selection = _RDEvaluationSelection(
+        selected.z,
+        selected.scores,
+        selected.mask,
+    )
+    rd_input = _RDEvaluationInput(transformed, row_ids, transformed.clone())
+
+    full_session = _RDEvaluationSession(model, codec)
+    full_session.consume(rd_input, threshold_selection=selection)
+    expected = full_session.finalize()
+
+    chunked_session = _RDEvaluationSession(model, codec)
+    _consume_chunked_rd_evaluation_batch(chunked_session, rd_input, selection)
+    actual = chunked_session.finalize()
+
+    assert actual == expected
+    assert _tensor_payload_digest(actual) == _tensor_payload_digest(expected)
+
+
 def test_calibrate_prefetches_and_closes_all_three_cuda_traversals() -> None:
     source = inspect.getsource(run_cell_module._calibrate)
     assert source.count("_prefetched_evaluation_batches(") == 3
@@ -1232,12 +1339,15 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     )
     assert set(qualification["implementation_identity"]["dependencies"]) == {
         "datasets",
+        "block-crosscoder-experiment",
         "huggingface-hub",
         "numpy",
         "sae-lens",
         "safetensors",
         "torch",
+        "transformer-lens",
         "transformers",
+        "triton",
     }
     evaluation = json.loads(refs["evaluation"].resolve(campaign.root).read_text())
     assert evaluation["synthetic_recovery"]["native"]["n_truth_factors"] > 0
@@ -1255,6 +1365,80 @@ def test_tiny_phase1_cell_runs_all_five_stages_and_binds_inputs(tmp_path: Path) 
     assert evaluation["deployed_selector"]["mode"] == "threshold"
     assert evaluation["codec_roundtrip"]["source_free_decode"] is True
     assert evaluation["rate_distortion"]["points"]["8"]["rate_bits_per_token"] >= 0
+
+
+def test_preparation_contract_rejects_cell_divergent_synthetic_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cell = _cell(seed=83)
+    campaign = _campaign(tmp_path, cell)
+    assert _runner(campaign).run(stop_after="prepare").completed_cells == 1
+    campaign.transition(cell.cell_id, RunState.RUNNING)
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign.root))
+    ctx = _Context(
+        campaign.cell_manifest_path(cell.cell_id),
+        campaign.cell_dir(cell.cell_id) / "contract-test-artifacts.json",
+        "train",
+    )
+    preparation = json.loads(ctx.preparation.read_text())
+    cell_manifest_sha256 = hashlib.sha256(ctx.cell_path.read_bytes()).hexdigest()
+    _validate_preparation_contract(
+        ctx.cell,
+        preparation,
+        cell_manifest_sha256=cell_manifest_sha256,
+    )
+
+    mutations = []
+    wrong_range = copy.deepcopy(preparation)
+    wrong_range["data"]["ranges"]["evaluation"][0] += 1
+    mutations.append(wrong_range)
+    wrong_normalization = copy.deepcopy(preparation)
+    wrong_normalization["data"]["normalization"]["scale"][0] *= 2.0
+    mutations.append(wrong_normalization)
+    wrong_stream = copy.deepcopy(preparation)
+    wrong_stream["data"]["evaluation_stream"] = "confirmation"
+    mutations.append(wrong_stream)
+    wrong_seed = copy.deepcopy(preparation)
+    wrong_seed["random"]["eval_data_seed"] += 1
+    mutations.append(wrong_seed)
+    for forged in mutations:
+        with pytest.raises(CellExecutionError, match="differs|stale"):
+            _validate_preparation_contract(
+                ctx.cell,
+                forged,
+                cell_manifest_sha256=cell_manifest_sha256,
+            )
+
+
+def test_executor_ignores_forged_state_snapshot_and_replays_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cell = _cell(seed=89)
+    campaign = _campaign(tmp_path, cell)
+    assert _runner(campaign).run(stop_after="prepare").completed_cells == 1
+    campaign.transition(cell.cell_id, RunState.RUNNING)
+    snapshot = json.loads(campaign.state_path(cell.cell_id).read_text())
+    snapshot["state"] = "trained"
+    snapshot["artifacts"] = [
+        {
+            "kind": "checkpoint",
+            "path": "/tmp/forged-checkpoint.pt",
+            "sha256": "f" * 64,
+            "size_bytes": 1,
+        }
+    ]
+    campaign.state_path(cell.cell_id).write_text(json.dumps(snapshot) + "\n")
+    monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign.root))
+    ctx = _Context(
+        campaign.cell_manifest_path(cell.cell_id),
+        campaign.cell_dir(cell.cell_id) / "journal-state-artifacts.json",
+        "train",
+    )
+    state, artifacts = ctx.state()
+    assert state == "running"
+    assert set(artifacts) == {"preparation", "prepare_manifest"}
 
 
 def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
@@ -1293,7 +1477,7 @@ def test_persistent_worker_is_byte_exact_with_one_shot_stage_processes(
     )
     assert "model_state" in durable_deployment
     assert "codec_payload" in durable_deployment
-    assert preparation["implementation"]["executor_schema"] == ("bsc-cell-executor-v12")
+    assert preparation["implementation"]["executor_schema"] == ("bsc-cell-executor-v13")
     assert preparation["implementation"]["executor_process_model"] == (
         "persistent_exact_snapshot_lineage_v5"
     )
@@ -2169,9 +2353,9 @@ def test_scientific_prepare_requires_clean_committed_source(
         preparation=tmp_path / "preparation.json",
     )
     identity = run_cell_module._implementation_identity()
-    identity["git_dirty"] = True
+    identity["provenance"]["git"]["source_dirty"] = True
     monkeypatch.setattr(run_cell_module, "_implementation_identity", lambda: identity)
-    with pytest.raises(CellExecutionError, match="scientific cells require"):
+    with pytest.raises(CellExecutionError, match="scientific execution requires"):
         run_cell_module._prepare(ctx)
 
 
@@ -2694,9 +2878,9 @@ def test_group_lasso_encoder_scale_fit_remeasures_postactivation_norm() -> None:
     assert result["statistic"] == "global_fp64_mean_postactivation_block_norm"
     assert result["solver"] == "positive_bracketed_bisection_remeasure_v1"
     assert result["remeasured_post_fit"] is True
-    assert abs(result["mean_block_norm_after"] - result["target"]) <= result[
-        "tolerance"
-    ]
+    assert (
+        abs(result["mean_block_norm_after"] - result["target"]) <= result["tolerance"]
+    )
     assert result["mean_block_norm_after"] != pytest.approx(
         result["mean_block_norm_before"] * result["scale_multiplier"],
         abs=1e-6,
@@ -2825,7 +3009,7 @@ def test_store_verification_cache_override_is_rejected(tmp_path, monkeypatch):
         _verify_store_reader_once(StoreReader(root, "train"), root, "train")
 
 
-def test_store_receipt_reuse_rechecks_deterministic_content_probe(
+def test_store_receipt_reuse_rechecks_complete_stat_fingerprint(
     tmp_path, monkeypatch
 ):
     root = tmp_path / "store"
@@ -2849,27 +3033,13 @@ def test_store_receipt_reuse_rechecks_deterministic_content_probe(
     monkeypatch.setenv("BSC_CAMPAIGN_ROOT", str(campaign_root))
     _VERIFIED_STORE_BINDINGS.clear()
     _verify_store_reader_once(StoreReader(root, "train"), root, "train")
-    [receipt_path] = (campaign_root / ".store-verification").glob("*.json")
-    receipt = json.loads(receipt_path.read_text())
-
     shard = root / "train" / "shard_00000.safetensors"
     body = bytearray(shard.read_bytes())
     body[-1] ^= 1
     shard.write_bytes(body)
 
-    # Simulate a stat-only receipt refreshed by an unsafe external actor while
-    # leaving the verifier-issued content probe unchanged. The bounded read
-    # must invalidate reuse and force the full checksum verifier.
-    status = shard.stat()
-    receipt["stat_fingerprint"]["shards"][0] = {
-        "path": str(shard.resolve()),
-        "size_bytes": status.st_size,
-        "mtime_ns": status.st_mtime_ns,
-        "ctime_ns": status.st_ctime_ns,
-        "device": status.st_dev,
-        "inode": status.st_ino,
-    }
-    receipt_path.write_text(json.dumps(receipt) + "\n")
+    # An ordinary in-place mutation changes ctime/mtime and must invalidate the
+    # durable receipt before any consumer can reuse it.
     _VERIFIED_STORE_BINDINGS.clear()
     with pytest.raises(ValueError, match="checksum"):
         _verify_store_reader_once(StoreReader(root, "train"), root, "train")
@@ -2931,12 +3101,18 @@ def test_host_gpu_lock_serializes_cuda_cells_across_campaigns(tmp_path, monkeypa
     cell_path = tmp_path / "cell.json"
     cell_path.write_text(json.dumps(cuda_cell.to_manifest()) + "\n")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", f"test-{tmp_path.name}")
+    monkeypatch.setattr(
+        implementation_module,
+        "physical_cuda_device_key",
+        lambda _device: "GPU-test-physical-device",
+    )
     lock_path = _gpu_lock_path(torch.device("cuda"))
     lock_path.unlink(missing_ok=True)
     with _host_gpu_execution_lock(cell_path):
         payload = json.loads(lock_path.read_text())
-        assert payload["schema"] == "bsc-host-gpu-lock-v1"
-        assert payload["cell_id"] == cuda_cell.cell_id
+        assert payload["schema"] == "bsc-host-gpu-lock-v2"
+        assert payload["owner_id"] == cuda_cell.cell_id
+        assert payload["physical_device"] == "GPU-test-physical-device"
         contender = os.open(lock_path, os.O_RDWR)
         try:
             with pytest.raises(BlockingIOError):
@@ -3440,37 +3616,58 @@ def test_fixed_rate_budget_uses_better_lower_rate_packet(
     deployment = tmp_path / "deployable-codec.pt"
     deployment.write_bytes(b"x")
     deployment_hash = hashlib.sha256(deployment.read_bytes()).hexdigest()
-    _, schedule_manifest, _ = _schedule_bundle(
+    ctx = SimpleNamespace(cell=cell, values=values)
+    rd_payload = {
+        "rate_model": "fixed_width_count_plus_block_ids_plus_amplitudes_v1",
+        "support_count_width_bits": 5,
+        "support_id_width_bits": 8,
+        "codec_meta": {
+            "packet_contract": values["codec.packet_contract"],
+            "side_information_contract": values["codec.side_information_contract"],
+            "count_alphabet_max": 16,
+        },
+        "points": {
+            "4": {"rate_bits_per_token": 4.0},
+            "8": {"rate_bits_per_token": 8.0},
+        },
+    }
+    raw_payload = {
+        "eligible": True,
+        "points": {
+            "4": {"fvu_pooled": 0.8},
+            "8": {"fvu_pooled": 0.9},
+        },
+    }
+    plans = _selected_time_sharing_plans(
+        ctx,
+        rd=rd_payload,
+        raw_space=raw_payload,
+        deployment_artifact_size_bytes=deployment.stat().st_size,
+    )
+    assert len(plans) == 1
+    _, schedule_manifest, loaded = _schedule_bundle(
         tmp_path,
         cell=cell,
         deployment_hash=deployment_hash,
         values=values,
-        plans={},
+        plans=plans,
     )
-    ctx = SimpleNamespace(cell=cell, values=values)
+    schedule_key = next(iter(loaded))
+    raw_payload["operational_time_sharing"] = {
+        schedule_key: {
+            **loaded[schedule_key],
+            "evaluation_tokens": 17,
+            "evaluation_upper_tokens": 0,
+            "raw_space_fvu": 0.8,
+            "distortion_measurement": (
+                "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+            ),
+        }
+    }
     result = _fixed_rate_raw_score(
         ctx,
-        rd={
-            "rate_model": "fixed_width_count_plus_block_ids_plus_amplitudes_v1",
-            "support_count_width_bits": 5,
-            "support_id_width_bits": 8,
-            "codec_meta": {
-                "packet_contract": values["codec.packet_contract"],
-                "side_information_contract": values["codec.side_information_contract"],
-                "count_alphabet_max": 16,
-            },
-            "points": {
-                "4": {"rate_bits_per_token": 4.0},
-                "8": {"rate_bits_per_token": 8.0},
-            },
-        },
-        raw_space={
-            "eligible": True,
-            "points": {
-                "4": {"fvu_pooled": 0.8},
-                "8": {"fvu_pooled": 0.9},
-            },
-        },
+        rd=rd_payload,
+        raw_space=raw_payload,
         deployment_path=deployment,
         deployment_hash=deployment_hash,
         calibration_hash="0" * 64,
@@ -3479,6 +3676,42 @@ def test_fixed_rate_budget_uses_better_lower_rate_packet(
     assert result["eligible"] is True
     assert result["fixed_budgets"][0]["raw_space_fvu"] == pytest.approx(0.8)
     assert result["fixed_budgets"][0]["bracket"] == ["q4", "q4"]
+    assert result["fixed_budgets"][0]["operating_record"]["header_bytes"] == 32
+
+
+def test_exact_fixed_rate_endpoint_is_selected_as_a_pure_record() -> None:
+    cell = _cell(phase=Phase.PHASE2)
+    horizon = 1_000
+    artifact_bytes = 1
+    budget = 4.0 + 8.0 * (artifact_bytes + 32) / horizon
+    values = {
+        **cell.decision_map,
+        "evaluation.fixed_rate_budgets_bits_per_token": (budget,),
+        "evaluation.side_information_amortization_tokens": horizon,
+    }
+    plans = _selected_time_sharing_plans(
+        SimpleNamespace(cell=cell, values=values),
+        rd={
+            "points": {
+                "4": {"rate_bits_per_token": 4.0},
+                "8": {"rate_bits_per_token": 8.0},
+            }
+        },
+        raw_space={
+            "eligible": True,
+            "points": {
+                "4": {"fvu_pooled": 0.5},
+                "8": {"fvu_pooled": 0.4},
+            },
+        },
+        deployment_artifact_size_bytes=artifact_bytes,
+    )
+    assert len(plans) == 1
+    plan = next(iter(plans.values()))
+    assert plan["lower_name"] == "q4"
+    assert plan["upper_name"] == "q4"
+    assert plan["upper_tokens"] == 0
+    assert plan["achieved_total_bits_per_token"] == pytest.approx(budget)
 
 
 def test_ineligible_fixed_rate_endpoint_produces_durable_worst_score(
@@ -3644,7 +3877,7 @@ def test_fixed_rate_mixture_prices_reproducible_schedule_header(
     assert point["raw_space_fvu"] == pytest.approx(0.37)
     assert point["bracket"] == ["q4", "q8"]
     assert point["achieved_total_bits_per_token"] <= 6.0
-    schedule = point["mixing_schedule"]
+    schedule = point["operating_record"]
     assert schedule["contract"] == "balanced_global_token_counter_u64_v1"
     assert schedule["header_bytes"] == 32
     assert schedule["per_token_mode_bits"] == 0
@@ -3656,7 +3889,20 @@ def test_fixed_rate_mixture_prices_reproducible_schedule_header(
 
     worse_schedule = copy.deepcopy(raw_payload)
     worse_schedule["operational_time_sharing"][schedule_key]["raw_space_fvu"] = 0.6
-    fallback = _fixed_rate_raw_score(
+    with pytest.raises(CellExecutionError, match="better lower endpoint"):
+        _fixed_rate_raw_score(
+            SimpleNamespace(cell=cell, values=values),
+            rd=rd_payload,
+            raw_space=worse_schedule,
+            deployment_path=deployment,
+            deployment_hash=deployment_hash,
+            calibration_hash="0" * 64,
+            deployment_schedule_manifest=schedule_manifest,
+        )
+
+    # Holdout evaluation must replay a frozen development policy even when its
+    # own distortion would have selected a different endpoint.
+    replayed = _fixed_rate_raw_score(
         SimpleNamespace(cell=cell, values=values),
         rd=rd_payload,
         raw_space=worse_schedule,
@@ -3664,10 +3910,173 @@ def test_fixed_rate_mixture_prices_reproducible_schedule_header(
         deployment_hash=deployment_hash,
         calibration_hash="0" * 64,
         deployment_schedule_manifest=schedule_manifest,
+        frozen_operating_policy=result["operating_policy"],
     )["fixed_budgets"][0]
-    assert fallback["bracket"] == ["q4", "q4"]
-    assert fallback["raw_space_fvu"] == pytest.approx(0.5)
-    assert fallback["reason"] == "lower_endpoint_outperformed_executed_time_sharing"
+    assert replayed["bracket"] == ["q4", "q8"]
+    assert replayed["raw_space_fvu"] == pytest.approx(0.6)
+
+
+def test_development_time_sharing_retains_better_lower_endpoint() -> None:
+    horizon = 1_000
+    budget = 6.0
+    schedule_rate = 8.0 * 32 / horizon
+    lower_rate = 4.0 + 8.0 / horizon
+    upper_rate = 8.0 + 8.0 / horizon
+    upper_tokens = math.floor(
+        ((budget - schedule_rate - lower_rate) / (upper_rate - lower_rate)) * horizon
+    )
+    key = _time_sharing_plan_key(
+        budget=budget,
+        lower_name="q4",
+        upper_name="q8",
+        upper_tokens=upper_tokens,
+        horizon_tokens=horizon,
+    )
+    weight = upper_tokens / horizon
+    plans = {
+        key: {
+            "budget_bits_per_token": budget,
+            "lower_name": "q4",
+            "lower_q": 4,
+            "upper_name": "q8",
+            "upper_q": 8,
+            "upper_tokens": upper_tokens,
+            "horizon_tokens": horizon,
+            "upper_mixture_weight": weight,
+            "achieved_total_bits_per_token": (
+                (1.0 - weight) * lower_rate + weight * upper_rate + schedule_rate
+            ),
+        }
+    }
+    measurements = {
+        key: {
+            **plans[key],
+            "evaluation_tokens": 17,
+            "evaluation_upper_tokens": 7,
+            "raw_space_fvu": 0.6,
+            "distortion_measurement": (
+                "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+            ),
+        }
+    }
+    finalized, selected = _finalize_development_time_sharing(
+        plans,
+        measurements,
+        rd={
+            "points": {
+                "4": {"rate_bits_per_token": 4.0},
+                "8": {"rate_bits_per_token": 8.0},
+            }
+        },
+        raw_space={
+            "points": {
+                "4": {"fvu_pooled": 0.5},
+                "8": {"fvu_pooled": 0.4},
+            }
+        },
+        deployment_artifact_size_bytes=1,
+        horizon_tokens=horizon,
+    )
+    final_key = next(iter(finalized))
+    assert finalized[final_key]["lower_name"] == "q4"
+    assert finalized[final_key]["upper_name"] == "q4"
+    assert finalized[final_key]["upper_tokens"] == 0
+    assert finalized[final_key]["achieved_total_bits_per_token"] == pytest.approx(
+        lower_rate + schedule_rate
+    )
+    assert selected[final_key]["raw_space_fvu"] == pytest.approx(0.5)
+    assert selected[final_key]["evaluation_upper_tokens"] == 0
+
+
+def test_frozen_fixed_rate_policy_is_independent_of_holdout_distortion(tmp_path):
+    cell = _cell(phase=Phase.PHASE2)
+    values = {
+        **cell.decision_map,
+        "evaluation.fixed_rate_budgets_bits_per_token": (6.0,),
+        "evaluation.side_information_amortization_tokens": 1_000,
+    }
+    ctx = SimpleNamespace(cell=cell, values=values)
+    rd = {
+        "rate_model": "fixed_width_decodable_payload_bits_v1",
+        "support_count_width_bits": 5,
+        "support_id_width_bits": 8,
+        "codec_meta": {
+            "packet_contract": values["codec.packet_contract"],
+            "side_information_contract": values["codec.side_information_contract"],
+            "count_alphabet_max": 16,
+        },
+        "points": {
+            "4": {"rate_bits_per_token": 4.0},
+            "8": {"rate_bits_per_token": 8.0},
+        },
+    }
+    development_raw = {
+        "eligible": True,
+        "points": {
+            "4": {"fvu_pooled": 0.5},
+            "8": {"fvu_pooled": 0.4},
+        },
+    }
+    plans = _selected_time_sharing_plans(
+        ctx,
+        rd=rd,
+        raw_space=development_raw,
+        deployment_artifact_size_bytes=1,
+    )
+    deployment = tmp_path / "deployable-codec.pt"
+    deployment.write_bytes(b"x")
+    deployment_hash = hashlib.sha256(deployment.read_bytes()).hexdigest()
+    _, manifest, loaded = _schedule_bundle(
+        tmp_path,
+        cell=cell,
+        deployment_hash=deployment_hash,
+        values=values,
+        plans=plans,
+    )
+    key = next(iter(loaded))
+    development_raw["operational_time_sharing"] = {
+        key: {
+            **loaded[key],
+            "evaluation_tokens": 17,
+            "evaluation_upper_tokens": 7,
+            "raw_space_fvu": 0.37,
+            "distortion_measurement": (
+                "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+            ),
+        }
+    }
+    selected = _fixed_rate_raw_score(
+        ctx,
+        rd=rd,
+        raw_space=development_raw,
+        deployment_path=deployment,
+        deployment_hash=deployment_hash,
+        calibration_hash="0" * 64,
+        deployment_schedule_manifest=manifest,
+    )
+    policy = selected["operating_policy"]
+    assert policy["rows"][0]["lower_name"] == "q4"
+    assert policy["rows"][0]["upper_name"] == "q8"
+
+    # These holdout outcomes would make q8 dominated if they were allowed to
+    # rebuild the hull. Endpoint identities must nevertheless remain frozen.
+    holdout_raw = {
+        "eligible": True,
+        "points": {
+            "4": {"fvu_pooled": 0.1},
+            "8": {"fvu_pooled": 0.9},
+        },
+    }
+    replay = _selected_time_sharing_plans(
+        ctx,
+        rd=rd,
+        raw_space=holdout_raw,
+        deployment_artifact_size_bytes=1,
+        frozen_operating_policy=policy,
+    )
+    replay_plan = next(iter(replay.values()))
+    assert replay_plan["lower_name"] == "q4"
+    assert replay_plan["upper_name"] == "q8"
 
 
 def test_phase2_evaluator_metric_schema_resolves_through_live_policy() -> None:
@@ -3740,7 +4149,10 @@ def test_anthropic_anchor_maps_only_the_minimal_dense_l1_method() -> None:
 
 
 def _bound_capture_manifest(
-    values: dict[str, object], *, profile: str
+    values: dict[str, object],
+    *,
+    profile: str,
+    split_manifests: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     source = _expected_real_source_contract(values)
     source_hash = hashlib.sha256(canonical_json(source).encode("utf-8")).hexdigest()
@@ -3755,8 +4167,13 @@ def _bound_capture_manifest(
     }
     store_site_count = len(values["data.store_sites"])
     captured_width = max(int(item) for item in values["data.site_dims"])
+    writer_pipeline = estimate_writer_residency_bytes(
+        [captured_width] * store_site_count,
+        tokens_per_shard=128,
+        row_id_width=3,
+    )
     binding = {
-        "schema": "bsc-capture-binding-v1",
+        "schema": CAPTURE_BINDING_SCHEMA,
         "campaign_profile": profile,
         "source_hash": source_hash,
         "split_order": list(split_order),
@@ -3769,27 +4186,75 @@ def _bound_capture_manifest(
         "batch_rows": 1,
         "write_batch_tokens": 1,
         "tokens_per_shard": 128,
-        "writer_pipeline": {"contract": "test_fixture_v1"},
-        "capture_transfer_pipeline": {"contract": "test_fixture_v1"},
+        "writer_pipeline": {
+            "contract": "one_pending_shard_v1",
+            **writer_pipeline,
+            "max_writer_residency_bytes": writer_pipeline["writer_residency_bytes"],
+        },
+        "capture_transfer_pipeline": estimate_capture_pipeline_residency_bytes(
+            writer_pipeline,
+            [captured_width] * store_site_count,
+            batch_rows=1,
+            context=int(source["context"]),
+            drop_positions=int(source["drop_positions"]),
+            cuda_overlap=True,
+        ),
     }
-    return {
-        "schema": "bsc-capture-manifest-v1",
+    records = {}
+    for split in split_order:
+        manifest = None if split_manifests is None else split_manifests[split]
+        records[split] = {
+            "allocation": copy.deepcopy(split_plan[split]),
+            "manifest_file_sha256": (
+                "0" * 64
+                if manifest is None
+                else hashlib.sha256(
+                    (json.dumps(manifest, indent=2) + "\n").encode()
+                ).hexdigest()
+            ),
+            "manifest_sha256": (
+                "1" * 64 if manifest is None else manifest["manifest_sha256"]
+            ),
+            "content_stream_sha256": (
+                "2" * 64 if manifest is None else manifest["content_stream_sha256"]
+            ),
+            "row_stream_sha256": (
+                "3" * 64 if manifest is None else manifest["row_stream_sha256"]
+            ),
+            "n_tokens": split_plan[split]["actual_tokens"],
+            "sites": list(range(store_site_count)),
+            "site_dims": [captured_width] * store_site_count,
+            "d_model": captured_width,
+            "row_id_width": 3,
+            "whitener_hash": f"raw:{source_hash}",
+        }
+    payload = {
+        "schema": CAPTURE_MANIFEST_SCHEMA,
         "source": source,
         "source_hash": source_hash,
         "split_order": list(split_order),
         "split_plan": split_plan,
-        "splits": copy.deepcopy(split_plan),
+        "splits": records,
         "capture_implementation": implementation,
         "capture_binding": binding,
         "capture_binding_sha256": hashlib.sha256(
             canonical_json(binding).encode("utf-8")
         ).hexdigest(),
     }
+    payload["capture_content_sha256"] = hashlib.sha256(
+        canonical_json(payload).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _rehash_capture_binding(payload: dict[str, object]) -> None:
     payload["capture_binding_sha256"] = hashlib.sha256(
         canonical_json(payload["capture_binding"]).encode("utf-8")
+    ).hexdigest()
+    unsigned = dict(payload)
+    unsigned.pop("capture_content_sha256", None)
+    payload["capture_content_sha256"] = hashlib.sha256(
+        canonical_json(unsigned).encode("utf-8")
     ).hexdigest()
 
 
@@ -3802,9 +4267,8 @@ def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
     tmp_path.mkdir(exist_ok=True)
     capture_path = tmp_path / "capture.json"
     capture_path.write_text(json.dumps(payload, indent=2) + "\n")
-    loaded = _load_capture_contract(tmp_path, values)
-    assert loaded["split_order"] == split_order
-    assert loaded["split_plan"] == split_plan
+    assert validate_capture_manifest(payload)["split_order"] == list(split_order)
+    assert payload["split_plan"] == split_plan
 
     reordered = copy.deepcopy(payload)
     reordered["split_order"][0], reordered["split_order"][1] = (
@@ -3828,13 +4292,16 @@ def test_capture_contract_refuses_reordered_or_reassigned_split_allocation(
         reassigned["split_plan"][second]["sequence_start"],
         reassigned["split_plan"][first]["sequence_start"],
     )
-    reassigned["splits"] = copy.deepcopy(reassigned["split_plan"])
+    for split in split_order:
+        reassigned["splits"][split]["allocation"] = copy.deepcopy(
+            reassigned["split_plan"][split]
+        )
     reassigned["capture_binding"]["split_plan"] = copy.deepcopy(
         reassigned["split_plan"]
     )
     _rehash_capture_binding(reassigned)
     capture_path.write_text(json.dumps(reassigned, indent=2) + "\n")
-    with pytest.raises(CellExecutionError, match="split allocation"):
+    with pytest.raises(CellExecutionError, match="split plan|split allocation"):
         _load_capture_contract(tmp_path, values)
 
 
@@ -3850,9 +4317,7 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
     split_order, split_plan = _expected_capture_allocation(values)
     capture_binding_sha256 = capture_manifest["capture_binding_sha256"]
     raw_root.mkdir()
-    (raw_root / "capture.json").write_text(
-        json.dumps(capture_manifest, indent=2) + "\n"
-    )
+    split_manifests: dict[str, dict[str, object]] = {}
     store_site_count = len(values["data.store_sites"])
     captured_width = max(int(item) for item in values["data.site_dims"])
     for split in split_order:
@@ -3896,7 +4361,15 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
             tokens_per_shard=n_tokens,
         )
         writer.add(x, row_ids)
-        writer.close()
+        split_manifests[split] = writer.close()
+    capture_manifest = _bound_capture_manifest(
+        values,
+        profile="phase3",
+        split_manifests=split_manifests,
+    )
+    (raw_root / "capture.json").write_text(
+        json.dumps(capture_manifest, indent=2) + "\n"
+    )
     fit_transform_artifacts(
         raw_root,
         raw_root / "transforms",
@@ -3976,7 +4449,10 @@ def test_phase3_single_raw_store_resolves_bound_transform_only_artifact(
         bad_writer.add(acts, shifted_ids)
     bad_writer.close()
     _VERIFIED_STORE_BINDINGS.clear()
-    with pytest.raises(CellExecutionError, match="row identity sequence"):
+    with pytest.raises(
+        CellExecutionError,
+        match="authenticated capture record|row identity sequence",
+    ):
         _resolve_real_store(values)
 
 

@@ -40,25 +40,119 @@ from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
     EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    ESTIMATOR_ACTIVATION_SHARD_TOKENS,
+    ESTIMATOR_CHECKPOINT_PARAMETER_BYTES,
+    ESTIMATOR_CHOLESKY_QR_SMALL_MATRIX_BUFFERS,
+    ESTIMATOR_CUDA_RUNTIME_HEADROOM_BYTES,
+    ESTIMATOR_DECODER_NUCLEAR_SMALL_MATRIX_BUFFERS,
+    ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES,
+    ESTIMATOR_EVALUATION_PARAMETER_RESIDENCY_BYTES,
+    ESTIMATOR_HOST_CHECKPOINT_RESIDENCY_BYTES,
+    ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES,
+    ESTIMATOR_LATENT_WORKSPACE_BASE_BUFFERS,
+    ESTIMATOR_MAP_NUCLEAR_SMALL_MATRIX_BUFFERS,
+    ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS,
+    ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES,
+    ESTIMATOR_SERIALIZATION_FIXED_BYTES,
+    ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR,
+    ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR,
+    ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES,
+    ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES,
+    ESTIMATOR_TRAINING_PARAMETER_RESIDENCY_BYTES,
+    GRAM_BLOCK_CHUNK,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_NET_WORKSPACE_CREDIT_BUFFERS,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
+    RD_EVALUATION_TOKEN_CHUNK,
+    RETRACTION_UNCHUNKED_MAX_GROUPS,
+    SMALL_MATRIX_EIGH_MAX_BATCH,
+    SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
+    SPECTRUM_CUDA_GRAM_BLOCK_CHUNK,
+    SPECTRUM_UNCHUNKED_MAX_GROUPS,
     TRUSTED_DECODE_Q_CHUNK,
     decoded_energy_code_norm_eligible,
     isolated_loss_mapped_eligible,
 )
 
 SCHEMA_VERSION = "bsc-study-v3"
+_ESTIMATOR_WORKSPACE_BINDING = (
+    (
+        "evaluation_threshold_consumer_lifetime",
+        "threshold_payload_only_after_shared_release_v1",
+    ),
+    ("rd_evaluation_token_chunk", RD_EVALUATION_TOKEN_CHUNK),
+    ("trusted_decode_q_chunk", TRUSTED_DECODE_Q_CHUNK),
+    ("evaluation_concordance_block_chunk", EVALUATION_CONCORDANCE_BLOCK_CHUNK),
+    ("evaluation_reduction_token_chunk", EVALUATION_REDUCTION_TOKEN_CHUNK),
+    (
+        "evaluation_sparse_decode_density_denominator",
+        EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    ),
+    ("gram_block_chunk", GRAM_BLOCK_CHUNK),
+    ("retraction_unchunked_max_groups", RETRACTION_UNCHUNKED_MAX_GROUPS),
+    ("spectrum_unchunked_max_groups", SPECTRUM_UNCHUNKED_MAX_GROUPS),
+    ("spectrum_cuda_gram_block_chunk", SPECTRUM_CUDA_GRAM_BLOCK_CHUNK),
+    ("small_matrix_eigh_max_batch", SMALL_MATRIX_EIGH_MAX_BATCH),
+    (
+        "small_matrix_eigensolver_workspace_bytes",
+        SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES,
+    ),
+    ("cuda_runtime_headroom_bytes", ESTIMATOR_CUDA_RUNTIME_HEADROOM_BYTES),
+    ("host_runtime_headroom_bytes", ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES),
+    ("activation_shard_tokens", ESTIMATOR_ACTIVATION_SHARD_TOKENS),
+    (
+        "safetensors_shard_framing_bytes",
+        ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES,
+    ),
+    ("split_manifest_base_bytes", ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES),
+    ("split_manifest_shard_bytes", ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES),
+    ("serialization_fixed_bytes", ESTIMATOR_SERIALIZATION_FIXED_BYTES),
+    (
+        "serialization_framing_numerator",
+        ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR,
+    ),
+    (
+        "serialization_framing_denominator",
+        ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR,
+    ),
+    (
+        "training_parameter_residency_bytes",
+        ESTIMATOR_TRAINING_PARAMETER_RESIDENCY_BYTES,
+    ),
+    (
+        "evaluation_parameter_residency_bytes",
+        ESTIMATOR_EVALUATION_PARAMETER_RESIDENCY_BYTES,
+    ),
+    (
+        "host_checkpoint_residency_bytes",
+        ESTIMATOR_HOST_CHECKPOINT_RESIDENCY_BYTES,
+    ),
+    ("latent_workspace_base_buffers", ESTIMATOR_LATENT_WORKSPACE_BASE_BUFFERS),
+    (
+        "cholesky_qr_small_matrix_buffers",
+        ESTIMATOR_CHOLESKY_QR_SMALL_MATRIX_BUFFERS,
+    ),
+    ("polar_small_matrix_buffers", ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS),
+    (
+        "map_nuclear_small_matrix_buffers",
+        ESTIMATOR_MAP_NUCLEAR_SMALL_MATRIX_BUFFERS,
+    ),
+    (
+        "decoder_nuclear_small_matrix_buffers",
+        ESTIMATOR_DECODER_NUCLEAR_SMALL_MATRIX_BUFFERS,
+    ),
+    ("checkpoint_parameter_bytes", ESTIMATOR_CHECKPOINT_PARAMETER_BYTES),
+    ("deployment_parameter_bytes", ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES),
+)
 ESTIMATOR_VERSION = (
-    "dense-linear-memory-v18"
-    f"-q{TRUSTED_DECODE_Q_CHUNK}"
-    f"-c{EVALUATION_CONCORDANCE_BLOCK_CHUNK}"
-    f"-t{EVALUATION_REDUCTION_TOKEN_CHUNK}"
-    f"-s{EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR}"
+    "dense-linear-memory-v20-"
+    + hashlib.sha256(
+        json.dumps(_ESTIMATOR_WORKSPACE_BINDING, separators=(",", ":")).encode()
+    ).hexdigest()
 )
 CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v3"
 BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v5"
@@ -76,6 +170,9 @@ PHASE3_MIN_SUSTAINED_FLOPS = 20_000_000_000_000
 PHASE3_RUNTIME_CEILING_SECONDS = 7 * 24 * 60 * 60
 PHASE3_COMPUTE_CEILING_FLOPS = (
     PHASE3_MIN_SUSTAINED_FLOPS * PHASE3_RUNTIME_CEILING_SECONDS
+)
+PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT = (
+    "exact_five_seed_panel_plus_production_stability_v1"
 )
 PHASE2_DEFAULT_WARMUP_FRACTION = 0.05
 PHASE2_CHECKPOINT_TOKENS = 1_000_000
@@ -123,9 +220,7 @@ PHASE1_QUALIFICATION_THRESHOLD_SENSITIVITY = (
     ("pathology.nonfinite_count_max", (0,)),
 )
 PHASE1_PATHOLOGY_ASSOCIATION_CUTOFF_SENSITIVITY = tuple(
-    (strong, weak)
-    for strong in (0.4, 0.5, 0.6)
-    for weak in (0.2, 0.25, 0.3)
+    (strong, weak) for strong in (0.4, 0.5, 0.6) for weak in (0.2, 0.25, 0.3)
 )
 PHASE1_TRANSFER_SCHEMA = "bsc-phase1-transfer-v3"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
@@ -1341,9 +1436,7 @@ class CellSpec:
             }
         for name, expected in expected_phase1_evaluation.items():
             if values[name] != expected:
-                raise StudyError(
-                    f"{self.phase.value} requires {name}={expected!r}"
-                )
+                raise StudyError(f"{self.phase.value} requires {name}={expected!r}")
         fit_split = values["data.normalization_fit_split"]
         fit_count = values["data.normalization_fit_count"]
         fit_statistic = values["data.normalization_fit_statistic"]
@@ -1406,8 +1499,7 @@ class CellSpec:
             or not isinstance(scale_fit_count, int)
             or isinstance(scale_fit_count, bool)
             or scale_fit_count <= 0
-            or scale_fit_statistic
-            != "global_fp64_mean_postactivation_block_norm"
+            or scale_fit_statistic != "global_fp64_mean_postactivation_block_norm"
             or scale_fit_contract
             != (
                 "positive_bracketed_bisection_remeasure_v1",
@@ -2769,6 +2861,11 @@ class FrozenPanelDecision:
             "_panel_id_cache",
             content_id(self.content_payload(), prefix="panel-selection"),
         )
+        # A panel is not a valid frozen decision if any selected Phase-2
+        # method becomes infeasible after the exact Phase-3 geometry transfer.
+        # Run this only after installing the provisional content ID because
+        # the projected Phase-3 cells bind that ID in their lineage.
+        project_phase3_panel_resources(self)
 
     def content_payload(self) -> dict[str, Any]:
         return {
@@ -2777,6 +2874,13 @@ class FrozenPanelDecision:
             "source_phase2_blueprint_id": self.source_phase2_blueprint_id,
             "phase2_campaign_manifest_sha256": self.phase2_campaign_manifest_sha256,
             "selection_universe_sha256": self.selection_universe_sha256,
+            "phase3_resource_projection_contract": {
+                "contract": PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT,
+                "estimator": ESTIMATOR_VERSION,
+                "seeds": [0, 1, 2, 3, 4],
+                "production_stability_tokens": PHASE3_PRODUCTION_STABILITY_TOKENS,
+                "panel_slots": PHASE3_PANEL_SLOTS,
+            },
             "entries": [
                 entry.to_dict()
                 for entry in sorted(self.entries, key=lambda item: item.panel_slot)
@@ -2792,6 +2896,15 @@ class FrozenPanelDecision:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "FrozenPanelDecision":
+        expected_projection = {
+            "contract": PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT,
+            "estimator": ESTIMATOR_VERSION,
+            "seeds": [0, 1, 2, 3, 4],
+            "production_stability_tokens": PHASE3_PRODUCTION_STABILITY_TOKENS,
+            "panel_slots": PHASE3_PANEL_SLOTS,
+        }
+        if payload.get("phase3_resource_projection_contract") != expected_projection:
+            raise StudyError("frozen panel resource projection contract mismatch")
         decision = cls(
             source_phase2_plan_id=str(payload["source_phase2_plan_id"]),
             source_phase2_blueprint_id=str(payload["source_phase2_blueprint_id"]),
@@ -3869,6 +3982,93 @@ def _positive_int(value: DecisionValue, name: str) -> int:
     return value
 
 
+def _serialized_payload_bytes(payload_bytes: int) -> int:
+    """Conservatively price container metadata and alignment around a payload."""
+
+    if payload_bytes < 0:
+        raise StudyError("serialized payload size must be non-negative")
+    proportional = math.ceil(
+        payload_bytes
+        * ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR
+        / ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR
+    )
+    return payload_bytes + max(ESTIMATOR_SERIALIZATION_FIXED_BYTES, proportional)
+
+
+def _checkpoint_artifact_bytes(parameters: int, tracker_bytes: int) -> int:
+    return _serialized_payload_bytes(
+        parameters * ESTIMATOR_CHECKPOINT_PARAMETER_BYTES + tracker_bytes
+    )
+
+
+def _deployment_artifact_bytes(parameters: int) -> int:
+    return _serialized_payload_bytes(parameters * ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES)
+
+
+def _activation_store_storage_bytes(
+    *,
+    rows_by_split: Sequence[int],
+    bytes_per_row: int,
+) -> tuple[int, int]:
+    """Return persistent store bytes and its largest atomic-publication temp.
+
+    The tensor payload is exact.  Safetensors headers and split manifests are
+    bounded per shard, and the transient price accounts for the largest shard
+    or manifest temporary coexisting with all already-published bytes.
+    """
+
+    if not rows_by_split:
+        raise StudyError("activation storage requires at least one split")
+    shard_counts = tuple(
+        math.ceil(rows / ESTIMATOR_ACTIVATION_SHARD_TOKENS) for rows in rows_by_split
+    )
+    shard_count = sum(shard_counts)
+    payload_bytes = sum(rows_by_split) * bytes_per_row
+    framing_bytes = (
+        shard_count * ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES
+        + len(rows_by_split) * ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES
+        + shard_count * ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES
+    )
+    largest_shard_rows = min(
+        ESTIMATOR_ACTIVATION_SHARD_TOKENS,
+        max(rows_by_split),
+    )
+    largest_shard_publication = (
+        largest_shard_rows * bytes_per_row + ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES
+    )
+    largest_manifest_publication = max(
+        ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES
+        + count * ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES
+        for count in shard_counts
+    )
+    return payload_bytes + framing_bytes, max(
+        largest_shard_publication,
+        largest_manifest_publication,
+    )
+
+
+def _symmetric_polar_workspace_bytes(
+    *,
+    groups: int,
+    block_width: int,
+    site_dim: int,
+) -> int:
+    """Price the exact chunked CUDA polar scratch and small eigensolver peak."""
+
+    polar_chunk = (
+        groups if groups <= RETRACTION_UNCHUNKED_MAX_GROUPS else GRAM_BLOCK_CHUNK
+    )
+    return (
+        4
+        * (
+            ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS * polar_chunk * block_width**2
+            + 4 * polar_chunk * block_width
+            + polar_chunk * block_width * site_dim
+        )
+        + polar_chunk * SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES
+    )
+
+
 def _evaluation_workspace_bytes(
     *,
     batch_tokens: int,
@@ -3896,7 +4096,8 @@ def _evaluation_workspace_bytes(
     """
 
     q_chunk = min(TRUSTED_DECODE_Q_CHUNK, quantizer_count)
-    events = batch_tokens * groups
+    rd_batch_tokens = min(batch_tokens, RD_EVALUATION_TOKEN_CHUNK)
+    rd_events = rd_batch_tokens * groups
     latents = groups * block_width
 
     # The q-independent event stream remains live with every int32 packet.
@@ -3905,22 +4106,28 @@ def _evaluation_workspace_bytes(
     # activations.  One traversal owns both metric spaces and the first packet
     # round trip; it does not receive a memory credit merely because the former
     # second traversal was removed.
-    retained_packet_bytes = batch_tokens * 4 + events * (32 + 12 * block_width)
+    retained_packet_bytes = rd_batch_tokens * 4 + rd_events * (
+        32 + 12 * block_width
+    )
     trusted_decode_bytes = (
         retained_packet_bytes
-        + q_chunk * events * block_width * 16
-        + events * block_width * 8
-        + (q_chunk * batch_tokens + 1) * 8
-        + q_chunk * batch_tokens * total_dim * 4
+        + q_chunk * rd_events * block_width * 16
+        + rd_events * block_width * 8
+        + (q_chunk * rd_batch_tokens + 1) * 8
+        + q_chunk * rd_batch_tokens * total_dim * 4
         + operational_decoder_elements * 4
     )
+    # Both transformed and paired raw outer-batch tensors own storage while
+    # the synchronous R-D microbatch views execute.  Their storage therefore
+    # remains tied to the full selector batch even though every derived packet
+    # and metric workspace below is chunk-bounded.
     joint_target_bytes = 2 * batch_tokens * total_dim * 4
     joint_metric_bytes = (
         # One raw inverse prediction and conservative fp64 transformed/raw
         # residual plus square lifetimes.
-        batch_tokens * total_dim * (4 + 4 * 8)
+        rd_batch_tokens * total_dim * (4 + 4 * 8)
         # Raw/transformed token denominators and all-q raw endpoint errors.
-        + batch_tokens * sites * (2 + quantizer_count) * 8
+        + rd_batch_tokens * sites * (2 + quantizer_count) * 8
         # Calibration means in both spaces.
         + total_dim * (4 + 8)
     )
@@ -4005,11 +4212,20 @@ def _evaluation_workspace_bytes(
     else:
         score_geometry_bytes = 0
     endpoint_resident_bytes = (
-        decoder_gram_bytes
-        + 2 * per_mode_accumulator_bytes
-        + selector_accumulator_bytes
+        decoder_gram_bytes + 2 * per_mode_accumulator_bytes + selector_accumulator_bytes
     )
-    fused_rd_bytes = joint_rd_bytes + endpoint_resident_bytes
+    # Runtime releases the shared-view encoder, predictions, alternate-mode
+    # mask, and batch reducers before entering the packet/R-D consumer.  The
+    # exact threshold z/scores/mask arguments necessarily survive that
+    # boundary and overlap with every packet/decode allocation, so price that
+    # irreducible carrier additively rather than granting it the former
+    # max(shared, R-D) lifetime credit.
+    threshold_consumer_carrier_bytes = batch_tokens * (
+        latents * 4 + groups * (4 + 1)
+    )
+    fused_rd_bytes = (
+        joint_rd_bytes + endpoint_resident_bytes + threshold_consumer_carrier_bytes
+    )
     fused_shared_bytes = (
         shared_code_bytes
         + joint_target_bytes
@@ -4431,8 +4647,8 @@ def _resolved_isolated_loss_implementation(
 
 def _estimate_components(
     cell: CellSpec,
-) -> tuple[int, int, int, int, int, int, int, int, tuple[Any, ...]]:
-    """Return tokens, parameters, storage, FLOPs, memory, tracker, and key."""
+) -> tuple[int, int, int, int, int, int, int, int, int, tuple[Any, ...]]:
+    """Return core resource components plus the exact activation-store key."""
 
     values = cell.decision_map
     site_dims_value = values["data.site_dims"]
@@ -4520,18 +4736,26 @@ def _estimate_components(
         raise StudyError(
             "data.split_sizes entries must be (name, positive count)"
         ) from exc
-    stored_rows = sum(
+    stored_rows_by_split = tuple(
         math.ceil(requested / tokens_per_sequence) * tokens_per_sequence
         for requested in requested_rows
     )
+    stored_rows = sum(stored_rows_by_split)
     row_id_width = _positive_int(values["data.row_id_width"], "data.row_id_width")
     row_id_bytes = _positive_int(values["data.row_id_bytes"], "data.row_id_bytes")
-    activation_storage = (
-        0
-        if cell.phase is Phase.PHASE1
-        else stored_rows
-        * (store_total_dim * store_bytes_per_value + row_id_width * row_id_bytes)
+    store_bytes_per_row = (
+        store_total_dim * store_bytes_per_value + row_id_width * row_id_bytes
     )
+    if cell.phase is Phase.PHASE1:
+        activation_storage = 0
+        activation_publication_bytes = 0
+    else:
+        activation_storage, activation_publication_bytes = (
+            _activation_store_storage_bytes(
+                rows_by_split=stored_rows_by_split,
+                bytes_per_row=store_bytes_per_row,
+            )
+        )
     operational_weight_elements = (
         operational_decoder_elements + operational_encoder_elements
     )
@@ -4559,7 +4783,7 @@ def _estimate_components(
     # estimator version and priced explicitly below.  A fixed 2 GiB covers
     # CUDA/PyTorch context and allocator slack.
     latent_workspace_buffers = (
-        6
+        ESTIMATOR_LATENT_WORKSPACE_BASE_BUFFERS
         - (
             DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS
             if decoded_energy_implementation
@@ -4614,24 +4838,25 @@ def _estimate_components(
     )
     decoder_tensor_bytes = operational_decoder_elements * 4
     encoder_tensor_bytes = operational_encoder_elements * 4
-    if decoder_retraction_implementation == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION:
+    if (
+        decoder_retraction_implementation
+        == DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION
+    ):
         retraction_workspace_bytes = 4 * (
             len(site_dims) * max(site_dims) * groups * block_width
-            + 6 * groups * block_width**2
+            + ESTIMATOR_CHOLESKY_QR_SMALL_MATRIX_BUFFERS * groups * block_width**2
         )
     elif decoder_retraction_implementation in {
         DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
         DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
     }:
-        # The live implementation is unchunked through 4,096 blocks and then
-        # uses 512-block chunks.  CUDA's small-matrix symmetric eigensolver has
-        # an empirically conservative ~256 KiB reservation per matrix; price
-        # that opaque workspace in addition to explicit Gram/eigen tensors.
-        polar_chunk = groups if groups <= 4_096 else 512
-        retraction_workspace_bytes = (
-            decoder_tensor_bytes
-            + 4 * (6 * polar_chunk * block_width**2 + block_width * max(site_dims))
-            + polar_chunk * 256 * 1024
+        # The CUDA path owns one [chunk,b,d] site scratch, not a full decoder
+        # copy.  The earlier formula accidentally omitted the chunk dimension
+        # from this scratch while also double-counting the resident decoder.
+        retraction_workspace_bytes = _symmetric_polar_workspace_bytes(
+            groups=groups,
+            block_width=block_width,
+            site_dim=max(site_dims),
         )
     else:
         retraction_workspace_bytes = 0
@@ -4645,19 +4870,23 @@ def _estimate_components(
         regularizer_workspace_bytes = (
             cast_decoder_bytes
             + cast_encoder_bytes
-            + 12 * groups * block_width**2 * 4
-            + groups * 256 * 1024
+            + ESTIMATOR_MAP_NUCLEAR_SMALL_MATRIX_BUFFERS * groups * block_width**2 * 4
+            + groups * SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES
         )
     elif regularizer == "decoder_nuclear":
         spectrum_batch = (
-            min(len(site_dims) * groups, 16_384)
-            if groups <= 4_096
-            else len(site_dims) * min(groups, 256)
+            min(len(site_dims) * groups, SMALL_MATRIX_EIGH_MAX_BATCH)
+            if groups <= SPECTRUM_UNCHUNKED_MAX_GROUPS
+            else len(site_dims) * min(groups, SPECTRUM_CUDA_GRAM_BLOCK_CHUNK)
         )
         regularizer_workspace_bytes = (
             cast_decoder_bytes
-            + 6 * len(site_dims) * min(groups, 4_096) * block_width**2 * 4
-            + spectrum_batch * 256 * 1024
+            + ESTIMATOR_DECODER_NUCLEAR_SMALL_MATRIX_BUFFERS
+            * len(site_dims)
+            * min(groups, SPECTRUM_UNCHUNKED_MAX_GROUPS)
+            * block_width**2
+            * 4
+            + spectrum_batch * SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES
         )
     elif regularizer == "activation_weighted_site_decoder_l1":
         regularizer_workspace_bytes = cast_decoder_bytes
@@ -4689,7 +4918,7 @@ def _estimate_components(
         tracker_checkpoint_bytes = 0
         tracker_residency_bytes = 0
     training_residency_bytes = (
-        parameters * 28
+        parameters * ESTIMATOR_TRAINING_PARAMETER_RESIDENCY_BYTES
         + dense_workspace_values * 4
         + factorized_materialization_bytes
         + retraction_workspace_bytes
@@ -4718,9 +4947,11 @@ def _estimate_components(
         operational_decoder_elements * 4 if tied else 0
     )
     evaluation_residency_bytes = (
-        parameters * 8 + evaluation_materialization_bytes + evaluation_workspace_bytes
+        parameters * ESTIMATOR_EVALUATION_PARAMETER_RESIDENCY_BYTES
+        + evaluation_materialization_bytes
+        + evaluation_workspace_bytes
     )
-    peak_vram_bytes = 2 * 1024**3 + max(
+    peak_vram_bytes = ESTIMATOR_CUDA_RUNTIME_HEADROOM_BYTES + max(
         training_residency_bytes,
         evaluation_residency_bytes,
     )
@@ -4734,9 +4965,12 @@ def _estimate_components(
     # shard/prefetch/runtime headroom without pretending the store is resident.
     endpoint_error_cache_bytes = stored_rows * (len(quantizer_bits) + 1) * 8
     peak_host_ram_bytes = max(
-        8 * 1024**3 + parameters * 20 + tracker_checkpoint_bytes,
-        8 * 1024**3 + calibration_ceiling,
-        8 * 1024**3 + endpoint_error_cache_bytes,
+        ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES
+        + parameters * ESTIMATOR_HOST_CHECKPOINT_RESIDENCY_BYTES
+        + tracker_checkpoint_bytes
+        + ESTIMATOR_SERIALIZATION_FIXED_BYTES,
+        ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES + calibration_ceiling,
+        ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES + endpoint_error_cache_bytes,
     )
     store_view_policy = values["data.store_view_policy"]
     view_identity = (
@@ -4772,6 +5006,7 @@ def _estimate_components(
         peak_host_ram_bytes,
         tracker_checkpoint_bytes,
         checkpoint_write_count,
+        activation_publication_bytes,
         store_key,
     )
 
@@ -4779,11 +5014,9 @@ def _estimate_components(
 def _persisted_cell_artifact_overhead(cell: CellSpec) -> int:
     """Conservative envelope for durable non-parameter cell artifacts.
 
-    The 16-byte parameter price in ``estimate_cell`` has explicit ownership:
-    fp32 checkpoint model (4), fp32 Adam moments (8), and the separately saved
-    fp32 deployment model (4). This envelope prices the remaining duplicated
-    codec tensors, nontrainable buffers, RNG/container metadata, and JSON
-    evaluation/qualification/manifests.
+    Checkpoint and deployment tensors are priced separately.  This envelope
+    owns duplicated codec tensors, nontrainable buffers, and the serialized
+    evaluation/qualification/manifests including conservative framing.
     """
 
     values = cell.decision_map
@@ -4792,12 +5025,47 @@ def _persisted_cell_artifact_overhead(cell: CellSpec) -> int:
     sites = len(values["data.store_sites"])
     quantizers = len(values["codec.quantizer_bits"])
     duplicated_codec_tensors = 2 * (
-        8 * groups * block_dim * block_dim
-        + 64 * groups * block_dim
-        + 128 * groups
+        8 * groups * block_dim * block_dim + 64 * groups * block_dim + 128 * groups
     )
     diagnostic_payload = 1024 * groups * max(1, sites) + 4096 * max(1, quantizers)
-    return 16 * 1024**2 + duplicated_codec_tensors + diagnostic_payload
+    return _serialized_payload_bytes(duplicated_codec_tensors + diagnostic_payload)
+
+
+def _cell_persisted_artifact_bytes(
+    cell: CellSpec,
+    *,
+    parameters: int,
+    tracker_checkpoint_bytes: int,
+) -> tuple[int, int, int]:
+    """Return checkpoint, deployment, and remaining durable artifact bytes."""
+
+    return (
+        _checkpoint_artifact_bytes(parameters, tracker_checkpoint_bytes),
+        _deployment_artifact_bytes(parameters),
+        _persisted_cell_artifact_overhead(cell),
+    )
+
+
+def _cell_transient_publication_bytes(
+    cell: CellSpec,
+    *,
+    parameters: int,
+    tracker_checkpoint_bytes: int,
+    activation_publication_bytes: int,
+) -> int:
+    """Largest temporary file that can coexist with durable experiment data."""
+
+    checkpoint, deployment, remaining = _cell_persisted_artifact_bytes(
+        cell,
+        parameters=parameters,
+        tracker_checkpoint_bytes=tracker_checkpoint_bytes,
+    )
+    return max(
+        activation_publication_bytes,
+        checkpoint,
+        deployment,
+        remaining,
+    )
 
 
 def estimate_cell(cell: CellSpec) -> ResourceEstimate:
@@ -4807,9 +5075,9 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
     (forward plus backward). This intentionally does not grant factorized
     models compute savings until the direct-rank schedule receives a separate
     planner audit. Storage includes one activation store, 16 bytes per trainable
-    parameter explicitly split across the checkpoint model, Adam moments, and
-    deployment model, the exact maximum persisted deadness tracker, and a
-    schema-derived envelope for remaining codec/report/container artifacts.
+    parameter in the checkpoint model, Adam moments, and deployment model;
+    exact tracker state; serialized framing; and the largest atomic-publication
+    temporary that can coexist with already durable data.
     """
 
     (
@@ -4821,22 +5089,35 @@ def estimate_cell(cell: CellSpec) -> ResourceEstimate:
         peak_host_ram_bytes,
         tracker_checkpoint_bytes,
         checkpoint_write_count,
+        activation_publication_bytes,
         _,
     ) = _estimate_components(cell)
-    checkpoint_storage = parameters * 16 + tracker_checkpoint_bytes
+    checkpoint_storage, deployment_storage, remaining_storage = (
+        _cell_persisted_artifact_bytes(
+            cell,
+            parameters=parameters,
+            tracker_checkpoint_bytes=tracker_checkpoint_bytes,
+        )
+    )
+    transient_publication = _cell_transient_publication_bytes(
+        cell,
+        parameters=parameters,
+        tracker_checkpoint_bytes=tracker_checkpoint_bytes,
+        activation_publication_bytes=activation_publication_bytes,
+    )
     storage_bytes = (
         activation_storage
         + checkpoint_storage
-        + _persisted_cell_artifact_overhead(cell)
+        + deployment_storage
+        + remaining_storage
+        + transient_publication
     )
     return ResourceEstimate(
         training_tokens=train_tokens,
         parameters=parameters,
         storage_bytes=storage_bytes,
         checkpoint_write_count=checkpoint_write_count,
-        cumulative_checkpoint_write_bytes=(
-            checkpoint_write_count * checkpoint_storage
-        ),
+        cumulative_checkpoint_write_bytes=(checkpoint_write_count * checkpoint_storage),
         compute_flops=compute_flops,
         peak_vram_bytes=peak_vram_bytes,
         peak_host_ram_bytes=peak_host_ram_bytes,
@@ -4853,7 +5134,7 @@ def estimate_activation_store(cell: CellSpec) -> tuple[int, tuple[Any, ...]]:
     """
 
     components = _estimate_components(cell)
-    return components[2], components[8]
+    return components[2], components[9]
 
 
 def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
@@ -4865,7 +5146,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     # that base exactly once for each capture contract.
     stores: dict[tuple[Any, ...], int] = {}
     raw_stores: dict[tuple[Any, ...], int] = {}
-    for _, _, store_bytes, _, _, _, _, _, key in components:
+    for _, _, store_bytes, _, _, _, _, _, _, key in components:
         stores[key] = max(stores.get(key, 0), store_bytes)
         if key[12] == "content_addressed_derived_view":
             raw_key = (*key[:13], "raw_source_view", *key[14:])
@@ -4876,12 +5157,33 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
         storage_bytes=(
             sum(stores.values())
             + sum(raw_stores.values())
-            + sum(item[1] * 16 + item[6] for item in components)
-            + sum(_persisted_cell_artifact_overhead(cell) for cell in plan.cells)
+            + sum(
+                sum(
+                    _cell_persisted_artifact_bytes(
+                        cell,
+                        parameters=item[1],
+                        tracker_checkpoint_bytes=item[6],
+                    )
+                )
+                for cell, item in zip(plan.cells, components)
+            )
+            + max(
+                (
+                    _cell_transient_publication_bytes(
+                        cell,
+                        parameters=item[1],
+                        tracker_checkpoint_bytes=item[6],
+                        activation_publication_bytes=item[8],
+                    )
+                    for cell, item in zip(plan.cells, components)
+                ),
+                default=0,
+            )
         ),
         checkpoint_write_count=sum(item[7] for item in components),
         cumulative_checkpoint_write_bytes=sum(
-            item[7] * (item[1] * 16 + item[6]) for item in components
+            item[7] * _checkpoint_artifact_bytes(item[1], item[6])
+            for item in components
         ),
         compute_flops=sum(item[3] for item in components),
         peak_vram_bytes=max((item[4] for item in components), default=0),
@@ -4922,10 +5224,6 @@ def enforce_plan_resources(plan: StudyPlan) -> StudyPlan:
 
     declared_phase_budget(plan.phase).enforce(estimate_plan(plan))
     return plan
-
-
-# Internal compatibility name for the existing staged-construction sites.
-_enforce_jobe_memory = enforce_plan_resources
 
 
 BSF = "Fel et al. 2026, Structuring Sparsity, Eq. 4 and Appendix D"
@@ -8758,7 +9056,7 @@ def materialize_child_plan(
     phase_slug = (
         "phase1_synthetic" if prefix.phase is Phase.PHASE1 else "phase2_small_real"
     )
-    return _enforce_jobe_memory(
+    return enforce_plan_resources(
         StudyPlan(
             name=f"{phase_slug}_prefix_{len(prefix.stages) + 1}{'_smoke' if smoke else ''}",
             phase=prefix.phase,
@@ -8941,7 +9239,7 @@ def materialize_family_child_plan(
         source_blueprint_id=blueprint.blueprint_id,
     )
     smoke = bool(prefix.cells[0].decision_map["runtime.smoke"])
-    return _enforce_jobe_memory(
+    return enforce_plan_resources(
         StudyPlan(
             name=(
                 f"phase2_family_{family.name}_prefix_{len(prefix.stages) + 1}"
@@ -9079,7 +9377,7 @@ def materialize_family_revisit_plan(
         selection_policy=family.revisit.selection_policy,
     )
     smoke = bool(prefix.cells[0].decision_map["runtime.smoke"])
-    return _enforce_jobe_memory(
+    return enforce_plan_resources(
         StudyPlan(
             name=(
                 f"phase2_family_{family.name}_revisit_{len(prefix.stages) + 1}"
@@ -10729,7 +11027,7 @@ def build_phase1_plan(
     """Return the honest materialized prefix; later factor rounds require evidence."""
 
     blueprint = build_phase1_blueprint(seeds, smoke=smoke)
-    return _enforce_jobe_memory(
+    return enforce_plan_resources(
         StudyPlan(
             "phase1_synthetic_prefix_4_smoke" if smoke else "phase1_synthetic_prefix_4",
             Phase.PHASE1,
@@ -10872,6 +11170,21 @@ def build_phase1_transfer(
                 validation = (
                     metrics.get("validation") if isinstance(metrics, Mapping) else None
                 )
+                identification = (
+                    metrics.get("identification")
+                    if isinstance(metrics, Mapping)
+                    else None
+                )
+                native_endpoint = (
+                    identification.get("native")
+                    if isinstance(identification, Mapping)
+                    else None
+                )
+                deployed_endpoint = (
+                    identification.get("deployed")
+                    if isinstance(identification, Mapping)
+                    else None
+                )
                 native_margin = (
                     margins.get("phase1_native_identification")
                     if isinstance(margins, Mapping)
@@ -10882,14 +11195,6 @@ def build_phase1_transfer(
                     if isinstance(margins, Mapping)
                     else None
                 )
-
-                def nonnegative_finite_margin(value: Any) -> bool:
-                    return bool(
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(float(value))
-                        and float(value) >= 0.0
-                    )
 
                 scientific_outcome_passed = bool(
                     isinstance(outcome, Mapping) and outcome.get("passed") is True
@@ -10902,11 +11207,16 @@ def build_phase1_transfer(
                     isinstance(validation, Mapping)
                     and validation.get("phase1_identification_conjunction") is True
                 )
-                native_passed = nonnegative_finite_margin(native_margin)
-                deployed_passed = nonnegative_finite_margin(deployed_margin)
-                conjunction_passed = bool(
-                    scientific_outcome_passed
-                    and identification_check_passed
+                native_passed = bool(
+                    isinstance(native_endpoint, Mapping)
+                    and native_endpoint.get("passed") is True
+                )
+                deployed_passed = bool(
+                    isinstance(deployed_endpoint, Mapping)
+                    and deployed_endpoint.get("passed") is True
+                )
+                identification_authorization_passed = bool(
+                    identification_check_passed
                     and validation_conjunction_passed
                     and native_passed
                     and deployed_passed
@@ -10925,10 +11235,10 @@ def build_phase1_transfer(
                         "native_passed": native_passed,
                         "deployed_margin": deployed_margin,
                         "deployed_passed": deployed_passed,
-                        "conjunction_passed": conjunction_passed,
-                        # Backward-readable diagnostic summary.  Phase 2 does
-                        # not prune options from this truth-known panel.
-                        "passed": conjunction_passed,
+                        "identification_authorization_passed": (
+                            identification_authorization_passed
+                        ),
+                        "passed": identification_authorization_passed,
                     }
                 )
             variants.append(
@@ -13372,7 +13682,7 @@ def build_phase2_plan(
     blueprint = build_phase2_blueprint(
         seeds, smoke=smoke, phase1_decision=phase1_decision
     )
-    return _enforce_jobe_memory(
+    return enforce_plan_resources(
         StudyPlan(
             "phase2_small_real_prefix_1_smoke"
             if smoke
@@ -13980,6 +14290,25 @@ def build_phase3_plan(
     return enforce_plan_resources(plan)
 
 
+def project_phase3_panel_resources(
+    panel_decision: FrozenPanelDecision,
+) -> ResourceEstimate:
+    """Project a proposed Phase-2 panel onto exact production Phase-3 work.
+
+    Construction uses the same recipe transfer, four-site Gemma geometry,
+    production-stability gate, five frozen seeds, estimator, deduplication, and
+    hard ceilings as an eventual launch.  Consequently a panel decision cannot
+    be frozen merely because its smaller GPT-2 confirmation cells fit Jobe.
+    """
+
+    plan = build_phase3_plan(
+        seeds=(0, 1, 2, 3, 4),
+        smoke=False,
+        panel_decision=panel_decision,
+    )
+    return estimate_plan(plan)
+
+
 def build_plan(
     phase: Phase | str,
     *,
@@ -14055,6 +14384,7 @@ __all__ = [
     "PHASE3_MIN_SUSTAINED_FLOPS",
     "PHASE3_PARAMETER_CEILING",
     "PHASE3_PANEL_SLOTS",
+    "PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT",
     "PHASE3_PRODUCTION_STABILITY_TOKENS",
     "PHASE3_PROVISIONED_STORAGE_BYTES",
     "PHASE3_RUNTIME_CEILING_SECONDS",
@@ -14107,4 +14437,5 @@ __all__ = [
     "materialize_family_revisit_plan",
     "novel",
     "phase2_root_recipe_from_phase1_decision",
+    "project_phase3_panel_resources",
 ]

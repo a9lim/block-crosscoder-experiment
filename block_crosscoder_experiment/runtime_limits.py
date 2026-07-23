@@ -1,9 +1,49 @@
 """Content-bound fixed workspace geometry shared with resource preflight."""
 
 TRUSTED_DECODE_Q_CHUNK = 2
+# Bound the packet/R-D half of the fused evaluator independently from the
+# scientific optimizer/evaluation batch.  The shared selector pass retains
+# its declared row batch; only its already-computed threshold payload is
+# streamed through this exact, order-preserving consumer chunk.
+RD_EVALUATION_TOKEN_CHUNK = 4096
 EVALUATION_CONCORDANCE_BLOCK_CHUNK = 512
 EVALUATION_REDUCTION_TOKEN_CHUNK = 256
 EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR = 32
+
+# Resource-estimator workspace geometry.  These values used to be duplicated
+# as local literals in ``gram`` and ``studies``.  Keeping every allocation-
+# shaping constant here lets the estimator identity bind the exact runtime
+# ladder it is pricing instead of silently drifting when a kernel is retuned.
+GRAM_BLOCK_CHUNK = 512
+RETRACTION_UNCHUNKED_MAX_GROUPS = 4096
+SPECTRUM_UNCHUNKED_MAX_GROUPS = 4096
+SPECTRUM_CPU_GRAM_BLOCK_CHUNK = 256
+SPECTRUM_CUDA_GRAM_BLOCK_CHUNK = 256
+SMALL_MATRIX_EIGH_MAX_BATCH = 16_384
+SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES = 256 * 1024
+
+ESTIMATOR_CUDA_RUNTIME_HEADROOM_BYTES = 2 * 1024**3
+ESTIMATOR_HOST_RUNTIME_HEADROOM_BYTES = 8 * 1024**3
+ESTIMATOR_ACTIVATION_SHARD_TOKENS = 150_000
+ESTIMATOR_SAFETENSORS_SHARD_FRAMING_BYTES = 64 * 1024
+ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES = 1024 * 1024
+ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES = 4 * 1024
+ESTIMATOR_SERIALIZATION_FIXED_BYTES = 16 * 1024**2
+ESTIMATOR_SERIALIZATION_FRAMING_NUMERATOR = 1
+ESTIMATOR_SERIALIZATION_FRAMING_DENOMINATOR = 64
+ESTIMATOR_TRAINING_PARAMETER_RESIDENCY_BYTES = 28
+ESTIMATOR_EVALUATION_PARAMETER_RESIDENCY_BYTES = 8
+ESTIMATOR_HOST_CHECKPOINT_RESIDENCY_BYTES = 20
+ESTIMATOR_LATENT_WORKSPACE_BASE_BUFFERS = 6
+ESTIMATOR_CHOLESKY_QR_SMALL_MATRIX_BUFFERS = 6
+ESTIMATOR_POLAR_SMALL_MATRIX_BUFFERS = 8
+ESTIMATOR_MAP_NUCLEAR_SMALL_MATRIX_BUFFERS = 12
+ESTIMATOR_DECODER_NUCLEAR_SMALL_MATRIX_BUFFERS = 6
+
+# Durable checkpoint contents are one fp32 model plus two fp32 Adam moments;
+# the separately published deployment model owns one additional fp32 copy.
+ESTIMATOR_CHECKPOINT_PARAMETER_BYTES = 12
+ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES = 4
 
 # A decoded-energy cell may use the cheaper block-code norm only while the
 # effective concatenated decoder is retracted onto the Stiefel carrier after

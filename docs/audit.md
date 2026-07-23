@@ -122,7 +122,7 @@ exit is not evidence by itself.
   normalization modes, zero support, q order/tails, padding/bias, packet
   corruption, and CUDA drift use the gates and benchmark in `design.md`.
   Phase-3 normalization and Phase-2 persisted-view validation execute on CUDA.
-  Estimator v18 prices the complete fused lifetime and dedicated-stream device
+  Estimator v20 prices the complete fused lifetime and dedicated-stream device
   lookahead without a traversal credit. Training and ordinary metric iterators
   use the same ordered event-bound transfer pipeline. All three calibration
   traversals use separately closed instances of that host/CUDA prefetch
@@ -142,7 +142,7 @@ exit is not evidence by itself.
   must match their run binding, and outer deployable and nested codec model
   configs must match exactly. Finite off-manifold states, missing identities,
   ineligible cadence/configuration, and rehashed configuration forgeries are
-  refusal fixtures. Estimator v18 credits only the four bounded selector buffers
+  refusal fixtures. Estimator v20 credits only the four bounded selector buffers
   and score Gram actually removed; explicit exact mode, sparse evaluation, and
   fp64 sharing geometry receive no such credit.
 - Exact TopK cutoff ties retain the lowest block index within each token or
@@ -211,7 +211,7 @@ exit is not evidence by itself.
   the fresh parameter shape before PyTorch may accept positional optimizer
   state. Rank `1/2/4`, fp32/bf16, masking/fusion, padding/bias,
   selector/score, forward/backward, exact-resume, and paired-trajectory gates
-  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v18
+  use the fixed bounds and RTX 4090 evidence in `design.md`. Estimator v20
   remains conservative and grants no runtime credit for this optimization.
   Unfactorized map-nuclear cells additionally bind
   `batched_site_gram_reference_guard_d1e-3_e1e-4_v1`; the old site-reducing
@@ -370,11 +370,28 @@ exit is not evidence by itself.
   cursor, and reports.
 - Campaign transitions are append-only and legal; retries cannot overwrite
   earlier attempts.
+- The active plan and every registered cell are derived from the initial
+  journal registrations plus the ordered `plan_extension` chain and immutable
+  plan histories. `plan.json`, `cell.json`, and `state.json` are repairable
+  projections, never authority. A partially journaled initial registration or
+  a child registered before its extension commit cannot run.
 - Atomic JSON publication fsyncs both file data and the replaced directory
   entry. Every journal append fsyncs the journal fd; a possible first creator
   additionally fsyncs the campaign root, so the authoritative commit cannot
   survive without its directory entry while ordinary appends avoid redundant
   directory flushes.
+- Immutable create-if-absent JSON, Torch, codec, and whitener artifacts use an
+  exclusive hard-link commit, so concurrent writers cannot replace a winner.
+  Recursive durable directory creation classifies an existing target from one
+  `stat` result and treats an atomic `mkdir` collision as a concurrent success
+  only under the declared `exist_ok`/parent semantics; separate existence/type
+  probes may not manufacture a false file collision.
+  Whiteners additionally require the sole current artifact/content schemas,
+  typed tensor digests, CPU fp32 dtype, canonical shapes, finite values, and
+  strict JSON metadata; dtype-coercing hash aliases and legacy payloads refuse.
+  A torn final journal fragment is ignored by readers and repaired under the
+  append lock: a complete record missing only its newline is preserved;
+  otherwise the discarded bytes and SHA256 are recorded before the next event.
 - A cell lock holds a never-unlinked advisory-lock guard for its whole lifetime
   and publishes heartbeat/worker ownership through a separate atomic lease.
   Reconciliation first acquires the guard nonblocking, then re-reads the stale
@@ -392,21 +409,63 @@ exit is not evidence by itself.
   artifact fails verification.
 - Qualification rehashes every prerequisite rather than trusting an artifact
   manifest's claim about itself.
+- The append-only journal, not `state.json`, supplies executor prerequisites
+  and frozen-parent qualifications. The runner repairs a missing/stale snapshot
+  under the cell guard, so power loss after journal fsync cannot make resume
+  consume an older projection or an injected artifact reference.
+- Reconcile repairs missing/corrupt plan, cell, state, activation-identity, and
+  unterminated-tail projections only while holding the registration/mutation/
+  implementation locks in the canonical order and every active cell guard
+  nonblocking. It refuses live work instead of racing a transition. A
+  post-journal projection error is nonauthoritative and cannot append a
+  contradictory `FAILED` event.
 - Study-v3/blueprint-v5 accept only the current prelaunch schema; any older or
   noncurrent local root remains physically preserved but is not migrated or
-  supported and must be replaced with a fresh root. Preparation-v3 and
-  qualification-v3 bind an exact versioned implementation-identity shape, the
+  supported and must be replaced with a fresh root. Preparation-v4,
+  evaluation-v3, and qualification-v4 bind exact versioned shapes, the
   exact eleven integrity checks, exact eight scientific checks and margins,
   cell-derived profile/thresholds, all six qualification inputs, and promotion
   reasons replayed from the bound evaluation. Detached Phase-1/Phase-2 replay
   reruns the same qualification semantics and refuses opaque, dirty, uncommitted,
   or noncanonical scientific identities. A selection refuses mixed
   implementation identities across seeds.
-- The first preparation atomically creates one immutable campaign-wide
-  implementation pin under a cross-cell lock. Concurrent first preparations
-  with different identities cannot both commit. Every non-smoke phase requires
+- Registration atomically creates one immutable campaign-wide implementation
+  pin before publishing plan state or workers. Preparation performs an O(1)
+  comparison with that pin, so no cell can win a first-preparation race and no
+  launch pays an O(cells) scan. Every non-smoke phase requires
   the canonical executor and clean committed source; custom executor modules
   are smoke-only.
+- Implementation identity v2 binds the executable package bytes, exact imported
+  dependency versions, Python/platform/Torch/CUDA build, numerical backend
+  flags and environment, driver/cuDNN, and physical CUDA device identities.
+  Git commit/dirty state is authenticated provenance; it is excluded from the
+  execution digest but still gates non-smoke work.
+- Every preparation is replayed against its registered cell before the
+  authoritative `PREPARED` journal append. Phase 1
+  must reproduce the exact deterministic generator protocols, ranges,
+  evaluation stream, and fitted normalization. Real data must reproduce the
+  exact model/corpus/revision/hook/site axis, whole-sequence split allocation,
+  raw/view row streams, capture and transform lineage, and training-row policy.
+  Its injectively framed identity admits one raw capture and one digest per view
+  key; a self-consistent alternate or orphan store cannot enter merely by
+  rehashing itself.
+- Direct state-machine transitions have the same boundary as runner-driven
+  transitions: artifact paths stay inside the campaign root, the registered
+  cell projection must equal the authoritative plan cell, and each exact stage
+  manifest must name the same path/hash/size records being committed.
+- Train, calibrate, and evaluate admission additionally require an unjournaled
+  process-local receipt for the exact executor stage. Scientific receipts can
+  be issued only for the canonical executor, which validates its durable
+  checkpoint/codec/evaluation outputs before emitting the manifest; this avoids
+  a second concurrent checkpoint/model load in the parent while preventing a
+  caller-built byte-valid intermediate artifact from poisoning append-only
+  state. Custom executors remain smoke-only.
+- Journal validation plus extension commit share one cross-process mutation
+  lock, so selected evidence cannot fail between its final replay and the
+  `plan_extension` append. The hot authority cursor retains and stat-revalidates
+  every extension artifact on each use; changed evidence forces a full hash and
+  refusal. Public event reads are deep-detached from private caches, and
+  activation/cell/plan caches reset on any changed journal prefix.
 - Embedded plan, blueprint, and plan-history hashes are recomputed from their
   canonical JSON evidence. Historical journal and selection-artifact digests
   that cannot be recomputed from the detached envelope are explicitly labeled
@@ -601,6 +660,11 @@ exit is not evidence by itself.
 - Phase 2 checks the exact mean score over 256, 384, and 512 total bits/token
   and records the complete zero/2/4/6/8/12/16-bit rate-distortion surface even
   though only the frozen scalar aggregate enters selection.
+- Development evidence freezes one content-addressed lower-envelope endpoint
+  identity pair at every exact budget. Confirmation and Phase 3 replay the
+  deterministic worst-source-seed policy and cannot use holdout/final
+  distortion to choose new endpoints. Every eligible budget serializes and
+  prices its fixed 32-byte operating record, including a pure endpoint.
 - Functional-dependence profiles are present before and after selection, but
   their coherence sum is descriptive and has no hard-coded monotone preference.
 - All-site and every site-only-to-all-site endpoints are emitted for masking
@@ -611,7 +675,7 @@ exit is not evidence by itself.
 
 - Estimates distinguish unique rows, optimizer-token presentations, model
   parameters, checkpoint bytes, activation-store bytes, and compute FLOPs.
-- Resource-estimator schema `dense-linear-memory-v18-q2-c512-t256-s32` binds peak training VRAM
+- Resource-estimator schema `dense-linear-memory-v20-e8cd28faf7b38d6e64f0426000de174679f4c01413ec6647fa6b997219978e55` binds peak training VRAM
   and peak host RAM in addition to persistent storage and aggregate compute;
   estimates are finite, nonnegative, and monotone under the declared scaling
   checks. Cholesky-QR1 reserves
@@ -621,6 +685,12 @@ exit is not evidence by itself.
   geometries remain below those respective estimates after warmup; the roughly
   8 MiB cold Inductor finite-check compile is covered by the separate fixed
   2 GiB CUDA/PyTorch context and allocator allowance.
+- Fused evaluation releases all shared-view carriers before the threshold
+  packet callback and runs that callback in exact ordered 4,096-token
+  microbatches. Estimator v20 adds the still-live full threshold
+  `z`/score/mask carrier to the bounded R-D workspace rather than taking their
+  maximum; the worst current Phase-3 scalar geometry projects
+  `19,212,206,256` bytes and remains below the 22 GB refusal gate.
 - The planner refuses a declared budget violation before registration.
 - Local filesystem planning checks live free space unless explicitly overridden
   for planning only.
@@ -656,10 +726,11 @@ exit is not evidence by itself.
   entry, rewritten capture binding, or divergent split.
 - Persistent store-verification receipts live only below the authenticated
   campaign root. Arbitrary cache-root overrides are refused; reuse requires both
-  an exact file-identity/timestamp fingerprint and bounded deterministic shard
-  content probes before the full checksum may be skipped. These probes narrow
-  silent media-corruption exposure; they do not replace the initial full hash
-  or constitute a later whole-store integrity proof.
+  an exact inode/device/size/mtime/ctime fingerprint and the exact row-allocation
+  contract. A changed fingerprint forces complete checksum and row replay; the
+  verifier refuses any before/after fingerprint change. The initial full pass
+  also records deterministic shard probes, but unchanged receipt reuse is a
+  metadata fast path and is not claimed as perpetual whole-store authentication.
 
 ## 7. Required review loop
 
@@ -675,6 +746,12 @@ Perform independent adversarial passes after implementation stabilizes:
 
 Every finding is closed in code/tests/docs or recorded as launch-blocking. A
 review that merely agrees with the design is not an adversarial pass.
+
+Subprocess verification must prepend the exact source tree under review rather
+than silently importing an editable checkout elsewhere on the host. A test that
+intentionally triggers a fatal CUDA device assertion runs in its own child
+process: the production fail-closed asynchronous path remains synchronization-
+free, while the shared full-suite CUDA context remains usable for later tests.
 
 ## 8. Minimum local verification
 

@@ -445,9 +445,8 @@ def test_guarded_map_nuclear_fast_path_has_bounded_reference_value_and_gradients
         implementation=MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     )
     value_drift = (
-        (actual - expected).detach().float().abs()
-        / expected.detach().float().abs()
-    )
+        actual - expected
+    ).detach().float().abs() / expected.detach().float().abs()
     assert float(value_drift) <= 2e-6
     actual_gradients = torch.autograd.grad(actual, values)
     expected_gradients = torch.autograd.grad(expected, oracle_values)
@@ -610,21 +609,29 @@ def test_factorized_nuclear_penalties_match_materialized_value_and_gradients(
 ):
     generator = torch.Generator(device="cpu").manual_seed(5101 + site_rank)
     d_site = torch.randn(S, site_rank, generator=generator).to(device).requires_grad_()
-    d_core = torch.randn(
-        site_rank,
-        G,
-        B_DIM,
-        D_MODEL,
-        generator=generator,
-    ).to(device).requires_grad_()
+    d_core = (
+        torch.randn(
+            site_rank,
+            G,
+            B_DIM,
+            D_MODEL,
+            generator=generator,
+        )
+        .to(device)
+        .requires_grad_()
+    )
     e_site = torch.randn(S, site_rank, generator=generator).to(device).requires_grad_()
-    e_core = torch.randn(
-        site_rank,
-        G,
-        B_DIM,
-        D_MODEL,
-        generator=generator,
-    ).to(device).requires_grad_()
+    e_core = (
+        torch.randn(
+            site_rank,
+            G,
+            B_DIM,
+            D_MODEL,
+            generator=generator,
+        )
+        .to(device)
+        .requires_grad_()
+    )
     oracle_inputs = [
         value.detach().clone().requires_grad_()
         for value in (d_site, d_core, e_site, e_core)
@@ -833,8 +840,8 @@ def test_block_gram_matches_naive(device):
 def test_chunked_gram_and_retraction_match(monkeypatch, device):
     D = random_stack(device, seed=9)
     expected = torch.einsum("sgbd,sgcd->gbc", D, D)
-    monkeypatch.setattr(gram_module, "_GRAM_BLOCK_CHUNK", 3)
-    monkeypatch.setattr(gram_module, "_RETRACT_UNCHUNKED_MAX", 0)
+    monkeypatch.setattr(gram_module, "GRAM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "RETRACTION_UNCHUNKED_MAX_GROUPS", 0)
     assert torch.allclose(block_gram(D), expected, atol=1e-5)
     retract_(D)
     assert gram_residual(D).max().item() < 1e-5
@@ -859,8 +866,8 @@ def test_sitewise_polar_application_is_bitwise_einsum_exact(
         @ evecs.transpose(-1, -2)
     )
     expected.copy_(torch.einsum("gbc,sgcd->sgbd", inv_sqrt, expected))
-    monkeypatch.setattr(gram_module, "_GRAM_BLOCK_CHUNK", 7)
-    monkeypatch.setattr(gram_module, "_RETRACT_UNCHUNKED_MAX", 0)
+    monkeypatch.setattr(gram_module, "GRAM_BLOCK_CHUNK", 7)
+    monkeypatch.setattr(gram_module, "RETRACTION_UNCHUNKED_MAX_GROUPS", 0)
     actual_hits = retract_(
         actual,
         implementation=DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
@@ -976,9 +983,9 @@ def test_polar_site_bmm_spectral_guard_falls_back_before_mutation(
 def test_chunked_site_spectrum_matches_and_has_grad(monkeypatch, device):
     D = random_stack(device, seed=10)
     expected = site_singular_values(D)
-    monkeypatch.setattr(gram_module, "_SPECTRUM_BLOCK_CHUNK", 3)
-    monkeypatch.setattr(gram_module, "_SPECTRUM_CUDA_BLOCK_CHUNK", 3)
-    monkeypatch.setattr(gram_module, "_SPECTRUM_UNCHUNKED_MAX", 0)
+    monkeypatch.setattr(gram_module, "SPECTRUM_CPU_GRAM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "SPECTRUM_CUDA_GRAM_BLOCK_CHUNK", 3)
+    monkeypatch.setattr(gram_module, "SPECTRUM_UNCHUNKED_MAX_GROUPS", 0)
     D.requires_grad_(True)
     actual = site_singular_values(D)
     assert torch.allclose(actual, expected, atol=1e-5)

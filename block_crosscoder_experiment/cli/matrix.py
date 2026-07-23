@@ -24,6 +24,7 @@ from block_crosscoder_experiment.cli.data import (
     expected_capture_source_contract,
     validate_capture_manifest,
     validate_derived_view_manifest,
+    validate_transform_artifact_manifest,
 )
 from block_crosscoder_experiment.campaign import (
     Campaign,
@@ -31,6 +32,7 @@ from block_crosscoder_experiment.campaign import (
     CampaignRunner,
     RunSummary,
 )
+from block_crosscoder_experiment.durability import durable_mkdir, durable_replace
 from block_crosscoder_experiment.store import NORMALIZATION_MODES, StoreReader, Whitener
 from block_crosscoder_experiment.studies import (
     Budget,
@@ -143,7 +145,7 @@ def _sha256(path: Path) -> str:
 
 
 def _write_verification_receipt(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     body = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
@@ -156,9 +158,11 @@ def _write_verification_receipt(path: Path, payload: dict[str, object]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     try:
-        os.replace(temporary, path)
+        durable_replace(temporary, path, file_already_synced=True)
+        temporary = None
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _verify_store_with_receipt(
@@ -331,11 +335,13 @@ def _verified_existing_input_storage(
         if not root.is_dir():
             raise StudyError(f"configured activation input is not a directory: {root}")
         split_manifests = sorted(root.rglob("split.json"))
+        view_manifests = sorted(root.rglob("view.json"))
         transform_manifests = sorted(root.rglob("transform.json"))
         root_files: set[Path] = set()
         verified_splits: list[str] = []
         verified_transforms: list[str] = []
         eligible_capture_files: set[Path] = set()
+        eligible_split_envelopes: dict[Path, tuple[str, dict[str, object]]] = {}
         for capture_path in root.rglob("capture.json"):
             try:
                 capture = json.loads(capture_path.read_text())
@@ -352,8 +358,51 @@ def _verified_existing_input_storage(
                 and capture.get("split_plan") == expected_split_plan
             ):
                 eligible_capture_files.add(capture_path.resolve())
+                for split in capture["split_order"]:
+                    eligible_split_envelopes[
+                        (capture_path.parent / split).resolve()
+                    ] = ("raw", dict(capture["splits"][split]))
+        for view_path in view_manifests:
+            try:
+                view = json.loads(view_path.read_text())
+                if not isinstance(view, dict):
+                    raise ValueError("manifest must be an object")
+                view = validate_derived_view_manifest(view)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise StudyError(
+                    f"invalid derived-view manifest {view_path}: {exc}"
+                ) from exc
+            eligible_view = expected_source is None or (
+                view["source_capture"]["source"] == expected_source
+                and view["source_capture"]["split_order"]
+                == list(expected_split_order or ())
+                and view["source_capture"]["split_plan"] == expected_split_plan
+                and view["mode"] in (expected_normalizations or set())
+            )
+            if not eligible_view:
+                continue
+            whitener_path = view_path.parent / "whitener.pt"
+            if (
+                not whitener_path.is_file()
+                or _sha256(whitener_path) != view["whitener_sha256"]
+            ):
+                raise StudyError(f"derived-view whitener is unverified at {view_path}")
+            root_files.update((view_path.resolve(), whitener_path.resolve()))
+            for split in view["split_order"]:
+                split_dir = (view_path.parent / split).resolve()
+                if split_dir in eligible_split_envelopes:
+                    raise StudyError(
+                        f"multiple root envelopes claim activation split {split_dir}"
+                    )
+                eligible_split_envelopes[split_dir] = (
+                    "derived",
+                    dict(view["splits"][split]),
+                )
         for manifest_path in split_manifests:
             split_dir = manifest_path.parent
+            envelope = eligible_split_envelopes.get(split_dir.resolve())
+            if envelope is None:
+                continue
             try:
                 reader = StoreReader(split_dir.parent, split_dir.name)
                 _verify_store_with_receipt(
@@ -364,6 +413,32 @@ def _verified_existing_input_storage(
                 raise StudyError(
                     f"unverified activation split at {split_dir}: {exc}"
                 ) from exc
+            envelope_kind, envelope_record = envelope
+            if envelope_kind == "raw":
+                envelope_matches = (
+                    _sha256(manifest_path) == envelope_record["manifest_file_sha256"]
+                    and reader.manifest.get("manifest_sha256")
+                    == envelope_record["manifest_sha256"]
+                    and reader.manifest.get("content_stream_sha256")
+                    == envelope_record["content_stream_sha256"]
+                    and reader.manifest.get("row_stream_sha256")
+                    == envelope_record["row_stream_sha256"]
+                    and reader.n_tokens == envelope_record["n_tokens"]
+                )
+            else:
+                envelope_matches = (
+                    reader.manifest.get("manifest_sha256")
+                    == envelope_record["manifest_sha256"]
+                    and reader.manifest.get("content_stream_sha256")
+                    == envelope_record["content_stream_sha256"]
+                    and reader.manifest.get("row_stream_sha256")
+                    == envelope_record["row_stream_sha256"]
+                    and reader.n_tokens == envelope_record["n_tokens"]
+                )
+            if not envelope_matches:
+                raise StudyError(
+                    f"activation split differs from its root envelope: {split_dir}"
+                )
             meta = reader.manifest.get("meta", {})
             eligible = expected_source is None
             if expected_source is not None and expected_split_plan is not None:
@@ -392,16 +467,17 @@ def _verified_existing_input_storage(
         for manifest_path in transform_manifests:
             try:
                 manifest = json.loads(manifest_path.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
+                if not isinstance(manifest, dict):
+                    raise ValueError("manifest must be an object")
+                validate_transform_artifact_manifest(manifest)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise StudyError(
                     f"invalid transform manifest {manifest_path}: {exc}"
                 ) from exc
             transform_path = manifest_path.parent / "whitener.pt"
-            if (
-                manifest.get("schema") != "bsc-transform-artifact-v1"
-                or not transform_path.is_file()
-                or manifest.get("whitener_sha256") != _sha256(transform_path)
-            ):
+            if not transform_path.is_file() or manifest.get(
+                "whitener_sha256"
+            ) != _sha256(transform_path):
                 raise StudyError(
                     f"unverified transform artifact at {manifest_path.parent}"
                 )
@@ -657,7 +733,7 @@ def _resolve_phase2_view_dispatch(
         raise StudyError(f"Phase-2 --view-root is not a directory: {root}")
     by_mode: dict[
         str,
-        tuple[Path, dict[str, tuple[object, ...]], dict[str, int]],
+        tuple[Path, dict[str, tuple[object, ...]], dict[str, int], str],
     ] = {}
     dispatched: dict[str, Path] = {}
     for cell_id, cell in cells.items():
@@ -688,9 +764,18 @@ def _resolve_phase2_view_dispatch(
                 raise StudyError(
                     f"Phase-2 view {mode!r} has an invalid root manifest: {exc}"
                 ) from exc
-            if view_manifest.get("mode") != mode or view_manifest.get(
-                "split_order"
-            ) != list(declared):
+            expected_order, expected_plan = expected_capture_allocation(values)
+            expected_source = expected_capture_source_contract(values)
+            source_capture = view_manifest["source_capture"]
+            if (
+                view_manifest.get("mode") != mode
+                or view_manifest.get("split_order") != list(declared)
+                or (
+                    source_capture.get("source") != expected_source
+                    or source_capture.get("split_order") != list(expected_order)
+                    or source_capture.get("split_plan") != expected_plan
+                )
+            ):
                 raise StudyError(f"Phase-2 view {mode!r} has a divergent root manifest")
             expected_root_entries = set(declared) | {"whitener.pt", "view.json"}
             actual_root_entries = {path.name for path in mode_root.iterdir()}
@@ -750,13 +835,17 @@ def _resolve_phase2_view_dispatch(
                         f"Phase-2 view {mode!r}/{split} does not bind its cell contract"
                     )
                 root_record = view_manifest["splits"].get(split)
-                expected_root_record = {
-                    "manifest_sha256": reader.manifest["manifest_sha256"],
-                    "content_stream_sha256": reader.manifest["content_stream_sha256"],
-                    "row_stream_sha256": reader.manifest["row_stream_sha256"],
-                    "n_tokens": reader.n_tokens,
-                }
-                if root_record != expected_root_record:
+                if not isinstance(root_record, dict) or any(
+                    root_record.get(key) != expected
+                    for key, expected in {
+                        "manifest_sha256": reader.manifest["manifest_sha256"],
+                        "content_stream_sha256": reader.manifest[
+                            "content_stream_sha256"
+                        ],
+                        "row_stream_sha256": reader.manifest["row_stream_sha256"],
+                        "n_tokens": reader.n_tokens,
+                    }.items()
+                ):
                     raise StudyError(
                         f"Phase-2 view {mode!r}/{split} differs from its root manifest"
                     )
@@ -766,7 +855,12 @@ def _resolve_phase2_view_dispatch(
                     tuple(reader.manifest["sites"]),
                     reader.d_model,
                 )
-            by_mode[mode] = (mode_root, signatures, declared)
+            by_mode[mode] = (
+                mode_root,
+                signatures,
+                declared,
+                str(source_capture["capture_content_sha256"]),
+            )
         elif by_mode[mode][2] != declared:
             raise StudyError(
                 f"cells using Phase-2 view {mode!r} declare different split contracts"
@@ -775,12 +869,12 @@ def _resolve_phase2_view_dispatch(
 
     mode_items = list(by_mode.items())
     if mode_items:
-        reference_mode, (_, reference, _) = mode_items[0]
-        for mode, (_, signatures, _) in mode_items[1:]:
-            if signatures != reference:
+        reference_mode, (_, reference, _, reference_capture) = mode_items[0]
+        for mode, (_, signatures, _, capture_identity) in mode_items[1:]:
+            if signatures != reference or capture_identity != reference_capture:
                 raise StudyError(
                     f"Phase-2 views {reference_mode!r} and {mode!r} do not share "
-                    "one exact row stream"
+                    "one exact content-addressed raw capture"
                 )
     return dispatched
 

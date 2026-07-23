@@ -1,5 +1,6 @@
 import copy
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -19,6 +20,10 @@ from unittest.mock import patch
 import pytest
 
 import block_crosscoder_experiment.campaign as campaign_module
+import block_crosscoder_experiment.studies as studies_module
+from block_crosscoder_experiment.implementation import (
+    execution_identity_sha256,
+)
 from block_crosscoder_experiment.campaign import (
     ArtifactError,
     ArtifactRef,
@@ -34,9 +39,13 @@ from block_crosscoder_experiment.campaign import (
     QUALIFICATION_SCHEMA,
     RunState,
 )
+from block_crosscoder_experiment.activation_identity import (
+    activation_content_identity,
+)
 from block_crosscoder_experiment.cli.matrix import main as matrix_main
 from block_crosscoder_experiment.studies import (
     CellSpec,
+    FrozenPanelEntry,
     FrozenPanelDecision,
     FrozenSelection,
     GateCondition,
@@ -63,28 +72,116 @@ from block_crosscoder_experiment.studies import (
 
 
 TEST_IMPLEMENTATION_IDENTITY = {
-    "executor_schema": "bsc-cell-executor-v12",
+    "schema": "bsc-implementation-identity-v2",
+    "executor_schema": "bsc-cell-executor-v13",
     "executor_process_model": "persistent_exact_snapshot_lineage_v5",
     "python_source_sha256": "1" * 64,
     "python_source_files": 1,
-    "git_commit": "1" * 40,
-    "git_dirty": False,
     "python": "3.12.test",
+    "platform": {"system": "Linux", "machine": "x86_64", "release": "test"},
     "torch": "2.8.0",
     "torch_cuda_build": "12.8",
     "dependencies": {
+        "block-crosscoder-experiment": "test",
         "datasets": "test",
         "huggingface-hub": "test",
         "numpy": "test",
         "sae-lens": "test",
         "safetensors": "test",
         "torch": "test",
+        "transformer-lens": "test",
         "transformers": "test",
+        "triton": "test",
     },
+    "numerical_runtime": {
+        "float32_matmul_precision": "highest",
+        "deterministic_algorithms": False,
+        "deterministic_warn_only": False,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": False,
+        "cudnn_allow_tf32": True,
+        "cuda_matmul_allow_tf32": False,
+        "cuda_matmul_allow_fp16_reduced_precision_reduction": True,
+        "cuda_matmul_allow_bf16_reduced_precision_reduction": True,
+        "environment": {
+            "CUBLAS_WORKSPACE_CONFIG": None,
+            "CUDA_VISIBLE_DEVICES": None,
+            "NVIDIA_TF32_OVERRIDE": None,
+            "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": None,
+        },
+    },
+    "cuda_runtime": {
+        "available": True,
+        "driver": "test",
+        "cudnn": "test",
+        "devices": [
+            {
+                "visible_index": 0,
+                "uuid": "GPU-test",
+                "name": "test",
+                "compute_capability": [8, 9],
+                "total_memory": 24_000_000_000,
+                "multi_processor_count": 128,
+            }
+        ],
+    },
+    "provenance": {"git": {"commit": "1" * 40, "source_dirty": False}},
 }
-TEST_IMPLEMENTATION_IDENTITY_SHA256 = hashlib.sha256(
-    canonical_json(TEST_IMPLEMENTATION_IDENTITY).encode("utf-8")
-).hexdigest()
+TEST_IMPLEMENTATION_IDENTITY_SHA256 = execution_identity_sha256(
+    TEST_IMPLEMENTATION_IDENTITY
+)
+
+
+_TEST_CAMPAIGNS_BY_ROOT: dict[Path, Campaign] = {}
+
+
+@pytest.fixture(autouse=True)
+def _pin_test_implementation_identity(monkeypatch):
+    monkeypatch.setattr(
+        campaign_module,
+        "implementation_identity",
+        lambda: copy.deepcopy(TEST_IMPLEMENTATION_IDENTITY),
+    )
+    # Campaign selection tests use deliberately synthetic real-data identities;
+    # live store replay is covered by the executor/store integration tests.
+    from block_crosscoder_experiment.cli import run_cell as run_cell_module
+
+    monkeypatch.setattr(
+        run_cell_module,
+        "_validate_real_preparation_data",
+        lambda cell, data, **kwargs: activation_content_identity(data),
+    )
+    original_register = Campaign.register
+    original_transition = Campaign.transition
+
+    def tracked_register(self, *args, **kwargs):
+        result = original_register(self, *args, **kwargs)
+        _TEST_CAMPAIGNS_BY_ROOT[self.root.resolve()] = self
+        return result
+
+    def executor_backed_transition(self, cell_id, target, *, artifacts=(), **kwargs):
+        parsed_target = RunState(target)
+        refs = tuple(artifacts)
+        stage = campaign_module.TARGET_STAGES.get(parsed_target)
+        if stage in {"train", "calibrate", "evaluate"} and refs:
+            refs = self._authorize_executor_stage_artifacts(
+                cell_id,
+                stage,
+                refs,
+                canonical_executor=True,
+            )
+        return original_transition(
+            self,
+            cell_id,
+            parsed_target,
+            artifacts=refs,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(Campaign, "register", tracked_register)
+    monkeypatch.setattr(Campaign, "transition", executor_backed_transition)
+    yield
+    _TEST_CAMPAIGNS_BY_ROOT.clear()
 
 
 def phase1_selection_template(
@@ -153,11 +250,169 @@ def register_test_plan(campaign: Campaign, plan: StudyPlan) -> None:
             "block_crosscoder_experiment.campaign.build_phase1_plan",
             return_value=plan,
         ),
+        patch(
+            "block_crosscoder_experiment.campaign.implementation_identity",
+            return_value=copy.deepcopy(TEST_IMPLEMENTATION_IDENTITY),
+        ),
     ):
         campaign.register(plan, blueprint_manifest=blueprint.to_manifest())
 
 
 _PHASE1_DECISION_CACHE: dict[bool, dict[str, object]] = {}
+
+
+def phase1_identification_metrics(
+    cell: CellSpec,
+    *,
+    native_passed: bool = True,
+    deployed_passed: bool = True,
+    passed_margin: float = 0.5,
+) -> tuple[dict[str, object], dict[str, object]]:
+    thresholds = {
+        str(item[0]): float(item[1])
+        for item in cell.decision_map["qualification.phase1_identification_thresholds"]
+    }
+    inapplicable = cell.decision_map.get("data.normalization") == "layer"
+
+    def endpoint(passed: bool) -> dict[str, object]:
+        if inapplicable:
+            return {
+                "applicable": False,
+                "ineligible_reason": (
+                    "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+                ),
+                "thresholds": thresholds,
+                "per_factor": [],
+                "aggregate": {
+                    "support_precision_diagnostic": 1.0,
+                    "support_recall_diagnostic": 1.0,
+                },
+                "checks": {},
+                "normalized_margins": {},
+                "margin": None,
+                "passed": None,
+            }
+        n_factors = int(cell.decision_map["data.n_factors"])
+        raw_factor = {
+            "support_association": 1.0 if passed else 0.0,
+            "subspace_overlap": 1.0 if passed else 0.0,
+            "global_isolated_input_r2": 1.0 if passed else 0.0,
+            "aligned_code_r2": 1.0 if passed else 0.0,
+        }
+        component_margins = {
+            "support_association": campaign_module._phase1_min_margin(
+                raw_factor["support_association"],
+                thresholds["per_factor.support_association_min"],
+            ),
+            "subspace_overlap": campaign_module._phase1_min_margin(
+                raw_factor["subspace_overlap"],
+                thresholds["per_factor.subspace_overlap_min_when_eligible"],
+            ),
+            "global_isolated_input_r2": campaign_module._phase1_min_margin(
+                raw_factor["global_isolated_input_r2"],
+                thresholds["per_factor.global_isolated_input_r2_min"],
+            ),
+            "aligned_code_r2": campaign_module._phase1_min_margin(
+                raw_factor["aligned_code_r2"],
+                thresholds["per_factor.aligned_code_r2_min"],
+            ),
+        }
+        factor_margin = min(component_margins.values())
+        per_factor = [
+            {
+                "factor": factor,
+                **raw_factor,
+                "rank_mismatch": {},
+                "component_margins": dict(component_margins),
+                "margin": factor_margin,
+                "identified": factor_margin >= 0.0,
+                "same_block_gate_has_positive_headroom": True,
+            }
+            for factor in range(n_factors)
+        ]
+        aggregate = {
+            "recovered_factor_fraction": 1.0 if passed else 0.0,
+            "support_precision": 1.0 if passed else 0.0,
+            "support_recall": 1.0 if passed else 0.0,
+            "inactive_dictionary_fraction_diagnostic": 0.0,
+            "duplicate_block_fraction": 0.0 if passed else 1.0,
+            "cross_factor_mixing_fraction": 0.0 if passed else 1.0,
+            "nonfinite_count": 0,
+        }
+        checks = {
+            "recovered_factor_fraction": aggregate["recovered_factor_fraction"]
+            >= thresholds["aggregate.recovered_factor_fraction_min"],
+            "support_precision": aggregate["support_precision"]
+            >= thresholds["aggregate.support_precision_min"],
+            "support_recall": aggregate["support_recall"]
+            >= thresholds["aggregate.support_recall_min"],
+            "duplicate_block_fraction": aggregate["duplicate_block_fraction"]
+            <= thresholds["pathology.duplicate_block_fraction_max"],
+            "cross_factor_mixing_fraction": aggregate["cross_factor_mixing_fraction"]
+            <= thresholds["pathology.cross_factor_mixing_fraction_max"],
+            "nonfinite_count": aggregate["nonfinite_count"]
+            <= thresholds["pathology.nonfinite_count_max"],
+        }
+        normalized = {
+            "worst_eligible_per_factor": factor_margin,
+            "recovered_factor_fraction": campaign_module._phase1_min_margin(
+                float(aggregate["recovered_factor_fraction"]),
+                thresholds["aggregate.recovered_factor_fraction_min"],
+            ),
+            "support_precision": campaign_module._phase1_min_margin(
+                float(aggregate["support_precision"]),
+                thresholds["aggregate.support_precision_min"],
+            ),
+            "support_recall": campaign_module._phase1_min_margin(
+                float(aggregate["support_recall"]),
+                thresholds["aggregate.support_recall_min"],
+            ),
+            "duplicate_block_fraction": campaign_module._phase1_max_margin(
+                float(aggregate["duplicate_block_fraction"]),
+                thresholds["pathology.duplicate_block_fraction_max"],
+            ),
+            "cross_factor_mixing_fraction": campaign_module._phase1_max_margin(
+                float(aggregate["cross_factor_mixing_fraction"]),
+                thresholds["pathology.cross_factor_mixing_fraction_max"],
+            ),
+        }
+        return {
+            "applicable": True,
+            "ineligible_reason": None,
+            "thresholds": thresholds,
+            "per_factor": per_factor,
+            "aggregate": aggregate,
+            "checks": checks,
+            "normalized_margins": normalized,
+            "margin_normalization_contract": cell.decision_map[
+                "evaluation.phase1_margin_normalization"
+            ],
+            "margin": min(normalized.values()),
+            "passed": all(checks.values()),
+        }
+
+    identification = {
+        "native": endpoint(native_passed),
+        "deployed": endpoint(deployed_passed),
+    }
+    applicable = not inapplicable
+    validation = {
+        "phase1_identification_applicable": applicable,
+        "phase1_identification_conjunction": bool(
+            applicable
+            and identification["native"]["passed"] is True
+            and identification["deployed"]["passed"] is True
+        ),
+        "phase1_identification_margin": (
+            None
+            if not applicable
+            else min(
+                float(identification["native"]["margin"]),
+                float(identification["deployed"]["margin"]),
+            )
+        ),
+    }
+    return identification, validation
 
 
 def phase1_decision_for_phase2(
@@ -181,9 +436,9 @@ def phase1_decision_for_phase2(
         if implementation_identity is None
         else implementation_identity
     )
-    resolved_implementation_identity_sha256 = hashlib.sha256(
-        canonical_json(resolved_implementation_identity).encode("utf-8")
-    ).hexdigest()
+    resolved_implementation_identity_sha256 = execution_identity_sha256(
+        resolved_implementation_identity
+    )
     seeds = (0,) if smoke else (0, 1, 2)
     blueprint = build_phase1_blueprint(seeds=seeds, smoke=smoke)
     plan = build_phase1_plan(seeds=seeds, smoke=smoke)
@@ -219,20 +474,28 @@ def phase1_decision_for_phase2(
                 capability_failure[2],
             )
         )
-        identification_conjunction = bool(
-            scientific_passed and not capability_conjunction_failed
-        )
-        identification_margin = (
-            -0.25
-            if capability_conjunction_failed
-            else (1.0 if scientific_passed else -1.0)
+        identification, identification_validation = phase1_identification_metrics(
+            cell,
+            native_passed=bool(scientific_passed and not capability_conjunction_failed),
+            deployed_passed=scientific_passed,
         )
         selection_metrics = {
-            "validation": {
-                "phase1_identification_conjunction": identification_conjunction,
-                "phase1_identification_margin": identification_margin,
-            }
+            "validation": identification_validation,
+            "identification": identification,
+            "fixed_rate_raw_selection": {
+                "schema": "bsc-fixed-rate-raw-selection-v2",
+                "applicable": False,
+                "eligible": False,
+                "operating_policy": None,
+                "reason": "phase1_uses_truth_known_identification",
+            },
         }
+        selection_metrics["phase1_threshold_sensitivity"] = (
+            campaign_module._expected_phase1_threshold_sensitivity(
+                identification,
+                cell,
+            )
+        )
         inputs = {
             kind: hashlib.sha256(f"{cell.cell_id}:{kind}".encode()).hexdigest()
             for kind in (
@@ -244,15 +507,16 @@ def phase1_decision_for_phase2(
                 "evaluation",
             )
         }
-        promotion_eligible = bool(
-            not smoke and (intent or forged_intent) and scientific_passed
-        )
         protocol_eligible = bool(smoke and (intent or forged_intent))
         identification_inapplicable = (
             cell.decision_map.get("data.normalization") == "layer"
         )
         scientific_identification_passed = bool(
-            identification_inapplicable or scientific_passed
+            identification_inapplicable
+            or identification_validation["phase1_identification_conjunction"] is True
+        )
+        promotion_eligible = bool(
+            not smoke and (intent or forged_intent) and scientific_identification_passed
         )
         scientific_checks = {
             "support_target_calibration": True,
@@ -305,14 +569,10 @@ def phase1_decision_for_phase2(
                     "codec_calibration_excluded_fraction": 0.01,
                     "codec_evaluation_excluded_fraction": 0.01,
                     "phase1_native_identification": (
-                        -0.25
-                        if capability_conjunction_failed
-                        else (1.0 if scientific_passed else -1.0)
+                        identification["native"]["margin"]
                     ),
                     "phase1_deployed_identification": (
-                        0.5
-                        if capability_conjunction_failed
-                        else (1.0 if scientific_passed else -1.0)
+                        identification["deployed"]["margin"]
                     ),
                     "production_precision_reconstruction": None,
                     "production_precision_support_iou": None,
@@ -326,19 +586,14 @@ def phase1_decision_for_phase2(
                 canonical_json(selection_metrics).encode()
             ).hexdigest(),
             "selection_metrics_evaluation_sha256": inputs["evaluation"],
+            "fixed_rate_operating_policy": None,
             "implementation_identity": resolved_implementation_identity,
-            "implementation_identity_sha256": (
-                resolved_implementation_identity_sha256
-            ),
+            "implementation_identity_sha256": (resolved_implementation_identity_sha256),
             "qualification_profile": cell.decision_map["qualification.profile"],
-            "thresholds_version": cell.decision_map[
-                "qualification.thresholds_version"
-            ],
+            "thresholds_version": cell.decision_map["qualification.thresholds_version"],
             "thresholds": campaign_module._qualification_thresholds(cell),
             "promotion_eligible": promotion_eligible,
-            "promotion_ineligible_reasons": (
-                [] if promotion_eligible else reasons
-            ),
+            "promotion_ineligible_reasons": ([] if promotion_eligible else reasons),
             "selection_eligible_for_protocol_test": protocol_eligible,
             "selection_eligibility_mode": (
                 "scientific_promotion"
@@ -507,6 +762,7 @@ def phase1_decision_for_phase2(
             "seed": cell.seed,
             "recipe_name": cell.recipe_name,
             "recipe_id": cell.recipe_id,
+            "cell": cell.to_manifest(),
             "state": "qualified",
             "qualification_sha256": qualification_sha256(cell),
             "qualification": qualification,
@@ -527,7 +783,7 @@ def phase1_decision_for_phase2(
                     "cell_id": cell.cell_id,
                     "qualification_sha256": evidence["qualification_sha256"],
                     **Campaign._phase1_claim_evidence(
-                        evidence["qualification"], smoke=smoke
+                        evidence["qualification"], cell=cell, smoke=smoke
                     ),
                 }
             )
@@ -634,11 +890,15 @@ def register_phase2_test_plan(
     blueprint: object,
     phase1_decision: dict[str, object],
 ) -> None:
-    campaign.register(
-        plan,
-        blueprint_manifest=blueprint.to_manifest(),
-        phase1_decision_manifest=phase1_decision,
-    )
+    with patch(
+        "block_crosscoder_experiment.campaign.implementation_identity",
+        return_value=copy.deepcopy(TEST_IMPLEMENTATION_IDENTITY),
+    ):
+        campaign.register(
+            plan,
+            blueprint_manifest=blueprint.to_manifest(),
+            phase1_decision_manifest=phase1_decision,
+        )
 
 
 def qualification_file_sha256(payload: dict[str, object]) -> str:
@@ -676,18 +936,14 @@ def rehash_panel_decision(payload: dict[str, object]) -> dict[str, object]:
             canonical_json(payload["selection_universe"]).encode()
         ).hexdigest()
     )
-    body = {
-        key: payload[key]
-        for key in (
-            "schema",
-            "source_phase2_plan_id",
-            "source_phase2_blueprint_id",
-            "phase2_campaign_manifest_sha256",
-            "selection_universe_sha256",
-            "entries",
-        )
-    }
-    payload["panel_id"] = content_id(body, prefix="panel-selection")
+    decision = FrozenPanelDecision(
+        source_phase2_plan_id=str(payload["source_phase2_plan_id"]),
+        source_phase2_blueprint_id=str(payload["source_phase2_blueprint_id"]),
+        phase2_campaign_manifest_sha256=str(payload["phase2_campaign_manifest_sha256"]),
+        selection_universe_sha256=str(payload["selection_universe_sha256"]),
+        entries=tuple(FrozenPanelEntry.from_dict(item) for item in payload["entries"]),
+    )
+    payload.update(decision.to_dict())
     return payload
 
 
@@ -706,9 +962,7 @@ def unreferenced_phase1_cell_evidence(
         for row in result["per_seed"]
     )
     return next(
-        item
-        for item in manifest["cells"]
-        if item["cell_id"] not in referenced_cell_ids
+        item for item in manifest["cells"] if item["cell_id"] not in referenced_cell_ids
     )
 
 
@@ -724,20 +978,28 @@ def set_phase1_variant_outcome(
     }
     evidence_by_id = {item["cell_id"]: item for item in manifest["cells"]}
     for cell_id in variant_cells:
+        cell = next(cell for cell in plan.cells if cell.cell_id == cell_id)
         evidence = evidence_by_id[cell_id]
         qualification = evidence["qualification"]
+        identification, validation = phase1_identification_metrics(
+            cell, native_passed=passed, deployed_passed=passed
+        )
         qualification["scientific_outcome"]["passed"] = passed
         qualification["scientific_outcome"]["checks"]["phase1_identification"] = passed
         qualification["scientific_outcome"]["margins"].update(
             {
-                "phase1_native_identification": 1.0 if passed else -1.0,
-                "phase1_deployed_identification": 1.0 if passed else -1.0,
+                "phase1_native_identification": identification["native"]["margin"],
+                "phase1_deployed_identification": identification["deployed"]["margin"],
             }
         )
-        qualification["selection_metrics"]["validation"] = {
-            "phase1_identification_conjunction": passed,
-            "phase1_identification_margin": 1.0 if passed else -1.0,
-        }
+        qualification["selection_metrics"]["validation"] = validation
+        qualification["selection_metrics"]["identification"] = identification
+        qualification["selection_metrics"]["phase1_threshold_sensitivity"] = (
+            campaign_module._expected_phase1_threshold_sensitivity(
+                identification,
+                cell,
+            )
+        )
         qualification["validation"] = qualification["selection_metrics"]["validation"]
         qualification["selection_metrics_sha256"] = hashlib.sha256(
             canonical_json(qualification["selection_metrics"]).encode()
@@ -759,7 +1021,13 @@ def set_phase1_variant_outcome(
         evidence = evidence_by_id[row["cell_id"]]
         row["qualification_sha256"] = evidence["qualification_sha256"]
         row.update(
-            Campaign._phase1_claim_evidence(evidence["qualification"], smoke=False)
+            Campaign._phase1_claim_evidence(
+                evidence["qualification"],
+                cell=next(
+                    cell for cell in plan.cells if cell.cell_id == row["cell_id"]
+                ),
+                smoke=False,
+            )
         )
     result["passed_all_seeds"] = all(
         row["conjunction_passed"] is True for row in result["per_seed"]
@@ -773,19 +1041,258 @@ def set_phase1_variant_outcome(
 def write_artifact(root: Path, kind: str, payload: object) -> ArtifactRef:
     path = root / "outputs" / f"{kind}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        kind.endswith("_manifest")
+        and isinstance(payload, dict)
+        and set(payload) == {"stage"}
+    ):
+        preparation = json.loads((path.parent / "preparation.json").read_text())
+        stage = str(payload["stage"])
+        payload = _test_stage_manifest(path.parent, preparation["cell_id"], stage)
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
     return ArtifactRef.from_path(kind, path, root=root)
 
 
-def evaluation_payload(
+def _test_stage_manifest(
+    directory: Path,
     cell_id: str,
+    stage: str,
+) -> dict[str, object]:
+    campaign_root = next(
+        (
+            candidate
+            for candidate in (directory, *directory.parents)
+            if (candidate / "journal.jsonl").is_file()
+        ),
+        None,
+    )
+    entries = []
+    for kind in sorted(campaign_module.EXPECTED_STAGE_ARTIFACTS[stage]):
+        artifact_path = directory / f"{kind}.json"
+        body = artifact_path.read_bytes()
+        entries.append(
+            {
+                "kind": kind,
+                "path": (
+                    str(artifact_path.relative_to(campaign_root))
+                    if campaign_root is not None
+                    else str(artifact_path)
+                ),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body),
+            }
+        )
+    return {
+        "schema": campaign_module.ARTIFACT_SCHEMA,
+        "cell_id": cell_id,
+        "stage": stage,
+        "artifacts": entries,
+    }
+
+
+def preparation_payload(
+    cell_id: str,
+    *,
+    campaign: Campaign | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": PREPARATION_SCHEMA,
+        "cell_id": cell_id,
+        "implementation": TEST_IMPLEMENTATION_IDENTITY,
+        "implementation_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
+    }
+    if campaign is None:
+        return payload
+    from block_crosscoder_experiment.cli.run_cell import _synthetic_preparation_data
+
+    cell = campaign._require_cell(cell_id)
+    values = cell.decision_map
+    data = (
+        _synthetic_preparation_data(cell)
+        if cell.phase is Phase.PHASE1
+        else fixture_preparation_data(cell)
+    )
+    assert data is not None
+    payload.update(
+        {
+            "cell_manifest_sha256": hashlib.sha256(
+                campaign.cell_manifest_path(cell_id).read_bytes()
+            ).hexdigest(),
+            "phase": cell.phase.value,
+            "stage_family": cell.stage,
+            "recipe_name": cell.recipe_name,
+            "recipe_id": cell.recipe_id,
+            "seed": cell.seed,
+            "decisions_sha256": hashlib.sha256(
+                canonical_json(cell.content_payload()).encode()
+            ).hexdigest(),
+            "data": data,
+            "data_identity": (
+                None
+                if cell.phase is Phase.PHASE1
+                else activation_content_identity(data)
+            ),
+            "runtime": {
+                "smoke": values["runtime.smoke"],
+                "device": str(values["runtime.device"]),
+                "torch_version": TEST_IMPLEMENTATION_IDENTITY["torch"],
+            },
+            "random": {
+                name.removeprefix("random."): values[name]
+                for name in (
+                    "random.model_seed",
+                    "random.structure_seed",
+                    "random.train_data_seed",
+                    "random.eval_data_seed",
+                    "random.confirmation_data_seed",
+                )
+            },
+            "selection": {
+                "id": values["selection.id"],
+                "source_blueprint_id": values["selection.source_blueprint_id"],
+                "source_plan_id": values["selection.source_plan_id"],
+                "upstream_selection_ids": list(
+                    values["selection.upstream_selection_ids"]
+                ),
+                "parent_candidate_id": values["selection.parent_candidate_id"],
+                "parent_cell_ids": list(values["selection.parent_cell_ids"]),
+                "delta_decision_names": list(
+                    values["selection.delta_decision_names"]
+                ),
+                "confirmation_sha256s": list(
+                    values["selection.confirmation_sha256s"]
+                ),
+                "qualification_sha256s": list(
+                    values["selection.qualification_sha256s"]
+                ),
+                "universe_sha256": values["selection.universe_sha256"],
+            },
+        }
+    )
+    return payload
+
+
+def fixture_preparation_data(cell: CellSpec) -> dict[str, object] | None:
+    if cell.phase is Phase.PHASE1:
+        return None
+    split_names = [str(name) for name, _ in cell.decision_map["data.split_sizes"]]
+    splits = {
+        name: {
+            "requested_tokens": int(count),
+            "actual_tokens": int(count),
+            "manifest_sha256": hashlib.sha256(f"manifest:{name}".encode()).hexdigest(),
+            "row_stream_sha256": hashlib.sha256(f"rows:{name}".encode()).hexdigest(),
+            "content_stream_sha256": hashlib.sha256(
+                f"content:{name}".encode()
+            ).hexdigest(),
+        }
+        for name, count in cell.decision_map["data.split_sizes"]
+    }
+    policy = str(cell.decision_map["data.store_view_policy"])
+    normalization = (
+        {
+            "mode": str(cell.decision_map["data.normalization"]),
+            "transform_hash": "4" * 64,
+            "transform_sha256": "5" * 64,
+            "view_manifest_sha256": "6" * 64,
+            "view_manifest_file_sha256": "7" * 64,
+        }
+        if policy == "content_addressed_derived_view"
+        else {
+            "mode": str(cell.decision_map["data.normalization"]),
+            "application": "on_the_fly",
+            "transform_path": "/fixture/whitener.pt",
+            "transform_sha256": "5" * 64,
+            "transform_hash": "4" * 64,
+            "transform_manifest": "/fixture/transform.json",
+            "transform_manifest_sha256": "6" * 64,
+            "selected_site_indices": list(range(len(cell.decision_map["data.sites"]))),
+            "source_capture_sha256": "1" * 64,
+            "source_fit_manifest": "/fixture/normalization_fit/split.json",
+            "source_fit_manifest_file_sha256": "7" * 64,
+            "source_fit_manifest_sha256": "8" * 64,
+            "source_fit_row_stream_sha256": "9" * 64,
+            "source_fit_requested_tokens": int(
+                cell.decision_map["data.normalization_fit_count"]
+            ),
+        }
+    )
+    return {
+        "kind": "activation_store",
+        "root": "/fixture/view",
+        "splits": {},
+        "bindings": {},
+        "row_intervals": {},
+        "row_intervals_disjoint": True,
+        "source_contract": {
+            "path": "/fixture/raw/capture.json",
+            "sha256": "1" * 64,
+            "capture_binding_sha256": "2" * 64,
+            "source_hash": "3" * 64,
+            "source": {},
+            "declared": {},
+            "split_order": split_names,
+            "split_plan": {},
+            "capture_binding": {},
+            "capture_implementation": {},
+            "capture_content_sha256": "a" * 64,
+            "splits": {},
+            "capture": {},
+        },
+        "declared_split_contract": copy.deepcopy(splits),
+        "raw_root": "/fixture/raw",
+        "raw_bindings": {},
+        "raw_declared_split_contract": copy.deepcopy(splits),
+        "store_view_policy": policy,
+        "training_row_policy": {
+            "kind": "immutable_prefix_then_deterministic_replay",
+            "unique_tokens": int(cell.decision_map["data.unique_tokens"]),
+            "train_tokens": int(cell.decision_map["data.train_tokens"]),
+        },
+        "normalization": normalization,
+    }
+
+
+def fixture_data_identity(cell: CellSpec) -> dict[str, object] | None:
+    data = fixture_preparation_data(cell)
+    if data is None:
+        return None
+    return activation_content_identity(data)
+
+
+def _fixture_selection_validation(
+    cell: CellSpec,
+    validation: dict[str, float],
+) -> dict[str, float]:
+    """Map legacy ordinal test scores into the physical negative-FVU range."""
+
+    if cell.phase is Phase.PHASE1:
+        return validation
+    raw = float(validation["negative_mean_raw_fvu"])
+    score = raw if -1.0 < raw < 0.0 else -0.6 + 0.02 * raw
+    if not -1.0 < score <= 0.0:
+        raise AssertionError("fixture score cannot be represented by fixed-rate FVU")
+    return {"negative_mean_raw_fvu": score}
+
+
+def evaluation_payload(
+    cell: CellSpec,
     inputs: dict[str, str],
     validation: dict[str, float],
     *,
     sharing_guard: dict[str, float] | None = None,
 ) -> dict[str, object]:
+    cell_id = cell.cell_id
+    validation = _fixture_selection_validation(cell, validation)
+    if cell.phase is Phase.PHASE1:
+        requested_margin = float(validation.get("phase1_identification_margin", 0.5))
+        identification, validation = phase1_identification_metrics(
+            cell, passed_margin=(requested_margin if requested_margin >= 0.0 else 0.5)
+        )
+    else:
+        identification = None
     selection_metrics = {
         "validation": validation,
         "sharing_guard": sharing_guard
@@ -809,11 +1316,31 @@ def evaluation_payload(
             "leave_one_out_intersection_energy_coverage_min": 0.92,
         },
     }
+    if identification is not None:
+        selection_metrics["identification"] = identification
+        selection_metrics["phase1_threshold_sensitivity"] = (
+            campaign_module._expected_phase1_threshold_sensitivity(
+                identification,
+                cell,
+            )
+        )
+        selection_metrics["fixed_rate_raw_selection"] = {
+            "schema": "bsc-fixed-rate-raw-selection-v2",
+            "applicable": False,
+            "eligible": False,
+            "operating_policy": None,
+            "reason": "phase1_uses_truth_known_identification",
+        }
+    else:
+        selection_metrics["phase1_threshold_sensitivity"] = None
+        selection_metrics["fixed_rate_raw_selection"] = _fixture_fixed_rate_evidence(
+            cell,
+            inputs,
+            score=float(validation["negative_mean_raw_fvu"]),
+        )
     return {
         "schema": EVALUATION_SCHEMA,
-        "evaluation_execution_implementation": (
-            "fused_deployable_full_view_packet_v2"
-        ),
+        "evaluation_execution_implementation": ("fused_deployable_full_view_packet_v2"),
         "cell_id": cell_id,
         "inputs": inputs,
         "validation": validation,
@@ -822,24 +1349,205 @@ def evaluation_payload(
             canonical_json(selection_metrics).encode("utf-8")
         ).hexdigest(),
         "raw_space": {"eligible": True},
-        "fixed_rate_raw_selection": {"eligible": True},
-        "synthetic_recovery": {
-            "deployed": {"shared_feature_claim_eligible": True}
-        },
+        "fixed_rate_raw_selection": selection_metrics["fixed_rate_raw_selection"],
+        "phase1_threshold_sensitivity": selection_metrics[
+            "phase1_threshold_sensitivity"
+        ],
+        "synthetic_recovery": {"deployed": {"shared_feature_claim_eligible": True}},
     }
+
+
+def _fixture_fixed_rate_policy(
+    cell: CellSpec,
+    *,
+    endpoint_name: str,
+    endpoint_q: int,
+) -> dict[str, object]:
+    aggregation = (
+        "worst_seed_frozen_parent"
+        if cell.phase is Phase.PHASE3
+        or cell.decision_map.get("evaluation.split") == "confirmation"
+        else "development_cell"
+    )
+    source_cell_id = cell.cell_id
+    if aggregation == "worst_seed_frozen_parent":
+        source_cell_id = str(cell.decision_map["selection.parent_cell_ids"][0])
+    policy: dict[str, object] = {
+        "schema": "bsc-fixed-rate-operating-policy-v1",
+        "source_cell_id": source_cell_id,
+        "source_evidence_sha256": hashlib.sha256(
+            f"fixed-rate:{cell.cell_id}".encode()
+        ).hexdigest(),
+        "aggregation": aggregation,
+        "rows": [
+            {
+                "budget_bits_per_token": float(budget),
+                "lower_name": endpoint_name,
+                "lower_q": endpoint_q,
+                "upper_name": endpoint_name,
+                "upper_q": endpoint_q,
+            }
+            for budget in cell.decision_map.get(
+                "evaluation.fixed_rate_budgets_bits_per_token", ()
+            )
+        ],
+    }
+    policy["content_sha256"] = hashlib.sha256(
+        canonical_json(policy).encode()
+    ).hexdigest()
+    return policy
+
+
+def _fixture_fixed_rate_evidence(
+    cell: CellSpec,
+    inputs: dict[str, str],
+    *,
+    score: float,
+) -> dict[str, object]:
+    """Build schema-complete, arithmetically replayable fixed-rate evidence."""
+
+    target_fvu = -float(score)
+    if not 0.0 <= target_fvu < 1.0:
+        raise AssertionError("real-data fixture scores must lie strictly above -1")
+    values = cell.decision_map
+    horizon = int(values["evaluation.side_information_amortization_tokens"])
+    side_rate = 8.0 / horizon
+    schedule_rate = 256.0 / horizon
+    quantizer_bits = tuple(sorted(int(q) for q in values["codec.quantizer_bits"]))
+    measured: list[dict[str, object]] = [
+        {
+            "name": "zero_event_calibration_mean",
+            "q": None,
+            "packet_bits_per_token": 0.0,
+            "side_information_bits_per_token": side_rate,
+            "total_bits_per_token": side_rate,
+            "raw_space_fvu": 1.0,
+        }
+    ]
+    for index, q in enumerate(quantizer_bits, start=1):
+        packet_rate = float(2 * q)
+        endpoint_fvu = target_fvu + (1.0 - target_fvu) * (
+            len(quantizer_bits) - index
+        ) / len(quantizer_bits)
+        measured.append(
+            {
+                "name": f"q{q}",
+                "q": q,
+                "packet_bits_per_token": packet_rate,
+                "side_information_bits_per_token": side_rate,
+                "total_bits_per_token": packet_rate + side_rate,
+                "raw_space_fvu": endpoint_fvu,
+            }
+        )
+    selected = measured[-1]
+    endpoint_name = str(selected["name"])
+    endpoint_q = int(selected["q"])
+    policy = _fixture_fixed_rate_policy(
+        cell,
+        endpoint_name=endpoint_name,
+        endpoint_q=endpoint_q,
+    )
+    budgets = tuple(
+        float(value) for value in values["evaluation.fixed_rate_budgets_bits_per_token"]
+    )
+    fixed_budgets = []
+    achieved_rate = float(selected["total_bits_per_token"]) + schedule_rate
+    for index, budget in enumerate(budgets):
+        assert achieved_rate <= budget
+        fixed_budgets.append(
+            {
+                "budget_bits_per_token": budget,
+                "eligible": True,
+                "raw_space_fvu": target_fvu,
+                "bracket": [endpoint_name, endpoint_name],
+                "upper_mixture_weight": 0.0,
+                "achieved_total_bits_per_token": achieved_rate,
+                "operating_record": {
+                    "contract": values["codec.time_sharing_schedule_contract"],
+                    "header_bytes": 32,
+                    "header_layout": (
+                        "binding_magic_u64,horizon_u64,upper_count_u64,"
+                        "lower_mode_u32,upper_mode_u32"
+                    ),
+                    "artifact_sha256": inputs["deployment_schedules"],
+                    "record_index": index,
+                    "record_offset_bytes": 32 * index,
+                    "record_sha256": hashlib.sha256(
+                        f"record:{cell.cell_id}:{index}".encode()
+                    ).hexdigest(),
+                    "binding_magic_u64": index + 1,
+                    "horizon_tokens": horizon,
+                    "upper_tokens": 0,
+                    "rule": (
+                        "upper iff floor((i+1)*upper_tokens/horizon) > "
+                        "floor(i*upper_tokens/horizon)"
+                    ),
+                    "per_token_mode_bits": 0,
+                    "header_bits_per_token": schedule_rate,
+                    "evaluation_tokens": min(17, horizon),
+                    "evaluation_upper_tokens": 0,
+                    "distortion_measurement": (
+                        "executed_balanced_schedule_on_paired_raw_evaluation_rows"
+                    ),
+                },
+                "reason": (
+                    "frozen_parent_operating_policy_replayed"
+                    if policy["aggregation"] == "worst_seed_frozen_parent"
+                    else "development_envelope_operating_policy_selected"
+                ),
+            }
+        )
+    evidence: dict[str, object] = {
+        "schema": "bsc-fixed-rate-raw-selection-v2",
+        "applicable": True,
+        "cell_id": cell.cell_id,
+        "deployment_codec_sha256": inputs["deployment_codec"],
+        "calibration_sha256": inputs["calibration"],
+        "side_information": {
+            "artifact": "deployable_codec",
+            "artifact_size_bytes": 1,
+            "amortization_tokens": horizon,
+            "bits_per_token": side_rate,
+            "includes_optimizer_checkpoint": False,
+            "time_sharing_schedule_contract": values[
+                "codec.time_sharing_schedule_contract"
+            ],
+            "operating_record_bytes_per_budget": 32,
+            "deployment_schedule_bundle_sha256": inputs["deployment_schedules"],
+            "deployment_schedule_bundle_size_bytes": 32 * len(budgets),
+            "deployment_schedule_record_count": len(budgets),
+        },
+        "packet_formula": {
+            "rate_model": "fixed_width_decodable_payload_bits_v1",
+            "count_width_bits": 5,
+            "block_id_width_bits": 4,
+            "included_block_alphabet": 16,
+            "sparse_amplitude_bits": "q * block_width * selected_events",
+        },
+        "rate_axis": values["evaluation.rate_axis"],
+        "interpolation": values["evaluation.rate_interpolation"],
+        "out_of_range": values["evaluation.rate_out_of_range"],
+        "zero_rate_reconstruction": values["evaluation.zero_rate_reconstruction"],
+        "measured_points": measured,
+        "lower_convex_envelope": campaign_module._fixed_rate_lower_envelope(measured),
+        "fixed_budgets": fixed_budgets,
+        "selection_score_name": values["evaluation.selection_score"],
+        "selection_score": score,
+        "operating_policy": policy,
+        "eligible": True,
+        "reason": "eligible",
+    }
+    evidence["content_sha256"] = hashlib.sha256(
+        canonical_json(evidence).encode()
+    ).hexdigest()
+    return evidence
 
 
 def advance_to_evaluated(campaign: Campaign, cell_id: str) -> dict[str, ArtifactRef]:
     preparation = write_artifact(
         campaign.root,
         "preparation",
-        {
-            "schema": PREPARATION_SCHEMA,
-            "cell_id": cell_id,
-            "ready": True,
-            "implementation": TEST_IMPLEMENTATION_IDENTITY,
-            "implementation_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
-        },
+        preparation_payload(cell_id, campaign=campaign),
     )
     prepare_manifest = write_artifact(
         campaign.root, "prepare_manifest", {"stage": "prepare"}
@@ -885,12 +1593,16 @@ def advance_to_evaluated(campaign: Campaign, cell_id: str) -> dict[str, Artifact
         "deployment_schedules",
         {"schema": "test-deployment-schedules-v1"},
     )
-    validation = {"fvu": 0.1, "rate_distortion": 0.8}
+    validation = (
+        {"phase1_identification_margin": 0.5}
+        if campaign._require_cell(cell_id).phase is Phase.PHASE1
+        else {"negative_mean_raw_fvu": -0.5}
+    )
     evaluation = write_artifact(
         campaign.root,
         "evaluation",
         evaluation_payload(
-            cell_id,
+            campaign._require_cell(cell_id),
             {
                 "checkpoint": checkpoint.sha256,
                 "calibration": calibration.sha256,
@@ -929,12 +1641,25 @@ def qualification_payload(
     protocol_eligible: bool = False,
 ) -> dict[str, object]:
     cell_id = cell.cell_id
-    validation = validation or {"fvu": 0.1, "rate_distortion": 0.8}
+    validation = validation or (
+        {"phase1_identification_margin": 0.5}
+        if cell.phase is Phase.PHASE1
+        else {"negative_mean_raw_fvu": -0.5}
+    )
+    validation = _fixture_selection_validation(cell, validation)
     resolved_promotion = (
         scientific_passed
         if promotion_eligible is None
         else scientific_passed and promotion_eligible
     )
+    if cell.phase is Phase.PHASE1:
+        requested_margin = float(validation.get("phase1_identification_margin", 0.5))
+        identification, validation = phase1_identification_metrics(
+            cell,
+            passed_margin=(requested_margin if requested_margin >= 0.0 else 0.5),
+        )
+    else:
+        identification = None
     selection_metrics = {
         "validation": validation,
         "sharing_guard": sharing_guard
@@ -958,6 +1683,32 @@ def qualification_payload(
             "leave_one_out_intersection_energy_coverage_min": 0.92,
         },
     }
+    if identification is not None:
+        selection_metrics["identification"] = identification
+        selection_metrics["phase1_threshold_sensitivity"] = (
+            campaign_module._expected_phase1_threshold_sensitivity(
+                identification,
+                cell,
+            )
+        )
+        fixed_rate_policy = None
+        selection_metrics["fixed_rate_raw_selection"] = {
+            "schema": "bsc-fixed-rate-raw-selection-v2",
+            "applicable": False,
+            "eligible": False,
+            "operating_policy": None,
+            "reason": "phase1_uses_truth_known_identification",
+        }
+    else:
+        selection_metrics["phase1_threshold_sensitivity"] = None
+        selection_metrics["fixed_rate_raw_selection"] = _fixture_fixed_rate_evidence(
+            cell,
+            inputs,
+            score=float(validation["negative_mean_raw_fvu"]),
+        )
+        fixed_rate_policy = selection_metrics["fixed_rate_raw_selection"][
+            "operating_policy"
+        ]
     identification_inapplicable = (
         cell.phase is Phase.PHASE1
         and cell.decision_map.get("data.normalization") == "layer"
@@ -967,7 +1718,7 @@ def qualification_payload(
         "codec_calibration_exclusion": scientific_passed,
         "codec_evaluation_exclusion": scientific_passed,
         "phase1_identification": (
-            True if identification_inapplicable else scientific_passed
+            True if cell.phase is Phase.PHASE1 else scientific_passed
         ),
         "production_precision_finite": scientific_passed,
         "production_precision_reconstruction": scientific_passed,
@@ -1015,10 +1766,14 @@ def qualification_payload(
                 "codec_calibration_excluded_fraction": 0.01,
                 "codec_evaluation_excluded_fraction": 0.01,
                 "phase1_native_identification": (
-                    0.1 if scientific_passed else -0.1
+                    None
+                    if identification is None
+                    else identification["native"]["margin"]
                 ),
                 "phase1_deployed_identification": (
-                    0.1 if scientific_passed else -0.1
+                    None
+                    if identification is None
+                    else identification["deployed"]["margin"]
                 ),
                 "production_precision_reconstruction": None,
                 "production_precision_support_iou": None,
@@ -1032,15 +1787,14 @@ def qualification_payload(
             canonical_json(selection_metrics).encode("utf-8")
         ).hexdigest(),
         "selection_metrics_evaluation_sha256": inputs["evaluation"],
+        "fixed_rate_operating_policy": fixed_rate_policy,
         "implementation_identity": TEST_IMPLEMENTATION_IDENTITY,
         "implementation_identity_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
         "qualification_profile": cell.decision_map["qualification.profile"],
         "thresholds_version": cell.decision_map["qualification.thresholds_version"],
         "thresholds": campaign_module._qualification_thresholds(cell),
         "promotion_eligible": resolved_promotion,
-        "promotion_ineligible_reasons": (
-            [] if resolved_promotion else reasons
-        ),
+        "promotion_ineligible_reasons": ([] if resolved_promotion else reasons),
         "selection_eligible_for_protocol_test": protocol_eligible,
         "selection_eligibility_mode": (
             "scientific_promotion"
@@ -1081,6 +1835,12 @@ def write_cell_artifact(
 ) -> ArtifactRef:
     path = campaign.cell_dir(cell_id) / "unit-artifacts" / f"{kind}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        kind.endswith("_manifest")
+        and isinstance(payload, dict)
+        and set(payload) == {"stage"}
+    ):
+        payload = _test_stage_manifest(path.parent, cell_id, str(payload["stage"]))
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
@@ -1096,17 +1856,12 @@ def qualify_cell(
     validation: dict[str, float] | None = None,
     sharing_guard: dict[str, float] | None = None,
 ) -> ArtifactRef:
+    cell = campaign._require_cell(cell_id)
     preparation = write_cell_artifact(
         campaign,
         cell_id,
         "preparation",
-        {
-            "schema": PREPARATION_SCHEMA,
-            "cell_id": cell_id,
-            "ready": True,
-            "implementation": TEST_IMPLEMENTATION_IDENTITY,
-            "implementation_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
-        },
+        preparation_payload(cell_id, campaign=campaign),
     )
     prepare_manifest = write_cell_artifact(
         campaign, cell_id, "prepare_manifest", {"stage": "prepare"}
@@ -1161,7 +1916,7 @@ def qualify_cell(
         cell_id,
         "evaluation",
         evaluation_payload(
-            cell_id,
+            cell,
             {
                 "checkpoint": checkpoint.sha256,
                 "calibration": calibration.sha256,
@@ -1185,7 +1940,7 @@ def qualify_cell(
         cell_id,
         "qualification",
         qualification_payload(
-            campaign._require_cell(cell_id),
+            cell,
             {
                 "preparation": preparation.sha256,
                 "checkpoint": checkpoint.sha256,
@@ -1230,6 +1985,7 @@ def qualified_phase2_campaign(
     root: Path,
     *,
     seeds: tuple[int, ...] = (0,),
+    negative_confirmation: bool = False,
 ) -> tuple[Campaign, object]:
     """Materialize every smoke round and qualify its complete declared panel."""
 
@@ -1246,6 +2002,11 @@ def qualified_phase2_campaign(
                 campaign,
                 cell.cell_id,
                 metric=float(index + 1),
+                scientific_passed=not (
+                    negative_confirmation
+                    and cell.decision_map["data.normalization"] == "scalar_rms"
+                    and cell.decision_map["evaluation.split"] == "confirmation"
+                ),
                 validation={"negative_mean_raw_fvu": float(index + 1)},
             )
         if stage.selection_policy is None:
@@ -1360,6 +2121,347 @@ def test_registration_is_idempotent_and_journal_is_authoritative(tmp_path):
     other = one_cell_plan(seed=1)
     with pytest.raises(CampaignError, match="different frozen blueprint"):
         register_test_plan(campaign, other)
+
+
+def test_runner_repairs_snapshot_after_post_journal_power_loss(tmp_path):
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_cell_artifact(
+        campaign,
+        cell_id,
+        "preparation",
+        {
+            **preparation_payload(cell_id, campaign=campaign),
+            "data_identity": None,
+        },
+    )
+    prepare_manifest = write_cell_artifact(
+        campaign,
+        cell_id,
+        "prepare_manifest",
+        {"stage": "prepare"},
+    )
+    with patch.object(campaign, "_write_snapshot", side_effect=OSError("power loss")):
+        result = campaign.transition(
+            cell_id,
+            RunState.PREPARED,
+            artifacts=(preparation, prepare_manifest),
+        )
+
+    assert result.state is RunState.PREPARED
+    assert campaign.record(cell_id).state is RunState.PREPARED
+    assert json.loads(campaign.state_path(cell_id).read_text())["state"] == "planned"
+    summary = CampaignRunner(campaign).run(
+        cell_ids=[cell_id],
+        stop_after="prepare",
+    )
+    assert summary.completed_cells == 1
+    assert json.loads(campaign.state_path(cell_id).read_text())["state"] == "prepared"
+
+
+def test_reconcile_republishes_missing_or_corrupt_initial_plan_projection(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+
+    campaign.plan_path.unlink()
+    assert campaign.plan == plan
+    assert campaign.reconcile()["plan_republished"] == plan.plan_id
+
+    campaign.plan_path.write_text('{"corrupt": true}\n')
+    assert campaign.plan == plan
+    assert campaign.reconcile()["plan_republished"] == plan.plan_id
+    assert StudyPlan.from_manifest(json.loads(campaign.plan_path.read_text())) == plan
+
+
+def test_public_events_are_detached_from_authority_cache(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    exposed = campaign.events()
+    exposed[0]["metadata"]["plan_id"] = "plan:missing"
+    exposed[0]["event_id"] = "poisoned"
+
+    assert campaign.plan == plan
+    assert campaign.events()[0]["metadata"]["plan_id"] == plan.plan_id
+
+
+def test_partial_initial_registration_cannot_run_until_resumed(tmp_path):
+    first = one_cell_plan(seed=0).cells[0]
+    second = one_cell_plan(seed=1).cells[0]
+    base = one_cell_plan(seed=0)
+    plan = StudyPlan(
+        "partial_registration",
+        Phase.PHASE1,
+        (
+            StageSpec(
+                "test",
+                (first, second),
+                selection_policy=base.stages[0].selection_policy,
+            ),
+        ),
+    )
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    first_registration = next(
+        event
+        for event in campaign.events()
+        if event.get("event") == "transition"
+        and event.get("previous") is None
+        and event.get("cell_id") == first.cell_id
+    )
+    campaign.journal_path.write_text(canonical_json(first_registration) + "\n")
+
+    restarted = Campaign(tmp_path)
+    with pytest.raises(CampaignError, match="registration is incomplete"):
+        restarted.transition(first.cell_id, RunState.FAILED)
+
+    register_test_plan(restarted, plan)
+    assert {cell.cell_id for cell in restarted.plan.cells} == {
+        first.cell_id,
+        second.cell_id,
+    }
+    assert restarted.transition(first.cell_id, RunState.FAILED).state is RunState.FAILED
+
+
+def test_uncommitted_extension_child_cannot_transition(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    parent = plan.cells[0]
+    child = replace(parent, name="phase1.test.uncommitted-child", stage="future")
+    uncommitted = StudyPlan(
+        plan.name,
+        plan.phase,
+        (*plan.stages, StageSpec("future", (child,), depends_on=("test",))),
+    )
+    with campaign._campaign_mutation():
+        campaign_module._write_immutable_json(
+            campaign.plans_dir / f"{campaign_module._slug(uncommitted.plan_id)}.json",
+            uncommitted.to_manifest(),
+        )
+        campaign._register_cells((child,), plan_id=uncommitted.plan_id)
+
+    assert campaign.record(child.cell_id).state is RunState.PLANNED
+    assert campaign.plan == plan
+    with pytest.raises(CampaignError, match="not a member of the committed active plan"):
+        campaign.transition(child.cell_id, RunState.PREPARED)
+
+
+def test_reconcile_removes_unchanged_malformed_stale_lease(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    lease = campaign.lock_path(cell_id)
+    lease.parent.mkdir(parents=True, exist_ok=True)
+    lease.write_text('{"torn":')
+    old = time.time() - 60
+    os.utime(lease, (old, old))
+
+    assert campaign.reconcile_stale_locks(1.0) == (cell_id,)
+    assert not lease.exists()
+    assert campaign.events()[-1]["event"] == "lock_reconciled"
+
+
+def test_reconcile_repairs_and_audits_torn_journal_tail(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    with campaign.journal_path.open("ab") as handle:
+        handle.write(b'{"schema":"bsc-campaign-v1"')
+
+    result = campaign.reconcile()
+    assert result["journal_tail_repaired"] is True
+    assert campaign.journal_path.read_bytes().endswith(b"\n")
+    event_types = [event["event"] for event in campaign.events()]
+    assert "journal_tail_recovered" in event_types
+    assert event_types[-1] == "journal_reconciled"
+
+
+def test_reconcile_refuses_to_race_a_live_cell_guard(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+
+    with campaign.lock(cell_id):
+        with pytest.raises(CampaignLocked, match="cannot reconcile while cell"):
+            campaign.reconcile()
+    assert campaign.reconcile()["snapshots_rebuilt"] == 1
+
+
+def test_preparation_and_reconcile_lock_order_cannot_deadlock(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_cell_artifact(
+        campaign,
+        cell_id,
+        "preparation",
+        preparation_payload(cell_id, campaign=campaign),
+    )
+    manifest = write_cell_artifact(
+        campaign, cell_id, "prepare_manifest", {"stage": "prepare"}
+    )
+    implementation_handle = campaign.implementation_identity_lock_path.open(
+        "a+", encoding="utf-8"
+    )
+    fcntl.flock(implementation_handle.fileno(), fcntl.LOCK_EX)
+
+    def prepare():
+        return campaign.transition(
+            cell_id,
+            RunState.PREPARED,
+            artifacts=(preparation, manifest),
+        )
+
+    def reconcile():
+        try:
+            campaign.reconcile()
+        except CampaignLocked:
+            return "refused"
+        return "completed"
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            prepare_future = executor.submit(prepare)
+            deadline = time.monotonic() + 5.0
+            while True:
+                probe = campaign.mutation_lock_path.open("a+", encoding="utf-8")
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    probe.close()
+                    break
+                else:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    probe.close()
+                if time.monotonic() >= deadline:
+                    pytest.fail("preparation did not acquire the mutation lock first")
+                time.sleep(0.01)
+            reconcile_future = executor.submit(reconcile)
+            assert not reconcile_future.done()
+            fcntl.flock(implementation_handle.fileno(), fcntl.LOCK_UN)
+            assert prepare_future.result(timeout=5.0).state is RunState.PREPARED
+            assert reconcile_future.result(timeout=5.0) in {"completed", "refused"}
+    finally:
+        try:
+            fcntl.flock(implementation_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            implementation_handle.close()
+
+
+def test_extension_commit_serializes_source_transition(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    parent = plan.cells[0]
+    child = replace(parent, name="phase1.test.atomic-child", stage="future")
+    child_stage = StageSpec("future", (child,), depends_on=("test",))
+    extended = StudyPlan(plan.name, plan.phase, (*plan.stages, child_stage))
+    evidence_path = campaign.root / "selections" / "atomic.json"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text('{"frozen": true}\n')
+    evidence = ArtifactRef.from_path(
+        "stage_selection", evidence_path, root=campaign.root
+    )
+    journal_sha256 = hashlib.sha256(campaign.journal_path.read_bytes()).hexdigest()
+    validation_entered = threading.Event()
+    release_validation = threading.Event()
+    transition_finished = threading.Event()
+
+    def live_evidence():
+        validation_entered.set()
+        assert release_validation.wait(5.0)
+        return {"frozen": True}
+
+    def commit_extension():
+        campaign._commit_plan_extension(
+            current=plan,
+            plan=extended,
+            child_stage=child_stage,
+            evidence_ref=evidence,
+            frozen_evidence={"frozen": True},
+            live_evidence=live_evidence,
+            journal_sha256=journal_sha256,
+            message="atomic test extension",
+            metadata={
+                "previous_plan_id": plan.plan_id,
+                "plan_id": extended.plan_id,
+                "stage": child_stage.name,
+            },
+        )
+
+    def fail_parent():
+        campaign.transition(parent.cell_id, RunState.FAILED)
+        transition_finished.set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        commit_future = executor.submit(commit_extension)
+        assert validation_entered.wait(5.0)
+        transition_future = executor.submit(fail_parent)
+        assert not transition_finished.wait(0.1)
+        release_validation.set()
+        commit_future.result(timeout=5.0)
+        transition_future.result(timeout=5.0)
+
+    ordered = [
+        event["event"]
+        for event in campaign.events()
+        if event.get("event") == "plan_extension"
+        or (
+            event.get("event") == "transition"
+            and event.get("cell_id") == parent.cell_id
+            and event.get("target") == RunState.FAILED.value
+        )
+    ]
+    assert ordered == ["plan_extension", "transition"]
+
+
+def test_intermediate_transition_requires_executor_stage_receipt(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_cell_artifact(
+        campaign,
+        cell_id,
+        "preparation",
+        preparation_payload(cell_id, campaign=campaign),
+    )
+    prepare_manifest = write_cell_artifact(
+        campaign, cell_id, "prepare_manifest", {"stage": "prepare"}
+    )
+    campaign.transition(
+        cell_id,
+        RunState.PREPARED,
+        artifacts=(preparation, prepare_manifest),
+    )
+    campaign.transition(cell_id, RunState.RUNNING)
+    checkpoint = write_cell_artifact(
+        campaign, cell_id, "checkpoint", {"not": "a torch checkpoint"}
+    )
+    training_report = write_cell_artifact(
+        campaign, cell_id, "training_report", {"forged": True}
+    )
+    train_manifest = write_cell_artifact(
+        campaign, cell_id, "train_manifest", {"stage": "train"}
+    )
+
+    with campaign.lock(cell_id):
+        with pytest.raises(ArtifactError, match="executor-stage receipt"):
+            campaign._transition_locked_commit(
+                cell_id,
+                RunState.TRAINED,
+                artifacts=(checkpoint, training_report, train_manifest),
+                message="",
+                metadata=None,
+            )
+    assert campaign.record(cell_id).state is RunState.RUNNING
 
 
 def test_phase2_registration_requires_authenticated_phase1_go(tmp_path):
@@ -1592,9 +2694,9 @@ def test_phase1_decision_rejects_mixed_implementation_identities_after_rehash():
         **qualification["implementation_identity"],
         "python_source_sha256": "f" * 64,
     }
-    qualification["implementation_identity_sha256"] = hashlib.sha256(
-        canonical_json(qualification["implementation_identity"]).encode("utf-8")
-    ).hexdigest()
+    qualification["implementation_identity_sha256"] = execution_identity_sha256(
+        qualification["implementation_identity"]
+    )
     evidence["qualification_sha256"] = qualification_file_sha256(qualification)
     rehash_phase1_decision(payload)
 
@@ -1603,8 +2705,9 @@ def test_phase1_decision_rejects_mixed_implementation_identities_after_rehash():
 
 
 def test_phase1_scientific_decision_rejects_dirty_identity():
-    identity = {**TEST_IMPLEMENTATION_IDENTITY, "git_dirty": True}
-    with pytest.raises(CampaignError, match="clean committed identity"):
+    identity = copy.deepcopy(TEST_IMPLEMENTATION_IDENTITY)
+    identity["provenance"]["git"]["source_dirty"] = True
+    with pytest.raises(CampaignError, match="clean committed source tree"):
         phase1_decision_for_phase2(
             smoke=False,
             implementation_identity=identity,
@@ -1685,13 +2788,97 @@ def test_phase1_transfer_records_full_capability_identification_conjunction():
         item for item in capacity["variants"] if item["variant"] == variant_name
     )
     row = variant["per_seed"][0]
-    assert row["scientific_outcome_passed"] is True
+    assert row["scientific_outcome_passed"] is False
     assert row["native_passed"] is False
     assert row["deployed_passed"] is True
     assert row["validation_conjunction_passed"] is False
-    assert row["conjunction_passed"] is False
+    assert row["identification_authorization_passed"] is False
     assert row["passed"] is False
     assert variant["passed_all_seeds"] is False
+
+
+def test_phase1_authorization_uses_declared_aggregate_factor_fraction():
+    payload = phase1_decision_for_phase2(smoke=False)
+    manifest = payload["phase1_campaign_manifest"]
+    plan = StudyPlan.from_manifest(manifest["plan"])
+    baseline = next(
+        cell
+        for cell in plan.stages[-1].cells
+        if cell.decision_map.get("factor.robustness") == "baseline"
+    )
+    evidence = next(
+        item for item in manifest["cells"] if item["cell_id"] == baseline.cell_id
+    )
+    qualification = copy.deepcopy(evidence["qualification"])
+    identification = qualification["selection_metrics"]["identification"]
+    for endpoint in (identification["native"], identification["deployed"]):
+        failed_factor = endpoint["per_factor"][0]
+        threshold = endpoint["thresholds"]["per_factor.support_association_min"]
+        failed_factor["support_association"] = threshold - 0.1 * abs(threshold)
+        failed_factor["component_margins"]["support_association"] = -0.1
+        failed_factor["margin"] = -0.1
+        failed_factor["identified"] = False
+        recovered_fraction = (len(endpoint["per_factor"]) - 1) / len(
+            endpoint["per_factor"]
+        )
+        endpoint["aggregate"]["recovered_factor_fraction"] = recovered_fraction
+        endpoint["checks"]["recovered_factor_fraction"] = True
+        endpoint["normalized_margins"]["worst_eligible_per_factor"] = -0.1
+        endpoint["normalized_margins"]["recovered_factor_fraction"] = (
+            campaign_module._phase1_min_margin(
+                recovered_fraction,
+                endpoint["thresholds"]["aggregate.recovered_factor_fraction_min"],
+            )
+        )
+        endpoint["margin"] = -0.1
+        endpoint["passed"] = True
+    validation = {
+        "phase1_identification_applicable": True,
+        "phase1_identification_conjunction": True,
+        "phase1_identification_margin": -0.1,
+    }
+    qualification["selection_metrics"]["validation"] = validation
+    qualification["validation"] = validation
+    qualification["scientific_outcome"]["margins"].update(
+        {
+            "phase1_native_identification": -0.1,
+            "phase1_deployed_identification": -0.1,
+        }
+    )
+
+    claim = Campaign._phase1_claim_evidence(qualification, cell=baseline, smoke=False)
+    assert claim["native_passed"] is True
+    assert claim["deployed_passed"] is True
+    assert claim["conjunction_passed"] is True
+
+
+def test_phase1_negative_control_failure_is_identification_specific():
+    payload = phase1_decision_for_phase2(smoke=False)
+    manifest = payload["phase1_campaign_manifest"]
+    plan = StudyPlan.from_manifest(manifest["plan"])
+    baseline = next(
+        cell
+        for cell in plan.stages[-1].cells
+        if cell.decision_map.get("factor.robustness") == "baseline"
+    )
+    evidence = next(
+        item for item in manifest["cells"] if item["cell_id"] == baseline.cell_id
+    )
+    qualification = copy.deepcopy(evidence["qualification"])
+    qualification["scientific_outcome"]["checks"]["support_target_calibration"] = False
+    qualification["scientific_outcome"]["passed"] = False
+
+    claim = Campaign._phase1_claim_evidence(qualification, cell=baseline, smoke=False)
+    assert claim["scientific_outcome_passed"] is False
+    assert claim["conjunction_passed"] is True
+
+
+def test_phase1_decision_rejects_extra_nested_cell_evidence():
+    payload = phase1_decision_for_phase2(smoke=False)
+    payload["phase1_campaign_manifest"]["cells"][0]["legacy_alias"] = True
+    rehash_phase1_decision(payload)
+    with pytest.raises(CampaignError, match="cell evidence"):
+        Campaign.phase1_decision_from_manifest(payload)
 
 
 def test_phase1_false_positive_negative_control_forces_no_go(tmp_path):
@@ -1752,7 +2939,9 @@ def test_only_legal_transitions_and_required_artifacts_are_accepted(tmp_path):
     cell_id = plan.cells[0].cell_id
     with pytest.raises(InvalidTransition, match="planned -> trained"):
         campaign.transition(cell_id, RunState.TRAINED)
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=campaign)
+    )
     prepare_manifest = write_artifact(
         tmp_path, "prepare_manifest", {"stage": "prepare"}
     )
@@ -1782,7 +2971,9 @@ def test_transition_rejects_future_artifacts_but_allows_identical_reemission(tmp
     campaign = Campaign(tmp_path)
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=campaign)
+    )
     prepare_manifest = write_artifact(
         tmp_path, "prepare_manifest", {"stage": "prepare"}
     )
@@ -1808,6 +2999,79 @@ def test_transition_rejects_future_artifacts_but_allows_identical_reemission(tmp
     )
 
 
+def test_direct_prepared_transition_rejects_forged_stage_manifest(tmp_path):
+    plan = one_cell_plan()
+    campaign = Campaign(tmp_path)
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_cell_artifact(
+        campaign,
+        cell_id,
+        "preparation",
+        preparation_payload(cell_id, campaign=campaign),
+    )
+    forged_manifest = write_cell_artifact(
+        campaign,
+        cell_id,
+        "prepare_manifest",
+        {"forged": True},
+    )
+    with pytest.raises(ArtifactError, match="stage manifest is noncanonical"):
+        campaign.transition(
+            cell_id,
+            RunState.PREPARED,
+            artifacts=(preparation, forged_manifest),
+        )
+    assert campaign.record(cell_id).state is RunState.PLANNED
+
+
+def test_transition_rejects_external_artifact_refs(tmp_path):
+    campaign_root = tmp_path / "campaign"
+    campaign = Campaign(campaign_root)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    outside = tmp_path / "outside-preparation.json"
+    outside.write_text(
+        json.dumps(preparation_payload(cell_id, campaign=campaign)) + "\n"
+    )
+    with pytest.raises(ArtifactError, match="outside the campaign root"):
+        ArtifactRef.from_path(
+            "preparation",
+            outside,
+            root=campaign.root,
+        )
+
+
+def test_prepared_transition_rejects_tampered_cell_projection(tmp_path):
+    campaign = Campaign(tmp_path)
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    cell_id = plan.cells[0].cell_id
+    preparation = write_cell_artifact(
+        campaign,
+        cell_id,
+        "preparation",
+        preparation_payload(cell_id, campaign=campaign),
+    )
+    manifest = write_cell_artifact(
+        campaign,
+        cell_id,
+        "prepare_manifest",
+        {"stage": "prepare"},
+    )
+    cell_path = campaign.cell_manifest_path(cell_id)
+    tampered = json.loads(cell_path.read_text())
+    tampered["name"] = "phase1.test.tampered.s0"
+    cell_path.write_text(json.dumps(tampered, sort_keys=True) + "\n")
+    with pytest.raises(ArtifactError, match="cell projection"):
+        campaign.transition(
+            cell_id,
+            RunState.PREPARED,
+            artifacts=(preparation, manifest),
+        )
+
+
 def test_journal_replay_rejects_illegal_transitions_and_artifact_replacement(tmp_path):
     illegal = Campaign(tmp_path / "illegal")
     illegal_plan = one_cell_plan()
@@ -1828,7 +3092,11 @@ def test_journal_replay_rejects_illegal_transitions_and_artifact_replacement(tmp
     replacement_plan = one_cell_plan()
     register_test_plan(replacement, replacement_plan)
     replacement_cell = replacement_plan.cells[0].cell_id
-    original = write_artifact(replacement.root, "preparation", {"version": 1})
+    original = write_artifact(
+        replacement.root,
+        "preparation",
+        preparation_payload(replacement_cell, campaign=replacement),
+    )
     prepare_manifest = write_artifact(
         replacement.root, "prepare_manifest", {"stage": "prepare"}
     )
@@ -1861,9 +3129,6 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
     inputs = advance_to_evaluated(campaign, cell_id)
-    qualify_manifest = write_artifact(
-        tmp_path, "qualify_manifest", {"stage": "qualify"}
-    )
     assert campaign.eligible_for_qualification(cell_id)
     assert not campaign.eligible_for_promotion(cell_id)
 
@@ -1876,6 +3141,9 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
             "qualified": True,
             "metrics": {"fvu": 0.1},
         },
+    )
+    qualify_manifest = write_artifact(
+        tmp_path, "qualify_manifest", {"stage": "qualify"}
     )
     with pytest.raises(ArtifactError, match="noncanonical field set"):
         campaign.transition(
@@ -1892,6 +3160,9 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
             {kind: "0" * 64 for kind in inputs},
         ),
     )
+    qualify_manifest = write_artifact(
+        tmp_path, "qualify_manifest", {"stage": "qualify"}
+    )
     with pytest.raises(ArtifactError, match="binding mismatch"):
         campaign.transition(
             cell_id,
@@ -1900,6 +3171,9 @@ def test_evaluation_report_is_not_qualification_and_inputs_are_hash_bound(tmp_pa
         )
 
     qualification = good_qualification(campaign, cell_id, inputs)
+    qualify_manifest = write_artifact(
+        tmp_path, "qualify_manifest", {"stage": "qualify"}
+    )
     record = campaign.transition(
         cell_id,
         RunState.QUALIFIED,
@@ -1931,12 +3205,7 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
         campaign,
         first.cell_id,
         "preparation",
-        {
-            "schema": PREPARATION_SCHEMA,
-            "cell_id": first.cell_id,
-            "implementation": TEST_IMPLEMENTATION_IDENTITY,
-            "implementation_sha256": TEST_IMPLEMENTATION_IDENTITY_SHA256,
-        },
+        preparation_payload(first.cell_id, campaign=campaign),
     )
     first_manifest = write_cell_artifact(
         campaign, first.cell_id, "prepare_manifest", {"stage": "prepare"}
@@ -1956,18 +3225,15 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
         second.cell_id,
         "preparation",
         {
-            "schema": PREPARATION_SCHEMA,
-            "cell_id": second.cell_id,
+            **preparation_payload(second.cell_id, campaign=campaign),
             "implementation": different_identity,
-            "implementation_sha256": hashlib.sha256(
-                canonical_json(different_identity).encode("utf-8")
-            ).hexdigest(),
+            "implementation_sha256": execution_identity_sha256(different_identity),
         },
     )
     second_manifest = write_cell_artifact(
         campaign, second.cell_id, "prepare_manifest", {"stage": "prepare"}
     )
-    with pytest.raises(ArtifactError, match="already prepared campaign cell"):
+    with pytest.raises(ArtifactError, match="differs from the campaign pin"):
         campaign.transition(
             second.cell_id,
             RunState.PREPARED,
@@ -1976,7 +3242,7 @@ def test_preparation_rejects_campaign_implementation_drift(tmp_path):
     assert campaign.record(second.cell_id).state is RunState.PLANNED
 
 
-def test_concurrent_first_preparations_atomically_pin_one_identity(tmp_path):
+def test_concurrent_preparations_enforce_registration_identity_pin(tmp_path):
     first_plan = one_cell_plan(seed=0, smoke=False)
     first = first_plan.cells[0]
     second = one_cell_plan(seed=1, smoke=False).cells[0]
@@ -2008,12 +3274,9 @@ def test_concurrent_first_preparations_atomically_pin_one_identity(tmp_path):
             cell.cell_id,
             "preparation",
             {
-                "schema": PREPARATION_SCHEMA,
-                "cell_id": cell.cell_id,
+                **preparation_payload(cell.cell_id, campaign=campaign),
                 "implementation": identity,
-                "implementation_sha256": hashlib.sha256(
-                    canonical_json(identity).encode("utf-8")
-                ).hexdigest(),
+                "implementation_sha256": execution_identity_sha256(identity),
             },
         )
         manifest = write_cell_artifact(
@@ -2039,15 +3302,20 @@ def test_concurrent_first_preparations_atomically_pin_one_identity(tmp_path):
         outcomes = list(executor.map(prepare, (first.cell_id, second.cell_id)))
 
     assert sorted(outcomes) == ["prepared", "refused"]
-    prepared = next(
+    prepared_cells = [
         cell
         for cell in (first, second)
         if campaign.record(cell.cell_id).state is RunState.PREPARED
-    )
-    refused = second if prepared is first else first
-    assert campaign.record(refused.cell_id).state is RunState.PLANNED
+    ]
+    planned_cells = [
+        cell
+        for cell in (first, second)
+        if campaign.record(cell.cell_id).state is RunState.PLANNED
+    ]
+    assert len(prepared_cells) == 1
+    assert len(planned_cells) == 1
     pin = json.loads(campaign.implementation_identity_path.read_text())
-    assert pin["implementation_identity"] == identities[prepared.cell_id]
+    assert pin["implementation_identity"] == identities[prepared_cells[0].cell_id]
 
 
 def test_running_and_failed_cells_are_explicitly_not_default_runnable(tmp_path):
@@ -2055,7 +3323,9 @@ def test_running_and_failed_cells_are_explicitly_not_default_runnable(tmp_path):
     campaign = Campaign(tmp_path)
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=campaign)
+    )
     prepare_manifest = write_artifact(
         tmp_path, "prepare_manifest", {"stage": "prepare"}
     )
@@ -2083,17 +3353,17 @@ def test_qualification_cannot_forge_selection_metrics_while_naming_real_evaluati
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
     inputs = advance_to_evaluated(campaign, cell_id)
-    forged = write_artifact(
-        tmp_path,
-        "qualification",
-        qualification_payload(
-            campaign._require_cell(cell_id),
-            {kind: ref.sha256 for kind, ref in inputs.items()},
-            validation={"fvu": -1_000.0, "rate_distortion": 1_000.0},
-            promotion_eligible=False,
-            protocol_eligible=True,
-        ),
+    forged_payload = qualification_payload(
+        campaign._require_cell(cell_id),
+        {kind: ref.sha256 for kind, ref in inputs.items()},
+        promotion_eligible=False,
+        protocol_eligible=True,
     )
+    forged_payload["selection_metrics"]["sharing_guard"]["all_site_fvu_mean"] = -1_000.0
+    forged_payload["selection_metrics_sha256"] = hashlib.sha256(
+        canonical_json(forged_payload["selection_metrics"]).encode()
+    ).hexdigest()
+    forged = write_artifact(tmp_path, "qualification", forged_payload)
     qualify_manifest = write_artifact(
         tmp_path, "qualify_manifest", {"stage": "qualify"}
     )
@@ -2220,7 +3490,9 @@ def test_artifact_mutation_fails_closed_on_the_next_gate(tmp_path):
     campaign = Campaign(tmp_path)
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=campaign)
+    )
     prepare_manifest = write_artifact(
         tmp_path, "prepare_manifest", {"stage": "prepare"}
     )
@@ -2265,7 +3537,9 @@ def test_failure_is_append_only_and_retry_returns_to_durable_predecessor(tmp_pat
     campaign = Campaign(tmp_path)
     register_test_plan(campaign, plan)
     cell_id = plan.cells[0].cell_id
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=campaign)
+    )
     prepare_manifest = write_artifact(
         tmp_path, "prepare_manifest", {"stage": "prepare"}
     )
@@ -2319,7 +3593,11 @@ def test_stale_lock_requires_explicit_reconciliation(tmp_path):
         now[0] = 111.0
         assert campaign.reconcile_stale_locks(10.0) == (cell_id,)
         assert not campaign.lock_path(cell_id).exists()
-        preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+        preparation = write_artifact(
+            tmp_path,
+            "preparation",
+            preparation_payload(cell_id, campaign=campaign),
+        )
         prepare_manifest = write_artifact(
             tmp_path, "prepare_manifest", {"stage": "prepare"}
         )
@@ -2391,14 +3669,17 @@ def test_stale_reconcile_terminates_owned_orphan_worker_group(tmp_path, monkeypa
     campaign_module._atomic_json(campaign.lock_path(cell_id), lease)
     worker_checks = iter((True, False))
 
-    def process_matches(pid, identity):
-        if pid == 111:
-            return False
+    def process_matches_for_termination(pid, identity):
         assert (pid, identity) == (222, "worker-birth")
         return next(worker_checks)
 
     signals = []
-    monkeypatch.setattr(campaign_module, "_process_matches", process_matches)
+    monkeypatch.setattr(campaign_module, "_process_matches", lambda *_: False)
+    monkeypatch.setattr(
+        campaign_module,
+        "_process_matches_for_termination",
+        process_matches_for_termination,
+    )
     monkeypatch.setattr(os, "getpgid", lambda pid: 333)
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
 
@@ -2556,22 +3837,33 @@ def test_main_extension_reconcile_recovers_post_commit_pointer_crash(
         return original_atomic_json(path, body)
 
     monkeypatch.setattr(campaign_module, "_atomic_json", crash_before_plan_projection)
-    with pytest.raises(OSError, match="post-journal crash"):
-        campaign.extend(
-            extended,
-            selection=selection,
-            selection_path=selection_path,
-        )
-    assert campaign.plan == plan
+    campaign.extend(
+        extended,
+        selection=selection,
+        selection_path=selection_path,
+    )
+    assert campaign.plan == extended
     extensions = [
         event for event in campaign.events() if event.get("event") == "plan_extension"
     ]
     assert len(extensions) == 1
     assert extensions[0]["metadata"]["plan_id"] == extended.plan_id
+    with pytest.raises(CampaignError, match="append exactly one stage"):
+        campaign.extend(
+            extended,
+            selection=selection,
+            selection_path=selection_path,
+        )
 
     monkeypatch.setattr(campaign_module, "_atomic_json", original_atomic_json)
     result = campaign.reconcile()
     assert result["plan_republished"] == extended.plan_id
+    assert campaign.plan == extended
+    frozen_selection = selection_path.read_text()
+    selection_path.write_text('{"tampered": true}\n')
+    with pytest.raises(ArtifactError, match="mismatch"):
+        _ = campaign.plan
+    selection_path.write_text(frozen_selection)
     assert campaign.plan == extended
     assert (
         len(
@@ -2668,13 +3960,12 @@ def test_family_revisit_reconcile_recovers_post_commit_pointer_crash(
         return original_atomic_json(path, body)
 
     monkeypatch.setattr(campaign_module, "_atomic_json", crash_before_plan_projection)
-    with pytest.raises(OSError, match="revisit post-journal crash"):
-        campaign.extend_family_revisit(
-            revisit_plan,
-            family_name=family.name,
-            selection_path=nomination_path,
-        )
-    assert campaign.plan == before_revisit
+    campaign.extend_family_revisit(
+        revisit_plan,
+        family_name=family.name,
+        selection_path=nomination_path,
+    )
+    assert campaign.plan == revisit_plan
     assert campaign.events()[-1]["metadata"]["plan_id"] == revisit_plan.plan_id
 
     monkeypatch.setattr(campaign_module, "_atomic_json", original_atomic_json)
@@ -3037,6 +4328,71 @@ def test_recomputed_sharing_guard_rejects_forged_measurements() -> None:
         )
 
 
+def test_threshold_sensitivity_holds_other_sharing_gates_at_center() -> None:
+    policy = studies_module._development_selection_policy()
+
+    def candidate(candidate_id: str, *, recall: float) -> dict[str, object]:
+        return {
+            "candidate_id": candidate_id,
+            "observations": [
+                {
+                    "sharing_guard": {
+                        "measurements": {
+                            "site_only_fvu_degradation": 0.01,
+                            "leave_one_out_fvu_degradation": 0.01,
+                            "root_site_only_fvu_degradation": 0.01,
+                            "root_leave_one_out_fvu_degradation": 0.01,
+                            "site_only_support_iou_drop": 0.01,
+                            "leave_one_out_support_iou_drop": 0.01,
+                            "site_only_coordinate_concordance": 0.85,
+                            "leave_one_out_coordinate_concordance": 0.85,
+                            "site_only_intersection_recall": recall,
+                            "leave_one_out_intersection_recall": recall,
+                            "site_only_intersection_energy_coverage": 0.92,
+                            "leave_one_out_intersection_energy_coverage": 0.92,
+                            "site_only_fvu_absolute": 0.50,
+                            "leave_one_out_fvu_absolute": 0.50,
+                        }
+                    }
+                }
+            ],
+        }
+
+    payload = Campaign._threshold_sensitivity_payload(
+        policy,
+        (
+            candidate("healthy", recall=0.80),
+            candidate("fails_center_recall", recall=0.70),
+        ),
+        smoke_protocol_only=False,
+    )
+    coordinate = next(
+        item
+        for item in payload["surfaces"]
+        if item["name"] == "sharing_coordinate_concordance_min"
+    )
+    relaxed = next(row for row in coordinate["rows"] if row["threshold"] == 0.50)
+    assert relaxed["passing_candidate_ids"] == ["healthy"]
+
+
+def test_confirmation_sensitivity_holds_qualification_and_sharing_gates() -> None:
+    sensitivity = campaign_module._confirmation_score_sensitivity_payload(
+        (
+            {
+                "seed": 0,
+                "score_degradation": 0.0,
+                "qualification_passed": True,
+                "sharing_guard_passed": False,
+            },
+        ),
+        (0.01, 0.02),
+        smoke=False,
+    )
+    assert sensitivity["ungated_passed_all_seeds"] is False
+    assert all(row["passing_seeds"] == [] for row in sensitivity["rows"])
+    assert all(row["passed_all_seeds"] is False for row in sensitivity["rows"])
+
+
 def test_confirmation_score_noninferiority_boundary_is_seedwise(tmp_path, monkeypatch):
     blueprint = build_phase2_blueprint(smoke=False)
     extended = build_phase2_plan(smoke=False)
@@ -3237,7 +4593,7 @@ def test_factorization_carrier_failure_retains_only_exact_parent_control(tmp_pat
     )
     gate = payload["ranked_candidates"][0]["noninferiority_gate"]
     assert gate["passed"] is False
-    assert gate["per_seed"][0]["degradation"] == 1.0
+    assert gate["per_seed"][0]["degradation"] == pytest.approx(0.02)
 
 
 def test_factorization_selection_uses_lowest_seedwise_noninferior_rank(tmp_path):
@@ -3247,11 +4603,11 @@ def test_factorization_selection_uses_lowest_seedwise_noninferior_rank(tmp_path)
     )
     factorization = campaign.plan.stages[-1]
     metrics = {
-        "selected_parent_carrier": 1.0,
-        "site_rank_1": 0.989,
-        "site_rank_2": 0.99,
-        "site_rank_4": 1.10,
-        "site_rank_full": 1.0,
+        "selected_parent_carrier": -0.5,
+        "site_rank_1": -0.511,
+        "site_rank_2": -0.51,
+        "site_rank_4": -0.4,
+        "site_rank_full": -0.5,
     }
     for cell in factorization.cells:
         variant = cell.recipe_name.removeprefix("derived_site_factorization_4m_")
@@ -3408,7 +4764,9 @@ def test_confirmation_guard_reuse_requires_exact_structure():
         "parent_cell_id": "cell:parent",
         "checks": {"sharing": True},
     }
-    campaign_module._validate_exact_confirmation_guard(copy.deepcopy(expected), expected)
+    campaign_module._validate_exact_confirmation_guard(
+        copy.deepcopy(expected), expected
+    )
     with pytest.raises(CampaignError, match="exact authenticated sharing guard"):
         campaign_module._validate_exact_confirmation_guard(
             {**expected, "unbound_summary": True},
@@ -3785,8 +5143,8 @@ def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
     row["parent_qualification_sha256"] = (
         "sha256:" + wrong_parent_qualification["sha256"]
     )
-    forged_parent["selection_universe"]["confirmation_noninferiority"] = (
-        copy.deepcopy(confirmation)
+    forged_parent["selection_universe"]["confirmation_noninferiority"] = copy.deepcopy(
+        confirmation
     )
     rehash_panel_decision(forged_parent)
     with pytest.raises(CampaignError, match="parent binding mismatch"):
@@ -3833,67 +5191,12 @@ def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
 
 
 def test_phase2_freeze_rejects_negative_missing_and_stale_evidence(tmp_path):
-    source, _ = qualified_phase2_campaign(tmp_path / "source", seeds=(0,))
-
-    negative_root = tmp_path / "negative"
-    shutil.copytree(source.root, negative_root)
-    negative = Campaign(negative_root)
-    finalist_cell = next(
-        cell
-        for cell in negative.plan.cells
-        if cell.decision_map["data.normalization"] == "scalar_rms"
-        and cell.decision_map["evaluation.split"] == "confirmation"
+    source, _ = qualified_phase2_campaign(
+        tmp_path / "source",
+        seeds=(0,),
+        negative_confirmation=True,
     )
-    qualification_ref = negative.record(finalist_cell.cell_id).artifact_map[
-        "qualification"
-    ]
-    qualification_path = qualification_ref.resolve(negative.root)
-    qualification_payload = json.loads(qualification_path.read_text())
-    qualification_payload["scientific_outcome"]["passed"] = False
-    qualification_payload["scientific_outcome"]["checks"][
-        "support_target_calibration"
-    ] = False
-    qualification_payload["scientific_outcome"]["margins"][
-        "support_target_abs_error"
-    ] = -0.1
-    qualification_payload["promotion_eligible"] = False
-    evaluation_path = negative.record(finalist_cell.cell_id).artifact_map[
-        "evaluation"
-    ].resolve(negative.root)
-    qualification_payload["promotion_ineligible_reasons"] = (
-        campaign_module._promotion_reasons_from_evidence(
-            finalist_cell,
-            outcome_passed=False,
-            evaluation=json.loads(evaluation_path.read_text()),
-        )
-    )
-    qualification_path.write_text(
-        json.dumps(
-            qualification_payload,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
-        )
-        + "\n"
-    )
-    qualification_sha256 = hashlib.sha256(qualification_path.read_bytes()).hexdigest()
-    qualification_size = qualification_path.stat().st_size
-    rewritten_events = []
-    for event in negative.events():
-        if (
-            event.get("event") == "transition"
-            and event.get("cell_id") == finalist_cell.cell_id
-            and event.get("target") == RunState.QUALIFIED.value
-        ):
-            for artifact in event["artifacts"]:
-                if artifact["kind"] == "qualification":
-                    artifact["sha256"] = qualification_sha256
-                    artifact["size_bytes"] = qualification_size
-        rewritten_events.append(event)
-    negative.journal_path.write_text(
-        "".join(canonical_json(event) + "\n" for event in rewritten_events)
-    )
-    protocol_panel = negative.freeze_panel()
+    protocol_panel = source.freeze_panel()
     assert protocol_panel["phase2_campaign_manifest"]["smoke"] is True
 
     incomplete_root = tmp_path / "incomplete"
@@ -3937,9 +5240,11 @@ def test_phase2_freeze_rejects_negative_missing_and_stale_evidence(tmp_path):
     plan_payload = json.loads(original_plan)
     plan_payload["stages"][-1]["cells"][0]["seed"] += 1
     campaign.plan_path.write_text(json.dumps(plan_payload) + "\n")
-    with pytest.raises(CampaignError, match="invalid Phase-2 plan"):
-        campaign.freeze_panel(out=tmp_path / "decisions" / "altered-plan.json")
-    campaign.plan_path.write_text(original_plan)
+    repaired_panel = campaign.freeze_panel(
+        out=campaign.root / "decisions" / "repaired-plan.json"
+    )
+    assert repaired_panel["source_phase2_plan_id"] == campaign.plan.plan_id
+    assert campaign.plan_path.read_text() == original_plan
 
     original_blueprint = campaign.blueprint_path.read_text()
     blueprint_payload = json.loads(original_blueprint)
@@ -4030,6 +5335,19 @@ import json
 import os
 from pathlib import Path
 
+from block_crosscoder_experiment.campaign import (
+    EVALUATION_SCHEMA,
+    PREPARATION_SCHEMA,
+    QUALIFICATION_SCHEMA,
+    _expected_phase1_threshold_sensitivity,
+)
+from block_crosscoder_experiment.implementation import execution_identity_sha256
+from block_crosscoder_experiment.cli.run_cell import (
+    _declared_device,
+    _synthetic_preparation_data,
+)
+from block_crosscoder_experiment.studies import CellSpec, canonical_json
+
 p = argparse.ArgumentParser()
 p.add_argument("--cell", type=Path, required=True)
 p.add_argument("--stage", required=True)
@@ -4037,30 +5355,63 @@ p.add_argument("--artifacts-out", type=Path, required=True)
 p.add_argument("--resume", action="store_true")
 a = p.parse_args()
 cell = json.loads(a.cell.read_text())
+cell_spec = CellSpec.from_manifest(cell)
 values = {item["name"]: item["value"] for item in cell["decisions"]}
 implementation = {
-    "executor_schema": "test-executor-v1",
-    "executor_process_model": "test-process-model-v1",
+    "schema": "bsc-implementation-identity-v2",
+    "executor_schema": "bsc-cell-executor-v13",
+    "executor_process_model": "persistent_exact_snapshot_lineage_v5",
     "python_source_sha256": "1" * 64,
     "python_source_files": 1,
-    "git_commit": "1" * 40,
-    "git_dirty": False,
     "python": "3.12.test",
+    "platform": {"system": "Linux", "machine": "x86_64", "release": "test"},
     "torch": "2.8.0",
-    "torch_cuda_build": None,
+    "torch_cuda_build": "12.8",
     "dependencies": {
+        "block-crosscoder-experiment": "test",
         "datasets": "test",
         "huggingface-hub": "test",
         "numpy": "test",
         "sae-lens": "test",
         "safetensors": "test",
         "torch": "test",
+        "transformer-lens": "test",
         "transformers": "test",
+        "triton": "test",
     },
+    "numerical_runtime": {
+        "float32_matmul_precision": "highest",
+        "deterministic_algorithms": False,
+        "deterministic_warn_only": False,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": False,
+        "cudnn_allow_tf32": True,
+        "cuda_matmul_allow_tf32": False,
+        "cuda_matmul_allow_fp16_reduced_precision_reduction": True,
+        "cuda_matmul_allow_bf16_reduced_precision_reduction": True,
+        "environment": {
+            "CUBLAS_WORKSPACE_CONFIG": None,
+            "CUDA_VISIBLE_DEVICES": None,
+            "NVIDIA_TF32_OVERRIDE": None,
+            "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": None,
+        },
+    },
+    "cuda_runtime": {
+        "available": True,
+        "driver": "test",
+        "cudnn": "test",
+        "devices": [{
+            "visible_index": 0,
+            "uuid": "GPU-test",
+            "name": "test",
+            "compute_capability": [8, 9],
+            "total_memory": 24000000000,
+            "multi_processor_count": 128,
+        }],
+    },
+    "provenance": {"git": {"commit": "1" * 40, "source_dirty": False}},
 }
-implementation_sha256 = hashlib.sha256(json.dumps(
-    implementation, sort_keys=True, separators=(",", ":")
-).encode("utf-8")).hexdigest()
+implementation_sha256 = execution_identity_sha256(implementation)
 root = Path(os.environ["BSC_CAMPAIGN_ROOT"])
 outdir = a.cell.parent / "fake-outputs"
 outdir.mkdir(parents=True, exist_ok=True)
@@ -4077,14 +5428,116 @@ stage_kinds = {
     "evaluate": ("deployment_schedules", "evaluation"),
     "qualify": ("qualification",),
 }
+
+def phase1_selection_metrics():
+    thresholds = {
+        str(item[0]): float(item[1])
+        for item in values["qualification.phase1_identification_thresholds"]
+    }
+    if values["data.normalization"] == "layer":
+        endpoint = {
+            "applicable": False,
+            "ineligible_reason": (
+                "token_layer_normalization_is_not_a_fixed_linear_factor_map"
+            ),
+            "thresholds": thresholds,
+            "per_factor": [],
+            "aggregate": {
+                "support_precision_diagnostic": 1.0,
+                "support_recall_diagnostic": 1.0,
+            },
+            "checks": {},
+            "normalized_margins": {},
+            "margin": None,
+            "passed": None,
+        }
+        validation = {
+            "phase1_identification_applicable": False,
+            "phase1_identification_conjunction": False,
+            "phase1_identification_margin": None,
+        }
+    else:
+        margin = 1.0
+        per_factor = [{
+            "factor": factor,
+            "support_association": 1.0,
+            "subspace_overlap": 1.0,
+            "global_isolated_input_r2": 1.0,
+            "aligned_code_r2": 1.0,
+            "rank_mismatch": {},
+            "component_margins": {
+                "support_association": margin,
+                "global_isolated_input_r2": margin,
+                "aligned_code_r2": margin,
+                "subspace_overlap": margin,
+            },
+            "margin": margin,
+            "identified": True,
+            "same_block_gate_has_positive_headroom": True,
+        } for factor in range(int(values["data.n_factors"]))]
+        endpoint = {
+            "applicable": True,
+            "ineligible_reason": None,
+            "thresholds": thresholds,
+            "per_factor": per_factor,
+            "aggregate": {
+                "recovered_factor_fraction": 1.0,
+                "support_precision": 1.0,
+                "support_recall": 1.0,
+                "inactive_dictionary_fraction_diagnostic": 0.0,
+                "duplicate_block_fraction": 0.0,
+                "cross_factor_mixing_fraction": 0.0,
+                "nonfinite_count": 0,
+            },
+            "checks": {
+                "recovered_factor_fraction": True,
+                "support_precision": True,
+                "support_recall": True,
+                "duplicate_block_fraction": True,
+                "cross_factor_mixing_fraction": True,
+                "nonfinite_count": True,
+            },
+            "normalized_margins": {
+                "worst_eligible_per_factor": margin,
+                "recovered_factor_fraction": margin,
+                "support_precision": margin,
+                "support_recall": margin,
+                "duplicate_block_fraction": margin,
+                "cross_factor_mixing_fraction": margin,
+            },
+            "margin_normalization_contract": values[
+                "evaluation.phase1_margin_normalization"
+            ],
+            "margin": margin,
+            "passed": True,
+        }
+        validation = {
+            "phase1_identification_applicable": True,
+            "phase1_identification_conjunction": True,
+            "phase1_identification_margin": margin,
+        }
+    metrics = {
+        "validation": validation,
+        "identification": {"native": endpoint, "deployed": endpoint},
+    }
+    metrics["phase1_threshold_sensitivity"] = (
+        _expected_phase1_threshold_sensitivity(metrics["identification"], cell_spec)
+    )
+    metrics["fixed_rate_raw_selection"] = {
+        "schema": "bsc-fixed-rate-raw-selection-v2",
+        "applicable": False,
+        "eligible": False,
+        "operating_policy": None,
+        "reason": "phase1_uses_truth_known_identification",
+    }
+    return metrics
+
 for kind in stage_kinds[a.stage]:
     target = outdir / f"{kind}.json"
     if kind == "qualification":
         state = json.loads((a.cell.parent / "state.json").read_text())
         refs = {item["kind"]: item for item in state["artifacts"]}
-        selection_metrics = {
-            "validation": {"fvu": 0.1, "rate_distortion": 0.8}
-        }
+        selection_metrics = phase1_selection_metrics()
         evaluation_sha256 = refs["evaluation"]["sha256"]
         scientific_checks = {
             "support_target_calibration": True,
@@ -4097,7 +5550,7 @@ for kind in stage_kinds[a.stage]:
             "production_fixed_rate_frontier": True,
         }
         payload = {
-            "schema": "bsc-qualification-v3",
+            "schema": QUALIFICATION_SCHEMA,
             "cell_id": cell["cell_id"],
             "qualified": True,
             "checks": {
@@ -4127,8 +5580,12 @@ for kind in stage_kinds[a.stage]:
                     "support_target_abs_error": 0.1,
                     "codec_calibration_excluded_fraction": 0.01,
                     "codec_evaluation_excluded_fraction": 0.01,
-                    "phase1_native_identification": 0.1,
-                    "phase1_deployed_identification": 0.1,
+                    "phase1_native_identification": selection_metrics[
+                        "identification"
+                    ]["native"]["margin"],
+                    "phase1_deployed_identification": selection_metrics[
+                        "identification"
+                    ]["deployed"]["margin"],
                     "production_precision_reconstruction": None,
                     "production_precision_support_iou": None,
                     "production_fixed_rate_nonzero_endpoints": None,
@@ -4140,7 +5597,7 @@ for kind in stage_kinds[a.stage]:
             )},
             "implementation_identity": implementation,
             "implementation_identity_sha256": implementation_sha256,
-            "validation": {"fvu": 0.1, "rate_distortion": 0.8},
+            "validation": selection_metrics["validation"],
             "qualification_profile": values["qualification.profile"],
             "thresholds_version": values["qualification.thresholds_version"],
             "thresholds": {
@@ -4198,6 +5655,7 @@ for kind in stage_kinds[a.stage]:
                 selection_metrics, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")).hexdigest(),
             "selection_metrics_evaluation_sha256": evaluation_sha256,
+            "fixed_rate_operating_policy": None,
             "promotion_eligible": False,
             "promotion_ineligible_reasons": ["runtime_smoke"],
             "selection_eligible_for_protocol_test": True,
@@ -4205,10 +5663,10 @@ for kind in stage_kinds[a.stage]:
         }
     elif kind == "evaluation":
         refs = {item["kind"]: item for item in artifacts}
-        validation = {"fvu": 0.1, "rate_distortion": 0.8}
-        selection_metrics = {"validation": validation}
+        selection_metrics = phase1_selection_metrics()
+        validation = selection_metrics["validation"]
         payload = {
-            "schema": "bsc-evaluation-v2",
+            "schema": EVALUATION_SCHEMA,
             "evaluation_execution_implementation": (
                 "fused_deployable_full_view_packet_v2"
             ),
@@ -4223,15 +5681,66 @@ for kind in stage_kinds[a.stage]:
                 selection_metrics, sort_keys=True, separators=(",", ":")
             ).encode("utf-8")).hexdigest(),
             "raw_space": {"eligible": True},
-            "fixed_rate_raw_selection": {"eligible": True},
+            "fixed_rate_raw_selection": selection_metrics[
+                "fixed_rate_raw_selection"
+            ],
+            "phase1_threshold_sensitivity": selection_metrics[
+                "phase1_threshold_sensitivity"
+            ],
             "synthetic_recovery": {
                 "deployed": {"shared_feature_claim_eligible": True}
             },
         }
     elif kind == "preparation":
         payload = {
-            "schema": "bsc-preparation-v3",
+            "schema": PREPARATION_SCHEMA,
             "cell_id": cell["cell_id"],
+            "cell_manifest_sha256": hashlib.sha256(a.cell.read_bytes()).hexdigest(),
+            "phase": cell_spec.phase.value,
+            "stage_family": cell_spec.stage,
+            "recipe_name": cell_spec.recipe_name,
+            "recipe_id": cell_spec.recipe_id,
+            "seed": cell_spec.seed,
+            "decisions_sha256": hashlib.sha256(
+                canonical_json(cell_spec.content_payload()).encode()
+            ).hexdigest(),
+            "data": _synthetic_preparation_data(cell_spec),
+            "data_identity": None,
+            "runtime": {
+                "smoke": values["runtime.smoke"],
+                "device": _declared_device(values),
+                "torch_version": implementation["torch"],
+            },
+            "random": {
+                name.removeprefix("random."): values[name]
+                for name in (
+                    "random.model_seed",
+                    "random.structure_seed",
+                    "random.train_data_seed",
+                    "random.eval_data_seed",
+                    "random.confirmation_data_seed",
+                )
+            },
+            "selection": {
+                "id": values["selection.id"],
+                "source_blueprint_id": values["selection.source_blueprint_id"],
+                "source_plan_id": values["selection.source_plan_id"],
+                "upstream_selection_ids": list(
+                    values["selection.upstream_selection_ids"]
+                ),
+                "parent_candidate_id": values["selection.parent_candidate_id"],
+                "parent_cell_ids": list(values["selection.parent_cell_ids"]),
+                "delta_decision_names": list(
+                    values["selection.delta_decision_names"]
+                ),
+                "confirmation_sha256s": list(
+                    values["selection.confirmation_sha256s"]
+                ),
+                "qualification_sha256s": list(
+                    values["selection.qualification_sha256s"]
+                ),
+                "universe_sha256": values["selection.universe_sha256"],
+            },
             "implementation": implementation,
             "implementation_sha256": implementation_sha256,
         }
@@ -4268,7 +5777,8 @@ def test_generic_runner_stops_at_evaluation_and_never_conflates_it_with_qualific
     plan = one_cell_plan()
     campaign = Campaign(root)
     register_test_plan(campaign, plan)
-    pythonpath = str(module_root)
+    source_root = Path(__file__).resolve().parents[1]
+    pythonpath = os.pathsep.join((str(module_root), str(source_root)))
     if os.environ.get("PYTHONPATH"):
         pythonpath += os.pathsep + os.environ["PYTHONPATH"]
     runner = CampaignRunner(
@@ -4367,9 +5877,9 @@ def test_artifact_ref_detects_bad_declared_hash_and_size(tmp_path):
     path = tmp_path / "artifact.bin"
     path.write_bytes(b"abc")
     digest = hashlib.sha256(b"abc").hexdigest()
-    ArtifactRef("x", str(path), digest, 3).verify(tmp_path)
+    ArtifactRef("x", path.name, digest, 3).verify(tmp_path)
     with pytest.raises(ArtifactError, match="size mismatch"):
-        ArtifactRef("x", str(path), digest, 4).verify(tmp_path)
+        ArtifactRef("x", path.name, digest, 4).verify(tmp_path)
 
 
 def test_campaign_publications_fsync_replacements_and_journal_directory(
@@ -4413,7 +5923,10 @@ def test_stage_manifest_rejects_extra_kinds_and_malformed_sizes_cleanly(tmp_path
     cell_id = plan.cells[0].cell_id
     runner = CampaignRunner(campaign)
     preparation = tmp_path / "preparation.json"
-    preparation.write_text('{"ready": true}\n')
+    preparation.write_text(
+        json.dumps(preparation_payload(cell_id, campaign=campaign), sort_keys=True)
+        + "\n"
+    )
     checkpoint = tmp_path / "checkpoint.json"
     checkpoint.write_text('{"future": true}\n')
 
@@ -4504,7 +6017,10 @@ def test_runner_hashes_each_new_artifact_once_without_gate_rescans(
     output_dir = tmp_path / "outputs"
     output_dir.mkdir()
     preparation = output_dir / "preparation.json"
-    preparation.write_text('{"ready": true}\n')
+    preparation.write_text(
+        json.dumps(preparation_payload(cell_id, campaign=campaign), sort_keys=True)
+        + "\n"
+    )
     prepare_manifest = tmp_path / "prepare-stage.json"
     _write_stage_artifact_manifest(
         prepare_manifest,
@@ -4528,7 +6044,12 @@ def test_runner_hashes_each_new_artifact_once_without_gate_rescans(
         campaign._verified_artifact_from_path("prepare_manifest", prepare_manifest)
     )
     campaign.transition(cell_id, RunState.PREPARED, artifacts=prepare_refs)
-    assert calls == [preparation.resolve(), prepare_manifest.resolve()]
+    cell_manifest = campaign.cell_manifest_path(cell_id).resolve()
+    assert calls == [
+        preparation.resolve(),
+        prepare_manifest.resolve(),
+        cell_manifest,
+    ]
 
     campaign.transition(cell_id, RunState.RUNNING)
     checkpoint = output_dir / "checkpoint.pt"
@@ -4553,6 +6074,7 @@ def test_runner_hashes_each_new_artifact_once_without_gate_rescans(
     assert calls == [
         preparation.resolve(),
         prepare_manifest.resolve(),
+        cell_manifest,
         checkpoint.resolve(),
         training_report.resolve(),
         train_manifest.resolve(),
@@ -4567,7 +6089,9 @@ def test_new_campaign_process_rehashes_unchanged_ancestors_once(
     first = Campaign(tmp_path)
     register_test_plan(first, plan)
     cell_id = plan.cells[0].cell_id
-    preparation = write_artifact(tmp_path, "preparation", {"ready": True})
+    preparation = write_artifact(
+        tmp_path, "preparation", preparation_payload(cell_id, campaign=first)
+    )
     prepare_manifest = write_artifact(
         tmp_path,
         "prepare_manifest",
@@ -4605,9 +6129,7 @@ def test_new_campaign_process_rehashes_unchanged_ancestors_once(
         return real_sha256(path, chunk_bytes)
 
     monkeypatch.setattr(campaign_module, "_sha256", counted_sha256)
-    refs = list(
-        runner._load_artifact_manifest(cell_id, "train", train_manifest_path)
-    )
+    refs = list(runner._load_artifact_manifest(cell_id, "train", train_manifest_path))
     refs.append(
         restarted._verified_artifact_from_path(
             "train_manifest",
@@ -4731,3 +6253,313 @@ def test_stale_and_foreign_tokens_force_content_reverification(tmp_path, monkeyp
     restarted_ref = restarted._verify_artifact(refreshed)
     assert calls == 3
     assert restarted_ref._verification != refreshed._verification
+
+
+def test_journal_tail_recovery_preserves_complete_records_and_audits_truncation(
+    tmp_path,
+):
+    campaign = Campaign(tmp_path / "torn")
+    plan = one_cell_plan()
+    register_test_plan(campaign, plan)
+    complete = campaign.events()
+    torn = b'{"schema":"bsc-campaign-v1","event":"transition"'
+    with campaign.journal_path.open("ab") as handle:
+        handle.write(torn)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    assert campaign.events() == complete
+    probe = campaign._event("audit_probe", "__campaign__")
+    campaign._append_event(probe)
+    recovered = campaign.events()
+    recovery = [
+        event for event in recovered if event.get("event") == "journal_tail_recovered"
+    ]
+    assert len(recovery) == 1
+    assert recovery[0]["metadata"] == {
+        "discarded_bytes": len(torn),
+        "discarded_sha256": hashlib.sha256(torn).hexdigest(),
+    }
+    assert recovered[-1] == probe
+
+    newline = Campaign(tmp_path / "newline")
+    register_test_plan(newline, plan)
+    original = newline.events()
+    body = newline.journal_path.read_bytes()
+    assert body.endswith(b"\n")
+    newline.journal_path.write_bytes(body[:-1])
+    second_probe = newline._event("audit_probe", "__campaign__")
+    newline._append_event(second_probe)
+    assert newline.events() == (*original, second_probe)
+
+
+def test_campaign_output_paths_cannot_escape_root_or_follow_external_symlinks(
+    tmp_path,
+):
+    root = tmp_path / "campaign"
+    root.mkdir()
+    with pytest.raises(CampaignError, match="inside campaign root"):
+        campaign_module._campaign_output_path(
+            root,
+            "../escape.json",
+            root / "decisions" / "default.json",
+        )
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside\n")
+    link = root / "decision.json"
+    link.symlink_to(outside)
+    with pytest.raises(CampaignError, match="resolves outside"):
+        campaign_module._campaign_output_path(
+            root,
+            link,
+            root / "decisions" / "default.json",
+        )
+
+
+def test_real_data_preparations_pin_one_raw_capture_and_one_digest_per_view(
+    tmp_path,
+):
+    plan, blueprint, phase1_decision = phase2_test_inputs(smoke=True)
+    campaign = Campaign(tmp_path)
+    register_phase2_test_plan(campaign, plan, blueprint, phase1_decision)
+    first, second = plan.cells[:2]
+    first_identity = fixture_data_identity(first)
+    first_data = fixture_preparation_data(first)
+    assert first_identity is not None
+    assert first_data is not None
+    first_preparation = write_cell_artifact(
+        campaign,
+        first.cell_id,
+        "preparation",
+        preparation_payload(first.cell_id, campaign=campaign),
+    )
+    first_manifest = write_cell_artifact(
+        campaign,
+        first.cell_id,
+        "prepare_manifest",
+        {"stage": "prepare"},
+    )
+    campaign.transition(
+        first.cell_id,
+        RunState.PREPARED,
+        artifacts=(first_preparation, first_manifest),
+    )
+
+    forged = copy.deepcopy(first_identity)
+    forged["raw_contract"]["source_hash"] = "forged-source"
+    forged["raw_content_identity_sha256"] = hashlib.sha256(
+        canonical_json(forged["raw_contract"]).encode()
+    ).hexdigest()
+    forged["view_contract"]["raw_content_identity_sha256"] = forged[
+        "raw_content_identity_sha256"
+    ]
+    forged["view_content_identity_sha256"] = hashlib.sha256(
+        canonical_json(forged["view_contract"]).encode()
+    ).hexdigest()
+    with pytest.raises(ArtifactError, match="differs from its data payload"):
+        campaign._validate_preparation_data_identity(
+            second,
+            {"data": first_data, "data_identity": forged},
+        )
+
+    different_data = copy.deepcopy(first_data)
+    different_data["source_contract"]["source_hash"] = "6" * 64
+    different_raw = activation_content_identity(different_data)
+    with pytest.raises(ArtifactError, match="different raw captures"):
+        campaign._validate_preparation_data_identity(
+            second,
+            {"data": different_data, "data_identity": different_raw},
+        )
+
+    different_view_data = copy.deepcopy(first_data)
+    different_view_data["normalization"]["transform_hash"] = "b" * 64
+    same_view = activation_content_identity(different_view_data)
+    with pytest.raises(ArtifactError, match="disagree on activation view"):
+        campaign._validate_preparation_data_identity(
+            first,
+            {"data": different_view_data, "data_identity": same_view},
+        )
+
+    campaign.activation_identity_path.unlink()
+    campaign.reconcile()
+    rebuilt = json.loads(campaign.activation_identity_path.read_text())
+    assert (
+        rebuilt["raw_content_identity_sha256"]
+        == first_identity["raw_content_identity_sha256"]
+    )
+
+
+def test_uncommitted_preparation_cannot_poison_activation_projection(tmp_path):
+    plan, blueprint, phase1_decision = phase2_test_inputs(smoke=True)
+    campaign = Campaign(tmp_path)
+    register_phase2_test_plan(campaign, plan, blueprint, phase1_decision)
+    first, second = plan.cells[:2]
+
+    def preparation_artifacts(cell, data):
+        identity = activation_content_identity(data)
+        return (
+            write_cell_artifact(
+                campaign,
+                cell.cell_id,
+                "preparation",
+                {
+                    **preparation_payload(cell.cell_id, campaign=campaign),
+                    "data": data,
+                    "data_identity": identity,
+                },
+            ),
+            write_cell_artifact(
+                campaign,
+                cell.cell_id,
+                "prepare_manifest",
+                {"stage": "prepare"},
+            ),
+        )
+
+    first_data = fixture_preparation_data(first)
+    assert first_data is not None
+    campaign.transition(
+        first.cell_id,
+        RunState.PREPARED,
+        artifacts=preparation_artifacts(first, first_data),
+    )
+    committed_projection = campaign.activation_identity_path.read_bytes()
+
+    uncommitted_data = copy.deepcopy(first_data)
+    uncommitted_data["normalization"]["mode"] = "uncommitted-view"
+    uncommitted = preparation_artifacts(second, uncommitted_data)
+    with patch.object(campaign, "_append_event", side_effect=OSError("power loss")):
+        with pytest.raises(OSError, match="power loss"):
+            campaign.transition(
+                second.cell_id,
+                RunState.PREPARED,
+                artifacts=uncommitted,
+            )
+    assert campaign.record(second.cell_id).state is RunState.PLANNED
+    assert campaign.activation_identity_path.read_bytes() == committed_projection
+    assert (
+        "uncommitted-view"
+        not in json.loads(campaign.activation_identity_path.read_text())["views"]
+    )
+
+
+def test_fixed_rate_policy_rejects_self_rehashed_wrong_budget_grid():
+    plan, _blueprint, _phase1_decision = phase2_test_inputs(smoke=True)
+    cell = plan.cells[0]
+    inputs = {
+        kind: hashlib.sha256(kind.encode()).hexdigest()
+        for kind in campaign_module.QUALIFICATION_INPUT_KINDS
+    }
+    evaluation_inputs = {
+        kind: inputs[kind]
+        for kind in (
+            "checkpoint",
+            "calibration",
+            "deployment_codec",
+            "deployment_schedules",
+        )
+    }
+    evaluation = evaluation_payload(
+        cell,
+        evaluation_inputs,
+        {"negative_mean_raw_fvu": -0.1},
+    )
+    qualification = qualification_payload(
+        cell,
+        inputs,
+        validation={"negative_mean_raw_fvu": -0.1},
+        promotion_eligible=False,
+        protocol_eligible=True,
+    )
+    policy = copy.deepcopy(qualification["fixed_rate_operating_policy"])
+    policy["rows"][0]["budget_bits_per_token"] = 999.0
+    content = dict(policy)
+    content.pop("content_sha256")
+    policy["content_sha256"] = hashlib.sha256(
+        canonical_json(content).encode()
+    ).hexdigest()
+    qualification["fixed_rate_operating_policy"] = policy
+    qualification["selection_metrics"]["fixed_rate_raw_selection"][
+        "operating_policy"
+    ] = policy
+    qualification["selection_metrics_sha256"] = hashlib.sha256(
+        canonical_json(qualification["selection_metrics"]).encode()
+    ).hexdigest()
+    evaluation["fixed_rate_raw_selection"]["operating_policy"] = policy
+    evaluation["selection_metrics"]["fixed_rate_raw_selection"]["operating_policy"] = (
+        policy
+    )
+    evaluation["selection_metrics_sha256"] = hashlib.sha256(
+        canonical_json(evaluation["selection_metrics"]).encode()
+    ).hexdigest()
+
+    with pytest.raises(ArtifactError, match="budget"):
+        campaign_module._validate_qualification_payload(
+            qualification,
+            cell=cell,
+            evaluation=evaluation,
+        )
+
+
+def test_phase1_qualification_recomputes_margins_from_raw_identification_metrics():
+    cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
+    inputs = {
+        kind: hashlib.sha256(f"phase1:{kind}".encode()).hexdigest()
+        for kind in campaign_module.QUALIFICATION_INPUT_KINDS
+    }
+    promotable = cell.decision_map["qualification.promotable"] is True
+    qualification = qualification_payload(
+        cell,
+        inputs,
+        promotion_eligible=False,
+        protocol_eligible=promotable,
+    )
+    qualification["selection_metrics"]["identification"]["native"]["per_factor"][0][
+        "support_association"
+    ] = 0.0
+    qualification["selection_metrics_sha256"] = hashlib.sha256(
+        canonical_json(qualification["selection_metrics"]).encode()
+    ).hexdigest()
+
+    with pytest.raises(ArtifactError, match="component margins are inconsistent"):
+        campaign_module._validate_qualification_payload(
+            qualification,
+            cell=cell,
+        )
+
+
+def test_phase2_qualification_cannot_self_authorize_an_arbitrary_selection_score():
+    plan, _blueprint, _phase1_decision = phase2_test_inputs(smoke=True)
+    cell = plan.cells[0]
+    inputs = {
+        kind: hashlib.sha256(f"phase2:{kind}".encode()).hexdigest()
+        for kind in campaign_module.QUALIFICATION_INPUT_KINDS
+    }
+    qualification = qualification_payload(
+        cell,
+        inputs,
+        validation={"negative_mean_raw_fvu": -0.5},
+        promotion_eligible=False,
+        protocol_eligible=True,
+    )
+    forged_score = 1_000_000.0
+    fixed_rate = qualification["selection_metrics"]["fixed_rate_raw_selection"]
+    fixed_rate["selection_score"] = forged_score
+    fixed_content = dict(fixed_rate)
+    fixed_content.pop("content_sha256")
+    fixed_rate["content_sha256"] = hashlib.sha256(
+        canonical_json(fixed_content).encode()
+    ).hexdigest()
+    forged_validation = {"negative_mean_raw_fvu": forged_score}
+    qualification["selection_metrics"]["validation"] = forged_validation
+    qualification["validation"] = forged_validation
+    qualification["selection_metrics_sha256"] = hashlib.sha256(
+        canonical_json(qualification["selection_metrics"]).encode()
+    ).hexdigest()
+
+    with pytest.raises(ArtifactError, match="selection score is inconsistent"):
+        campaign_module._validate_qualification_payload(
+            qualification,
+            cell=cell,
+        )

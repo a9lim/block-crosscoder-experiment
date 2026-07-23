@@ -1184,16 +1184,33 @@ def test_joint_mode_threshold_consumer_reuses_exact_full_view_selection(
     expected = evaluate_selector_and_shared_code_modes(model, batches)
     consumed = []
     select_calls = 0
+    frozen_encoder_sites_ref = None
+    full_topk_mask_ref = None
     original_select = model.select_with_materialized
+    original_frozen_encoder_sites = model._frozen_encoder_sites
+
+    def tracked_frozen_encoder_sites(*args, **kwargs):
+        nonlocal frozen_encoder_sites_ref
+        result = original_frozen_encoder_sites(*args, **kwargs)
+        frozen_encoder_sites_ref = weakref.ref(result.values)
+        return result
 
     def counted_select(*args, **kwargs):
-        nonlocal select_calls
+        nonlocal full_topk_mask_ref, select_calls
         select_calls += 1
-        return original_select(*args, **kwargs)
+        result = original_select(*args, **kwargs)
+        if kwargs.get("observed") is None:
+            full_topk_mask_ref = weakref.ref(result[0].mask)
+        return result
 
+    monkeypatch.setattr(model, "_frozen_encoder_sites", tracked_frozen_encoder_sites)
     monkeypatch.setattr(model, "select_with_materialized", counted_select)
 
     def consume(transformed, z, scores, mask) -> None:
+        assert frozen_encoder_sites_ref is not None
+        assert frozen_encoder_sites_ref() is None
+        assert full_topk_mask_ref is not None
+        assert full_topk_mask_ref() is None
         consumed.append(
             (
                 transformed.detach().clone(),

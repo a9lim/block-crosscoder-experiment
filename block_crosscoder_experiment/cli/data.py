@@ -15,12 +15,16 @@ import platform
 import re
 import shutil
 import socket
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import torch
+
+from block_crosscoder_experiment.implementation import host_cuda_execution_lock
+from block_crosscoder_experiment.durability import durable_mkdir
 
 from block_crosscoder_experiment.store import (
     NORMALIZATION_MODES,
@@ -59,8 +63,15 @@ TOKENIZER_PREFLIGHTS = {
 CAPTURE_STATE_NAME = "capture.state.json"
 CAPTURE_MANIFEST_NAME = "capture.json"
 VIEW_MANIFEST_NAME = "view.json"
+CAPTURE_MANIFEST_SCHEMA = "bsc-capture-manifest-v2"
+CAPTURE_BINDING_SCHEMA = "bsc-capture-binding-v2"
+DERIVED_VIEW_MANIFEST_SCHEMA = "bsc-derived-view-manifest-v2"
+TRANSFORM_ARTIFACT_SCHEMA = "bsc-transform-artifact-v2"
 DEFAULT_MAX_WRITER_RESIDENCY_BYTES = 8 * 1024**3
 DEFAULT_PREWRITE_METADATA_RESERVE_BYTES = 1024**2
+DEFAULT_SPLIT_MANIFEST_RESERVE_BYTES = 64 * 1024
+DEFAULT_SHARD_HEADER_RESERVE_BYTES = 4096
+DEFAULT_SHARD_MANIFEST_RECORD_RESERVE_BYTES = 1024
 DEFAULT_FREE_SPACE_FLOOR_FRAC = 0.15
 CAPTURE_PROFILE_SPLITS = {
     "phase2": (
@@ -285,8 +296,94 @@ def _immutable_revision(value: object, *, label: str) -> str:
     return value
 
 
-def _atomic_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _is_int(value: object, *, minimum: int | None = None) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (minimum is None or value >= minimum)
+    )
+
+
+def _is_sha256(value: object, *, prefixed: bool = False) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = value.removeprefix("sha256:") if prefixed else value
+    if prefixed and not value.startswith("sha256:"):
+        return False
+    return re.fullmatch(r"[0-9a-f]{64}", candidate) is not None
+
+
+def _require_exact_keys(
+    value: object,
+    expected: set[str],
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    actual = set(value)
+    if actual != expected or any(not isinstance(key, str) for key in value):
+        raise ValueError(
+            f"{label} keys mismatch: missing={sorted(expected - actual)}, "
+            f"extra={sorted(actual - expected, key=str)}"
+        )
+    return value
+
+
+def _validate_split_allocation(value: object, *, label: str) -> dict[str, int]:
+    allocation = _require_exact_keys(
+        value,
+        {
+            "requested_tokens",
+            "actual_tokens",
+            "sequence_start",
+            "sequence_stop_exclusive",
+            "tokens_per_sequence",
+        },
+        label=label,
+    )
+    if any(not _is_int(item, minimum=0) for item in allocation.values()):
+        raise ValueError(f"{label} contains a non-integer or negative field")
+    result = {key: int(allocation[key]) for key in allocation}
+    if (
+        result["requested_tokens"] <= 0
+        or result["tokens_per_sequence"] <= 0
+        or result["sequence_stop_exclusive"] <= result["sequence_start"]
+        or result["actual_tokens"] < result["requested_tokens"]
+        or result["actual_tokens"]
+        != (result["sequence_stop_exclusive"] - result["sequence_start"])
+        * result["tokens_per_sequence"]
+    ):
+        raise ValueError(f"{label} is internally inconsistent")
+    return result
+
+
+def _publish_temporary(
+    temporary: Path,
+    destination: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Publish one same-directory file without an immutable-name race."""
+
+    if overwrite:
+        os.replace(temporary, destination)
+    else:
+        # A same-filesystem hard link is an atomic create-if-absent operation.
+        # Unlike an exists-check followed by replace, it cannot clobber bytes
+        # published by an uncooperative concurrent producer in the gap.
+        os.link(temporary, destination)
+        temporary.unlink()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(destination.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_json(path: Path, payload: object, *, overwrite: bool = True) -> None:
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -309,13 +406,8 @@ def _atomic_json(path: Path, payload: object) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        descriptor = os.open(path.parent, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _publish_temporary(temporary, path, overwrite=overwrite)
+        temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -323,7 +415,20 @@ def _atomic_json(path: Path, payload: object) -> None:
 
 def _producer_lock_path(output_root: Path) -> Path:
     resolved = output_root.expanduser().resolve()
-    return resolved.parent / f".{resolved.name}.bsc-producer.lock"
+    lock_root = Path(f"/var/tmp/block-crosscoder-experiment-data-locks-{os.getuid()}")
+    try:
+        lock_root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    status = lock_root.lstat()
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != os.getuid()
+        or stat.S_IMODE(status.st_mode) & 0o077
+    ):
+        raise ValueError(f"unsafe data-producer lock directory: {lock_root}")
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:24]
+    return lock_root / f"output-{digest}.lock"
 
 
 @contextmanager
@@ -331,40 +436,65 @@ def _producer_lock(output_root: Path, *, operation: str) -> Iterator[None]:
     """Hold one nonblocking producer lease outside an immutable output tree."""
 
     lock_path = _producer_lock_path(output_root)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
+    durable_mkdir(lock_path.parent, parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError(
+            f"cannot open safe data-producer lock file: {lock_path}"
+        ) from exc
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_nlink != 1
+        ):
+            raise ValueError(f"unsafe data-producer lock file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        descriptor = -1
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                handle.seek(0)
+                owner = handle.read().strip() or "unknown owner"
+                raise ValueError(
+                    f"{operation} output is locked by another producer at {lock_path}: "
+                    f"{owner}"
+                ) from exc
+            owner = {
+                "schema": "bsc-data-producer-lock-v1",
+                "operation": operation,
+                "output_root": str(output_root.expanduser().resolve()),
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+            }
             handle.seek(0)
-            owner = handle.read().strip() or "unknown owner"
-            raise ValueError(
-                f"{operation} output is locked by another producer at {lock_path}: "
-                f"{owner}"
-            ) from exc
-        owner = {
-            "schema": "bsc-data-producer-lock-v1",
-            "operation": operation,
-            "output_root": str(output_root.expanduser().resolve()),
-            "host": socket.gethostname(),
-            "pid": os.getpid(),
-        }
-        handle.seek(0)
-        handle.truncate()
-        json.dump(owner, handle, sort_keys=True, allow_nan=False)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        try:
-            yield
+            handle.truncate()
+            json.dump(owner, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _save_whitener_atomic(transform: Whitener, path: Path) -> None:
     """Publish deterministic transform bytes through a unique temporary name."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -377,28 +507,11 @@ def _save_whitener_atomic(transform: Whitener, path: Path) -> None:
             temporary = Path(handle.name)
             # A file object gives torch.save the stable ``archive/`` member
             # prefix; a random path would leak its basename into the ZIP bytes.
-            torch.save(
-                {
-                    "mean": transform.mean,
-                    "W": transform.W,
-                    "ridge": transform.ridge,
-                    "eigenvalues": transform.eigenvalues,
-                    "sites": list(transform.sites),
-                    "n_fit_tokens": transform.n_fit_tokens,
-                    "meta": transform.meta,
-                    "hash": transform.hash,
-                },
-                handle,
-            )
+            torch.save(transform.payload(), handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory = os.open(path.parent, flags)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _publish_temporary(temporary, path, overwrite=False)
+        temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -546,118 +659,380 @@ def expected_capture_allocation(
     )
 
 
-def validate_capture_manifest(capture: Mapping[str, Any]) -> dict[str, Any]:
-    """Authenticate an embedded capture binding and its duplicated fields."""
+_CAPTURE_SOURCE_KEYS = {
+    "format_version",
+    "sources",
+    "corpus",
+    "corpus_config",
+    "corpus_revision",
+    "corpus_split",
+    "text_field",
+    "context",
+    "drop_positions",
+    "tokenizer_class",
+    "tokenizer_vocab_sha256",
+    "add_special_tokens",
+    "bos_token_id",
+    "packing_algorithm",
+    "sequence_allocation",
+    "tokenizer_hashes",
+    "tokenizer_contract",
+    "store_contract_version",
+    "alignment_version",
+    "alignment_audit",
+    "row_identity_columns",
+    "capture_mode",
+    "model_loader",
+    "transformer_lens_model_names",
+    "model_forward_dtype",
+    "store_dtype",
+}
+_CAPTURE_IMPLEMENTATION_KEYS = {
+    "schema",
+    "python",
+    "dependencies",
+    "data_module_sha256",
+    "store_module_sha256",
+    "runtime",
+}
+_CAPTURE_BINDING_KEYS = {
+    "schema",
+    "campaign_profile",
+    "source_hash",
+    "split_order",
+    "split_plan",
+    "capture_implementation",
+    "sites",
+    "site_dims",
+    "d_model",
+    "physical_store_format_version",
+    "batch_rows",
+    "write_batch_tokens",
+    "tokens_per_shard",
+    "writer_pipeline",
+    "capture_transfer_pipeline",
+}
+_CAPTURE_SPLIT_RECORD_KEYS = {
+    "allocation",
+    "manifest_file_sha256",
+    "manifest_sha256",
+    "content_stream_sha256",
+    "row_stream_sha256",
+    "n_tokens",
+    "sites",
+    "site_dims",
+    "d_model",
+    "row_id_width",
+    "whitener_hash",
+}
 
-    if capture.get("schema") != "bsc-capture-manifest-v1":
-        raise ValueError("capture manifest has an unknown schema")
-    source = capture.get("source")
-    if not isinstance(source, dict) or capture.get("source_hash") != _canonical_hash(
-        source
-    ):
-        raise ValueError("capture manifest source hash mismatch")
-    binding = capture.get("capture_binding")
+
+def _validate_capture_source(value: object) -> dict[str, Any]:
+    source = _require_exact_keys(value, _CAPTURE_SOURCE_KEYS, label="capture source")
+    text_fields = (
+        "corpus",
+        "corpus_config",
+        "corpus_split",
+        "text_field",
+        "tokenizer_class",
+        "tokenizer_contract",
+        "store_contract_version",
+        "alignment_version",
+        "alignment_audit",
+    )
+    sources = source["sources"]
+    source_entries_ok = isinstance(sources, list) and bool(sources)
+    if source_entries_ok:
+        for index, entry in enumerate(sources):
+            try:
+                item = _require_exact_keys(
+                    entry,
+                    {"model", "revision", "hook"},
+                    label=f"capture source entry {index}",
+                )
+            except ValueError:
+                source_entries_ok = False
+                break
+            if (
+                any(not isinstance(item[key], str) or not item[key] for key in item)
+                or re.fullmatch(r"[0-9a-f]{40}", item["revision"]) is None
+            ):
+                source_entries_ok = False
+                break
+        if source_entries_ok:
+            source_entries_ok = len(
+                {(item["model"], item["revision"]) for item in sources}
+            ) == 1 and len({item["hook"] for item in sources}) == len(sources)
     if (
-        not isinstance(binding, dict)
-        or binding.get("schema") != "bsc-capture-binding-v1"
+        source["format_version"] != 2
+        or any(
+            not isinstance(source[key], str) or not source[key] for key in text_fields
+        )
+        or re.fullmatch(r"[0-9a-f]{40}", source["corpus_revision"]) is None
+        or not source_entries_ok
+        or not _is_int(source["context"], minimum=2)
+        or not _is_int(source["drop_positions"], minimum=0)
+        or source["drop_positions"] >= source["context"]
+        or not _is_sha256(source["tokenizer_vocab_sha256"], prefixed=True)
+        or source["add_special_tokens"] is not False
+        or not _is_int(source["bos_token_id"], minimum=0)
+        or source["packing_algorithm"] != "bos_prefixed_greedy_document_stream_v1"
+        or source["sequence_allocation"] != "whole_packed_contexts_v1"
+        or not isinstance(source["tokenizer_hashes"], list)
+        or len(source["tokenizer_hashes"]) != 1
+        or not _is_sha256(source["tokenizer_hashes"][0], prefixed=True)
+        or source["tokenizer_contract"] not in TOKENIZER_CONTRACT_FILES
+        or source["store_contract_version"]
+        not in {"activation-store-v3-derived-views", "activation-store-v3-single-view"}
+        or source["row_identity_columns"] != ["sequence", "position", "token_id"]
+        or source["capture_mode"] != "raw_once"
+        or source["model_loader"] != "transformer_lens_from_pretrained_no_processing_v1"
+        or not isinstance(source["transformer_lens_model_names"], list)
+        or len(source["transformer_lens_model_names"]) != 1
+        or not isinstance(source["transformer_lens_model_names"][0], str)
+        or not source["transformer_lens_model_names"][0]
+        or source["model_forward_dtype"] != "bfloat16"
+        or source["store_dtype"] != "bfloat16"
     ):
-        raise ValueError("capture manifest lacks its canonical embedded binding")
-    required_binding_keys = {
-        "schema",
-        "campaign_profile",
-        "source_hash",
-        "split_order",
-        "split_plan",
-        "capture_implementation",
-        "sites",
-        "site_dims",
-        "d_model",
-        "physical_store_format_version",
-        "batch_rows",
-        "write_batch_tokens",
-        "tokens_per_shard",
-        "writer_pipeline",
-        "capture_transfer_pipeline",
-    }
-    if set(binding) != required_binding_keys:
-        raise ValueError("capture binding has missing or unexpected fields")
-    implementation = binding.get("capture_implementation")
+        raise ValueError("capture source fields are malformed")
+    return dict(source)
+
+
+def _validate_capture_implementation(value: object) -> dict[str, Any]:
+    implementation = _require_exact_keys(
+        value,
+        _CAPTURE_IMPLEMENTATION_KEYS,
+        label="capture implementation",
+    )
+    dependencies = implementation["dependencies"]
+    runtime = _require_exact_keys(
+        implementation["runtime"],
+        {"requested_device", "torch_cuda_version", "cuda_device_name"},
+        label="capture runtime",
+    )
     if (
-        not isinstance(implementation, dict)
-        or implementation.get("schema") != "bsc-capture-implementation-v1"
+        implementation["schema"] != "bsc-capture-implementation-v1"
+        or not isinstance(implementation["python"], str)
+        or not implementation["python"]
+        or not isinstance(dependencies, dict)
+        or not dependencies
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(version, str)
+            or not version
+            for key, version in dependencies.items()
+        )
+        or not _is_sha256(implementation["data_module_sha256"])
+        or not _is_sha256(implementation["store_module_sha256"])
+        or not isinstance(runtime["requested_device"], str)
+        or not runtime["requested_device"]
+        or runtime["torch_cuda_version"] is not None
+        and not isinstance(runtime["torch_cuda_version"], str)
+        or runtime["cuda_device_name"] is not None
+        and not isinstance(runtime["cuda_device_name"], str)
     ):
         raise ValueError("capture implementation contract is malformed")
+    return dict(implementation)
+
+
+def _validate_capture_split_record(
+    value: object,
+    *,
+    split: str,
+    allocation: Mapping[str, int],
+    binding: Mapping[str, Any],
+    source_hash: str,
+) -> dict[str, Any]:
+    record = _require_exact_keys(
+        value,
+        _CAPTURE_SPLIT_RECORD_KEYS,
+        label=f"capture split record {split!r}",
+    )
+    record_allocation = _validate_split_allocation(
+        record["allocation"], label=f"capture split allocation {split!r}"
+    )
+    if (
+        record_allocation != allocation
+        or any(
+            not _is_sha256(record[field])
+            for field in (
+                "manifest_file_sha256",
+                "manifest_sha256",
+                "content_stream_sha256",
+                "row_stream_sha256",
+            )
+        )
+        or not _is_int(record["n_tokens"], minimum=1)
+        or record["n_tokens"] != allocation["actual_tokens"]
+        or record["sites"] != binding["sites"]
+        or record["site_dims"] != binding["site_dims"]
+        or record["d_model"] != binding["d_model"]
+        or record["row_id_width"] != 3
+        or record["whitener_hash"] != f"raw:{source_hash}"
+    ):
+        raise ValueError(f"capture split record {split!r} is malformed")
+    return dict(record)
+
+
+def validate_capture_manifest(capture: Mapping[str, Any]) -> dict[str, Any]:
+    """Authenticate the exact current capture schema and all raw split IDs."""
+
+    capture = _require_exact_keys(
+        capture,
+        {
+            "schema",
+            "source",
+            "source_hash",
+            "split_order",
+            "split_plan",
+            "splits",
+            "capture_implementation",
+            "capture_binding",
+            "capture_binding_sha256",
+            "capture_content_sha256",
+        },
+        label="capture manifest",
+    )
+    if capture["schema"] != CAPTURE_MANIFEST_SCHEMA:
+        raise ValueError("capture manifest has an unknown schema")
+    unsigned = dict(capture)
+    claimed_content = unsigned.pop("capture_content_sha256")
+    if not _is_sha256(claimed_content) or claimed_content != _canonical_hash(unsigned):
+        raise ValueError("capture manifest content digest mismatch")
+    source = _validate_capture_source(capture["source"])
+    source_hash = capture["source_hash"]
+    if not _is_sha256(source_hash) or source_hash != _canonical_hash(source):
+        raise ValueError("capture manifest source hash mismatch")
+    binding = _require_exact_keys(
+        capture["capture_binding"],
+        _CAPTURE_BINDING_KEYS,
+        label="capture binding",
+    )
+    if binding["schema"] != CAPTURE_BINDING_SCHEMA:
+        raise ValueError("capture manifest lacks its canonical embedded binding")
+    implementation = _validate_capture_implementation(binding["capture_implementation"])
+    if capture["capture_implementation"] != implementation:
+        raise ValueError("capture implementation differs from its embedded binding")
     binding_sha256 = _canonical_hash(binding)
-    if capture.get("capture_binding_sha256") != binding_sha256:
+    if (
+        not _is_sha256(capture["capture_binding_sha256"])
+        or capture["capture_binding_sha256"] != binding_sha256
+    ):
         raise ValueError("capture binding digest mismatch")
-    sites = binding.get("sites")
-    site_dims = binding.get("site_dims")
-    d_model = binding.get("d_model")
-    positive_integer_fields = (
-        binding.get("batch_rows"),
-        binding.get("write_batch_tokens"),
-        binding.get("tokens_per_shard"),
+    sites = binding["sites"]
+    site_dims = binding["site_dims"]
+    writer_pipeline = _require_exact_keys(
+        binding["writer_pipeline"],
+        {
+            "contract",
+            "bytes_per_token",
+            "shard_payload_bytes",
+            "pending_shard_bytes",
+            "staging_shard_bytes",
+            "writer_residency_bytes",
+            "max_writer_residency_bytes",
+        },
+        label="capture writer pipeline",
+    )
+    transfer_pipeline = _require_exact_keys(
+        binding["capture_transfer_pipeline"],
+        {
+            "contract",
+            "activation_batch_bytes",
+            "row_identity_batch_bytes",
+            "pinned_activation_buffer_count",
+            "pinned_activation_host_bytes",
+            "retained_row_identity_host_bytes",
+            "retained_cuda_source_bytes",
+            "peak_host_pipeline_bytes",
+            "peak_cuda_capture_lookahead_bytes",
+        },
+        label="capture transfer pipeline",
     )
     if (
         not isinstance(sites, list)
         or sites != list(range(len(sites)))
+        or len(sites) != len(source["sources"])
         or not isinstance(site_dims, list)
         or len(site_dims) != len(sites)
         or not site_dims
+        or any(not _is_int(width, minimum=1) for width in site_dims)
+        or not _is_int(binding["d_model"], minimum=1)
+        or binding["d_model"] != max(site_dims)
+        or binding["physical_store_format_version"] != STORE_FORMAT_VERSION
         or any(
-            not isinstance(width, int) or isinstance(width, bool) or width <= 0
-            for width in site_dims
+            not _is_int(binding[field], minimum=1)
+            for field in ("batch_rows", "write_batch_tokens", "tokens_per_shard")
         )
-        or not isinstance(d_model, int)
-        or isinstance(d_model, bool)
-        or d_model != max(site_dims)
-        or binding.get("physical_store_format_version") != STORE_FORMAT_VERSION
+        or writer_pipeline["contract"] != "one_pending_shard_v1"
         or any(
-            not isinstance(value, int) or isinstance(value, bool) or value <= 0
-            for value in positive_integer_fields
+            not _is_int(value, minimum=1)
+            for key, value in writer_pipeline.items()
+            if key != "contract"
         )
-        or not isinstance(binding.get("writer_pipeline"), dict)
-        or not isinstance(binding.get("capture_transfer_pipeline"), dict)
+        or transfer_pipeline["contract"]
+        not in {
+            "two_pinned_activation_d2h_lookahead_v1",
+            "synchronous_cpu_capture_v1",
+        }
+        or any(
+            not _is_int(value, minimum=0)
+            for key, value in transfer_pipeline.items()
+            if key != "contract"
+        )
     ):
         raise ValueError("capture binding geometry or execution fields are malformed")
-    duplicated = {
-        "source_hash": capture.get("source_hash"),
-        "split_order": capture.get("split_order"),
-        "split_plan": capture.get("split_plan"),
-        "capture_implementation": capture.get("capture_implementation"),
-    }
-    mismatches = {
-        key: {"manifest": value, "binding": binding.get(key)}
-        for key, value in duplicated.items()
-        if value != binding.get(key)
-    }
-    if capture.get("splits") != capture.get("split_plan"):
-        mismatches["splits"] = {
-            "manifest": capture.get("splits"),
-            "binding": binding.get("split_plan"),
-        }
-    profile = binding.get("campaign_profile")
-    required_roles = CAPTURE_PROFILE_SPLITS.get(str(profile))
+    profile = binding["campaign_profile"]
+    required_roles = CAPTURE_PROFILE_SPLITS.get(profile)
+    split_order = capture["split_order"]
+    split_plan = capture["split_plan"]
+    split_records = capture["splits"]
     if (
         required_roles is None
-        or capture.get("split_order") != list(required_roles)
-        or not isinstance(capture.get("split_plan"), dict)
-        or set(capture.get("split_plan", {})) != set(required_roles or ())
+        or split_order != list(required_roles)
+        or not isinstance(split_plan, dict)
+        or set(split_plan) != set(required_roles)
+        or not isinstance(split_records, dict)
+        or set(split_records) != set(required_roles)
+        or binding["source_hash"] != source_hash
+        or binding["split_order"] != split_order
+        or binding["split_plan"] != split_plan
     ):
-        mismatches["campaign_profile"] = {
-            "manifest": capture.get("split_order"),
-            "binding": profile,
-        }
-    if mismatches:
-        raise ValueError(
-            "capture manifest differs from its embedded binding: "
-            + json.dumps(mismatches, sort_keys=True)
+        raise ValueError("capture manifest differs from its embedded binding")
+    next_sequence = 0
+    for split in split_order:
+        allocation = _validate_split_allocation(
+            split_plan[split], label=f"capture split plan {split!r}"
+        )
+        if allocation["sequence_start"] != next_sequence:
+            raise ValueError("capture split plan is not one contiguous ordered stream")
+        next_sequence = allocation["sequence_stop_exclusive"]
+        _validate_capture_split_record(
+            split_records[split],
+            split=split,
+            allocation=allocation,
+            binding=binding,
+            source_hash=source_hash,
         )
     return dict(binding)
 
 
+_DERIVED_SPLIT_RECORD_KEYS = {
+    "allocation",
+    "manifest_sha256",
+    "content_stream_sha256",
+    "row_stream_sha256",
+    "n_tokens",
+    "source_manifest_file_sha256",
+    "source_manifest_sha256",
+    "source_content_stream_sha256",
+    "source_row_stream_sha256",
+}
+
+
 def validate_derived_view_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Authenticate a derived-view root envelope without reading shard bytes."""
+    """Authenticate a complete current-schema derived-view root envelope."""
 
     required_keys = {
         "schema",
@@ -673,41 +1048,132 @@ def validate_derived_view_manifest(manifest: Mapping[str, Any]) -> dict[str, Any
         "splits",
         "view_manifest_sha256",
     }
-    if set(manifest) != required_keys:
-        raise ValueError("derived-view root manifest has missing or unexpected fields")
-    claimed_digest = manifest.get("view_manifest_sha256")
+    manifest = _require_exact_keys(
+        manifest, required_keys, label="derived-view root manifest"
+    )
+    claimed_digest = manifest["view_manifest_sha256"]
     unsigned = dict(manifest)
-    unsigned.pop("view_manifest_sha256", None)
+    unsigned.pop("view_manifest_sha256")
     if (
-        manifest.get("schema") != "bsc-derived-view-manifest-v1"
-        or not isinstance(claimed_digest, str)
+        manifest["schema"] != DERIVED_VIEW_MANIFEST_SCHEMA
+        or not _is_sha256(claimed_digest)
         or claimed_digest != _canonical_hash(unsigned)
     ):
         raise ValueError("derived-view root manifest digest mismatch")
-    source_capture = manifest.get("source_capture")
+    source_capture = manifest["source_capture"]
     if not isinstance(source_capture, dict):
         raise ValueError("derived-view root manifest lacks embedded capture evidence")
     capture_binding = validate_capture_manifest(source_capture)
     if (
-        manifest.get("source_capture_manifest_sha256")
-        != _canonical_hash(source_capture)
-        or manifest.get("source_hash") != source_capture.get("source_hash")
-        or manifest.get("capture_binding_sha256") != _canonical_hash(capture_binding)
+        not _is_sha256(manifest["source_capture_sha256"])
+        or manifest["source_capture_manifest_sha256"] != _canonical_hash(source_capture)
+        or manifest["source_hash"] != source_capture["source_hash"]
+        or manifest["capture_binding_sha256"] != _canonical_hash(capture_binding)
     ):
         raise ValueError("derived-view embedded capture binding mismatch")
-    mode = manifest.get("mode")
-    split_order = manifest.get("split_order")
-    split_records = manifest.get("splits")
+    mode = manifest["mode"]
+    split_order = manifest["split_order"]
+    split_records = manifest["splits"]
     if (
         mode not in NORMALIZATION_MODES
-        or not isinstance(split_order, list)
-        or not split_order
-        or any(not isinstance(split, str) or not split for split in split_order)
-        or len(set(split_order)) != len(split_order)
+        or split_order != source_capture["split_order"]
         or not isinstance(split_records, dict)
         or set(split_records) != set(split_order)
+        or not _is_sha256(manifest["transform_hash"])
+        or not _is_sha256(manifest["whitener_sha256"])
     ):
         raise ValueError("derived-view root manifest has malformed roles")
+    for split in split_order:
+        record = _require_exact_keys(
+            split_records[split],
+            _DERIVED_SPLIT_RECORD_KEYS,
+            label=f"derived-view split record {split!r}",
+        )
+        allocation = _validate_split_allocation(
+            record["allocation"],
+            label=f"derived-view split allocation {split!r}",
+        )
+        source_record = source_capture["splits"][split]
+        if (
+            allocation != source_capture["split_plan"][split]
+            or not _is_int(record["n_tokens"], minimum=1)
+            or record["n_tokens"] != allocation["actual_tokens"]
+            or any(
+                not _is_sha256(record[field])
+                for field in _DERIVED_SPLIT_RECORD_KEYS
+                if field not in {"allocation", "n_tokens"}
+            )
+            or record["row_stream_sha256"] != record["source_row_stream_sha256"]
+            or record["source_manifest_file_sha256"]
+            != source_record["manifest_file_sha256"]
+            or record["source_manifest_sha256"] != source_record["manifest_sha256"]
+            or record["source_content_stream_sha256"]
+            != source_record["content_stream_sha256"]
+            or record["source_row_stream_sha256"] != source_record["row_stream_sha256"]
+        ):
+            raise ValueError(
+                f"derived-view split record {split!r} diverges from source capture"
+            )
+    return dict(manifest)
+
+
+def validate_transform_artifact_manifest(
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate one current-schema transform-only artifact manifest."""
+
+    required = {
+        "schema",
+        "mode",
+        "transform_hash",
+        "whitener_sha256",
+        "source_capture_sha256",
+        "source_capture_manifest_sha256",
+        "source_capture",
+        "source_hash",
+        "source_fit_manifest_file_sha256",
+        "source_fit_manifest_sha256",
+        "source_fit_row_stream_sha256",
+        "source_fit_content_stream_sha256",
+        "source_fit_requested_tokens",
+        "source_raw_root",
+        "transform_contract",
+        "transform_manifest_sha256",
+    }
+    manifest = _require_exact_keys(manifest, required, label="transform manifest")
+    unsigned = dict(manifest)
+    claimed = unsigned.pop("transform_manifest_sha256")
+    if (
+        manifest["schema"] != TRANSFORM_ARTIFACT_SCHEMA
+        or not _is_sha256(claimed)
+        or claimed != _canonical_hash(unsigned)
+    ):
+        raise ValueError("transform manifest digest mismatch")
+    source_capture = manifest["source_capture"]
+    if not isinstance(source_capture, dict):
+        raise ValueError("transform manifest lacks embedded capture evidence")
+    validate_capture_manifest(source_capture)
+    fit_record = source_capture["splits"]["normalization_fit"]
+    fit_allocation = source_capture["split_plan"]["normalization_fit"]
+    if (
+        manifest["mode"] not in NORMALIZATION_MODES
+        or not _is_sha256(manifest["transform_hash"])
+        or not _is_sha256(manifest["whitener_sha256"])
+        or not _is_sha256(manifest["source_capture_sha256"])
+        or manifest["source_capture_manifest_sha256"] != _canonical_hash(source_capture)
+        or manifest["source_hash"] != source_capture["source_hash"]
+        or manifest["source_fit_manifest_file_sha256"]
+        != fit_record["manifest_file_sha256"]
+        or manifest["source_fit_manifest_sha256"] != fit_record["manifest_sha256"]
+        or manifest["source_fit_row_stream_sha256"] != fit_record["row_stream_sha256"]
+        or manifest["source_fit_content_stream_sha256"]
+        != fit_record["content_stream_sha256"]
+        or manifest["source_fit_requested_tokens"] != fit_allocation["requested_tokens"]
+        or not isinstance(manifest["source_raw_root"], str)
+        or not manifest["source_raw_root"]
+        or manifest["transform_contract"] != "content_addressed_transform_only-v1"
+    ):
+        raise ValueError("transform manifest source binding mismatch")
     return dict(manifest)
 
 
@@ -847,9 +1313,10 @@ def estimate_store_bytes(
     *,
     n_views: int = 1,
     row_id_width: int = 3,
+    tokens_per_shard: int = 150_000,
 ) -> int:
-    # Payload only. Safetensors headers and int64 row IDs are included as a
-    # conservative fixed per-token allowance.
+    """Conservatively bound payload, shard headers, and evidence manifests."""
+
     dimensions = tuple(int(width) for width in site_dims)
     if not dimensions or any(width <= 0 for width in dimensions):
         raise ValueError("site dimensions must be nonempty and positive")
@@ -857,8 +1324,30 @@ def estimate_store_bytes(
         raise ValueError("n_views must be positive")
     if row_id_width <= 0:
         raise ValueError("row_id_width must be positive")
+    if tokens_per_shard <= 0:
+        raise ValueError("tokens_per_shard must be positive")
+    if any(
+        not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0
+        for tokens in split_sizes.values()
+    ):
+        raise ValueError("split token counts must be nonnegative integers")
     per_token = 2 * len(dimensions) * max(dimensions) + row_id_width * 8
-    return sum(split_sizes.values()) * per_token * n_views
+    payload = sum(split_sizes.values()) * per_token
+    shard_count = sum(
+        math.ceil(tokens / tokens_per_shard)
+        for tokens in split_sizes.values()
+        if tokens > 0
+    )
+    metadata = (
+        DEFAULT_PREWRITE_METADATA_RESERVE_BYTES
+        + len(split_sizes) * DEFAULT_SPLIT_MANIFEST_RESERVE_BYTES
+        + shard_count
+        * (
+            DEFAULT_SHARD_HEADER_RESERVE_BYTES
+            + DEFAULT_SHARD_MANIFEST_RECORD_RESERVE_BYTES
+        )
+    )
+    return (payload + metadata) * n_views
 
 
 def estimate_writer_residency_bytes(
@@ -991,7 +1480,7 @@ def whole_sequence_split_plan(
 def _ensure_empty(path: Path) -> None:
     if path.exists() and any(path.iterdir()):
         raise ValueError(f"refusing nonempty output directory {path}")
-    path.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path, parents=True, exist_ok=True)
 
 
 def _normalization_fit_requested_tokens(capture: dict, fit_reader: StoreReader) -> int:
@@ -1016,6 +1505,58 @@ def _normalization_fit_requested_tokens(capture: dict, fit_reader: StoreReader) 
     ):
         raise ValueError("normalization_fit allocation is inconsistent with its store")
     return requested
+
+
+def _capture_split_record(
+    root: Path,
+    split: str,
+    reader: StoreReader,
+    allocation: Mapping[str, int],
+) -> dict[str, object]:
+    """Build the exact raw-split evidence bound by ``capture.json``."""
+
+    manifest_path = root / split / "split.json"
+    return {
+        "allocation": dict(allocation),
+        "manifest_file_sha256": _file_sha256(manifest_path),
+        "manifest_sha256": reader.manifest["manifest_sha256"],
+        "content_stream_sha256": reader.manifest["content_stream_sha256"],
+        "row_stream_sha256": reader.manifest["row_stream_sha256"],
+        "n_tokens": reader.n_tokens,
+        "sites": list(reader.sites),
+        "site_dims": list(reader.site_dims),
+        "d_model": reader.d_model,
+        "row_id_width": int(reader.manifest["row_id_width"]),
+        "whitener_hash": reader.whitener_hash,
+    }
+
+
+def _with_content_digest(
+    payload: dict[str, object], *, field: str
+) -> dict[str, object]:
+    if field in payload:
+        raise ValueError(f"digest field {field!r} already exists")
+    result = dict(payload)
+    result[field] = _canonical_hash(payload)
+    return result
+
+
+def _derived_view_split_record(
+    manifest: Mapping[str, Any],
+    source_record: Mapping[str, Any],
+    allocation: Mapping[str, int],
+) -> dict[str, object]:
+    return {
+        "allocation": dict(allocation),
+        "manifest_sha256": manifest["manifest_sha256"],
+        "content_stream_sha256": manifest["content_stream_sha256"],
+        "row_stream_sha256": manifest["row_stream_sha256"],
+        "n_tokens": manifest["n_tokens"],
+        "source_manifest_file_sha256": source_record["manifest_file_sha256"],
+        "source_manifest_sha256": source_record["manifest_sha256"],
+        "source_content_stream_sha256": source_record["content_stream_sha256"],
+        "source_row_stream_sha256": source_record["row_stream_sha256"],
+    }
 
 
 def _sequential_prefix(
@@ -1125,7 +1666,7 @@ def _derive_views_unlocked(
     for mode in modes:
         view_root = out_root / mode
         if resume:
-            view_root.mkdir(parents=True, exist_ok=True)
+            durable_mkdir(view_root, parents=True, exist_ok=True)
             allowed_entries = set(split_names) | {"whitener.pt", VIEW_MANIFEST_NAME}
             foreign = sorted(
                 path.name
@@ -1145,6 +1686,9 @@ def _derive_views_unlocked(
             "source_capture_sha256": capture_sha256,
             "source_capture_manifest_sha256": capture_manifest_sha256,
             "source_hash": source_hash,
+            "source_fit_manifest_file_sha256": capture["splits"]["normalization_fit"][
+                "manifest_file_sha256"
+            ],
             "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
             "source_fit_row_stream_sha256": fit_reader.manifest["row_stream_sha256"],
             "source_fit_content_stream_sha256": fit_reader.manifest[
@@ -1224,7 +1768,13 @@ def _derive_views_unlocked(
                 **transform_source_meta,
                 "source_raw_root": str(raw_root.resolve()),
                 "derived_view": True,
+                "source_split_manifest_file_sha256": capture["splits"][split][
+                    "manifest_file_sha256"
+                ],
                 "source_split_manifest_sha256": reader.manifest["manifest_sha256"],
+                "source_split_content_stream_sha256": reader.manifest[
+                    "content_stream_sha256"
+                ],
                 "row_stream_sha256": reader.manifest["row_stream_sha256"],
                 "normalization": mode,
                 "writer_pipeline": {
@@ -1282,16 +1832,11 @@ def _derive_views_unlocked(
                         f"split binding differs in {failed}"
                     )
                 if prior_view_manifest is not None:
-                    expected_root_record = {
-                        "manifest_sha256": existing_reader.manifest["manifest_sha256"],
-                        "content_stream_sha256": existing_reader.manifest[
-                            "content_stream_sha256"
-                        ],
-                        "row_stream_sha256": existing_reader.manifest[
-                            "row_stream_sha256"
-                        ],
-                        "n_tokens": existing_reader.n_tokens,
-                    }
+                    expected_root_record = _derived_view_split_record(
+                        existing_reader.manifest,
+                        capture["splits"][split],
+                        capture["split_plan"][split],
+                    )
                     if prior_view_manifest["splits"].get(split) != expected_root_record:
                         raise ValueError(
                             f"cannot resume derived view {mode!r}/{split}; split "
@@ -1307,6 +1852,7 @@ def _derive_views_unlocked(
                     reader.site_dims,
                     n_views=1,
                     row_id_width=int(reader.manifest["row_id_width"]),
+                    tokens_per_shard=tokens_per_shard,
                 ),
                 operation=f"derive {mode!r}/{split}",
             )
@@ -1339,7 +1885,7 @@ def _derive_views_unlocked(
             ).verify()
             view_splits[split] = manifest
         view_manifest = {
-            "schema": "bsc-derived-view-manifest-v1",
+            "schema": DERIVED_VIEW_MANIFEST_SCHEMA,
             "mode": mode,
             "transform_hash": transform.hash,
             "whitener_sha256": _file_sha256(transform_path),
@@ -1350,16 +1896,16 @@ def _derive_views_unlocked(
             "capture_binding_sha256": _canonical_hash(capture_binding),
             "split_order": list(split_names),
             "splits": {
-                split: {
-                    "manifest_sha256": manifest["manifest_sha256"],
-                    "content_stream_sha256": manifest["content_stream_sha256"],
-                    "row_stream_sha256": manifest["row_stream_sha256"],
-                    "n_tokens": manifest["n_tokens"],
-                }
+                split: _derived_view_split_record(
+                    manifest,
+                    capture["splits"][split],
+                    capture["split_plan"][split],
+                )
                 for split, manifest in view_splits.items()
             },
         }
         view_manifest["view_manifest_sha256"] = _canonical_hash(view_manifest)
+        validate_derived_view_manifest(view_manifest)
         view_manifest_path = view_root / VIEW_MANIFEST_NAME
         if view_manifest_path.is_file():
             try:
@@ -1378,7 +1924,7 @@ def _derive_views_unlocked(
                 DEFAULT_PREWRITE_METADATA_RESERVE_BYTES,
                 operation=f"derive {mode!r} root manifest",
             )
-            _atomic_json(view_manifest_path, view_manifest)
+            _atomic_json(view_manifest_path, view_manifest, overwrite=False)
         results[mode] = {
             "whitener_hash": transform.hash,
             "view_manifest": view_manifest,
@@ -1482,6 +2028,9 @@ def _fit_transform_artifacts_unlocked(
         "source_capture_sha256": capture_sha256,
         "source_capture_manifest_sha256": capture_manifest_sha256,
         "source_hash": source_hash,
+        "source_fit_manifest_file_sha256": capture["splits"]["normalization_fit"][
+            "manifest_file_sha256"
+        ],
         "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
         "source_fit_row_stream_sha256": fit_reader.manifest["row_stream_sha256"],
         "source_fit_content_stream_sha256": fit_reader.manifest[
@@ -1512,31 +2061,40 @@ def _fit_transform_artifacts_unlocked(
             ),
             operation=f"fit-transform {mode!r}",
         )
-        artifact_root.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(artifact_root, parents=True, exist_ok=True)
         if transform_path.exists():
             existing = Whitener.load(transform_path)
             if existing.hash != transform.hash:
                 raise ValueError(f"content-address collision at {artifact_root}")
         else:
             _save_whitener_atomic(transform, transform_path)
-        manifest = {
-            "schema": "bsc-transform-artifact-v1",
-            "mode": mode,
-            "transform_hash": transform.hash,
-            "whitener_sha256": _file_sha256(transform_path),
-            "source_capture_sha256": capture_sha256,
-            "source_capture_manifest_sha256": capture_manifest_sha256,
-            "source_capture": capture,
-            "source_hash": source_hash,
-            "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
-            "source_fit_row_stream_sha256": fit_reader.manifest["row_stream_sha256"],
-            "source_fit_content_stream_sha256": fit_reader.manifest[
-                "content_stream_sha256"
-            ],
-            "source_fit_requested_tokens": fit_tokens,
-            "source_raw_root": str(raw_root.resolve()),
-            "transform_contract": "content_addressed_transform_only-v1",
-        }
+        manifest = _with_content_digest(
+            {
+                "schema": TRANSFORM_ARTIFACT_SCHEMA,
+                "mode": mode,
+                "transform_hash": transform.hash,
+                "whitener_sha256": _file_sha256(transform_path),
+                "source_capture_sha256": capture_sha256,
+                "source_capture_manifest_sha256": capture_manifest_sha256,
+                "source_capture": capture,
+                "source_hash": source_hash,
+                "source_fit_manifest_file_sha256": capture["splits"][
+                    "normalization_fit"
+                ]["manifest_file_sha256"],
+                "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
+                "source_fit_row_stream_sha256": fit_reader.manifest[
+                    "row_stream_sha256"
+                ],
+                "source_fit_content_stream_sha256": fit_reader.manifest[
+                    "content_stream_sha256"
+                ],
+                "source_fit_requested_tokens": fit_tokens,
+                "source_raw_root": str(raw_root.resolve()),
+                "transform_contract": "content_addressed_transform_only-v1",
+            },
+            field="transform_manifest_sha256",
+        )
+        validate_transform_artifact_manifest(manifest)
         encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         if manifest_path.exists():
             if manifest_path.read_text() != encoded:
@@ -1544,7 +2102,7 @@ def _fit_transform_artifacts_unlocked(
                     f"existing transform manifest differs at {manifest_path}"
                 )
         else:
-            _atomic_json(manifest_path, manifest)
+            _atomic_json(manifest_path, manifest, overwrite=False)
         results[mode] = {
             **manifest,
             "path": str(transform_path),
@@ -1638,6 +2196,17 @@ def _verify_raw_store_root(root: Path) -> dict[str, object]:
         raise ValueError(
             "activation store split set differs from the declared capture roles"
         )
+    allowed_entries = set(declared_order) | {
+        CAPTURE_MANIFEST_NAME,
+        CAPTURE_STATE_NAME,
+    }
+    foreign_entries = sorted(
+        path.name for path in root.iterdir() if path.name not in allowed_entries
+    )
+    if foreign_entries:
+        raise ValueError(
+            f"activation store contains entries absent from capture evidence: {foreign_entries}"
+        )
     result: dict[str, object] = {}
     for split in declared_order:
         reader = StoreReader(root, split)
@@ -1678,6 +2247,11 @@ def _verify_raw_store_root(root: Path) -> dict[str, object]:
             or reader.d_model != binding["d_model"]
         ):
             raise ValueError(f"split {split!r} geometry differs from capture binding")
+        expected_record = _capture_split_record(root, split, reader, allocation)
+        if capture_payload["splits"][split] != expected_record:
+            raise ValueError(
+                f"split {split!r} differs from its authenticated capture record"
+            )
         result[split] = verification
     return result
 
@@ -1715,56 +2289,45 @@ def _verify_derived_store_root(root: Path) -> dict[str, object]:
     transform = Whitener.load(transform_path)
     if transform.hash != manifest.get("transform_hash") or transform.mode != mode:
         raise ValueError("derived-view whitener binding mismatch")
+    source_capture = manifest["source_capture"]
+    fit_record = source_capture["splits"]["normalization_fit"]
     if (
         transform.meta.get("source_capture_sha256")
         != manifest.get("source_capture_sha256")
         or transform.meta.get("source_capture_manifest_sha256")
         != manifest.get("source_capture_manifest_sha256")
         or transform.meta.get("source_hash") != manifest.get("source_hash")
+        or transform.meta.get("source_fit_manifest_file_sha256")
+        != fit_record["manifest_file_sha256"]
+        or transform.meta.get("source_fit_manifest_sha256")
+        != fit_record["manifest_sha256"]
+        or transform.meta.get("source_fit_row_stream_sha256")
+        != fit_record["row_stream_sha256"]
+        or transform.meta.get("source_fit_content_stream_sha256")
+        != fit_record["content_stream_sha256"]
+        or transform.meta.get("source_fit_requested_tokens")
+        != source_capture["split_plan"]["normalization_fit"]["requested_tokens"]
     ):
         raise ValueError("derived-view source binding mismatch")
 
     result: dict[str, object] = {}
     for split in split_order:
         record = split_records[split]
-        if not isinstance(record, dict):
-            raise ValueError(f"derived-view split record {split!r} is malformed")
-        if set(record) != {
-            "manifest_sha256",
-            "content_stream_sha256",
-            "row_stream_sha256",
-            "n_tokens",
-        }:
-            raise ValueError(f"derived-view split record {split!r} is malformed")
+        allocation = source_capture["split_plan"][split]
+        source_record = source_capture["splits"][split]
         reader = StoreReader(root, split, expected_whitener_hash=transform.hash)
         meta = reader.manifest.get("meta", {})
-        identity_fields = (
-            "sequence_start",
-            "sequence_stop_exclusive",
-            "tokens_per_sequence",
-            "drop_positions",
-        )
-        if any(
-            not isinstance(meta.get(name), int) or isinstance(meta.get(name), bool)
-            for name in identity_fields
-        ):
-            raise ValueError(
-                f"derived-view split {split!r} lacks canonical row allocation"
-            )
         verification = reader.verify(
             expected_row_identity={
-                "sequence_start": meta["sequence_start"],
-                "sequence_stop_exclusive": meta["sequence_stop_exclusive"],
-                "tokens_per_sequence": meta["tokens_per_sequence"],
-                "position_start": meta["drop_positions"],
+                "sequence_start": allocation["sequence_start"],
+                "sequence_stop_exclusive": allocation["sequence_stop_exclusive"],
+                "tokens_per_sequence": allocation["tokens_per_sequence"],
+                "position_start": source_capture["source"]["drop_positions"],
             }
         )
-        expected_record = {
-            "manifest_sha256": reader.manifest["manifest_sha256"],
-            "content_stream_sha256": reader.manifest["content_stream_sha256"],
-            "row_stream_sha256": reader.manifest["row_stream_sha256"],
-            "n_tokens": reader.n_tokens,
-        }
+        expected_record = _derived_view_split_record(
+            reader.manifest, source_record, allocation
+        )
         if record != expected_record:
             raise ValueError(
                 f"derived-view split {split!r} differs from its root manifest"
@@ -1775,8 +2338,27 @@ def _verify_derived_store_root(root: Path) -> dict[str, object]:
             or meta.get("source_capture_sha256")
             != manifest.get("source_capture_sha256")
             or meta.get("source_hash") != manifest.get("source_hash")
+            or meta.get("split_requested_tokens") != allocation["requested_tokens"]
+            or meta.get("split_actual_tokens") != allocation["actual_tokens"]
+            or meta.get("sequence_start") != allocation["sequence_start"]
+            or meta.get("sequence_stop_exclusive")
+            != allocation["sequence_stop_exclusive"]
+            or meta.get("tokens_per_sequence") != allocation["tokens_per_sequence"]
+            or meta.get("drop_positions") != source_capture["source"]["drop_positions"]
+            or meta.get("ordered_split_allocation") != split_order
+            or meta.get("source_split_manifest_file_sha256")
+            != source_record["manifest_file_sha256"]
+            or meta.get("source_split_manifest_sha256")
+            != source_record["manifest_sha256"]
+            or meta.get("source_split_content_stream_sha256")
+            != source_record["content_stream_sha256"]
+            or meta.get("row_stream_sha256") != source_record["row_stream_sha256"]
+            or reader.n_tokens != allocation["actual_tokens"]
             or tuple(reader.sites) != transform.sites
             or tuple(reader.site_dims) != transform.site_dims
+            or list(reader.sites) != source_record["sites"]
+            or list(reader.site_dims) != source_record["site_dims"]
+            or reader.d_model != source_record["d_model"]
         ):
             raise ValueError(
                 f"derived-view split {split!r} has a divergent source/geometry binding"
@@ -1800,13 +2382,9 @@ def verify_store_root(root: Path) -> dict[str, object]:
     )
 
 
-def _capture_unlocked(
+def _preflight_capture_arguments(
     args: argparse.Namespace,
-    *,
-    failure_injector: Callable[[str, int], None] | None = None,
-) -> dict[str, object]:
-    """Capture one pinned model's hooks into a resumable immutable row stream."""
-
+) -> tuple[list[SourceSpec], list[str], str | None, dict[str, int], int]:
     if args.context <= 1 or args.drop_positions < 0:
         raise ValueError(
             "context must exceed one and drop_positions cannot be negative"
@@ -1834,6 +2412,19 @@ def _capture_unlocked(
     tokens_per_row = args.context - args.drop_positions
     if tokens_per_row <= 0:
         raise ValueError("drop_positions must be smaller than context")
+    return raw_sources, hooks, profile, split_sizes, tokens_per_row
+
+
+def _capture_unlocked(
+    args: argparse.Namespace,
+    *,
+    failure_injector: Callable[[str, int], None] | None = None,
+) -> dict[str, object]:
+    """Capture one pinned model's hooks into a resumable immutable row stream."""
+
+    raw_sources, hooks, profile, split_sizes, tokens_per_row = (
+        _preflight_capture_arguments(args)
+    )
 
     from datasets import load_dataset
     from huggingface_hub import HfApi
@@ -1969,7 +2560,7 @@ def _capture_unlocked(
         ),
     }
     binding = {
-        "schema": "bsc-capture-binding-v1",
+        "schema": CAPTURE_BINDING_SCHEMA,
         "campaign_profile": profile,
         "source_hash": source_hash,
         "split_order": split_order,
@@ -1997,6 +2588,7 @@ def _capture_unlocked(
         site_dims,
         n_views=1,
         row_id_width=3,
+        tokens_per_shard=args.tokens_per_shard,
     )
     _enforce_prewrite_storage(
         args.out,
@@ -2169,7 +2761,9 @@ def _capture_unlocked(
             if reader.n_tokens != expected_tokens:
                 raise ValueError(f"complete split {split!r} has the wrong token count")
             verify_sequence_identity(split, reader)
-            complete_splits[split] = dict(split_plan[split])
+            complete_splits[split] = _capture_split_record(
+                args.out, split, reader, split_plan[split]
+            )
         else:
             if reader.n_tokens > expected_tokens:
                 raise ValueError(f"incomplete split {split!r} exceeds its allocation")
@@ -2187,7 +2781,9 @@ def _capture_unlocked(
                 finalizer.close()
                 reader = verified_reader(split)
                 verify_sequence_identity(split, reader)
-                complete_splits[split] = dict(split_plan[split])
+                complete_splits[split] = _capture_split_record(
+                    args.out, split, reader, split_plan[split]
+                )
             else:
                 saw_gap_or_partial = True
 
@@ -2200,6 +2796,7 @@ def _capture_unlocked(
         site_dims,
         n_views=1,
         row_id_width=3,
+        tokens_per_shard=args.tokens_per_shard,
     )
     _enforce_prewrite_storage(
         args.out,
@@ -2214,24 +2811,28 @@ def _capture_unlocked(
         raise ValueError("capture progress exceeds the ordered split allocation")
 
     if committed_tokens == total_tokens:
-        expected_capture: dict[str, object] = {
-            "schema": "bsc-capture-manifest-v1",
-            "source": source_meta,
-            "source_hash": source_hash,
-            "split_order": split_order,
-            "split_plan": split_plan,
-            "splits": complete_splits,
-            "capture_implementation": implementation,
-            "capture_binding": binding,
-            "capture_binding_sha256": binding_sha256,
-        }
+        expected_capture = _with_content_digest(
+            {
+                "schema": CAPTURE_MANIFEST_SCHEMA,
+                "source": source_meta,
+                "source_hash": source_hash,
+                "split_order": split_order,
+                "split_plan": split_plan,
+                "splits": complete_splits,
+                "capture_implementation": implementation,
+                "capture_binding": binding,
+                "capture_binding_sha256": binding_sha256,
+            },
+            field="capture_content_sha256",
+        )
+        validate_capture_manifest(expected_capture)
         if capture_path.is_file():
             existing_capture = json.loads(capture_path.read_text())
             if existing_capture != expected_capture:
                 raise ValueError("capture.json differs from the resume binding")
         else:
             existing_capture = expected_capture
-            _atomic_json(capture_path, existing_capture)
+            _atomic_json(capture_path, existing_capture, overwrite=False)
         state["status"] = "complete"
         state["capture_manifest_sha256"] = _file_sha256(capture_path)
         _atomic_json(state_path, state)
@@ -2416,7 +3017,9 @@ def _capture_unlocked(
         verify_sequence_identity(split, reader)
         state["progress"][split] = manifest["n_tokens"]
         _atomic_json(state_path, state)
-        capture_splits[split] = dict(split_plan[split])
+        capture_splits[split] = _capture_split_record(
+            args.out, split, reader, split_plan[split]
+        )
         print(
             json.dumps(
                 {
@@ -2432,18 +3035,22 @@ def _capture_unlocked(
             )
         )
 
-    capture_manifest: dict[str, object] = {
-        "schema": "bsc-capture-manifest-v1",
-        "source": source_meta,
-        "source_hash": source_hash,
-        "split_order": split_order,
-        "split_plan": split_plan,
-        "splits": capture_splits,
-        "capture_implementation": implementation,
-        "capture_binding": binding,
-        "capture_binding_sha256": binding_sha256,
-    }
-    _atomic_json(capture_path, capture_manifest)
+    capture_manifest = _with_content_digest(
+        {
+            "schema": CAPTURE_MANIFEST_SCHEMA,
+            "source": source_meta,
+            "source_hash": source_hash,
+            "split_order": split_order,
+            "split_plan": split_plan,
+            "splits": capture_splits,
+            "capture_implementation": implementation,
+            "capture_binding": binding,
+            "capture_binding_sha256": binding_sha256,
+        },
+        field="capture_content_sha256",
+    )
+    validate_capture_manifest(capture_manifest)
+    _atomic_json(capture_path, capture_manifest, overwrite=False)
     state["status"] = "complete"
     state["progress"] = {
         split: split_plan[split]["actual_tokens"] for split in split_order
@@ -2458,8 +3065,14 @@ def capture(
     *,
     failure_injector: Callable[[str, int], None] | None = None,
 ) -> dict[str, object]:
+    _preflight_capture_arguments(args)
     with _producer_lock(args.out, operation="capture"):
-        return _capture_unlocked(args, failure_injector=failure_injector)
+        with host_cuda_execution_lock(
+            args.device,
+            operation="activation-capture",
+            owner_id=str(args.out.resolve()),
+        ):
+            return _capture_unlocked(args, failure_injector=failure_injector)
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -2607,6 +3220,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             args.site_dim,
             n_views=args.views,
             row_id_width=args.row_id_width,
+            tokens_per_shard=args.tokens_per_shard,
         )
         writer_residency = estimate_writer_residency_bytes(
             args.site_dim,

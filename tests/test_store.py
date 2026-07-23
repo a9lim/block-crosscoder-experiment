@@ -301,6 +301,56 @@ def test_whitener_roundtrip_and_hash(tmp_path):
     assert torch.equal(w2.W, w.W)
 
 
+@pytest.mark.parametrize("field", ["mean", "W", "ridge", "eigenvalues"])
+def test_whitener_load_rejects_dtype_alias_of_same_content_hash(tmp_path, field):
+    batches, _ = gaussian_batches(n_batches=2)
+    transform = fit_whitener(batches)
+    path = tmp_path / "w.pt"
+    transform.save(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload[field] = payload[field].double()
+    # The old fp32-coercing digest accepted this payload while the transform
+    # subsequently executed in fp64. The current artifact has one physical
+    # tensor dtype and fails before its claimed hash is considered.
+    torch.save(payload, path)
+    with pytest.raises(TypeError, match=rf"whitener {field} must have dtype"):
+        Whitener.load(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload.__setitem__("legacy", True), "noncanonical field set"),
+        (lambda payload: payload.__setitem__("schema", "legacy"), "wrong schema"),
+        (
+            lambda payload: payload.__setitem__("digest_contract", "legacy"),
+            "wrong digest contract",
+        ),
+        (
+            lambda payload: payload.__setitem__(
+                "mean", payload["mean"].reshape(-1)
+            ),
+            "mean must have nonempty shape",
+        ),
+        (
+            lambda payload: payload["mean"].__setitem__((0, 0), float("nan")),
+            "mean must contain only finite values",
+        ),
+    ],
+)
+def test_whitener_load_rejects_noncanonical_current_payload(
+    tmp_path, mutation, message
+):
+    batches, _ = gaussian_batches(n_batches=2)
+    path = tmp_path / "w.pt"
+    fit_whitener(batches).save(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    mutation(payload)
+    torch.save(payload, path)
+    with pytest.raises((TypeError, ValueError), match=message):
+        Whitener.load(path)
+
+
 def test_transform_hash_covers_eigenvalues_and_fit_count():
     batches, _ = gaussian_batches(n_batches=3)
     w = fit_whitener(batches)

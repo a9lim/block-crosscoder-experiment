@@ -624,10 +624,10 @@ class BSCConfig:
                 raise ValueError(
                     "site-axis factorization requires encoder_constraint='none'"
                 )
-            factor_regularizer_eligible = (
-                self.site_rank in {1, 2}
-                and self.regularizer in {"map_nuclear", "decoder_nuclear"}
-            )
+            factor_regularizer_eligible = self.site_rank in {
+                1,
+                2,
+            } and self.regularizer in {"map_nuclear", "decoder_nuclear"}
             if (
                 self.factorized_execution_implementation
                 == FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION
@@ -876,6 +876,16 @@ def _token_topk_interior(scores: torch.Tensor, n_keep: int) -> torch.Tensor:
     return _eager_token_topk_interior(scores, n_keep)
 
 
+def _assert_finite_selector_scores(scores: torch.Tensor) -> None:
+    finite = torch.isfinite(scores).all()
+    if scores.is_cuda:
+        # Keep the hot path asynchronous: the device-side assertion is
+        # ordered before TopK without a scalar host synchronization.
+        torch._assert_async(finite, "selector scores must be finite")
+    elif not bool(finite):
+        raise ValueError("selector scores must be finite")
+
+
 def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     """BatchTopK over blocks: keep the top round(k*B) block-activations
     batch-wide. Fractional k sets the budget below one block per token —
@@ -884,6 +894,7 @@ def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     Per-token counts vary by design; only the batch total is pinned.
     scores: [B, G]  ->  bool mask [B, G]
     """
+    _assert_finite_selector_scores(scores)
     B, G = scores.shape
     n_keep = min(int(round(k * B)), B * G)
     if n_keep == 0:
@@ -895,6 +906,7 @@ def batch_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
 
 def token_topk_mask(scores: torch.Tensor, k: float) -> torch.Tensor:
     """Per-token block TopK used by the published BSF and SASA recipes."""
+    _assert_finite_selector_scores(scores)
     B, G = scores.shape
     n_keep = min(max(int(round(k)), 0), G)
     if n_keep == 0:
@@ -2159,8 +2171,7 @@ class BlockCrosscoder(nn.Module):
         selected = self._hard_topk_selected_count(batch)
         return (
             selected > 0
-            and selected * CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR
-            <= batch * groups
+            and selected * CUDA_SPARSE_DECODE_DENSITY_DENOMINATOR <= batch * groups
         )
 
     def _hard_topk_selected_count(self, batch: int) -> int:

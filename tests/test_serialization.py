@@ -8,7 +8,42 @@ import pytest
 import torch
 
 import block_crosscoder_experiment.serialization as serialization
-from block_crosscoder_experiment.serialization import model_state_digest
+from block_crosscoder_experiment.serialization import (
+    model_state_digest,
+    typed_payload_digest,
+)
+
+
+def test_typed_payload_digest_separates_previously_colliding_frames() -> None:
+    assert typed_payload_digest([1, 2]) != typed_payload_digest([12])
+    assert typed_payload_digest([1, 2]) != typed_payload_digest((1, 2))
+    assert typed_payload_digest({"1": "value"}) != typed_payload_digest(["1", "value"])
+    assert typed_payload_digest(1) != typed_payload_digest(True)
+    assert typed_payload_digest(1) != typed_payload_digest(1.0)
+
+
+def test_typed_payload_digest_is_mapping_order_independent_and_tensor_sensitive() -> (
+    None
+):
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    left = {"tensor": tensor, "meta": {"label": "x", "count": 12}}
+    right = {"meta": {"count": 12, "label": "x"}, "tensor": tensor}
+    assert typed_payload_digest(left) == typed_payload_digest(right)
+    assert typed_payload_digest(left) != typed_payload_digest(
+        {**left, "tensor": tensor.view(torch.int32)}
+    )
+    assert typed_payload_digest(left) != typed_payload_digest(
+        {**left, "tensor": tensor.reshape(2, 6)}
+    )
+
+
+def test_typed_payload_digest_refuses_ambiguous_or_unsupported_values() -> None:
+    with pytest.raises(TypeError, match="string keys"):
+        typed_payload_digest({1: "value"})
+    with pytest.raises(TypeError, match="does not support"):
+        typed_payload_digest(object())
+    with pytest.raises(ValueError, match="non-finite"):
+        typed_payload_digest(float("nan"))
 
 
 def test_model_state_digest_is_worker_independent_and_binds_mapping_order() -> None:

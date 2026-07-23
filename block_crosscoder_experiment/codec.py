@@ -53,8 +53,8 @@ Pipeline, per model:
 from __future__ import annotations
 
 import math
-import hashlib
-import json
+import os
+import tempfile
 import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -63,9 +63,10 @@ from typing import NamedTuple, Protocol
 
 import torch
 
-from .durability import durable_replace
+from .durability import durable_mkdir, fsync_directory
 from .model import BSCOutput, BSCSelection
 from .runtime_limits import TRUSTED_DECODE_Q_CHUNK
+from .serialization import TYPED_PAYLOAD_DIGEST_CONTRACT, typed_payload_digest
 
 __all__ = [
     "CodecSpec",
@@ -83,6 +84,7 @@ __all__ = [
 
 _CODEC_PAYLOAD_KEYS = {
     "format_version",
+    "artifact_digest_contract",
     "spec",
     "included",
     "rank_to_block",
@@ -115,9 +117,7 @@ _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE = 1e-6
 # A covariance-null direction has no data-defined frame.  Eigh roundoff can
 # lift an exact null eigenvalue by O(eps * lambda_max), so this narrow bound
 # distinguishes numerical nullity from merely low-variance active content.
-_CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE = 512.0 * torch.finfo(
-    torch.float64
-).eps
+_CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE = 512.0 * torch.finfo(torch.float64).eps
 
 
 def estimate_calibration_peak_bytes(selected_events: int, block_dim: int) -> int:
@@ -232,13 +232,10 @@ def _canonical_second_moment_frames(
         canonical_columns: list[torch.Tensor] = []
         for cluster_start, cluster_stop in clusters:
             dimension = cluster_stop - cluster_start
-            spectral_basis = eigenvectors[
-                group, :, cluster_start:cluster_stop
-            ]
+            spectral_basis = eigenvectors[group, :, cluster_start:cluster_stop]
             largest_eigenvalue = values[0].abs()
             null_threshold = (
-                largest_eigenvalue
-                * _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
+                largest_eigenvalue * _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
             ).clamp_min(torch.finfo(torch.float64).tiny)
             cluster_is_null = bool(
                 values[cluster_start:cluster_stop].abs().max() <= null_threshold
@@ -375,25 +372,7 @@ def _grouped_coordinate_quantiles(
 
 
 def _artifact_digest(payload: dict) -> str:
-    h = hashlib.sha256()
-
-    def add(value) -> None:
-        if torch.is_tensor(value):
-            tensor = value.detach().cpu().contiguous()
-            h.update(str(tensor.dtype).encode() + str(tuple(tensor.shape)).encode())
-            h.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-        elif isinstance(value, dict):
-            for key in sorted(value):
-                h.update(str(key).encode() + b"\0")
-                add(value[key])
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                add(item)
-        else:
-            h.update(json.dumps(value, sort_keys=True, default=str).encode())
-
-    add(payload)
-    return h.hexdigest()
+    return typed_payload_digest(payload)
 
 
 def _normalized_quantizer_position(
@@ -750,18 +729,13 @@ class Codec:
         ):
             raise ValueError("codec excluded-event share disagrees with its counts")
         if (
-            self.meta["canonical_orientation"]
-            != "second_moment_ordered_event_frame_v2"
+            self.meta["canonical_orientation"] != "second_moment_ordered_event_frame_v2"
             or self.meta["canonical_eigenspace_relative_tolerance"]
             != _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE
             or not isinstance(self.meta["canonical_near_degenerate_groups"], int)
             or isinstance(self.meta["canonical_near_degenerate_groups"], bool)
-            or not 0
-            <= self.meta["canonical_near_degenerate_groups"]
-            <= self.n_included
-            or not isinstance(
-                self.meta["canonical_near_degenerate_block_ids"], list
-            )
+            or not 0 <= self.meta["canonical_near_degenerate_groups"] <= self.n_included
+            or not isinstance(self.meta["canonical_near_degenerate_block_ids"], list)
             or self.meta["canonical_null_eigenvalue_relative_tolerance"]
             != _CANONICAL_NULL_EIGENVALUE_RELATIVE_TOLERANCE
             or not isinstance(self.meta["canonical_null_coordinate_count"], int)
@@ -781,16 +755,13 @@ class Codec:
                 self.meta["canonical_min_relative_eigengap"], (int, float)
             )
             or isinstance(self.meta["canonical_min_relative_eigengap"], bool)
-            or not math.isfinite(
-                float(self.meta["canonical_min_relative_eigengap"])
-            )
+            or not math.isfinite(float(self.meta["canonical_min_relative_eigengap"]))
             or float(self.meta["canonical_min_relative_eigengap"]) < 0
         ):
             raise ValueError("codec canonical-orientation metadata is invalid")
         near_degenerate_ids = self.meta["canonical_near_degenerate_block_ids"]
         if (
-            len(near_degenerate_ids)
-            != self.meta["canonical_near_degenerate_groups"]
+            len(near_degenerate_ids) != self.meta["canonical_near_degenerate_groups"]
             or any(
                 not isinstance(block_id, int)
                 or isinstance(block_id, bool)
@@ -828,14 +799,12 @@ class Codec:
                 if dimension
             ]
             != null_block_ids
-            or sum(null_dimensions)
-            != self.meta["canonical_null_coordinate_count"]
+            or sum(null_dimensions) != self.meta["canonical_null_coordinate_count"]
             or max(null_dimensions, default=0)
             != self.meta["canonical_max_null_dimension"]
             or bool(null_block_ids)
             != bool(self.meta["canonical_null_coordinate_count"])
-            or bool(null_block_ids)
-            != bool(self.meta["canonical_max_null_dimension"])
+            or bool(null_block_ids) != bool(self.meta["canonical_max_null_dimension"])
         ):
             raise ValueError("codec null-space block IDs are invalid")
         for block_id, null_dimension in enumerate(null_dimensions):
@@ -914,17 +883,38 @@ class Codec:
         """Atomically serialize every calibration-fit codec parameter."""
         payload = self.to_payload()
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save(payload, tmp)
-        durable_replace(tmp, path)
+        durable_mkdir(path.parent, parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                torch.save(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Codec artifacts are immutable.  Atomic create-if-absent closes
+            # the exists-check/replace race and can never clobber another
+            # publisher's durable bytes.
+            os.link(temporary, path)
+            temporary.unlink()
+            temporary = None
+            fsync_directory(path.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def to_payload(self) -> dict:
         """Return the complete, internally authenticated consumer payload."""
 
         self._validate_serialized_semantics()
         payload = {
-            "format_version": 2,
+            "format_version": 3,
+            "artifact_digest_contract": TYPED_PAYLOAD_DIGEST_CONTRACT,
             "spec": asdict(self.spec),
             "included": self.included,
             "rank_to_block": self.rank_to_block,
@@ -954,7 +944,10 @@ class Codec:
                 f"missing={missing}, extra={extra}"
             )
         payload = dict(value)
-        if payload.get("format_version") != 2:
+        if (
+            payload.get("format_version") != 3
+            or payload.get("artifact_digest_contract") != TYPED_PAYLOAD_DIGEST_CONTRACT
+        ):
             raise ValueError(f"unsupported codec format in {source}")
         claimed = payload.pop("artifact_sha256", None)
         if claimed is None or claimed != _artifact_digest(payload):
@@ -2445,7 +2438,7 @@ def evaluate_rd(
 ) -> dict:
     """Evaluate transformed-space packet rate and distortion.
 
-    This public compatibility surface intentionally exposes no observer.  The
+    This focused public surface intentionally exposes no observer.  The
     executor uses :func:`_evaluate_rd_stream` when it also needs paired
     raw-space endpoints from the identical trusted traversal.
     """

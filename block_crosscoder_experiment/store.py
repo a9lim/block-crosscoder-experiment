@@ -36,6 +36,9 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import torch
 
+from .serialization import TYPED_PAYLOAD_DIGEST_CONTRACT, tensor_payload_digest
+from .durability import durable_mkdir
+
 __all__ = [
     "cuda_prefetch_batches",
     "DEFAULT_RIDGE_SCALE",
@@ -61,6 +64,22 @@ MANIFEST_NAME = "split.json"
 STORE_FORMAT_VERSION = 3
 ROW_IDS_DTYPE = torch.int64
 ROW_IDS_DTYPE_NAME = "int64"
+WHITENER_ARTIFACT_SCHEMA = "bsc-whitener-artifact-v1"
+WHITENER_CONTENT_SCHEMA = "bsc-whitener-content-v3"
+WHITENER_PAYLOAD_KEYS = frozenset(
+    {
+        "schema",
+        "digest_contract",
+        "mean",
+        "W",
+        "ridge",
+        "eigenvalues",
+        "sites",
+        "n_fit_tokens",
+        "meta",
+        "hash",
+    }
+)
 
 
 def _fsync_file(path: Path) -> None:
@@ -401,7 +420,7 @@ class WhitenerAccumulator:
 
 @dataclass
 class Whitener:
-    """Frozen activation transform (legacy name retained for checkpoints)."""
+    """Frozen activation transform."""
 
     mean: torch.Tensor  # [S, d] fp32
     W: torch.Tensor  # [S, d, d] fp32
@@ -410,6 +429,98 @@ class Whitener:
     sites: tuple[int, ...]
     n_fit_tokens: int
     meta: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._validate_canonical()
+
+    @staticmethod
+    def _validate_json_value(value: Any, *, path: str) -> None:
+        """Require one injective JSON-like representation for metadata."""
+
+        if value is None or isinstance(value, (str, bool)):
+            return
+        if type(value) is int:
+            return
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(f"{path} must not contain non-finite floats")
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                Whitener._validate_json_value(child, path=f"{path}[{index}]")
+            return
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise TypeError(f"{path} keys must be strings")
+            for key, child in value.items():
+                Whitener._validate_json_value(child, path=f"{path}.{key}")
+            return
+        raise TypeError(
+            f"{path} contains unsupported {type(value).__module__}."
+            f"{type(value).__qualname__}"
+        )
+
+    def _validate_canonical(self) -> None:
+        tensors = {
+            "mean": self.mean,
+            "W": self.W,
+            "ridge": self.ridge,
+            "eigenvalues": self.eigenvalues,
+        }
+        for name, tensor in tensors.items():
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"whitener {name} must be a tensor")
+            if tensor.layout != torch.strided:
+                raise TypeError(f"whitener {name} must be a dense strided tensor")
+            if tensor.device.type != "cpu":
+                raise TypeError(f"whitener {name} must be stored on CPU")
+            if tensor.dtype != torch.float32:
+                raise TypeError(f"whitener {name} must have dtype torch.float32")
+            if not tensor.is_contiguous():
+                raise TypeError(f"whitener {name} must be contiguous")
+            if tensor.requires_grad:
+                raise TypeError(f"whitener {name} must not require gradients")
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"whitener {name} must contain only finite values")
+
+        if self.mean.ndim != 2 or self.mean.shape[0] <= 0 or self.mean.shape[1] <= 0:
+            raise ValueError("whitener mean must have nonempty shape [sites, d_model]")
+        n_sites, d_model = (int(value) for value in self.mean.shape)
+        expected_shapes = {
+            "W": (n_sites, d_model, d_model),
+            "ridge": (n_sites,),
+            "eigenvalues": (n_sites, d_model),
+        }
+        for name, expected in expected_shapes.items():
+            if tuple(tensors[name].shape) != expected:
+                raise ValueError(
+                    f"whitener {name} has shape {tuple(tensors[name].shape)}, "
+                    f"expected {expected}"
+                )
+
+        if not isinstance(self.sites, tuple) or len(self.sites) != n_sites:
+            raise TypeError("whitener sites must be one tuple entry per site")
+        if (
+            any(type(site) is not int or site < 0 for site in self.sites)
+            or len(set(self.sites)) != len(self.sites)
+        ):
+            raise ValueError("whitener sites must be unique non-negative integers")
+        if type(self.n_fit_tokens) is not int or self.n_fit_tokens <= 0:
+            raise ValueError("whitener n_fit_tokens must be a positive integer")
+        if not isinstance(self.meta, dict):
+            raise TypeError("whitener meta must be a JSON object")
+        self._validate_json_value(self.meta, path="whitener meta")
+        if self.mode not in NORMALIZATION_MODES:
+            raise ValueError(f"unsupported whitener normalization mode {self.mode!r}")
+        raw_site_dims = self.meta.get("site_dims")
+        if (
+            not isinstance(raw_site_dims, list)
+            or len(raw_site_dims) != n_sites
+            or any(type(width) is not int or width <= 0 or width > d_model for width in raw_site_dims)
+        ):
+            raise ValueError(
+                "whitener meta.site_dims must give one positive padded width per site"
+            )
 
     @property
     def mode(self) -> str:
@@ -426,16 +537,22 @@ class Whitener:
 
     @property
     def hash(self) -> str:
-        """sha256 over every transform-defining field and source manifest."""
-        h = hashlib.sha256()
-        for t in (self.mean, self.W, self.ridge, self.eigenvalues):
-            h.update(t.contiguous().to(torch.float32).numpy().tobytes())
-        h.update(
-            json.dumps(
-                [self.sites, self.n_fit_tokens, self.meta], sort_keys=True
-            ).encode()
+        """Unambiguous typed digest of every transform-defining field."""
+
+        self._validate_canonical()
+        return tensor_payload_digest(
+            {
+                "schema": WHITENER_CONTENT_SCHEMA,
+                "digest_contract": TYPED_PAYLOAD_DIGEST_CONTRACT,
+                "mean": self.mean,
+                "W": self.W,
+                "ridge": self.ridge,
+                "eigenvalues": self.eigenvalues,
+                "sites": self.sites,
+                "n_fit_tokens": self.n_fit_tokens,
+                "meta": self.meta,
+            }
         )
-        return h.hexdigest()
 
     def site_rms_scalars(self) -> torch.Tensor:
         """Additional site-RMS scaling required at load time.
@@ -488,8 +605,12 @@ class Whitener:
         Winv = torch.linalg.inv(self.W.double()).float().to(xw.device)
         return torch.einsum("sde,nse->nsd", Winv, xw.float()) + self.mean.to(xw.device)
 
-    def save(self, path: str | Path) -> None:
-        payload = {
+    def payload(self) -> dict[str, Any]:
+        """Return the sole current serialized Whitener representation."""
+
+        return {
+            "schema": WHITENER_ARTIFACT_SCHEMA,
+            "digest_contract": TYPED_PAYLOAD_DIGEST_CONTRACT,
             "mean": self.mean,
             "W": self.W,
             "ridge": self.ridge,
@@ -499,9 +620,11 @@ class Whitener:
             "meta": self.meta,
             "hash": self.hash,
         }
+
+    def save(self, path: str | Path) -> None:
         path = Path(path)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save(payload, tmp)
+        torch.save(self.payload(), tmp)
         _fsync_file(tmp)
         os.replace(tmp, path)
         _fsync_directory(path.parent)
@@ -509,6 +632,14 @@ class Whitener:
     @classmethod
     def load(cls, path: str | Path) -> "Whitener":
         p = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(p, dict) or set(p) != WHITENER_PAYLOAD_KEYS:
+            raise ValueError(f"whitener payload has a noncanonical field set in {path}")
+        if p.get("schema") != WHITENER_ARTIFACT_SCHEMA:
+            raise ValueError(f"whitener payload has the wrong schema in {path}")
+        if p.get("digest_contract") != TYPED_PAYLOAD_DIGEST_CONTRACT:
+            raise ValueError(f"whitener payload has the wrong digest contract in {path}")
+        if not isinstance(p.get("sites"), list):
+            raise TypeError(f"whitener payload sites must be a list in {path}")
         w = cls(
             mean=p["mean"],
             W=p["W"],
@@ -558,7 +689,7 @@ class ShardWriter:
         if not 0.0 <= max_zero_row_frac <= 1.0:
             raise ValueError("max_zero_row_frac must be in [0, 1]")
         self.dir = Path(root) / split
-        self.dir.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.dir, parents=True, exist_ok=True)
         self.split = split
         self.whitener_hash = whitener_hash
         self.sites = resolved_sites

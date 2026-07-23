@@ -16,20 +16,16 @@ from __future__ import annotations
 import argparse
 import copy
 from contextlib import closing, contextmanager
-import fcntl
 import functools
 import gc
 import hashlib
-import importlib.metadata
 import itertools
 import json
 import math
 import os
 import random
-import socket
-import stat
+import re
 import struct
-import subprocess
 import sys
 import tempfile
 import weakref
@@ -40,16 +36,23 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import torch
 import numpy as np
 
+from block_crosscoder_experiment.activation_identity import (
+    activation_content_identity,
+)
 from block_crosscoder_experiment.cli.data import (
+    CAPTURE_MANIFEST_SCHEMA,
+    TRANSFORM_ARTIFACT_SCHEMA,
+    VIEW_MANIFEST_NAME,
     capture_implementation_contract,
     expected_capture_allocation,
     expected_capture_source_contract,
     validate_capture_manifest,
+    validate_derived_view_manifest,
+    validate_transform_artifact_manifest,
 )
 
 from block_crosscoder_experiment.campaign import (
     ARTIFACT_SCHEMA,
-    CAMPAIGN_SCHEMA,
     Campaign,
     CampaignError,
     EVALUATION_EXECUTION_IMPLEMENTATION,
@@ -69,11 +72,24 @@ from block_crosscoder_experiment.codec import (
     estimate_calibration_peak_bytes,
     fit_codec,
 )
-from block_crosscoder_experiment.durability import durable_replace
+from block_crosscoder_experiment.durability import (
+    durable_create,
+    durable_mkdir,
+    durable_replace,
+)
 from block_crosscoder_experiment.evaluation import (
     EvaluationModeEndpoints,
     evaluate_selector_and_shared_code_modes,
     load_trained_model,
+)
+from block_crosscoder_experiment.implementation import (
+    CANONICAL_EXECUTOR_PROCESS_MODEL,
+    CANONICAL_EXECUTOR_SCHEMA,
+    cuda_execution_lock_path,
+    execution_identity_sha256,
+    host_cuda_execution_lock,
+    implementation_identity,
+    validate_implementation_identity,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
 from block_crosscoder_experiment.phase1 import (
@@ -109,6 +125,7 @@ from block_crosscoder_experiment.runtime_limits import (
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     MODEL_IMPLEMENTATION_IDENTITY_FIELDS,
+    RD_EVALUATION_TOKEN_CHUNK,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
     decoded_energy_code_norm_eligible,
@@ -147,10 +164,10 @@ from block_crosscoder_experiment.trainer import (
 
 _NATIVE_TORCH_SAVE = torch.save
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
-EXECUTOR_SCHEMA = "bsc-cell-executor-v12"
-EXECUTOR_PROCESS_MODEL = "persistent_exact_snapshot_lineage_v5"
+EXECUTOR_SCHEMA = CANONICAL_EXECUTOR_SCHEMA
+EXECUTOR_PROCESS_MODEL = CANONICAL_EXECUTOR_PROCESS_MODEL
 STAGES = ("prepare", "train", "calibrate", "evaluate", "qualify")
-_VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str]] = set()
+_VERIFIED_STORE_BINDINGS: set[tuple[str, str, str, str, str]] = set()
 _VERIFICATION_PROBE_BYTES = 64 * 1024
 _SYNTHETIC_NORMALIZATION_CACHE: dict[
     tuple[int, torch.dtype, torch.device],
@@ -175,7 +192,8 @@ _DEPLOYABLE_CODEC_KEYS = {
     "artifact_sha256",
 }
 TIME_SHARING_HEADER_BYTES = 32
-TIME_SHARING_BUNDLE_SCHEMA = "bsc-deployment-schedule-bundle-v1"
+TIME_SHARING_BUNDLE_SCHEMA = "bsc-deployment-operating-record-bundle-v2"
+FIXED_RATE_OPERATING_POLICY_SCHEMA = "bsc-fixed-rate-operating-policy-v1"
 TIME_SHARING_HEADER_LAYOUT = ">QQQII"
 TIME_SHARING_HEADER_LAYOUT_DESCRIPTION = (
     "binding_magic_u64,horizon_u64,upper_count_u64,lower_mode_u32,upper_mode_u32"
@@ -266,21 +284,9 @@ def _verify_store_reader_once(
     split: str,
     *,
     expected_row_identity: Mapping[str, int] | None = None,
+    verification_campaign_root: Path | None = None,
 ) -> None:
     manifest = root / split / MANIFEST_NAME
-    manifest_sha256 = _sha256(manifest)
-    row_identity_digest = (
-        "generic"
-        if expected_row_identity is None
-        else hashlib.sha256(
-            canonical_json(dict(expected_row_identity)).encode("utf-8")
-        ).hexdigest()
-    )
-    key = (str(root.resolve()), split, manifest_sha256, row_identity_digest)
-    generic_key = (str(root.resolve()), split, manifest_sha256, "generic")
-    if key in _VERIFIED_STORE_BINDINGS:
-        return
-
     def stat_record(path: Path) -> dict[str, int | str]:
         status = path.stat()
         return {
@@ -291,6 +297,26 @@ def _verify_store_reader_once(
             "device": status.st_dev,
             "inode": status.st_ino,
         }
+
+    manifest_before_hash = stat_record(manifest)
+    manifest_sha256 = _sha256(manifest)
+    manifest_after_hash = stat_record(manifest)
+    if manifest_after_hash != manifest_before_hash:
+        raise CellExecutionError(
+            f"store split {split!r} manifest changed while it was being hashed"
+        )
+    live_manifest = _read_object(manifest, label=f"store split {split!r} manifest")
+    if dict(live_manifest) != reader.manifest:
+        raise CellExecutionError(
+            f"store split {split!r} manifest changed after reader construction"
+        )
+    row_identity_digest = (
+        "generic"
+        if expected_row_identity is None
+        else hashlib.sha256(
+            canonical_json(dict(expected_row_identity)).encode("utf-8")
+        ).hexdigest()
+    )
 
     def content_probe(path: Path) -> dict[str, int | str]:
         size = path.stat().st_size
@@ -317,7 +343,7 @@ def _verify_store_reader_once(
         }
 
     fingerprint = {
-        "manifest": stat_record(manifest),
+        "manifest": manifest_after_hash,
         "shards": [
             stat_record(root / split / str(record["file"]))
             for record in reader.manifest["shards"]
@@ -326,21 +352,55 @@ def _verify_store_reader_once(
     shard_paths = [
         root / split / str(record["file"]) for record in reader.manifest["shards"]
     ]
-    probes = [content_probe(path) for path in shard_paths]
+    stat_fingerprint_sha256 = hashlib.sha256(
+        canonical_json(fingerprint).encode("utf-8")
+    ).hexdigest()
+    key = (
+        str(root.resolve()),
+        split,
+        manifest_sha256,
+        row_identity_digest,
+        stat_fingerprint_sha256,
+    )
+    generic_key = (
+        str(root.resolve()),
+        split,
+        manifest_sha256,
+        "generic",
+        stat_fingerprint_sha256,
+    )
+    if key in _VERIFIED_STORE_BINDINGS:
+        return
     if os.environ.get("BSC_VERIFICATION_CACHE_ROOT") is not None:
         raise CellExecutionError(
             "BSC_VERIFICATION_CACHE_ROOT is unsupported for canonical execution; "
             "verification receipts are bound to BSC_CAMPAIGN_ROOT"
         )
-    campaign_root = os.environ.get("BSC_CAMPAIGN_ROOT")
-    if campaign_root is None:
+    configured_campaign_root = (
+        verification_campaign_root
+        if verification_campaign_root is not None
+        else (
+            None
+            if os.environ.get("BSC_CAMPAIGN_ROOT") is None
+            else Path(str(os.environ["BSC_CAMPAIGN_ROOT"]))
+        )
+    )
+    if configured_campaign_root is None:
         # Ad-hoc callers receive only the process-local cache. Persistent
         # receipts belong to one authenticated registered campaign.
-        reader.verify(expected_row_identity=expected_row_identity)
+        verified_tokens = reader.verify(expected_row_identity=expected_row_identity)
+        after_fingerprint = {
+            "manifest": stat_record(manifest),
+            "shards": [stat_record(path) for path in shard_paths],
+        }
+        if verified_tokens != reader.n_tokens or after_fingerprint != fingerprint:
+            raise CellExecutionError(
+                f"store split {split!r} changed while it was being verified"
+            )
         _VERIFIED_STORE_BINDINGS.add(key)
         _VERIFIED_STORE_BINDINGS.add(generic_key)
         return
-    campaign_path = Path(campaign_root).resolve()
+    campaign_path = configured_campaign_root.resolve()
     cache_root = campaign_path / ".store-verification"
     if cache_root.exists() and cache_root.resolve().parent != campaign_path:
         raise CellExecutionError(
@@ -357,7 +417,7 @@ def _verify_store_reader_once(
         ).encode("utf-8")
     ).hexdigest()
     receipt_path = cache_root / f"{cache_key}.json"
-    expected_receipt = {
+    expected_receipt_core = {
         "schema": "bsc-store-verification-receipt-v2",
         "root": str(root.resolve()),
         "split": split,
@@ -368,22 +428,41 @@ def _verify_store_reader_once(
         "n_tokens": reader.n_tokens,
         "expected_row_identity": expected_row_identity,
         "stat_fingerprint": fingerprint,
-        "content_probes": probes,
     }
     if receipt_path.is_file():
         try:
             receipt = json.loads(receipt_path.read_text())
         except (OSError, json.JSONDecodeError):
             receipt = None
-        if receipt == expected_receipt:
+        if (
+            isinstance(receipt, dict)
+            and {
+                name: receipt.get(name) for name in expected_receipt_core
+            }
+            == expected_receipt_core
+            and isinstance(receipt.get("content_probes"), list)
+        ):
             _VERIFIED_STORE_BINDINGS.add(key)
             _VERIFIED_STORE_BINDINGS.add(generic_key)
             return
+    probes = [content_probe(path) for path in shard_paths]
+    expected_receipt = {
+        **expected_receipt_core,
+        "content_probes": probes,
+    }
     verified_tokens = reader.verify(expected_row_identity=expected_row_identity)
     if verified_tokens != reader.n_tokens:
         raise CellExecutionError(
             f"store verification returned {verified_tokens} rows, expected "
             f"{reader.n_tokens}"
+        )
+    after_fingerprint = {
+        "manifest": stat_record(manifest),
+        "shards": [stat_record(path) for path in shard_paths],
+    }
+    if after_fingerprint != fingerprint:
+        raise CellExecutionError(
+            f"store split {split!r} changed while it was being verified"
         )
     _atomic_bytes(receipt_path, _json_bytes(expected_receipt))
     _VERIFIED_STORE_BINDINGS.add(key)
@@ -398,7 +477,7 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
 
 
 def _atomic_bytes(path: Path, body: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -417,24 +496,34 @@ def _atomic_bytes(path: Path, body: bytes) -> None:
 
 
 def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
-    body = _json_bytes(payload)
-    if path.exists():
-        if path.read_bytes() != body:
-            raise CellExecutionError(
-                f"immutable artifact already exists with different content: {path}"
-            )
-        return
-    _atomic_bytes(path, body)
+    _write_immutable_bytes(path, _json_bytes(payload))
 
 
 def _write_immutable_bytes(path: Path, body: bytes) -> None:
-    if path.exists():
-        if path.read_bytes() != body:
-            raise CellExecutionError(
-                f"immutable artifact already exists with different content: {path}"
-            )
-        return
-    _atomic_bytes(path, body)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            durable_create(temporary, path, file_already_synced=True)
+            temporary = None
+        except FileExistsError:
+            if path.read_bytes() != body:
+                raise CellExecutionError(
+                    f"immutable artifact already exists with different content: {path}"
+                )
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _read_object(path: Path, *, label: str = "JSON") -> dict[str, Any]:
@@ -551,6 +640,7 @@ class _Context:
                 "cell and stage manifest must live inside BSC_CAMPAIGN_ROOT"
             ) from exc
         campaign = Campaign(self.root)
+        self.campaign = campaign
         try:
             active_plan_payload = _read_object(
                 self.root / "plan.json", label="campaign plan"
@@ -811,25 +901,15 @@ class _Context:
         )
 
     def state(self) -> tuple[str, dict[str, dict[str, Any]]]:
-        path = self.cell_dir / "state.json"
-        payload = _read_object(path, label="campaign state")
-        if payload.get("schema") != CAMPAIGN_SCHEMA:
-            raise CellExecutionError(f"wrong campaign state schema at {path}")
-        if payload.get("cell_id") != self.cell.cell_id:
-            raise CellExecutionError("campaign state is bound to a different cell")
-        artifacts: dict[str, dict[str, Any]] = {}
-        for raw in payload.get("artifacts", ()):
-            if not isinstance(raw, dict) or not raw.get("kind"):
-                raise CellExecutionError(
-                    "campaign state has a malformed artifact entry"
-                )
-            kind = str(raw["kind"])
-            if kind in artifacts:
-                raise CellExecutionError(
-                    f"campaign state repeats artifact kind {kind!r}"
-                )
-            artifacts[kind] = raw
-        return str(payload.get("state")), artifacts
+        try:
+            record = self.campaign.record(self.cell.cell_id)
+        except CampaignError as exc:
+            raise CellExecutionError(
+                f"cannot replay authoritative campaign state: {exc}"
+            ) from exc
+        return record.state.value, {
+            artifact.kind: artifact.to_dict() for artifact in record.artifacts
+        }
 
     def verify_ref(self, raw: Mapping[str, Any]) -> Path:
         path = Path(str(raw.get("path", "")))
@@ -1180,69 +1260,11 @@ def _declared_device(values: Mapping[str, Any]) -> str:
 
 
 def _implementation_identity() -> dict[str, Any]:
-    package_root = Path(__file__).resolve().parents[1]
-    digest = hashlib.sha256()
-    source_files = sorted(package_root.rglob("*.py"))
-    for path in source_files:
-        relative = path.relative_to(package_root)
-        digest.update(str(relative).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    git_commit: str | None = None
-    git_dirty: bool | None = None
-    try:
-        top = subprocess.run(
-            ["git", "-C", str(package_root), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        git_commit = subprocess.run(
-            ["git", "-C", top, "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "-C", top, "status", "--porcelain", "--untracked-files=all"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        git_dirty = bool(status.strip())
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    dependencies: dict[str, str | None] = {}
-    for distribution in (
-        "datasets",
-        "huggingface-hub",
-        "numpy",
-        "sae-lens",
-        "safetensors",
-        "torch",
-        "transformers",
-    ):
-        try:
-            dependencies[distribution] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            dependencies[distribution] = None
-    return {
-        "executor_schema": EXECUTOR_SCHEMA,
-        "executor_process_model": EXECUTOR_PROCESS_MODEL,
-        "python_source_sha256": digest.hexdigest(),
-        "python_source_files": len(source_files),
-        "git_commit": git_commit,
-        "git_dirty": git_dirty,
-        "python": sys.version,
-        "torch": torch.__version__,
-        "torch_cuda_build": torch.version.cuda,
-        "dependencies": dependencies,
-    }
+    return implementation_identity()
 
 
 def _implementation_identity_sha256(identity: Mapping[str, Any]) -> str:
-    return hashlib.sha256(canonical_json(dict(identity)).encode("utf-8")).hexdigest()
+    return execution_identity_sha256(identity)
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -1886,16 +1908,45 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
     ):
         raise CellExecutionError("scientific activation capture must run on CUDA")
     split_order, split_plan = _expected_capture_allocation(values)
-    if capture.get("schema") != "bsc-capture-manifest-v1":
+    if capture.get("schema") != CAPTURE_MANIFEST_SCHEMA:
         raise CellExecutionError("capture source contract has an unknown schema")
     if capture.get("split_order") != list(split_order):
         raise CellExecutionError(
             "capture split order differs from the canonical cell allocation"
         )
-    if capture.get("split_plan") != split_plan or capture.get("splits") != split_plan:
+    if capture.get("split_plan") != split_plan or set(capture.get("splits", {})) != set(
+        split_plan
+    ):
         raise CellExecutionError(
             "capture split allocation differs from data.split_sizes"
         )
+    for split in split_order:
+        manifest_path = raw_root / split / MANIFEST_NAME
+        if not manifest_path.is_file():
+            raise CellExecutionError(
+                f"raw capture lacks authenticated split manifest {manifest_path}"
+            )
+        reader = StoreReader(raw_root, split)
+        allocation = split_plan[split]
+        expected_record = {
+            "allocation": dict(allocation),
+            "manifest_file_sha256": _sha256(manifest_path),
+            "manifest_sha256": reader.manifest.get("manifest_sha256"),
+            "content_stream_sha256": reader.manifest.get(
+                "content_stream_sha256"
+            ),
+            "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
+            "n_tokens": reader.n_tokens,
+            "sites": list(reader.sites),
+            "site_dims": list(reader.site_dims),
+            "d_model": reader.d_model,
+            "row_id_width": int(reader.manifest.get("row_id_width", -1)),
+            "whitener_hash": reader.whitener_hash,
+        }
+        if capture["splits"].get(split) != expected_record:
+            raise CellExecutionError(
+                f"raw split {split!r} differs from its authenticated capture record"
+            )
     capture_binding_sha256 = capture.get("capture_binding_sha256")
     if not isinstance(capture_binding_sha256, str) or len(capture_binding_sha256) != 64:
         raise CellExecutionError("capture binding digest is malformed")
@@ -1910,7 +1961,75 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
         "capture_binding_sha256": capture_binding_sha256,
         "capture_binding": capture_binding,
         "capture_implementation": capture_implementation,
+        "capture_content_sha256": capture["capture_content_sha256"],
+        "splits": capture["splits"],
+        "capture": capture,
     }
+
+
+def _validate_derived_root_envelope(
+    root: Path,
+    *,
+    source_contract: Mapping[str, Any],
+    transform: Whitener,
+) -> tuple[str, str]:
+    """Replay the immutable derived-root envelope without rescanning shards."""
+
+    manifest_path = root / VIEW_MANIFEST_NAME
+    manifest = _read_object(manifest_path, label="derived-view root manifest")
+    try:
+        validated = validate_derived_view_manifest(manifest)
+    except ValueError as exc:
+        raise CellExecutionError(
+            f"derived-view root manifest is unauthenticated: {exc}"
+        ) from exc
+    capture = source_contract["capture"]
+    split_order = tuple(source_contract["split_order"])
+    expected_entries = set(split_order) | {"whitener.pt", VIEW_MANIFEST_NAME}
+    actual_entries = {path.name for path in root.iterdir()}
+    if actual_entries != expected_entries:
+        raise CellExecutionError(
+            "derived-view root entries differ from its authenticated envelope"
+        )
+    if (
+        validated.get("mode") != transform.mode
+        or validated.get("transform_hash") != transform.hash
+        or validated.get("whitener_sha256") != _sha256(root / "whitener.pt")
+        or validated.get("source_capture_sha256") != source_contract["sha256"]
+        or validated.get("source_capture") != capture
+        or validated.get("source_hash") != source_contract["source_hash"]
+        or validated.get("capture_binding_sha256")
+        != source_contract["capture_binding_sha256"]
+        or validated.get("split_order") != list(split_order)
+    ):
+        raise CellExecutionError(
+            "derived-view root envelope differs from its capture or transform"
+        )
+    for split in split_order:
+        reader = StoreReader(root, split)
+        source_record = capture["splits"][split]
+        expected_record = {
+            "allocation": dict(capture["split_plan"][split]),
+            "manifest_sha256": reader.manifest.get("manifest_sha256"),
+            "content_stream_sha256": reader.manifest.get(
+                "content_stream_sha256"
+            ),
+            "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
+            "n_tokens": reader.n_tokens,
+            "source_manifest_file_sha256": source_record[
+                "manifest_file_sha256"
+            ],
+            "source_manifest_sha256": source_record["manifest_sha256"],
+            "source_content_stream_sha256": source_record[
+                "content_stream_sha256"
+            ],
+            "source_row_stream_sha256": source_record["row_stream_sha256"],
+        }
+        if validated["splits"].get(split) != expected_record:
+            raise CellExecutionError(
+                f"derived split {split!r} differs from its authenticated root envelope"
+            )
+    return str(validated["view_manifest_sha256"]), _sha256(manifest_path)
 
 
 def _site_selection(
@@ -1943,6 +2062,7 @@ def _verify_declared_split_contract(
     capture_contract: Mapping[str, Any],
     expected_store_axis: tuple[int, ...],
     expected_whitener_hash: str,
+    verification_campaign_root: Path | None = None,
 ) -> dict[str, Any]:
     declared_items = tuple(values["data.split_sizes"])
     declared = {str(name): int(tokens) for name, tokens in declared_items}
@@ -1989,6 +2109,7 @@ def _verify_declared_split_contract(
                     "tokens_per_sequence": int(allocation["tokens_per_sequence"]),
                     "position_start": int(capture_contract["source"]["drop_positions"]),
                 },
+                verification_campaign_root=verification_campaign_root,
             )
         except (OSError, ValueError) as exc:
             raise CellExecutionError(
@@ -2192,7 +2313,13 @@ def _resolve_single_raw_store(
     accepted: list[tuple[Path, Whitener]] = []
     expected_meta = {
         "source_capture_sha256": source_contract["sha256"],
+        "source_capture_manifest_sha256": hashlib.sha256(
+            canonical_json(source_contract["capture"]).encode("utf-8")
+        ).hexdigest(),
         "source_hash": source_hash,
+        "source_fit_manifest_file_sha256": source_contract["splits"][fit_split][
+            "manifest_file_sha256"
+        ],
         "source_fit_manifest_sha256": fit_reader.manifest["manifest_sha256"],
         "source_fit_row_stream_sha256": fit_reader.manifest["row_stream_sha256"],
         "source_fit_content_stream_sha256": fit_reader.manifest[
@@ -2248,12 +2375,22 @@ def _resolve_single_raw_store(
     transform_manifest = _read_object(
         transform_manifest_path, label="transform artifact manifest"
     )
+    try:
+        validate_transform_artifact_manifest(transform_manifest)
+    except ValueError as exc:
+        raise CellExecutionError(
+            f"Phase-3 transform manifest is unauthenticated: {exc}"
+        ) from exc
     expected_transform_manifest = {
-        "schema": "bsc-transform-artifact-v1",
+        "schema": TRANSFORM_ARTIFACT_SCHEMA,
         "mode": normalization,
         "transform_hash": transform.hash,
         "whitener_sha256": _sha256(transform_path),
         **expected_meta,
+        "source_capture": source_contract["capture"],
+        "source_fit_manifest_file_sha256": source_contract["splits"][fit_split][
+            "manifest_file_sha256"
+        ],
         "source_raw_root": str(raw_root),
     }
     manifest_mismatch = {
@@ -2276,6 +2413,7 @@ def _resolve_single_raw_store(
         "declared_split_contract": declared_split_contract,
         "raw_root": str(raw_root),
         "raw_bindings": raw_bindings,
+        "raw_declared_split_contract": declared_split_contract,
         "source_contract": source_contract,
         "store_view_policy": str(values["data.store_view_policy"]),
         "training_row_policy": {
@@ -2454,7 +2592,6 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
                 f"declared hook axis {expected_store_axis}"
             )
         reader = StoreReader(root, split, sites=selected_sites)
-        _verify_store_reader_once(reader, root, split)
         meta = reader.manifest.get("meta", {})
         manifest_mode = meta.get("normalization")
         if manifest_mode is None and str(reader.whitener_hash).startswith("raw:"):
@@ -2520,6 +2657,14 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
         raw_root = Path(raw_configured).resolve()
     source_contract = _load_capture_contract(raw_root, values)
     source_hash = source_contract["source_hash"]
+    assert transform is not None
+    view_manifest_sha256, view_manifest_file_sha256 = (
+        _validate_derived_root_envelope(
+            root,
+            source_contract=source_contract,
+            transform=transform,
+        )
+    )
     expected_store_axis = tuple(range(len(store_site_names)))
     raw_declared_split_contract = _verify_declared_split_contract(
         raw_root,
@@ -2683,11 +2828,53 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
         },
         "normalization": {
             "mode": normalization,
-            "transform_sha256": (
-                None if transform is None else _sha256(root / "whitener.pt")
-            ),
-            "transform_hash": None if transform is None else transform.hash,
+            "transform_sha256": _sha256(root / "whitener.pt"),
+            "transform_hash": transform.hash,
+            "view_manifest_sha256": view_manifest_sha256,
+            "view_manifest_file_sha256": view_manifest_file_sha256,
         },
+    }
+
+
+def _synthetic_preparation_data(cell: CellSpec) -> dict[str, Any]:
+    """Materialize the one exact Phase-1 data payload from its cell."""
+
+    values = cell.decision_map
+    train = _synthetic_dataset(cell, "train")
+    evaluation_split = str(values["evaluation.split"])
+    if evaluation_split == "synthetic_test":
+        evaluation_stream = "eval"
+    elif evaluation_split == "confirmation":
+        evaluation_stream = "confirmation"
+    else:
+        raise CellExecutionError(
+            "Phase-1 evaluation.split must be synthetic_test or confirmation, "
+            f"got {evaluation_split!r}"
+        )
+    calibration_dataset = _synthetic_dataset(cell, "eval")
+    evaluation = _synthetic_dataset(cell, evaluation_stream)
+    ranges = {
+        str(name): [int(start), int(stop)]
+        for name, start, stop in values["data.synthetic_split_ranges"]
+    }
+    evaluation_role = (
+        "development" if evaluation_split == "synthetic_test" else "confirmation"
+    )
+    return {
+        "kind": "synthetic",
+        "source_contract": _synthetic_source_contract(values),
+        "train_protocol": train.protocol_dict(),
+        "calibration_protocol": calibration_dataset.protocol_dict(),
+        "evaluation_protocol": evaluation.protocol_dict(),
+        "evaluation_stream": evaluation_stream,
+        "normalization": _normalization_record(train, values),
+        "ranges": {
+            "train": [0, int(values["data.train_tokens"])],
+            "factor_calibration": ranges["factor_calibration"],
+            "calibration": ranges["calibration"],
+            "evaluation": ranges[evaluation_role],
+        },
+        "evaluation_role": evaluation_role,
     }
 
 
@@ -2709,14 +2896,13 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
         )
     declared_device = _declared_device(values)
     implementation = _implementation_identity()
-    if values["runtime.smoke"] is False and (
-        implementation["git_commit"] is None or implementation["git_dirty"] is not False
-    ):
-        raise CellExecutionError(
-            "scientific cells require a clean committed implementation; source identity "
-            f"is commit={implementation['git_commit']!r}, "
-            f"dirty={implementation['git_dirty']!r}"
+    try:
+        validate_implementation_identity(
+            implementation,
+            scientific=values["runtime.smoke"] is False,
         )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CellExecutionError(str(exc)) from exc
     if ctx.cell.phase is Phase.PHASE3 or "confirmation" in ctx.cell.stage:
         if (
             not values["selection.id"]
@@ -2727,46 +2913,17 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
                 "Phase 2 confirmation and Phase 3 are not materializable without "
                 "a frozen upstream selection decision and its parent cell IDs"
             )
-    if ctx.cell.phase is Phase.PHASE1:
-        train = _synthetic_dataset(ctx.cell, "train")
-        evaluation_split = str(values["evaluation.split"])
-        if evaluation_split == "synthetic_test":
-            evaluation_stream = "eval"
-        elif evaluation_split == "confirmation":
-            evaluation_stream = "confirmation"
-        else:
-            raise CellExecutionError(
-                "Phase-1 evaluation.split must be synthetic_test or confirmation, "
-                f"got {evaluation_split!r}"
-            )
-        calibration_dataset = _synthetic_dataset(ctx.cell, "eval")
-        evaluation = _synthetic_dataset(ctx.cell, evaluation_stream)
-        ranges = {
-            str(name): [int(start), int(stop)]
-            for name, start, stop in values["data.synthetic_split_ranges"]
-        }
-        evaluation_role = (
-            "development" if evaluation_split == "synthetic_test" else "confirmation"
+    data = (
+        _synthetic_preparation_data(ctx.cell)
+        if ctx.cell.phase is Phase.PHASE1
+        else {"kind": "activation_store", **_resolve_real_store(values)}
+    )
+    try:
+        data_identity = (
+            None if data["kind"] == "synthetic" else activation_content_identity(data)
         )
-        normalization = _normalization_record(train, values)
-        data = {
-            "kind": "synthetic",
-            "source_contract": _synthetic_source_contract(values),
-            "train_protocol": train.protocol_dict(),
-            "calibration_protocol": calibration_dataset.protocol_dict(),
-            "evaluation_protocol": evaluation.protocol_dict(),
-            "evaluation_stream": evaluation_stream,
-            "normalization": normalization,
-            "ranges": {
-                "train": [0, int(values["data.train_tokens"])],
-                "factor_calibration": ranges["factor_calibration"],
-                "calibration": ranges["calibration"],
-                "evaluation": ranges[evaluation_role],
-            },
-            "evaluation_role": evaluation_role,
-        }
-    else:
-        data = {"kind": "activation_store", **_resolve_real_store(values)}
+    except ValueError as exc:
+        raise CellExecutionError(str(exc)) from exc
     payload = {
         "schema": PREPARATION_SCHEMA,
         "cell_id": ctx.cell.cell_id,
@@ -2780,6 +2937,7 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
             canonical_json(ctx.cell.content_payload()).encode("utf-8")
         ).hexdigest(),
         "data": data,
+        "data_identity": data_identity,
         "runtime": {
             "smoke": values["runtime.smoke"],
             "device": declared_device,
@@ -3294,9 +3452,603 @@ def validate_cell_config(cell: CellSpec) -> tuple[BSCConfig, TrainConfig]:
     return model_cfg, train_cfg
 
 
-def _load_preparation(path: Path, cell_id: str) -> dict[str, Any]:
+_PREPARATION_CONTRACT_CACHE: set[tuple[str, str]] = set()
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise CellExecutionError(f"{label} is not a lowercase SHA-256 digest")
+    return value
+
+
+def _validate_real_preparation_data(
+    cell: CellSpec,
+    data: Mapping[str, Any],
+    *,
+    verification_campaign_root: Path | None = None,
+) -> None:
+    """Replay the current real-data topology against immutable cell decisions."""
+
+    expected_keys = {
+        "kind",
+        "root",
+        "splits",
+        "bindings",
+        "row_intervals",
+        "row_intervals_disjoint",
+        "declared_split_contract",
+        "raw_root",
+        "raw_bindings",
+        "raw_declared_split_contract",
+        "source_contract",
+        "store_view_policy",
+        "training_row_policy",
+        "normalization",
+    }
+    if set(data) != expected_keys or data.get("kind") != "activation_store":
+        raise CellExecutionError("real preparation data uses a noncanonical field set")
+    values = cell.decision_map
+    expected_source = _expected_real_source_contract(values)
+    expected_order, expected_plan = _expected_capture_allocation(values)
+    source = data.get("source_contract")
+    source_keys = {
+        "path",
+        "sha256",
+        "source_hash",
+        "source",
+        "declared",
+        "split_order",
+        "split_plan",
+        "capture_binding_sha256",
+        "capture_binding",
+        "capture_implementation",
+        "capture_content_sha256",
+        "splits",
+        "capture",
+    }
+    if not isinstance(source, Mapping) or set(source) != source_keys:
+        raise CellExecutionError("real preparation source contract is noncanonical")
+    expected_source_hash = hashlib.sha256(
+        canonical_json(expected_source).encode("utf-8")
+    ).hexdigest()
+    if (
+        source.get("source") != expected_source
+        or source.get("declared") != expected_source
+        or source.get("source_hash") != expected_source_hash
+        or source.get("split_order") != list(expected_order)
+        or source.get("split_plan") != expected_plan
+    ):
+        raise CellExecutionError(
+            "real preparation source/corpus/model/split contract differs from the cell"
+        )
+    for name in (
+        "sha256",
+        "source_hash",
+        "capture_binding_sha256",
+        "capture_content_sha256",
+    ):
+        _require_sha256(source.get(name), label=f"capture {name}")
+    capture = source.get("capture")
+    try:
+        live_binding = validate_capture_manifest(capture)
+    except ValueError as exc:
+        raise CellExecutionError(
+            f"prepared capture manifest is invalid: {exc}"
+        ) from exc
+    if (
+        source.get("capture_binding") != live_binding
+        or source.get("capture_binding_sha256") != capture.get("capture_binding_sha256")
+        or source.get("capture_content_sha256") != capture.get("capture_content_sha256")
+    ):
+        raise CellExecutionError("prepared capture binding is internally inconsistent")
+    raw_root = Path(str(data.get("raw_root", ""))).resolve()
+    source_path = Path(str(source.get("path", ""))).resolve()
+    if (
+        source_path != raw_root / "capture.json"
+        or _sha256(source_path) != source["sha256"]
+    ):
+        raise CellExecutionError("prepared capture file/path binding changed")
+    live_source = _load_capture_contract(raw_root, values)
+    if canonical_json(live_source) != canonical_json(source):
+        raise CellExecutionError(
+            "prepared capture contract differs from the authenticated live capture"
+        )
+
+    normalization = data.get("normalization")
+    view_policy = str(values["data.store_view_policy"])
+    normalization_keys = (
+        {
+            "mode",
+            "application",
+            "transform_path",
+            "transform_sha256",
+            "transform_hash",
+            "transform_manifest",
+            "transform_manifest_sha256",
+            "selected_site_indices",
+            "source_capture_sha256",
+            "source_fit_manifest",
+            "source_fit_manifest_file_sha256",
+            "source_fit_manifest_sha256",
+            "source_fit_row_stream_sha256",
+            "source_fit_requested_tokens",
+        }
+        if view_policy == "single_bf16_raw_view_on_the_fly_invertible_normalization"
+        else {
+            "mode",
+            "transform_sha256",
+            "transform_hash",
+            "view_manifest_sha256",
+            "view_manifest_file_sha256",
+        }
+    )
+    if (
+        not isinstance(normalization, Mapping)
+        or set(normalization) != normalization_keys
+        or normalization.get("mode") != values["data.normalization"]
+        or data.get("store_view_policy") != view_policy
+    ):
+        raise CellExecutionError(
+            "real preparation normalization/view policy differs from the cell"
+        )
+    _require_sha256(
+        normalization.get("transform_sha256"), label="normalization transform file"
+    )
+    _require_sha256(
+        normalization.get("transform_hash"), label="normalization transform content"
+    )
+    if view_policy == "single_bf16_raw_view_on_the_fly_invertible_normalization":
+        if (
+            normalization.get("application") != "on_the_fly"
+            or normalization.get("selected_site_indices")
+            != list(
+                tuple(str(item) for item in values["data.store_sites"]).index(str(name))
+                for name in values["data.sites"]
+            )
+            or normalization.get("source_capture_sha256") != source["sha256"]
+            or normalization.get("source_fit_requested_tokens")
+            != int(values["data.normalization_fit_count"])
+        ):
+            raise CellExecutionError(
+                "on-the-fly normalization lineage differs from the cell"
+            )
+        for name in (
+            "transform_manifest_sha256",
+            "source_capture_sha256",
+            "source_fit_manifest_file_sha256",
+            "source_fit_manifest_sha256",
+            "source_fit_row_stream_sha256",
+        ):
+            _require_sha256(normalization.get(name), label=f"normalization {name}")
+    else:
+        _require_sha256(
+            normalization.get("view_manifest_sha256"),
+            label="derived-view manifest content",
+        )
+        _require_sha256(
+            normalization.get("view_manifest_file_sha256"),
+            label="derived-view manifest file",
+        )
+
+    store_sites = tuple(str(item) for item in values["data.store_sites"])
+    selected_names = tuple(str(item) for item in values["data.sites"])
+    try:
+        selected_indices = tuple(store_sites.index(name) for name in selected_names)
+    except ValueError as exc:
+        raise CellExecutionError(
+            "cell site selection is absent from its store axis"
+        ) from exc
+    expected_roles = {
+        "train": "train",
+        "calibration": str(values["evaluation.calibration_split"]),
+        "evaluation": str(values["evaluation.split"]),
+        "normalization_fit": str(values["data.normalization_fit_split"]),
+    }
+    splits = data.get("splits")
+    bindings = data.get("bindings")
+    raw_bindings = data.get("raw_bindings")
+    intervals = data.get("row_intervals")
+    if (
+        splits != expected_roles
+        or not isinstance(bindings, Mapping)
+        or not isinstance(raw_bindings, Mapping)
+        or not isinstance(intervals, Mapping)
+        or set(bindings) != set(expected_roles)
+        or set(raw_bindings) != set(expected_roles)
+        or set(intervals) != set(expected_roles)
+        or data.get("row_intervals_disjoint") is not True
+    ):
+        raise CellExecutionError(
+            "real preparation role/split topology differs from the cell"
+        )
+
+    root = Path(str(data.get("root", ""))).resolve()
+    if str(root) != data.get("root") or str(raw_root) != data.get("raw_root"):
+        raise CellExecutionError("real preparation store roots are not canonical")
+    if view_policy == "content_addressed_derived_view":
+        transform_path = root / "whitener.pt"
+        try:
+            transform = Whitener.load(transform_path)
+        except Exception as exc:  # noqa: BLE001
+            raise CellExecutionError(
+                f"cannot verify prepared derived transform: {exc}"
+            ) from exc
+        if (
+            transform.mode != values["data.normalization"]
+            or transform.hash != normalization["transform_hash"]
+            or _sha256(transform_path) != normalization["transform_sha256"]
+            or transform.n_fit_tokens
+            != int(values["data.normalization_fit_count"])
+        ):
+            raise CellExecutionError(
+                "prepared derived transform differs from the cell or data binding"
+            )
+        view_manifest_sha256, view_manifest_file_sha256 = (
+            _validate_derived_root_envelope(
+                root,
+                source_contract=source,
+                transform=transform,
+            )
+        )
+        if (
+            normalization["view_manifest_sha256"] != view_manifest_sha256
+            or normalization["view_manifest_file_sha256"]
+            != view_manifest_file_sha256
+        ):
+            raise CellExecutionError(
+                "prepared derived-view envelope digest is stale"
+            )
+        view_whitener_hash = transform.hash
+    else:
+        if root != raw_root:
+            raise CellExecutionError(
+                "single-view on-the-fly normalization must consume the raw root"
+            )
+        transform_path = Path(str(normalization["transform_path"])).resolve()
+        transform_manifest_path = Path(
+            str(normalization["transform_manifest"])
+        ).resolve()
+        try:
+            transform = Whitener.load(transform_path)
+        except Exception as exc:  # noqa: BLE001
+            raise CellExecutionError(
+                f"cannot verify prepared transform-only artifact: {exc}"
+            ) from exc
+        transform_manifest = _read_object(
+            transform_manifest_path,
+            label="prepared transform-only manifest",
+        )
+        try:
+            validate_transform_artifact_manifest(transform_manifest)
+        except ValueError as exc:
+            raise CellExecutionError(
+                f"prepared transform-only manifest is unauthenticated: {exc}"
+            ) from exc
+        if (
+            transform_path.name != "whitener.pt"
+            or transform_manifest_path != transform_path.with_name("transform.json")
+            or transform.mode != values["data.normalization"]
+            or transform.hash != normalization["transform_hash"]
+            or _sha256(transform_path) != normalization["transform_sha256"]
+            or _sha256(transform_manifest_path)
+            != normalization["transform_manifest_sha256"]
+            or transform.n_fit_tokens
+            != int(values["data.normalization_fit_count"])
+            or transform_manifest.get("transform_hash") != transform.hash
+            or transform_manifest.get("whitener_sha256")
+            != normalization["transform_sha256"]
+            or transform_manifest.get("source_capture") != source["capture"]
+            or transform_manifest.get("source_capture_sha256") != source["sha256"]
+            or Path(str(transform_manifest.get("source_raw_root", ""))).resolve()
+            != raw_root
+        ):
+            raise CellExecutionError(
+                "prepared transform-only artifact differs from its source or cell"
+            )
+        view_whitener_hash = f"raw:{source['source_hash']}"
+
+    expected_axis = tuple(range(len(store_sites)))
+    expected_raw_declared = _verify_declared_split_contract(
+        raw_root,
+        values,
+        capture_contract=source,
+        expected_store_axis=expected_axis,
+        expected_whitener_hash=f"raw:{source['source_hash']}",
+        verification_campaign_root=verification_campaign_root,
+    )
+    expected_view_declared = (
+        expected_raw_declared
+        if root == raw_root
+        else _verify_declared_split_contract(
+            root,
+            values,
+            capture_contract=source,
+            expected_store_axis=expected_axis,
+            expected_whitener_hash=view_whitener_hash,
+            verification_campaign_root=verification_campaign_root,
+        )
+    )
+    if (
+        data.get("raw_declared_split_contract") != expected_raw_declared
+        or data.get("declared_split_contract") != expected_view_declared
+    ):
+        raise CellExecutionError(
+            "prepared declared split contracts differ from the live stores"
+        )
+
+    binding_keys = {
+        "split",
+        "manifest",
+        "manifest_sha256",
+        "n_tokens",
+        "row_stream_sha256",
+        "content_stream_sha256",
+        "selected_site_indices",
+        "selected_site_names",
+    }
+    for role, split in expected_roles.items():
+        view = bindings[role]
+        raw = raw_bindings[role]
+        view_manifest_path = root / split / MANIFEST_NAME
+        raw_manifest_path = raw_root / split / MANIFEST_NAME
+        raw_reader = StoreReader(raw_root, split, sites=selected_indices)
+        view_reader = (
+            raw_reader
+            if root == raw_root
+            else StoreReader(root, split, sites=selected_indices)
+        )
+        expected_view_binding = {
+            "split": split,
+            "manifest": str(view_manifest_path),
+            "manifest_sha256": _sha256(view_manifest_path),
+            "n_tokens": view_reader.n_tokens,
+            "row_stream_sha256": view_reader.manifest.get("row_stream_sha256"),
+            "content_stream_sha256": view_reader.manifest.get(
+                "content_stream_sha256"
+            ),
+            "selected_site_indices": list(selected_indices),
+            "selected_site_names": list(selected_names),
+        }
+        expected_raw_binding = {
+            "split": split,
+            "manifest": str(raw_manifest_path),
+            "manifest_sha256": _sha256(raw_manifest_path),
+            "n_tokens": raw_reader.n_tokens,
+            "row_stream_sha256": raw_reader.manifest.get("row_stream_sha256"),
+            "content_stream_sha256": raw_reader.manifest.get(
+                "content_stream_sha256"
+            ),
+            "selected_site_indices": list(selected_indices),
+            "selected_site_names": list(selected_names),
+        }
+        if (
+            not isinstance(view, Mapping)
+            or not isinstance(raw, Mapping)
+            or set(view) != binding_keys
+            or set(raw) != binding_keys
+            or dict(view) != expected_view_binding
+            or dict(raw) != expected_raw_binding
+            or view.get("split") != split
+            or raw.get("split") != split
+            or view.get("selected_site_indices") != list(selected_indices)
+            or raw.get("selected_site_indices") != list(selected_indices)
+            or view.get("selected_site_names") != list(selected_names)
+            or raw.get("selected_site_names") != list(selected_names)
+            or view.get("n_tokens") != raw.get("n_tokens")
+            or view.get("row_stream_sha256") != raw.get("row_stream_sha256")
+        ):
+            raise CellExecutionError(
+                f"real preparation {role} raw/view binding is inconsistent"
+            )
+        for prefix, binding in (("view", view), ("raw", raw)):
+            for name in (
+                "manifest_sha256",
+                "row_stream_sha256",
+                "content_stream_sha256",
+            ):
+                _require_sha256(binding.get(name), label=f"{role} {prefix} {name}")
+        interval = intervals[role]
+        expected_interval = _row_interval(raw_reader)
+        if (
+            not isinstance(interval, Mapping)
+            or set(interval) != {"first", "last", "count"}
+            or interval.get("count") != view.get("n_tokens")
+            or dict(interval) != expected_interval
+            or not all(
+                isinstance(item, list)
+                and len(item) >= 2
+                and all(type(value) is int for value in item)
+                for item in (interval.get("first"), interval.get("last"))
+            )
+        ):
+            raise CellExecutionError(
+                f"real preparation {role} row interval is malformed"
+            )
+
+    if not _intervals_are_disjoint(dict(intervals)):
+        raise CellExecutionError(
+            "prepared train/normalization/calibration/evaluation rows overlap"
+        )
+
+    declared_keys = {
+        "requested_tokens",
+        "actual_tokens",
+        "manifest_sha256",
+        "row_stream_sha256",
+        "content_stream_sha256",
+    }
+    declared_view = data.get("declared_split_contract")
+    declared_raw = data.get("raw_declared_split_contract")
+    if (
+        not isinstance(declared_view, Mapping)
+        or not isinstance(declared_raw, Mapping)
+        or set(declared_view) != set(expected_order)
+        or set(declared_raw) != set(expected_order)
+    ):
+        raise CellExecutionError("real preparation declared split grid is incomplete")
+    requested_by_split = {
+        str(name): int(count) for name, count in values["data.split_sizes"]
+    }
+    for split in expected_order:
+        view = declared_view[split]
+        raw = declared_raw[split]
+        if (
+            not isinstance(view, Mapping)
+            or not isinstance(raw, Mapping)
+            or set(view) != declared_keys
+            or set(raw) != declared_keys
+            or view.get("requested_tokens") != requested_by_split[split]
+            or raw.get("requested_tokens") != requested_by_split[split]
+            or view.get("actual_tokens") != raw.get("actual_tokens")
+            or view.get("row_stream_sha256") != raw.get("row_stream_sha256")
+        ):
+            raise CellExecutionError(
+                f"real preparation declared split {split!r} is inconsistent"
+            )
+        for record in (view, raw):
+            if (
+                type(record.get("actual_tokens")) is not int
+                or record["actual_tokens"] < requested_by_split[split]
+            ):
+                raise CellExecutionError(
+                    f"real preparation split {split!r} is undersized"
+                )
+            for name in (
+                "manifest_sha256",
+                "row_stream_sha256",
+                "content_stream_sha256",
+            ):
+                _require_sha256(record.get(name), label=f"{split} {name}")
+
+    if data.get("training_row_policy") != {
+        "kind": "immutable_prefix_then_deterministic_replay",
+        "unique_tokens": int(values["data.unique_tokens"]),
+        "train_tokens": int(values["data.train_tokens"]),
+    }:
+        raise CellExecutionError(
+            "real preparation training-row policy differs from cell"
+        )
+    try:
+        expected_identity = activation_content_identity(data)
+    except ValueError as exc:
+        raise CellExecutionError(str(exc)) from exc
+    if data.get("kind") != "activation_store" or expected_identity["view_key"] != str(
+        values["data.normalization"]
+    ):
+        raise CellExecutionError("real preparation activation identity role is invalid")
+
+
+def _validate_preparation_contract(
+    cell: CellSpec,
+    payload: Mapping[str, Any],
+    *,
+    cell_manifest_sha256: str,
+    verification_campaign_root: Path | None = None,
+) -> None:
+    expected_keys = {
+        "schema",
+        "cell_id",
+        "cell_manifest_sha256",
+        "phase",
+        "stage_family",
+        "recipe_name",
+        "recipe_id",
+        "seed",
+        "decisions_sha256",
+        "data",
+        "data_identity",
+        "runtime",
+        "random",
+        "selection",
+        "implementation",
+        "implementation_sha256",
+    }
+    if set(payload) != expected_keys:
+        raise CellExecutionError("preparation artifact uses a noncanonical field set")
+    values = cell.decision_map
+    expected_static = {
+        "cell_id": cell.cell_id,
+        "cell_manifest_sha256": cell_manifest_sha256,
+        "phase": cell.phase.value,
+        "stage_family": cell.stage,
+        "recipe_name": cell.recipe_name,
+        "recipe_id": cell.recipe_id,
+        "seed": cell.seed,
+        "decisions_sha256": hashlib.sha256(
+            canonical_json(cell.content_payload()).encode("utf-8")
+        ).hexdigest(),
+    }
+    if any(payload.get(name) != expected for name, expected in expected_static.items()):
+        raise CellExecutionError("preparation artifact differs from its cell manifest")
+    expected_runtime = {
+        "smoke": values["runtime.smoke"],
+        "device": _declared_device(values),
+        "torch_version": payload.get("implementation", {}).get("torch"),
+    }
+    expected_random = {
+        name.removeprefix("random."): values[name]
+        for name in (
+            "random.model_seed",
+            "random.structure_seed",
+            "random.train_data_seed",
+            "random.eval_data_seed",
+            "random.confirmation_data_seed",
+        )
+    }
+    expected_selection = {
+        "id": values["selection.id"],
+        "source_blueprint_id": values["selection.source_blueprint_id"],
+        "source_plan_id": values["selection.source_plan_id"],
+        "upstream_selection_ids": list(values["selection.upstream_selection_ids"]),
+        "parent_candidate_id": values["selection.parent_candidate_id"],
+        "parent_cell_ids": list(values["selection.parent_cell_ids"]),
+        "delta_decision_names": list(values["selection.delta_decision_names"]),
+        "confirmation_sha256s": list(values["selection.confirmation_sha256s"]),
+        "qualification_sha256s": list(values["selection.qualification_sha256s"]),
+        "universe_sha256": values["selection.universe_sha256"],
+    }
+    if (
+        payload.get("runtime") != expected_runtime
+        or payload.get("random") != expected_random
+        or payload.get("selection") != expected_selection
+    ):
+        raise CellExecutionError(
+            "preparation runtime/random/selection binding is stale"
+        )
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise CellExecutionError("preparation data payload is missing")
+    if cell.phase is Phase.PHASE1:
+        if payload.get("data_identity") is not None:
+            raise CellExecutionError(
+                "synthetic preparation cannot bind activation data"
+            )
+        if dict(data) != _synthetic_preparation_data(cell):
+            raise CellExecutionError(
+                "synthetic preparation data differs from the registered cell"
+            )
+    else:
+        _validate_real_preparation_data(
+            cell,
+            data,
+            verification_campaign_root=verification_campaign_root,
+        )
+        try:
+            expected_identity = activation_content_identity(data)
+        except ValueError as exc:
+            raise CellExecutionError(str(exc)) from exc
+        if payload.get("data_identity") != expected_identity:
+            raise CellExecutionError(
+                "real preparation identity differs from its validated data"
+            )
+
+
+def _load_preparation(path: Path, ctx: _Context) -> dict[str, Any]:
     payload = _read_object(path, label="preparation artifact")
-    if payload.get("schema") != PREPARATION_SCHEMA or payload.get("cell_id") != cell_id:
+    if (
+        payload.get("schema") != PREPARATION_SCHEMA
+        or payload.get("cell_id") != ctx.cell.cell_id
+    ):
         raise CellExecutionError("preparation artifact binding mismatch")
     current_implementation = _implementation_identity()
     if payload.get("implementation") != current_implementation:
@@ -3308,6 +4060,14 @@ def _load_preparation(path: Path, cell_id: str) -> dict[str, Any]:
         current_implementation
     ):
         raise CellExecutionError("preparation implementation digest mismatch")
+    cache_key = (ctx.cell.cell_id, ctx.artifact_sha256(path))
+    if cache_key not in _PREPARATION_CONTRACT_CACHE:
+        _validate_preparation_contract(
+            ctx.cell,
+            payload,
+            cell_manifest_sha256=_sha256(ctx.cell_path),
+        )
+        _PREPARATION_CONTRACT_CACHE.add(cache_key)
     return payload
 
 
@@ -3367,7 +4127,21 @@ def _store_reader(
             f"{role} store binding changed after prepare: "
             + canonical_json({"expected": expected, "actual": live})
         )
-    _verify_store_reader_once(reader, root, split)
+    source_contract = data["source_contract"]
+    allocation = source_contract["split_plan"][split]
+    _verify_store_reader_once(
+        reader,
+        root,
+        split,
+        expected_row_identity={
+            "sequence_start": int(allocation["sequence_start"]),
+            "sequence_stop_exclusive": int(
+                allocation["sequence_stop_exclusive"]
+            ),
+            "tokens_per_sequence": int(allocation["tokens_per_sequence"]),
+            "position_start": int(source_contract["source"]["drop_positions"]),
+        },
+    )
     return reader
 
 
@@ -3952,7 +4726,8 @@ def _save_immutable_torch(
             model_lineage,
             label="deployable artifact",
         )
-    if path.exists():
+
+    def verify_existing() -> None:
         existing = torch.load(path, map_location="cpu", weights_only=True)
         if _tensor_payload_digest(existing) != _tensor_payload_digest(dict(payload)):
             raise CellExecutionError(
@@ -3964,8 +4739,11 @@ def _save_immutable_torch(
                 model_lineage,
                 label="deployable artifact",
             )
+
+    if path.exists():
+        verify_existing()
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent, parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
     ) as handle:
@@ -3989,7 +4767,10 @@ def _save_immutable_torch(
                 model_lineage,
                 label="deployable artifact",
             )
-        durable_replace(temporary, path)
+        try:
+            durable_create(temporary, path)
+        except FileExistsError:
+            verify_existing()
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -5122,7 +5903,7 @@ def _train(
     resume: bool,
     execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
-    preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
+    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
     device = _device(ctx)
     model_cfg, train_cfg = validate_cell_config(ctx.cell)
     init_x, init_observed, initialization = _initialization_slice(ctx, preparation)
@@ -5462,7 +6243,7 @@ def _calibrate(
     *,
     execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
-    preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
+    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
     checkpoint_path, checkpoint_hash = prerequisites["checkpoint"]
     training_report = _read_object(
         prerequisites["training_report"][0], label="training report"
@@ -6932,6 +7713,98 @@ def _phase1_identification_evidence(
     }
 
 
+def _phase1_counterfactual_endpoint(
+    endpoint: Mapping[str, Any],
+    thresholds: Mapping[str, float],
+) -> dict[str, Any]:
+    if endpoint.get("applicable") is not True:
+        return {"passed": None, "recovered_factor_fraction": None}
+    per_factor = endpoint["per_factor"]
+    identified = 0
+    for factor in per_factor:
+        component_passes = [
+            float(factor["support_association"])
+            >= thresholds["per_factor.support_association_min"],
+            float(factor["global_isolated_input_r2"])
+            >= thresholds["per_factor.global_isolated_input_r2_min"],
+            float(factor["aligned_code_r2"])
+            >= thresholds["per_factor.aligned_code_r2_min"],
+        ]
+        if factor["subspace_overlap"] is not None:
+            component_passes.append(
+                float(factor["subspace_overlap"])
+                >= thresholds["per_factor.subspace_overlap_min_when_eligible"]
+            )
+        identified += int(all(component_passes))
+    recovered_fraction = identified / len(per_factor)
+    aggregate = endpoint["aggregate"]
+    passed = all(
+        (
+            recovered_fraction >= thresholds["aggregate.recovered_factor_fraction_min"],
+            float(aggregate["support_precision"])
+            >= thresholds["aggregate.support_precision_min"],
+            float(aggregate["support_recall"])
+            >= thresholds["aggregate.support_recall_min"],
+            float(aggregate["duplicate_block_fraction"])
+            <= thresholds["pathology.duplicate_block_fraction_max"],
+            float(aggregate["cross_factor_mixing_fraction"])
+            <= thresholds["pathology.cross_factor_mixing_fraction_max"],
+            int(aggregate["nonfinite_count"])
+            <= thresholds["pathology.nonfinite_count_max"],
+        )
+    )
+    return {
+        "passed": passed,
+        "recovered_factor_fraction": recovered_fraction,
+    }
+
+
+def _phase1_threshold_sensitivity_payload(
+    identification: Mapping[str, Any],
+    sensitivity: Sequence[Sequence[Any]],
+) -> dict[str, Any]:
+    center = {
+        str(name): float(value)
+        for name, value in identification["native"]["thresholds"].items()
+    }
+    if identification["deployed"]["thresholds"] != center:
+        raise CellExecutionError("Phase-1 endpoints disagree on center thresholds")
+    rows: list[dict[str, Any]] = []
+    if {str(item[0]) for item in sensitivity} != set(center):
+        raise CellExecutionError("Phase-1 threshold sensitivity grid is incomplete")
+    for name, values in sensitivity:
+        name = str(name)
+        value_rows: list[dict[str, Any]] = []
+        for value in values:
+            varied = dict(center)
+            varied[name] = float(value)
+            native = _phase1_counterfactual_endpoint(identification["native"], varied)
+            deployed = _phase1_counterfactual_endpoint(
+                identification["deployed"], varied
+            )
+            conjunction = (
+                None
+                if native["passed"] is None and deployed["passed"] is None
+                else bool(native["passed"] and deployed["passed"])
+            )
+            value_rows.append(
+                {
+                    "value": float(value),
+                    "native": native,
+                    "deployed": deployed,
+                    "conjunction_passed": conjunction,
+                }
+            )
+        rows.append({"threshold": name, "values": value_rows})
+    return {
+        "schema": "bsc-phase1-identification-threshold-sensitivity-v1",
+        "mode": "marginal_counterfactuals_center_policy_not_retuned",
+        "center_thresholds": center,
+        "rows": rows,
+        "changes_primary_gate": False,
+    }
+
+
 def _finite_json(value: Any) -> bool:
     if isinstance(value, bool) or value is None or isinstance(value, str):
         return True
@@ -7290,7 +8163,7 @@ def _time_sharing_header_binding(
     horizon_tokens: int,
 ) -> dict[str, Any]:
     return {
-        "schema": "bsc-deployment-schedule-header-v1",
+        "schema": "bsc-deployment-operating-record-v2",
         "cell_id": cell_id,
         "deployment_codec_sha256": deployment_codec_sha256,
         "schedule_contract": schedule_contract,
@@ -7323,12 +8196,14 @@ def _pack_time_sharing_header(
 ) -> bytes:
     if schedule_contract != "balanced_global_token_counter_u64_v1":
         raise CellExecutionError("cannot serialize an unsupported schedule contract")
-    if horizon_tokens <= 0 or upper_tokens <= 0 or upper_tokens >= horizon_tokens:
+    if horizon_tokens <= 0 or not 0 <= upper_tokens < horizon_tokens:
         raise CellExecutionError("time-sharing header has invalid token counts")
     lower_mode = _time_sharing_mode_code(lower_name)
     upper_mode = _time_sharing_mode_code(upper_name)
-    if lower_mode == upper_mode:
-        raise CellExecutionError("time-sharing header endpoints must differ")
+    if (lower_mode == upper_mode) != (upper_tokens == 0):
+        raise CellExecutionError(
+            "pure operating records require one endpoint and mixtures require two"
+        )
     binding = _time_sharing_header_binding(
         cell_id=cell_id,
         deployment_codec_sha256=deployment_codec_sha256,
@@ -7647,6 +8522,47 @@ class _RawEndpointErrorCache:
     chunks: tuple[torch.Tensor, ...]  # each [endpoints, batch_tokens] fp64 CPU
     tokens: int
     pooled_denominator: float
+
+
+def _consume_chunked_rd_evaluation_batch(
+    session: _RDEvaluationSession,
+    rd_input: _RDEvaluationInput,
+    selection: _RDEvaluationSelection,
+) -> None:
+    """Consume one exact outer selection in bounded, ordered R-D chunks."""
+
+    batch_tokens = len(rd_input.transformed)
+    if (
+        selection.z.shape[0] != batch_tokens
+        or selection.scores.shape[0] != batch_tokens
+        or selection.mask.shape[0] != batch_tokens
+    ):
+        raise CellExecutionError("R-D threshold selection batch is misbound")
+    if rd_input.row_ids is not None and len(rd_input.row_ids) != batch_tokens:
+        raise CellExecutionError("R-D row IDs are misbound")
+    if rd_input.context is not None and (
+        not torch.is_tensor(rd_input.context) or len(rd_input.context) != batch_tokens
+    ):
+        raise CellExecutionError("R-D observer context is not a batch tensor")
+
+    for start in range(0, batch_tokens, RD_EVALUATION_TOKEN_CHUNK):
+        token_slice = slice(start, min(start + RD_EVALUATION_TOKEN_CHUNK, batch_tokens))
+        session.consume(
+            _RDEvaluationInput(
+                transformed=rd_input.transformed[token_slice],
+                row_ids=(
+                    None if rd_input.row_ids is None else rd_input.row_ids[token_slice]
+                ),
+                context=(
+                    None if rd_input.context is None else rd_input.context[token_slice]
+                ),
+            ),
+            threshold_selection=_RDEvaluationSelection(
+                selection.z[token_slice],
+                selection.scores[token_slice],
+                selection.mask[token_slice],
+            ),
+        )
 
 
 @torch.no_grad()
@@ -8126,9 +9042,10 @@ def _evaluate_rate_distortion_and_raw_space(
         rd_input = current_rd_input
         if rd_input is None or transformed is not rd_input.transformed:
             raise CellExecutionError("joint selector/R-D batch identity diverged")
-        rd_session.consume(
+        _consume_chunked_rd_evaluation_batch(
+            rd_session,
             rd_input,
-            threshold_selection=_RDEvaluationSelection(z, scores, mask),
+            _RDEvaluationSelection(z, scores, mask),
         )
         current_rd_input = None
 
@@ -8330,6 +9247,159 @@ def _evaluate_cached_time_sharing(
     }
 
 
+def _finalize_development_time_sharing(
+    plans: Mapping[str, Mapping[str, Any]],
+    measurements: Mapping[str, Mapping[str, Any]],
+    *,
+    rd: Mapping[str, Any],
+    raw_space: Mapping[str, Any],
+    deployment_artifact_size_bytes: int,
+    horizon_tokens: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Retain a feasible lower endpoint when its executed mixture is no better.
+
+    The endpoint errors and the operational mixtures are measured on the same
+    paired raw rows.  Reusing the already accumulated lower-endpoint result
+    avoids a second traversal of the potentially large evaluation cache.
+    """
+
+    measured, _hull, _side_rate = _fixed_rate_hull(
+        rd=rd,
+        raw_space=raw_space,
+        deployment_artifact_size_bytes=deployment_artifact_size_bytes,
+        horizon_tokens=horizon_tokens,
+    )
+    endpoints = {str(point["name"]): point for point in measured}
+    schedule_rate = 8.0 * TIME_SHARING_HEADER_BYTES / horizon_tokens
+    finalized_plans: dict[str, dict[str, Any]] = {}
+    finalized_measurements: dict[str, dict[str, Any]] = {}
+    seen_budgets: set[float] = set()
+    for provisional_key, raw_plan in plans.items():
+        plan = dict(raw_plan)
+        measured_schedule = measurements.get(str(provisional_key))
+        if not isinstance(measured_schedule, Mapping):
+            raise CellExecutionError(
+                "development operating plan lacks its executed measurement"
+            )
+        expected_binding = {
+            name: plan[name]
+            for name in (
+                "budget_bits_per_token",
+                "lower_name",
+                "lower_q",
+                "upper_name",
+                "upper_q",
+                "upper_tokens",
+                "horizon_tokens",
+                "upper_mixture_weight",
+                "achieved_total_bits_per_token",
+            )
+        }
+        if any(
+            measured_schedule.get(name) != expected
+            for name, expected in expected_binding.items()
+        ):
+            raise CellExecutionError(
+                "development operating measurement/plan binding mismatch"
+            )
+        budget = float(plan["budget_bits_per_token"])
+        if budget in seen_budgets:
+            raise CellExecutionError("development operating plans repeat a budget")
+        seen_budgets.add(budget)
+        lower_name = str(plan["lower_name"])
+        lower = endpoints.get(lower_name)
+        if lower is None or lower.get("q") != plan["lower_q"]:
+            raise CellExecutionError(
+                "development operating plan names an unavailable lower endpoint"
+            )
+        scheduled_fvu = float(measured_schedule["raw_space_fvu"])
+        lower_fvu = float(lower["raw_space_fvu"])
+        if str(plan["upper_name"]) != lower_name and not scheduled_fvu < lower_fvu:
+            plan = {
+                "budget_bits_per_token": budget,
+                "lower_name": lower_name,
+                "lower_q": lower["q"],
+                "upper_name": lower_name,
+                "upper_q": lower["q"],
+                "upper_tokens": 0,
+                "horizon_tokens": horizon_tokens,
+                "upper_mixture_weight": 0.0,
+                "achieved_total_bits_per_token": (
+                    float(lower["total_bits_per_token"]) + schedule_rate
+                ),
+            }
+            final_key = _time_sharing_plan_key(
+                budget=budget,
+                lower_name=lower_name,
+                upper_name=lower_name,
+                upper_tokens=0,
+                horizon_tokens=horizon_tokens,
+            )
+            measured_schedule = {
+                **plan,
+                "evaluation_tokens": int(measured_schedule["evaluation_tokens"]),
+                "evaluation_upper_tokens": 0,
+                "raw_space_fvu": lower_fvu,
+                "distortion_measurement": (
+                    "retained_lower_endpoint_from_paired_raw_evaluation_rows"
+                ),
+            }
+        else:
+            final_key = str(provisional_key)
+            measured_schedule = dict(measured_schedule)
+        if final_key in finalized_plans:
+            raise CellExecutionError("development operating plans repeat a key")
+        if float(plan["achieved_total_bits_per_token"]) > budget + 1e-12:
+            raise CellExecutionError(
+                "development lower-endpoint fallback exceeded its fixed budget"
+            )
+        finalized_plans[final_key] = plan
+        finalized_measurements[final_key] = dict(measured_schedule)
+    return finalized_plans, finalized_measurements
+
+
+def _bind_deployment_schedule_measurements(
+    plans: Mapping[str, Mapping[str, Any]],
+    measurements: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Attach reloaded immutable record bindings to prior raw measurements."""
+
+    if set(plans) != set(measurements):
+        raise CellExecutionError(
+            "deployment operating plans and raw measurements cover different keys"
+        )
+    bound: dict[str, dict[str, Any]] = {}
+    plan_fields = (
+        "budget_bits_per_token",
+        "lower_name",
+        "lower_q",
+        "upper_name",
+        "upper_q",
+        "upper_tokens",
+        "horizon_tokens",
+        "upper_mixture_weight",
+        "achieved_total_bits_per_token",
+    )
+    measurement_fields = (
+        "evaluation_tokens",
+        "evaluation_upper_tokens",
+        "raw_space_fvu",
+        "distortion_measurement",
+    )
+    for key, raw_plan in plans.items():
+        plan = dict(raw_plan)
+        measurement = measurements[key]
+        if any(measurement.get(name) != plan.get(name) for name in plan_fields):
+            raise CellExecutionError(
+                "deployment operating record differs from its raw measurement"
+            )
+        bound[key] = {
+            **plan,
+            **{name: measurement[name] for name in measurement_fields},
+        }
+    return bound
+
+
 def _lower_convex_rate_envelope(
     points: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -8440,14 +9510,143 @@ def _fixed_rate_hull(
     return measured, hull, side_rate
 
 
+def _qualification_operating_policy(
+    qualification: Mapping[str, Any],
+    *,
+    cell_id: str,
+) -> tuple[float, dict[str, Any]]:
+    if qualification.get("cell_id") != cell_id:
+        raise CellExecutionError("frozen parent qualification/cell binding mismatch")
+    validation = qualification.get("validation")
+    policy = qualification.get("fixed_rate_operating_policy")
+    if not isinstance(validation, Mapping) or not isinstance(policy, Mapping):
+        raise CellExecutionError(
+            "frozen parent qualification lacks its fixed-rate operating policy"
+        )
+    metric = validation.get(PHASE2_SELECTION_METRIC_KEY)
+    if (
+        not isinstance(metric, (int, float))
+        or isinstance(metric, bool)
+        or not math.isfinite(float(metric))
+    ):
+        raise CellExecutionError("frozen parent qualification has no finite metric")
+    return float(metric), dict(policy)
+
+
+def _load_parent_qualification_policies(
+    ctx: _Context,
+) -> list[tuple[float, str, dict[str, Any]]]:
+    parent_ids = tuple(str(item) for item in ctx.values["selection.parent_cell_ids"])
+    expected_hashes = {
+        str(item).removeprefix("sha256:")
+        for item in ctx.values["selection.qualification_sha256s"]
+    }
+    if not parent_ids or len(expected_hashes) != len(parent_ids):
+        raise CellExecutionError(
+            "frozen operating policy requires exact parent qualification hashes"
+        )
+    resolved: list[tuple[float, str, dict[str, Any]]] = []
+    if ctx.cell.phase is Phase.PHASE3:
+        panel = _read_object(
+            ctx.root / "panel-decision.json", label="Phase-3 panel decision"
+        )
+        campaign_manifest = panel.get("phase2_campaign_manifest")
+        cells = (
+            campaign_manifest.get("cells")
+            if isinstance(campaign_manifest, Mapping)
+            else None
+        )
+        if not isinstance(cells, list):
+            raise CellExecutionError("Phase-3 panel lacks embedded Phase-2 evidence")
+        by_id = {
+            str(item.get("cell_id")): item
+            for item in cells
+            if isinstance(item, Mapping)
+        }
+        for parent_id in parent_ids:
+            evidence = by_id.get(parent_id)
+            if not isinstance(evidence, Mapping):
+                raise CellExecutionError(
+                    "Phase-3 panel omits a frozen parent qualification"
+                )
+            qualification = evidence.get("qualification")
+            if not isinstance(qualification, Mapping):
+                raise CellExecutionError("Phase-3 parent qualification is malformed")
+            metric, policy = _qualification_operating_policy(
+                qualification, cell_id=parent_id
+            )
+            resolved.append((metric, parent_id, policy))
+        return resolved
+
+    for parent_id in parent_ids:
+        try:
+            parent_record = ctx.campaign.record(parent_id)
+        except CampaignError as exc:
+            raise CellExecutionError(
+                f"cannot replay frozen parent campaign state: {exc}"
+            ) from exc
+        ref = parent_record.artifact_map.get("qualification")
+        if ref is None:
+            raise CellExecutionError("selected parent is not qualified")
+        path = ref.resolve(ctx.root)
+        observed_hash = _sha256(path)
+        if observed_hash != ref.sha256 or observed_hash not in expected_hashes:
+            raise CellExecutionError(
+                "selected parent qualification hash differs from the frozen selection"
+            )
+        qualification = _read_object(path, label="parent qualification")
+        metric, policy = _qualification_operating_policy(
+            qualification, cell_id=parent_id
+        )
+        resolved.append((metric, parent_id, policy))
+    return resolved
+
+
+def _frozen_fixed_rate_operating_policy(
+    ctx: _Context,
+) -> dict[str, Any] | None:
+    if ctx.cell.phase is Phase.PHASE1:
+        return None
+    if (
+        ctx.cell.phase is not Phase.PHASE3
+        and ctx.values["evaluation.split"] != "confirmation"
+    ):
+        return None
+    policies = _load_parent_qualification_policies(ctx)
+    if not policies:
+        raise CellExecutionError("holdout evaluation has no frozen parent policy")
+    # Higher selection metrics are better. Replaying the worst source seed's
+    # endpoint policy is the preregistered conservative aggregate and is
+    # deterministic under cell-ID ties.
+    _metric, parent_id, selected = min(policies, key=lambda item: (item[0], item[1]))
+    result = {
+        "schema": FIXED_RATE_OPERATING_POLICY_SCHEMA,
+        "source_cell_id": parent_id,
+        "source_evidence_sha256": selected.get("source_evidence_sha256"),
+        "aggregation": "worst_seed_frozen_parent",
+        "rows": selected.get("rows"),
+    }
+    result["content_sha256"] = hashlib.sha256(
+        canonical_json(result).encode("utf-8")
+    ).hexdigest()
+    return result
+
+
 def _selected_time_sharing_plans(
     ctx: _Context,
     *,
     rd: Mapping[str, Any],
     raw_space: Mapping[str, Any],
     deployment_artifact_size_bytes: int,
+    frozen_operating_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Resolve the one operational mixture, if any, for each fixed budget."""
+    """Resolve one priced operating record for every eligible fixed budget.
+
+    Development evidence may choose a lower-envelope bracket. Confirmation
+    and final evaluation pass a frozen policy and may use current serialized
+    rates only to derive the largest integer mixture that fits the budget.
+    They never inspect current distortion to choose endpoint identities.
+    """
 
     if ctx.cell.phase is Phase.PHASE1 or raw_space.get("eligible") is not True:
         return {}
@@ -8458,45 +9657,130 @@ def _selected_time_sharing_plans(
     )
     if horizon <= 0 or not budgets:
         raise CellExecutionError("real time-sharing plan has invalid rate inputs")
-    _, hull, _ = _fixed_rate_hull(
+    measured, hull, _ = _fixed_rate_hull(
         rd=rd,
         raw_space=raw_space,
         deployment_artifact_size_bytes=deployment_artifact_size_bytes,
         horizon_tokens=horizon,
     )
     schedule_rate = 8.0 * TIME_SHARING_HEADER_BYTES / horizon
+    endpoints = {str(point["name"]): point for point in measured}
+    frozen_rows: dict[float, Mapping[str, Any]] = {}
+    if frozen_operating_policy is not None:
+        expected_policy_keys = {
+            "schema",
+            "source_cell_id",
+            "source_evidence_sha256",
+            "aggregation",
+            "rows",
+            "content_sha256",
+        }
+        raw_rows = frozen_operating_policy.get("rows")
+        content = {
+            key: frozen_operating_policy[key]
+            for key in expected_policy_keys.difference({"content_sha256"})
+            if key in frozen_operating_policy
+        }
+        if (
+            set(frozen_operating_policy) != expected_policy_keys
+            or frozen_operating_policy.get("schema")
+            != FIXED_RATE_OPERATING_POLICY_SCHEMA
+            or frozen_operating_policy.get("aggregation")
+            not in {"development_cell", "worst_seed_frozen_parent"}
+            or not isinstance(raw_rows, list)
+            or frozen_operating_policy.get("content_sha256")
+            != hashlib.sha256(canonical_json(content).encode("utf-8")).hexdigest()
+        ):
+            raise CellExecutionError("frozen fixed-rate operating policy is malformed")
+        expected_row_keys = {
+            "budget_bits_per_token",
+            "lower_name",
+            "lower_q",
+            "upper_name",
+            "upper_q",
+        }
+        for row in raw_rows:
+            if not isinstance(row, Mapping) or set(row) != expected_row_keys:
+                raise CellExecutionError(
+                    "frozen fixed-rate operating policy has a malformed row"
+                )
+            budget = float(row["budget_bits_per_token"])
+            if not math.isfinite(budget) or budget in frozen_rows:
+                raise CellExecutionError(
+                    "frozen fixed-rate operating policy repeats a budget"
+                )
+            frozen_rows[budget] = row
+        if set(frozen_rows) != set(budgets):
+            raise CellExecutionError(
+                "frozen fixed-rate operating policy does not cover exact budgets"
+            )
     plans: dict[str, dict[str, Any]] = {}
     for budget in budgets:
-        if budget < float(hull[0]["total_bits_per_token"]) or budget >= float(
-            hull[-1]["total_bits_per_token"]
-        ):
-            continue
-        upper_index = next(
-            index
-            for index, point in enumerate(hull)
-            if float(point["total_bits_per_token"]) >= budget
-        )
-        lower = hull[max(0, upper_index - 1)]
-        upper = hull[upper_index]
+        available_rate = budget - schedule_rate
+        if frozen_rows:
+            row = frozen_rows[budget]
+            lower = endpoints.get(str(row["lower_name"]))
+            upper = endpoints.get(str(row["upper_name"]))
+            if lower is None or upper is None:
+                raise CellExecutionError(
+                    "frozen operating policy names an unavailable codec endpoint"
+                )
+            if lower.get("q") != row["lower_q"] or upper.get("q") != row["upper_q"]:
+                raise CellExecutionError(
+                    "frozen operating policy endpoint/q binding mismatch"
+                )
+        else:
+            if available_rate < float(hull[0]["total_bits_per_token"]):
+                continue
+            if available_rate >= float(hull[-1]["total_bits_per_token"]):
+                lower = upper = hull[-1]
+            else:
+                upper_index = next(
+                    index
+                    for index, point in enumerate(hull)
+                    if float(point["total_bits_per_token"]) >= available_rate
+                )
+                exact_endpoint = hull[upper_index]
+                if math.isclose(
+                    float(exact_endpoint["total_bits_per_token"]),
+                    available_rate,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    lower = upper = exact_endpoint
+                else:
+                    lower = hull[max(0, upper_index - 1)]
+                    upper = exact_endpoint
         lower_rate = float(lower["total_bits_per_token"])
         upper_rate = float(upper["total_bits_per_token"])
-        if math.isclose(budget, upper_rate, rel_tol=0.0, abs_tol=1e-12):
-            continue
-        target_weight = (budget - schedule_rate - lower_rate) / (
-            upper_rate - lower_rate
-        )
-        upper_tokens = max(0, min(horizon, math.floor(target_weight * horizon)))
-        if upper_tokens <= 0:
-            continue
-        if upper_tokens >= horizon:
-            raise CellExecutionError("time-sharing mixture selected no lower endpoint")
-        weight = upper_tokens / horizon
-        achieved_rate = (
-            (1.0 - weight) * lower_rate + weight * upper_rate + schedule_rate
-        )
+        if str(lower["name"]) == str(upper["name"]):
+            upper_tokens = 0
+            weight = 0.0
+            achieved_rate = lower_rate + schedule_rate
+        else:
+            target_weight = (available_rate - lower_rate) / (upper_rate - lower_rate)
+            upper_tokens = math.floor(target_weight * horizon)
+            if upper_tokens <= 0:
+                if frozen_rows:
+                    raise CellExecutionError(
+                        "frozen mixture no longer fits one upper-endpoint token"
+                    )
+                upper = lower
+                upper_tokens = 0
+                weight = 0.0
+                achieved_rate = lower_rate + schedule_rate
+            else:
+                if upper_tokens >= horizon:
+                    raise CellExecutionError(
+                        "time-sharing mixture selected no lower endpoint"
+                    )
+                weight = upper_tokens / horizon
+                achieved_rate = (
+                    (1.0 - weight) * lower_rate + weight * upper_rate + schedule_rate
+                )
         if achieved_rate > budget + 1e-12:
             raise CellExecutionError(
-                "selected time-sharing plan exceeded its fixed-rate budget"
+                "selected operating record exceeded its fixed-rate budget"
             )
         key = _time_sharing_plan_key(
             budget=budget,
@@ -8528,6 +9812,7 @@ def _fixed_rate_raw_score(
     deployment_hash: str,
     calibration_hash: str,
     deployment_schedule_manifest: Mapping[str, Any] | None = None,
+    frozen_operating_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply the frozen total-rate policy to raw-space distortion."""
 
@@ -8549,9 +9834,10 @@ def _fixed_rate_raw_score(
         }:
             raise CellExecutionError("Phase-1 rate decisions must be not-applicable")
         return {
-            "schema": "bsc-fixed-rate-raw-selection-v1",
+            "schema": "bsc-fixed-rate-raw-selection-v2",
             "applicable": False,
             "eligible": False,
+            "operating_policy": None,
             "reason": "phase1_uses_truth_known_identification",
         }
     expected = {
@@ -8627,12 +9913,20 @@ def _fixed_rate_raw_score(
         if raw_space.get("eligible") is True
         else "raw_space_decoder_requires_unpriced_oracle_information"
     )
-    any_out_of_range = False
+    records_by_budget = {
+        float(record["budget_bits_per_token"]): record
+        for record in raw_schedule_records
+        if isinstance(record, Mapping)
+    }
+    if len(records_by_budget) != len(raw_schedule_records):
+        raise CellExecutionError("deployment operating records repeat a budget")
+    scheduled_results = raw_space.get("operational_time_sharing", {})
+    if not isinstance(scheduled_results, Mapping):
+        raise CellExecutionError("raw evaluation lacks operating-record results")
     for budget in budgets:
         entry: dict[str, Any] = {"budget_bits_per_token": budget}
-        if raw_reason is not None or budget < float(hull[0]["total_bits_per_token"]):
-            out_of_range = budget < float(hull[0]["total_bits_per_token"])
-            any_out_of_range = any_out_of_range or out_of_range
+        record = records_by_budget.get(budget)
+        if raw_reason is not None or record is None:
             entry.update(
                 {
                     "eligible": False,
@@ -8640,97 +9934,23 @@ def _fixed_rate_raw_score(
                     "bracket": None,
                     "upper_mixture_weight": None,
                     "achieved_total_bits_per_token": None,
-                    "mixing_schedule": None,
-                    "reason": raw_reason or "budget_outside_measured_envelope",
+                    "operating_record": None,
+                    "reason": raw_reason or "budget_outside_frozen_operating_policy",
                 }
             )
             fixed.append(entry)
             continue
-        if budget >= float(hull[-1]["total_bits_per_token"]):
-            endpoint = hull[-1]
-            entry.update(
-                {
-                    "eligible": True,
-                    "raw_space_fvu": float(endpoint["raw_space_fvu"]),
-                    "bracket": [endpoint["name"], endpoint["name"]],
-                    "upper_mixture_weight": 0.0,
-                    "achieved_total_bits_per_token": float(
-                        endpoint["total_bits_per_token"]
-                    ),
-                    "mixing_schedule": None,
-                    "reason": "best_measured_point_within_at_most_budget",
-                }
-            )
-            fixed.append(entry)
-            continue
-        upper_index = next(
-            index
-            for index, point in enumerate(hull)
-            if float(point["total_bits_per_token"]) >= budget
-        )
-        lower_index = max(0, upper_index - 1)
-        lower, upper = hull[lower_index], hull[upper_index]
-        lower_rate = float(lower["total_bits_per_token"])
-        upper_rate = float(upper["total_bits_per_token"])
-        if math.isclose(budget, upper_rate, rel_tol=0.0, abs_tol=1e-12):
-            entry.update(
-                {
-                    "eligible": True,
-                    "raw_space_fvu": float(upper["raw_space_fvu"]),
-                    "bracket": [upper["name"], upper["name"]],
-                    "upper_mixture_weight": 0.0,
-                    "achieved_total_bits_per_token": upper_rate,
-                    "mixing_schedule": None,
-                    "reason": "measured_endpoint_exactly_matches_budget",
-                }
-            )
-            fixed.append(entry)
-            continue
-        available_for_packets = budget - schedule_rate
-        target_weight = (available_for_packets - lower_rate) / (upper_rate - lower_rate)
-        upper_tokens = max(
-            0,
-            min(horizon, math.floor(target_weight * horizon)),
-        )
-        if upper_tokens == 0:
-            entry.update(
-                {
-                    "eligible": True,
-                    "raw_space_fvu": float(lower["raw_space_fvu"]),
-                    "bracket": [lower["name"], lower["name"]],
-                    "upper_mixture_weight": 0.0,
-                    "achieved_total_bits_per_token": lower_rate,
-                    "mixing_schedule": None,
-                    "reason": "schedule_header_would_exceed_budget_use_lower_endpoint",
-                }
-            )
-            fixed.append(entry)
-            continue
-        weight = upper_tokens / horizon
-        achieved_rate = (
-            (1.0 - weight) * lower_rate + weight * upper_rate + schedule_rate
-        )
-        if achieved_rate > budget + 1e-12:
-            raise CellExecutionError(
-                "balanced time-sharing arithmetic exceeded its fixed-rate budget"
-            )
-        schedule_key = _time_sharing_plan_key(
-            budget=budget,
-            lower_name=str(lower["name"]),
-            upper_name=str(upper["name"]),
-            upper_tokens=upper_tokens,
-            horizon_tokens=horizon,
-        )
-        scheduled = raw_space.get("operational_time_sharing", {}).get(schedule_key)
+        schedule_key = str(record["schedule_key"])
+        scheduled = scheduled_results.get(schedule_key)
         if not isinstance(scheduled, Mapping):
             raise CellExecutionError(
-                "selected time-sharing bracket was not executed on raw evaluation rows"
+                "frozen operating policy was not executed on raw evaluation rows"
             )
         expected_schedule = {
             "budget_bits_per_token": budget,
-            "lower_name": str(lower["name"]),
-            "upper_name": str(upper["name"]),
-            "upper_tokens": upper_tokens,
+            "lower_name": str(record["lower_name"]),
+            "upper_name": str(record["upper_name"]),
+            "upper_tokens": int(record["upper_tokens"]),
             "horizon_tokens": horizon,
         }
         mismatched_schedule = {
@@ -8744,10 +9964,10 @@ def _fixed_rate_raw_score(
                 + canonical_json(mismatched_schedule)
             )
         schedule_binding = scheduled.get("deployment_schedule")
-        record = schedule_records.get(schedule_key)
-        if not isinstance(schedule_binding, Mapping) or not isinstance(record, Mapping):
+        keyed_record = schedule_records.get(schedule_key)
+        if not isinstance(schedule_binding, Mapping) or keyed_record is not record:
             raise CellExecutionError(
-                "executed time-sharing measurement lacks its serialized header"
+                "executed operating policy lacks its serialized record"
             )
         expected_serialized_binding = {
             "artifact_sha256": deployment_schedule_manifest["artifact_sha256"],
@@ -8766,33 +9986,37 @@ def _fixed_rate_raw_score(
             raise CellExecutionError(
                 "executed time-sharing measurement has invalid raw distortion"
             )
-        if fvu >= float(lower["raw_space_fvu"]):
-            entry.update(
-                {
-                    "eligible": True,
-                    "raw_space_fvu": float(lower["raw_space_fvu"]),
-                    "bracket": [lower["name"], lower["name"]],
-                    "upper_mixture_weight": 0.0,
-                    "achieved_total_bits_per_token": lower_rate,
-                    "mixing_schedule": None,
-                    "rejected_mixing_schedule": {
-                        "schedule_key": schedule_key,
-                        "raw_space_fvu": fvu,
-                        "reason": "executed_schedule_did_not_improve_lower_endpoint",
-                    },
-                    "reason": ("lower_endpoint_outperformed_executed_time_sharing"),
-                }
+        lower_endpoint = next(
+            (
+                point
+                for point in measured
+                if str(point["name"]) == str(record["lower_name"])
+            ),
+            None,
+        )
+        if lower_endpoint is None:
+            raise CellExecutionError(
+                "deployment operating record names an unmeasured lower endpoint"
             )
-            fixed.append(entry)
-            continue
+        if (
+            frozen_operating_policy is None
+            and record["lower_name"] != record["upper_name"]
+            and not fvu < float(lower_endpoint["raw_space_fvu"])
+        ):
+            raise CellExecutionError(
+                "development operating policy failed to retain its better "
+                "lower endpoint"
+            )
         entry.update(
             {
                 "eligible": True,
                 "raw_space_fvu": fvu,
-                "bracket": [lower["name"], upper["name"]],
-                "upper_mixture_weight": weight,
-                "achieved_total_bits_per_token": achieved_rate,
-                "mixing_schedule": {
+                "bracket": [record["lower_name"], record["upper_name"]],
+                "upper_mixture_weight": float(record["upper_mixture_weight"]),
+                "achieved_total_bits_per_token": float(
+                    record["achieved_total_bits_per_token"]
+                ),
+                "operating_record": {
                     "contract": values["codec.time_sharing_schedule_contract"],
                     "header_bytes": TIME_SHARING_HEADER_BYTES,
                     "header_layout": TIME_SHARING_HEADER_LAYOUT_DESCRIPTION,
@@ -8802,7 +10026,7 @@ def _fixed_rate_raw_score(
                     "record_sha256": schedule_binding["record_sha256"],
                     "binding_magic_u64": schedule_binding["binding_magic_u64"],
                     "horizon_tokens": horizon,
-                    "upper_tokens": upper_tokens,
+                    "upper_tokens": int(record["upper_tokens"]),
                     "rule": (
                         "upper iff floor((i+1)*upper_tokens/horizon) > "
                         "floor(i*upper_tokens/horizon)"
@@ -8815,13 +10039,17 @@ def _fixed_rate_raw_score(
                     ),
                     "distortion_measurement": scheduled["distortion_measurement"],
                 },
-                "reason": ("adjacent_envelope_executed_balanced_rational_time_sharing"),
+                "reason": (
+                    "frozen_parent_operating_policy_replayed"
+                    if frozen_operating_policy is not None
+                    else "development_envelope_operating_policy_selected"
+                ),
             }
         )
         fixed.append(entry)
     eligible = (
         raw_reason is None
-        and not any_out_of_range
+        and len(fixed) == len(budgets)
         and all(item["eligible"] for item in fixed)
     )
     score = (
@@ -8829,8 +10057,50 @@ def _fixed_rate_raw_score(
         if eligible
         else None
     )
+    policy: dict[str, Any] | None
+    if frozen_operating_policy is not None:
+        policy = dict(frozen_operating_policy)
+    elif eligible:
+        rows = [
+            {
+                "budget_bits_per_token": float(item["budget_bits_per_token"]),
+                "lower_name": str(item["bracket"][0]),
+                "lower_q": (
+                    None
+                    if item["bracket"][0] == "zero_event_calibration_mean"
+                    else _time_sharing_mode_code(str(item["bracket"][0]))
+                ),
+                "upper_name": str(item["bracket"][1]),
+                "upper_q": (
+                    None
+                    if item["bracket"][1] == "zero_event_calibration_mean"
+                    else _time_sharing_mode_code(str(item["bracket"][1]))
+                ),
+            }
+            for item in fixed
+        ]
+        source_evidence = {
+            "cell_id": ctx.cell.cell_id,
+            "rate_distortion_points": rd["points"],
+            "raw_space_points": raw_space["points"],
+            "operating_policy_rows": rows,
+        }
+        policy = {
+            "schema": FIXED_RATE_OPERATING_POLICY_SCHEMA,
+            "source_cell_id": ctx.cell.cell_id,
+            "source_evidence_sha256": hashlib.sha256(
+                canonical_json(source_evidence).encode("utf-8")
+            ).hexdigest(),
+            "aggregation": "development_cell",
+            "rows": rows,
+        }
+        policy["content_sha256"] = hashlib.sha256(
+            canonical_json(policy).encode("utf-8")
+        ).hexdigest()
+    else:
+        policy = None
     payload = {
-        "schema": "bsc-fixed-rate-raw-selection-v1",
+        "schema": "bsc-fixed-rate-raw-selection-v2",
         "applicable": True,
         "cell_id": ctx.cell.cell_id,
         "deployment_codec_sha256": deployment_hash,
@@ -8844,7 +10114,7 @@ def _fixed_rate_raw_score(
             "time_sharing_schedule_contract": values[
                 "codec.time_sharing_schedule_contract"
             ],
-            "mixture_header_bytes_when_used": TIME_SHARING_HEADER_BYTES,
+            "operating_record_bytes_per_budget": TIME_SHARING_HEADER_BYTES,
             "deployment_schedule_bundle_sha256": (
                 deployment_schedule_manifest["artifact_sha256"]
             ),
@@ -8871,6 +10141,7 @@ def _fixed_rate_raw_score(
         "fixed_budgets": fixed,
         "selection_score_name": values["evaluation.selection_score"],
         "selection_score": score,
+        "operating_policy": policy,
         "eligible": eligible,
         "reason": (
             "eligible"
@@ -8969,7 +10240,7 @@ def _evaluate(
     *,
     execution_cache: _StageExecutionCache | None = None,
 ) -> tuple[tuple[str, Path], ...]:
-    preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
+    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
     checkpoint_path, checkpoint_hash = prerequisites["checkpoint"]
     calibration_path, calibration_hash = prerequisites["calibration"]
     deployment_path, deployment_hash = prerequisites["deployment_codec"]
@@ -9114,12 +10385,31 @@ def _evaluate(
     shared_native = mode_endpoints.shared_code["topk"]
     shared_deployed = mode_endpoints.shared_code["threshold"]
     assert raw_endpoint_cache is not None
+    frozen_operating_policy = _frozen_fixed_rate_operating_policy(ctx)
     schedule_plans = _selected_time_sharing_plans(
         ctx,
         rd=rd,
         raw_space=raw_space,
         deployment_artifact_size_bytes=deployment_path.stat().st_size,
+        frozen_operating_policy=frozen_operating_policy,
     )
+    schedule_measurements: dict[str, dict[str, Any]] | None = None
+    if schedule_plans and frozen_operating_policy is None:
+        schedule_measurements = _evaluate_cached_time_sharing(
+            raw_endpoint_cache,
+            schedule_plans,
+            device=device,
+        )
+        schedule_plans, schedule_measurements = _finalize_development_time_sharing(
+            schedule_plans,
+            schedule_measurements,
+            rd=rd,
+            raw_space=raw_space,
+            deployment_artifact_size_bytes=deployment_path.stat().st_size,
+            horizon_tokens=int(
+                ctx.values["evaluation.side_information_amortization_tokens"]
+            ),
+        )
     deployment_schedule_manifest = _write_deployment_schedule_bundle(
         ctx.deployment_schedules,
         cell_id=ctx.cell.cell_id,
@@ -9135,11 +10425,19 @@ def _evaluate(
         schedule_contract=str(ctx.values["codec.time_sharing_schedule_contract"]),
     )
     if loaded_schedule_plans:
-        raw_space["operational_time_sharing"] = _evaluate_cached_time_sharing(
-            raw_endpoint_cache,
-            loaded_schedule_plans,
-            device=device,
-        )
+        if schedule_measurements is None:
+            raw_space["operational_time_sharing"] = _evaluate_cached_time_sharing(
+                raw_endpoint_cache,
+                loaded_schedule_plans,
+                device=device,
+            )
+        else:
+            raw_space["operational_time_sharing"] = (
+                _bind_deployment_schedule_measurements(
+                    loaded_schedule_plans,
+                    schedule_measurements,
+                )
+            )
     del raw_endpoint_cache
     fixed_rate = _fixed_rate_raw_score(
         ctx,
@@ -9149,11 +10447,20 @@ def _evaluate(
         deployment_hash=deployment_hash,
         calibration_hash=calibration_hash,
         deployment_schedule_manifest=deployment_schedule_manifest,
+        frozen_operating_policy=frozen_operating_policy,
     )
     validation = _selection_validation_metrics(
         ctx.cell.phase,
         identification=identification,
         fixed_rate=fixed_rate,
+    )
+    phase1_threshold_sensitivity = (
+        None
+        if identification is None
+        else _phase1_threshold_sensitivity_payload(
+            identification,
+            ctx.values["qualification.phase1_threshold_sensitivity"],
+        )
     )
     site_only = shared_deployed["site_only_fvu"]
     loo = shared_deployed["leave_one_site_out_fvu"]
@@ -9276,6 +10583,7 @@ def _evaluate(
         },
         "recovery": recovery,
         "identification": identification,
+        "phase1_threshold_sensitivity": phase1_threshold_sensitivity,
         "fixed_rate_raw_selection": fixed_rate,
     }
     selection_metrics_sha256 = hashlib.sha256(
@@ -9305,6 +10613,7 @@ def _evaluate(
         "fixed_rate_raw_selection": fixed_rate,
         "synthetic_recovery": recovery,
         "synthetic_identification": identification,
+        "phase1_threshold_sensitivity": phase1_threshold_sensitivity,
         "codec_roundtrip": roundtrip,
         "raw_space": raw_space,
         "deployment_schedules": deployment_schedule_manifest,
@@ -9355,7 +10664,7 @@ def _qualify(
         "deployment_codec": input_hashes["deployment_codec"],
         "deployment_schedules": input_hashes["deployment_schedules"],
     }
-    preparation = _load_preparation(prerequisites["preparation"][0], ctx.cell.cell_id)
+    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
     training_report = _read_object(
         prerequisites["training_report"][0], label="training report"
     )
@@ -9532,6 +10841,7 @@ def _qualify(
         deployment_artifact_size_bytes=prerequisites["deployment_codec"][0]
         .stat()
         .st_size,
+        frozen_operating_policy=fixed_rate.get("operating_policy"),
     )
 
     def schedule_core(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -9774,7 +11084,7 @@ def _qualify(
                 )
         production_frontier_endpoint_count = len(distinct_nonzero_endpoints)
         production_frontier_passed = bool(
-            fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v1"
+            fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v2"
             and fixed_rate.get("eligible") is True
             and fixed_rate.get("applicable") is True
             and ctx.values["evaluation.fixed_rate_budget_scale_factor"] == 4.0
@@ -9835,7 +11145,7 @@ def _qualify(
         and (
             ctx.cell.phase is Phase.PHASE1
             or (
-                fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v1"
+                fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v2"
                 and fixed_rate.get("applicable") is True
                 and fixed_rate.get("deployment_codec_sha256")
                 == prerequisites["deployment_codec"][1]
@@ -10216,6 +11526,7 @@ def _qualify(
         "selection_metrics": selection_metrics,
         "selection_metrics_sha256": selection_metrics_sha256,
         "selection_metrics_evaluation_sha256": input_hashes["evaluation"],
+        "fixed_rate_operating_policy": fixed_rate.get("operating_policy"),
         "promotion_eligible": promotion_eligible,
         "promotion_ineligible_reasons": promotion_reasons,
         "selection_eligible_for_protocol_test": (selection_eligible_for_protocol_test),
@@ -10273,17 +11584,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _gpu_lock_path(device: torch.device) -> Path:
-    logical_index = 0 if device.index is None else device.index
-    visible = [
-        item.strip()
-        for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-        if item.strip()
-    ]
-    physical_identity = (
-        visible[logical_index] if logical_index < len(visible) else str(logical_index)
-    )
-    identity_hash = hashlib.sha256(physical_identity.encode("utf-8")).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / f"bsc-gpu-{os.getuid()}-{identity_hash}.lock"
+    try:
+        return cuda_execution_lock_path(device)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CellExecutionError(str(exc)) from exc
 
 
 @contextmanager
@@ -10301,42 +11605,15 @@ def _host_gpu_execution_lock(cell_path: Path):
         yield
         return
 
-    path = _gpu_lock_path(device)
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise CellExecutionError(f"cannot open host GPU lock {path}: {exc}") from exc
-    try:
-        status = os.fstat(fd)
-        if (
-            not stat.S_ISREG(status.st_mode)
-            or status.st_uid != os.getuid()
-            or status.st_nlink != 1
+        with host_cuda_execution_lock(
+            device,
+            operation="cell-stage",
+            owner_id=cell.cell_id,
         ):
-            raise CellExecutionError(f"unsafe host GPU lock file: {path}")
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        payload = {
-            "schema": "bsc-host-gpu-lock-v1",
-            "cell_id": cell.cell_id,
-            "device": str(device),
-            "host": socket.gethostname(),
-            "pid": os.getpid(),
-        }
-        body = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, body)
-        os.fsync(fd)
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+            yield
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CellExecutionError(str(exc)) from exc
 
 
 def _execute_stage_request(
