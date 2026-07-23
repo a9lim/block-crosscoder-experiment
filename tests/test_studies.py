@@ -6,7 +6,10 @@ import pytest
 
 import block_crosscoder_experiment.studies as studies_module
 from block_crosscoder_experiment.campaign import Campaign
-from block_crosscoder_experiment.cli.run_cell import validate_cell_config
+from block_crosscoder_experiment.cli.run_cell import (
+    CellExecutionError,
+    validate_cell_config,
+)
 from block_crosscoder_experiment.runtime_limits import (
     CODE_NORM_CUDA_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
@@ -300,7 +303,7 @@ def test_lineage_is_mandatory_and_scientific_deltas_require_ablation():
 
 
 def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
-    assert len(PAPER_RECIPES) == 8
+    assert len(PAPER_RECIPES) == 7
     assert len(CONTROL_RECIPES) == 4
     assert set(BRIDGE_RECIPES) == {DECODER_WEIGHTED_BATCHTOPK_BRIDGE.name}
     assert set(RELEASE_DIAGNOSTIC_RECIPES) == {
@@ -319,14 +322,8 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
     )
     assert values["model.decoder_norm_geometry"] == "sum_l2"
     assert values["objective.auxiliary"] == "none"
-    group_lasso_aux = {
-        decision.name: decision
-        for decision in PAPER_RECIPES["bsf_group_lasso_appendix_aux"].decisions
-    }["objective.auxiliary"]
-    assert group_lasso_aux.value == "runner_up_blocks"
-    assert group_lasso_aux.lineage is Lineage.ADAPTED
-    assert "pre-shrink" in group_lasso_aux.rationale
-    assert group_lasso_aux.ablation is not None
+    with pytest.raises(StudyError, match="undefined for learned Group-Lasso"):
+        studies_module._bsf_recipe("group_lasso", appendix_aux=True)
     for recipe_name in (
         "bsf_vanilla_appendix_aux",
         "bsf_grassmannian_appendix_aux",
@@ -335,18 +332,23 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
             decision.name: decision for decision in PAPER_RECIPES[recipe_name].decisions
         }["objective.auxiliary"]
         assert auxiliary.lineage is Lineage.EXACT
-    family_runner = next(
-        variant
-        for variant in studies_module._family_aux_variants("bsf_group_lasso")
-        if variant.name == "aux_runner_up"
+    with pytest.raises(StudyError, match="no auxiliary calibration surface"):
+        studies_module._family_aux_variants("bsf_group_lasso")
+    group_lasso = next(
+        cell
+        for cell in build_phase1_plan(seeds=(0,), smoke=True).cells
+        if cell.recipe_name == "bsf_group_lasso_primary"
     )
-    family_runner_decisions = {
-        decision.name: decision for decision in family_runner.decisions
-    }
-    assert family_runner_decisions["factor.family_auxiliary"].lineage is Lineage.NOVEL
-    assert family_runner_decisions["objective.auxiliary"].lineage is Lineage.ADAPTED
-    assert family_runner_decisions["auxiliary.count"].lineage is Lineage.EXACT
-    assert family_runner_decisions["auxiliary.coefficient"].lineage is Lineage.EXACT
+    invalid_group_lasso_aux = _replace_decision(
+        group_lasso,
+        "objective.auxiliary",
+        "runner_up_blocks",
+    )
+    with pytest.raises(
+        CellExecutionError,
+        match="undefined for learned Group-Lasso",
+    ):
+        validate_cell_config(invalid_group_lasso_aux)
     sasa_release = {
         decision.name: decision.value
         for decision in RELEASE_DIAGNOSTIC_RECIPES["sasa_released_code_drift"].decisions
@@ -375,10 +377,10 @@ def test_scope_registries_exclude_dsf_dfc_and_model_diffing_recipes():
 def test_phase1_blueprint_is_an_honest_conditional_one_factor_campaign():
     blueprint = build_phase1_blueprint()
     prefix = build_phase1_plan()
-    assert blueprint.projected_cells == 198
-    assert len(prefix.cells) == 51
+    assert blueprint.projected_cells == 195
+    assert len(prefix.cells) == 48
     assert [(stage.name, len(stage.cells)) for stage in prefix.stages] == [
-        ("paper_anchors", 24),
+        ("paper_anchors", 21),
         ("representable_controls", 12),
         ("fusion_identification", 6),
         ("dgp_identification_screen", 9),
@@ -481,9 +483,9 @@ def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
     phase1 = build_phase1_blueprint()
     phase2 = build_phase2_blueprint()
     assert phase1.seeds == (0, 1, 2)
-    assert phase1.projected_cells == 198
+    assert phase1.projected_cells == 195
     assert phase2.seeds == (0, 1)
-    assert phase2.declared_cell_ceiling == 414
+    assert phase2.declared_cell_ceiling == 410
 
     for builder in (build_phase1_blueprint, build_phase1_plan):
         with pytest.raises(StudyError, match="exact preregistered seeds"):
@@ -496,7 +498,7 @@ def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
 def test_phase1_selection_uses_qualified_truth_margin_and_untouched_confirmation():
     blueprint = build_phase1_blueprint(seeds=(0, 1), smoke=True)
     plan = _materialize_all(blueprint, build_phase1_plan(seeds=(0, 1), smoke=True))
-    assert len(plan.cells) == blueprint.projected_cells == 132
+    assert len(plan.cells) == blueprint.projected_cells == 130
     assert all(stage.selection_policy is not None for stage in plan.stages[3:-1])
     assert plan.stages[-1].selection_policy is None
     for stage in plan.stages[3:-1]:
@@ -603,7 +605,7 @@ def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chai
             for family in blueprint.comparator_families
         )
     )
-    assert blueprint.declared_cell_ceiling == expected == 414
+    assert blueprint.declared_cell_ceiling == expected == 410
     assert [(item.name, len(item.variants)) for item in blueprint.rounds] == [
         ("architecture_4m", 5),
         ("capacity_4m", 9),
@@ -1028,6 +1030,9 @@ def test_coupled_geometry_and_decoder_weighted_bundles_are_complete():
     assert rounds["group_threshold_method_4m"].source_stage == (
         "hard_selector_score_interaction_4m"
     )
+    assert rounds["auxiliary_16m"].activation_condition == (
+        "fixed_token_topk_runner_up"
+    )
     architecture = {
         variant.name: variant for variant in rounds["architecture_4m"].variants
     }
@@ -1266,7 +1271,7 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
     phase1 = build_phase1_blueprint(seeds=(0,), smoke=True)
     materialize(phase1, build_phase1_plan(seeds=(0,), smoke=True), {})
     phase2 = build_phase2_blueprint(seeds=(0,), smoke=True)
-    for choices in (
+    choice_sets = (
         {},
         {"architecture_4m": "tied_grassmann_b4_polar"},
         {
@@ -1282,12 +1287,35 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
             "regularization_16m": "map_nuclear_initial_ratio_0p03",
         },
         {"auxiliary_16m": "sasa_low_weight"},
-    ):
-        materialize(
+    )
+    for choices in choice_sets:
+        plan = materialize(
             phase2,
             build_phase2_plan(seeds=(0,), smoke=True),
             choices,
         )
+        auxiliary_stage = next(
+            stage for stage in plan.stages if stage.name == "auxiliary_16m"
+        )
+        selector = auxiliary_stage.cells[0].decision_map["model.selector"]
+        if selector != "token_topk":
+            assert auxiliary_stage.conditional_elision_reason == (
+                "appendix_runner_up_requires_fixed_token_topk"
+            )
+            assert auxiliary_stage.elided_conditional_variants == (
+                "bsf_runner_up_aux",
+            )
+            assert all(
+                "bsf_runner_up_aux" not in cell.name
+                for cell in auxiliary_stage.cells
+            )
+        else:
+            assert auxiliary_stage.conditional_elision_reason is None
+            assert auxiliary_stage.elided_conditional_variants == ()
+            assert any(
+                "bsf_runner_up_aux" in cell.name
+                for cell in auxiliary_stage.cells
+            )
 
 
 def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():

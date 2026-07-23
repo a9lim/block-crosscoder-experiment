@@ -1189,7 +1189,7 @@ def test_block_auxk_cutoff_ties_choose_lowest_block_indices(
     assert torch.equal(support, expected)
 
 
-def test_group_lasso_fel_aux_uses_preactivation_and_updates_encoder_decoder(device):
+def test_group_lasso_fel_aux_is_rejected_as_undefined(device):
     model = BlockCrosscoder(
         BSCConfig(
             n_blocks=4,
@@ -1211,25 +1211,15 @@ def test_group_lasso_fel_aux_uses_preactivation_and_updates_encoder_decoder(devi
         generator=torch.Generator().manual_seed(2193),
     ).to(device)
     out = model(x)
-    preactivation = model.encode_preactivation(x)
-    assert bool(preactivation.count_nonzero())
-    assert not bool(out.z.count_nonzero())
-    assert not bool(out.mask.any())
-    loss = aux_loss(
-        model,
-        x,
-        out,
-        "fel",
-        dead=None,
-        s_aux=2,
-        encoder_preactivation=preactivation,
-    )
-    assert loss is not None and torch.isfinite(loss)
-    loss.backward()
-    assert model.E is not None and model.E.grad is not None
-    assert model.D is not None and model.D.grad is not None
-    assert bool(model.E.grad.count_nonzero())
-    assert bool(model.D.grad.count_nonzero())
+    with pytest.raises(ValueError, match="undefined for learned Group-Lasso"):
+        aux_loss(
+            model,
+            x,
+            out,
+            "fel",
+            dead=None,
+            s_aux=2,
+        )
 
 
 def test_fel_aux_fails_closed_when_any_row_cannot_supply_full_width(device):

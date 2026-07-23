@@ -161,11 +161,11 @@ dead-feature handling.
 
 For Vanilla and Grassmannian TopK, the unselected encoder carrier remains
 available exactly as the Appendix describes. Group Lasso instead maps every
-inactive block to exact zero after shrinkage, and the source does not specify
-that interaction. Its executable Appendix-Aux cell is therefore an adapted
-bridge: rank and decode the affine pre-shrink `u`, require the complete
-declared runner-up count in every row, and retain the source `1/l` weight. The
-primary Group-Lasso cell remains the unadapted control.
+inactive block to exact zero after shrinkage, its initial learned threshold can
+activate every block, and the source does not specify that interaction. The
+matrix therefore does not invent a Group-Lasso Appendix-Aux bridge; it retains
+the primary Group-Lasso cell and confines the exact runner-up auxiliary to the
+two hard-TopK carriers.
 
 ### 2.8 Inspected-release drift
 

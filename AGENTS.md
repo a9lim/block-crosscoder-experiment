@@ -89,12 +89,13 @@ preview cannot authorize registration.
   aggregate reconstruction is not manifold recovery.
 - Development, confirmation, and final evaluation are disjoint. Never tune on
   confirmation or final evidence.
-- The default Phase-1 blueprint declares and executes 198 cells at seeds 0/1/2.
-  The Phase-2 blueprint has a 414-cell pre-elision ceiling at seeds 0/1: 176
-  main-chain plus 238 family-chain cells. Materialization deterministically
+- The default Phase-1 blueprint declares and executes 195 cells at seeds 0/1/2.
+  The Phase-2 blueprint has a 410-cell pre-elision ceiling at seeds 0/1: 176
+  main-chain plus 234 family-chain cells. Materialization deterministically
   records and elides execution-equivalent parent/center cells; if zero
-  Bernoulli masking wins, the rank revisit emits only its exact parent. Report
-  the realized count, not the ceiling, as executed work.
+  Bernoulli masking wins, the rank revisit emits only its exact parent, and
+  the Appendix-D runner-up arm is elided unless the selected parent uses fixed
+  per-token TopK. Report the realized count, not the ceiling, as executed work.
 
 ## Code surface
 

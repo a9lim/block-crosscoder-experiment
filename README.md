@@ -96,13 +96,15 @@ Phase 2 cells use their declared bf16 forward precision. The executable
 fp32/bf16 parity-and-short-run stability gate is a Phase-3-only preflight; the
 pilot does not claim to have passed that later production-shape gate.
 
-At the default seeds, Phase 1 declares and executes **198 cells**. Phase 2 has
-a **414-cell pre-elision ceiling**: 176 main-chain cells and 238 independently
+At the default seeds, Phase 1 declares and executes **195 cells**. Phase 2 has
+a **410-cell pre-elision ceiling**: 176 main-chain cells and 234 independently
 calibrated comparator-family cells. At materialization, execution-equivalent
 parent/center variants are deterministically elided and recorded. The rank
 revisit keeps only its parent when zero Bernoulli masking wins, so the realized
-Phase-2 count is lower and evidence-dependent. These values are derived from
-the serialized blueprints rather than maintained as parallel constants.
+Phase-2 count is lower and evidence-dependent. The Appendix-D runner-up arm is
+also elided when the selected parent is not fixed per-token TopK. These values
+are derived from the serialized blueprints rather than maintained as parallel
+constants.
 Phase 3 projects eight short production-stability cells plus the frozen 40-cell
 final panel. Its rate budgets are `1024/1536/2048` bits/token: the explicit
 fourfold transfer of the Phase-2 frontier matching `128/32` nominal active

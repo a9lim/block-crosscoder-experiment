@@ -76,15 +76,17 @@ thresholds and penalizes group activity while activity exceeds target.
 
 Appendix D adds a distinct runner-up residual auxiliary: select the next four
 unselected blocks and weight their residual reconstruction by `1/4`. The live
-matrix therefore separates primary and Appendix-Aux recipes. The exact toy
+matrix therefore separates primary and Appendix-Aux recipes on the Vanilla
+and Grassmannian hard-TopK carriers. The exact toy
 optimizer schedule is incompletely disclosed; transferred batch/LR/epoch
 values remain adapted even when the architecture is exact.
 
 The source does not resolve Appendix D after Group-Lasso shrinkage, whose
-inactive output codes are identically zero. That combined cell is explicitly
-adapted to rank and decode the affine pre-shrink encoder carrier, with exactly
-four available runner-ups per token or a fail-closed refusal. Vanilla and
-Grassmannian Appendix-Aux cells keep the source hard-TopK carrier unchanged.
+inactive output codes are identically zero and whose initial learned threshold
+can activate every block. There is then no complete unselected runner-up set.
+The executable matrix keeps Group Lasso primary-only instead of inventing a
+capacity-conditioned auxiliary; Vanilla and Grassmannian Appendix-Aux cells
+retain the source hard-TopK carrier unchanged.
 
 ### 3.2 SASA
 
@@ -206,8 +208,8 @@ one flattened decoder projection and mapped block-Gram products, with exact
 observed-site weighting for partial and source-only views. This optimization
 is a local adaptation, not a paper value or a distinct score arm.
 
-At seeds 0, 1, and 2 the serialized variants declare and execute **198 cells**:
-51 initial, 96 capability/contract cells, and 51 confirmation cells. The score
+At seeds 0, 1, and 2 the serialized variants declare and execute **195 cells**:
+48 initial, 96 capability/contract cells, and 51 confirmation cells. The score
 panel contributes 18 cells: three Stiefel equality controls and the same three
 scores on a common free decoder, at all three seeds. Synthetic LR,
 native-regularizer, and Aux tuning rounds do not exist.
@@ -343,7 +345,7 @@ authenticated measurements without retuning the center policy.
 
 Seven independent comparator-family chains branch from their own anchor
 selection. Width/activity are calibrated for block families; Group Lasso
-calibrates its coefficient and Appendix-Aux bundle; SASA calibrates its
+calibrates its coefficient; SASA calibrates its
 `0/.01/.03/.10` initial map-penalty ratios and source Aux bundles; Anthropic
 calibrates L1 coefficient; both BatchTopK scalar families calibrate
 batch size; every family calibrates activity, schedule, and the exact four-rate
@@ -359,12 +361,15 @@ winner and strongest distinct resolved runner-up,
 followed by a one-winner family selection. This probes local path/order sensitivity but does not
 claim a global optimum. Phase 3 consumes those content-addressed family
 selections, never the root anchors. At seeds 0 and 1 the blueprint derives
-a pre-elision ceiling of **176 main-chain cells** and **238 family cells**,
-**414 total**, computed from the manifest. The main chain has 18 anchors and
+a pre-elision ceiling of **176 main-chain cells** and **234 family cells**,
+**410 total**, computed from the manifest. The main chain has 18 anchors and
 158 declared cells in 15 rounds from architecture through confirmation.
 Execution-equivalent parent/center cells are deterministically elided, and the
 rank revisit conditionally loses four children when Bernoulli-zero masking
-wins, so the realized count is lower and recorded in each materialized stage.
+wins. The main-chain Appendix-D runner-up arm is likewise elided unless the
+selected parent uses fixed per-token TopK, because BatchTopK and learned
+thresholding cannot guarantee the complete per-row runner-up set. The realized
+count is lower and recorded in each materialized stage.
 
 Scientific-outcome guardrails require calibrated mean support within `0.1`
 block of target and no more than `1%` selected events excluded on calibration

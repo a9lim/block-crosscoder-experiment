@@ -1605,12 +1605,9 @@ class BlockCrosscoder(nn.Module):
     ) -> torch.Tensor:
         """Return the exact fused affine code before its nonlinearity.
 
-        Hard TopK signed and ReLU recipes normally consume the activated code
-        directly.  The adapted Group-Lasso Appendix-Aux bridge instead needs
-        the affine carrier ``u``: post-shrinkage inactive groups are exact
-        zero and cannot reconstruct a runner-up residual.  An already
-        materialized encoder may be supplied by the trainer so the API does
-        not rebuild structured weights.
+        This primitive exposes the affine carrier for exact structured-weight
+        diagnostics. An already materialized encoder may be supplied so those
+        diagnostics do not rebuild structured weights.
         """
 
         if self.uses_direct_factorized_execution and _encoder is None:

@@ -424,6 +424,8 @@ Estimator v18 default-plan checks pass at 198 Phase-1 cells, 158 realized
 Phase-2 cells under the 414-cell pre-elision ceiling, and 48 Phase-3 cells.
 Phase 3 estimates 21,546,492,064 peak-VRAM bytes against 22,000,000,000 and
 813,332,723,968 storage bytes against 850,000,000,000.
+These v18 counts are a historical second-pass snapshot and are superseded by
+the 2026-07-23 launch correction below.
 
 ## Third adversarial pass after clearing `data/runs`
 
@@ -459,6 +461,32 @@ the current source and data contracts.
 | G20 | high | The first incremental authority cache exposed its mutable event dictionaries, repeatedly rescanned activation identities, and stopped rechecking an old extension artifact after advancing its cursor. Same-process behavior could therefore diverge from a fresh Campaign instance after cache poisoning or evidence loss. | Public events are deep-detached from private immutable-use caches. Journal-prefix cursors reset on any prefix change; activation replay processes only new events; plan/cell projections are stat-fingerprinted; and every cached extension artifact is stat-reverified on each authority use, forcing a full rehash on change. Same-instance tamper regressions cover both event mutation and post-warmup selection loss. |
 | G21 | high | Durable recursive directory creation read `is_dir()` and `exists()` separately. A concurrent creator could publish the directory between those calls, causing a valid shared lock directory to be misclassified as a file and nondeterministically refusing one campaign worker. | Existing-target classification now uses one `stat()` result and relies on atomic `mkdir` collision semantics for the missing-target race. A deterministic interleaving regression reproduces the old fault, and the concurrent preparation path passed 30 consecutive two-worker Jobe stress runs. |
 | G22 | operational | Two verification paths did not isolate the implementation they claimed to test. A subprocess fixture could import Jobe's editable canonical checkout instead of the isolated snapshot, while an adversarial CUDA nonfinite probe intentionally fired the production device assertion inside the shared pytest process and poisoned every later CUDA call. | Subprocess fixtures prepend the exact source root to `PYTHONPATH`. Fatal CUDA-selector refusal is exercised in its own child process, preserving the zero-host-sync production selector path while proving fail-closed behavior without contaminating the full-suite CUDA context. |
+
+## 2026-07-23 launch correction
+
+The first scientific Phase-1 launch exposed one protocol defect that smoke and
+static materialization had not exercised. All three seeds of
+`bsf_group_lasso_appendix_aux` failed before their first optimizer step:
+learned Group-Lasso support selected every block in at least one row, leaving
+zero unselected blocks for the declared four-wide Appendix-D runner-up set.
+The strict kernel correctly refused `minimum=0`; the invalidity was in the
+declared adapted bridge, not in CUDA execution.
+
+The complete failed campaign is preserved at
+`/data/runs/bsc-phase1-aborted-173a0a1-20260723T0122-group-lasso-aux` with 15
+qualified cells, the three deterministic failures, 32 planned cells, and one
+successor interrupted when the root was retired. No failed evidence was
+rewritten or reused.
+
+The repair removes the source-undefined Group-Lasso × Appendix-D paper anchor
+and its Phase-2 comparator-family auxiliary round. Recipe construction, cell
+preflight, and the auxiliary kernel now reject learned Group-Lasso runner-ups
+directly. The Phase-2 main-chain Appendix-D arm remains available only when the
+selected parent is fixed per-token TopK; BatchTopK and learned-threshold parents
+content-bind its deterministic elision because neither guarantees the complete
+per-row runner-up set. The regenerated scientific contracts declare 195
+Phase-1 cells (21 paper anchors and a 48-cell initial prefix) and a 410-cell
+Phase-2 pre-elision ceiling (176 main-chain plus 234 family-chain cells).
 
 The normative current shapes are implementation identity v2, executor v13,
 capture/binding/view/transform v2, codec/store format v3, preparation v4,

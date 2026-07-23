@@ -340,9 +340,9 @@ controls—`support_only` and `site_span_one`—fail that conjunction on every
 seed. Other failed stress cells do not silently veto the pilot, but each one
 must produce an explicit claim-scope narrowing in the frozen decision.
 
-With seeds 0, 1, and 2, the serialized blueprint declares and executes **198
+With seeds 0, 1, and 2, the serialized blueprint declares and executes **195
 cells**:
-24 paper anchors, 12 controls, 6 fusion-parity diagnostics, 9 DGP-screen cells,
+21 paper anchors, 12 controls, 6 fusion-parity diagnostics, 9 DGP-screen cells,
 24 capacity, 6 retraction, 15 factorization, 9 fusion-control, 18 masking,
 18 score, 6 selector, and 51 confirmation cells. The score count is six arms
 per seed: three Stiefel equality controls plus the same three scores on the
@@ -602,13 +602,17 @@ Learned group-threshold training support is exactly the nonzero support of the
 post-shrinkage code. The inherited endpoint score is used only for calibrated
 deployment ranking; it cannot add an undeclared `score > 0` training gate.
 
-The BSF runner-up auxiliary uses the encoder carrier before hard selection.
-For signed hard-TopK cells that is the ordinary pre-selection code. Combining
-Appendix D with Group Lasso is an explicit adaptation because shrinkage makes
-every inactive post-shrink code exactly zero: that bundle ranks and decodes the
-affine pre-shrink code instead. Every token must have the complete declared
-runner-up count; an under-capacity row fails rather than silently changing the
-auxiliary width or its fixed `1/l` coefficient.
+The BSF runner-up auxiliary uses the encoder carrier before fixed per-token
+hard selection. For signed token-TopK cells that is the ordinary pre-selection
+code. Every token must have the complete declared runner-up count; an
+under-capacity row fails rather than silently changing the auxiliary width or
+its fixed `1/l` coefficient. Learned Group-Lasso support has no guaranteed
+unselected runner-up set—the initial threshold can activate every block—and
+BatchTopK does not guarantee per-row residual capacity. Appendix D defines
+neither interaction. The executable matrix therefore keeps Group Lasso
+primary-only, runs paper Appendix-Aux only on the Vanilla and Grassmannian
+token-TopK carriers, and conditionally elides the Phase-2 main-chain runner-up
+arm unless fixed token-TopK is the selected parent.
 
 The real architecture round retains only the narrow transfer that synthetic
 evidence cannot settle: whether untied inference or a tied Stiefel carrier is
@@ -654,7 +658,7 @@ IDs even when another family's stage is most recent in the journal.
 |---|---|
 | shared-coordinate BSC | width; activity; learning rate; schedule |
 | BSF Grassmannian | width; activity; learning rate; schedule |
-| BSF Group Lasso | width; activity; L2,1 coefficient; Appendix-Aux on/off; learning rate; schedule |
+| BSF Group Lasso | width; activity; L2,1 coefficient; learning rate; schedule |
 | SASA | width; activity; initial map-penalty ratio `0/.01/.03/.10`; dead-residual Aux; learning rate; schedule |
 | Anthropic dense L1 | activity; decoder-weighted L1 coefficient; learning rate; schedule |
 | decoder-weighted BatchTopK | activity; learning rate; batch size; schedule |
@@ -679,14 +683,16 @@ gates. It freshly reruns the overall development winner and strongest distinct
 resolved runner-up for 16M tokens, then selects one family comparator. This revisit
 probes local order sensitivity; the staged search does not estimate every
 interaction or establish a global optimum. At seeds 0 and 1, the serialized
-blueprint declares a pre-elision ceiling of **176 main-chain cells** plus **238
-family-calibration cells**, for **414 total**. The 176 comprise 18 anchors and
+blueprint declares a pre-elision ceiling of **176 main-chain cells** plus **234
+family-calibration cells**, for **410 total**. The 176 comprise 18 anchors and
 158 declared cells across the 15 rounds from `architecture_4m` through
 `confirmation_16m`. The realized count is lower: execution-equivalent
 parent/center variants are deterministically elided, and a zero-Bernoulli-mask
-winner conditionally removes the four rank children from the revisit. Both
-forms of elision are content-addressed in the materialized stage, and reports
-must distinguish the declared ceiling from cells actually executed.
+winner conditionally removes the four rank children from the revisit. A
+non-token-TopK winner also conditionally removes the two-seed Appendix-D
+runner-up arm. All forms of elision are content-addressed in the materialized
+stage, and reports must distinguish the declared ceiling from cells actually
+executed.
 
 SASA does not disclose a numerical `lambda_dim`, and its absolute scale changes
 with dimension and reduction convention. A ratio-calibrated cell therefore
@@ -1853,10 +1859,10 @@ identification/fixed-rate endpoints, and have a bounded declared role.
 The deferred candidates either require a measured trigger, introduce an
 unpriced second representation or alignment map, or change the ontology and
 evaluation contract. They are promising conditional follow-ups, not free
-degrees of freedom to add to the present 198-cell Phase 1, 414-cell Phase-2
+degrees of freedom to add to the present 195-cell Phase 1, 410-cell Phase-2
 pre-elision ceiling, and 48-cell Phase 3 (the last count is eight refusal-gate
 cells plus 40 final cells). Phase-2 execution-equivalent and conditionally
-vacuous cells are removed at materialization and recorded, so 414 is not an
+vacuous cells are removed at materialization and recorded, so 410 is not an
 executed-cell claim.
 
 The relevant Phase-1 order is `site_factorization_identification`,

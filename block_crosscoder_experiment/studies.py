@@ -3014,6 +3014,7 @@ class StageBlueprint:
         if self.activation_condition not in {
             "always",
             "nonzero_or_structured_site_mask",
+            "fixed_token_topk_runner_up",
         }:
             raise StudyError("blueprint stage has an unknown activation condition")
         if (
@@ -5512,6 +5513,11 @@ def _paper_runtime(citation: str) -> tuple[Decision, ...]:
 
 
 def _bsf_recipe(kind: str, *, appendix_aux: bool) -> Recipe:
+    if kind == "group_lasso" and appendix_aux:
+        raise StudyError(
+            "Appendix-D runner-ups are undefined for learned Group-Lasso "
+            "support; use the primary Group-Lasso recipe or a hard-TopK carrier"
+        )
     if kind == "vanilla":
         architecture = (
             exact("model.encoder", "untied_affine", BSF),
@@ -5578,28 +5584,9 @@ def _bsf_recipe(kind: str, *, appendix_aux: bool) -> Recipe:
         )
     else:  # pragma: no cover - construction is internal
         raise AssertionError(kind)
-    runner_up_decision = (
-        adapted(
-            "objective.auxiliary",
-            "runner_up_blocks",
-            citation=BSF_AUX,
-            rationale=(
-                "Appendix D specifies runner-ups for an encoder-score TopK "
-                "carrier, while Group Lasso zeros inactive post-shrink codes; "
-                "retain the affine pre-shrink encoder code for its runner-up "
-                "ranking and residual decode"
-            ),
-            ablation=(
-                "compare primary Group Lasso with the complete pre-shrink "
-                "runner-up bundle and report auxiliary gradients/event capacity"
-            ),
-        )
-        if kind == "group_lasso"
-        else exact("objective.auxiliary", "runner_up_blocks", BSF_AUX)
-    )
     aux = (
         (
-            runner_up_decision,
+            exact("objective.auxiliary", "runner_up_blocks", BSF_AUX),
             exact("auxiliary.count", "match_active_blocks", BSF_AUX),
             exact("auxiliary.coefficient", "1/active_blocks", BSF_AUX),
         )
@@ -5692,10 +5679,13 @@ def _bsf_recipe(kind: str, *, appendix_aux: bool) -> Recipe:
     )
 
 
-BSF_RECIPES = tuple(
-    _bsf_recipe(kind, appendix_aux=appendix_aux)
-    for kind in ("vanilla", "grassmannian", "group_lasso")
-    for appendix_aux in (False, True)
+BSF_RECIPES = (
+    *(
+        _bsf_recipe(kind, appendix_aux=appendix_aux)
+        for kind in ("vanilla", "grassmannian")
+        for appendix_aux in (False, True)
+    ),
+    _bsf_recipe("group_lasso", appendix_aux=False),
 )
 
 _BSF_GROUP_LASSO_PAPER = next(
@@ -8970,6 +8960,30 @@ def materialize_child_stage(
                 "zero_bernoulli_mask_has_no_rank_mask_interaction"
             )
             variants = (parent_variant,)
+    elif stage_blueprint.activation_condition == "fixed_token_topk_runner_up":
+        selectors = {
+            str(parent.decision_map["model.selector"])
+            for parent in ordered_parents
+        }
+        if len(selectors) != 1:
+            raise StudyError(
+                "a conditional runner-up round requires one seed-complete selector"
+            )
+        if next(iter(selectors)) != "token_topk":
+            runner_up_variant = "bsf_runner_up_aux"
+            if not any(variant.name == runner_up_variant for variant in variants):
+                raise StudyError(
+                    "conditional runner-up round lacks its Appendix-D variant"
+                )
+            elided_conditional_variants = (runner_up_variant,)
+            conditional_elision_reason = (
+                "appendix_runner_up_requires_fixed_token_topk"
+            )
+            variants = tuple(
+                variant
+                for variant in variants
+                if variant.name != runner_up_variant
+            )
     for variant in variants:
         variant_cells = tuple(
             derive_child_cell(
@@ -11768,64 +11782,6 @@ def _family_coefficient_variants(
 
 
 def _family_aux_variants(family: str) -> tuple[ChildVariant, ...]:
-    if family == "bsf_group_lasso":
-        return (
-            ChildVariant(
-                "aux_none",
-                (
-                    _factor(
-                        "factor.family_auxiliary",
-                        "none",
-                        "isolate Group-Lasso without the Appendix-D revival term",
-                        "compare the complete runner-up auxiliary",
-                    ),
-                    _factor(
-                        "objective.auxiliary",
-                        "none",
-                        "disable the family auxiliary",
-                        "compare the paper appendix bundle",
-                    ),
-                    _factor(
-                        "auxiliary.coefficient",
-                        0.0,
-                        "make auxiliary absence exact",
-                        "compare the paper appendix coefficient",
-                    ),
-                ),
-            ),
-            ChildVariant(
-                "aux_runner_up",
-                (
-                    _factor(
-                        "factor.family_auxiliary",
-                        "runner_up_blocks",
-                        "test the adapted pre-shrink BSF Appendix-D residual auxiliary on the calibrated Group-Lasso family",
-                        "compare the same selected penalty with no auxiliary",
-                    ),
-                    adapted(
-                        "objective.auxiliary",
-                        "runner_up_blocks",
-                        citation=BSF_AUX,
-                        rationale=(
-                            "rank and decode Group-Lasso runner-ups from the "
-                            "affine pre-shrink encoder carrier because inactive "
-                            "post-shrink codes are zero"
-                        ),
-                        ablation="compare no auxiliary",
-                    ),
-                    exact(
-                        "auxiliary.count",
-                        "match_active_blocks",
-                        BSF_AUX,
-                    ),
-                    exact(
-                        "auxiliary.coefficient",
-                        "1/active_blocks",
-                        BSF_AUX,
-                    ),
-                ),
-            ),
-        )
     if family == "sasa":
         variants: list[ChildVariant] = [
             ChildVariant(
@@ -11928,7 +11884,7 @@ def _comparator_family_blueprints(
         "anthropic_dense_l1": (3e-6, 1e-5, 3e-5),
     }
     batch_families = {"decoder_weighted_batchtopk", "scalar_relu_batchtopk"}
-    auxiliary_families = {"bsf_group_lasso", "sasa"}
+    auxiliary_families = {"sasa"}
     families: list[ComparatorFamilyBlueprint] = []
     disclaimer = (
         "The conditional one-factor path does not estimate all interactions or prove a "
@@ -13652,7 +13608,11 @@ def build_phase2_blueprint(
                 activation_condition=(
                     "nonzero_or_structured_site_mask"
                     if name == "site_factorization_revisit_4m"
-                    else "always"
+                    else (
+                        "fixed_token_topk_runner_up"
+                        if name == "auxiliary_16m"
+                        else "always"
+                    )
                 ),
             )
         )

@@ -568,10 +568,11 @@ exit is not evidence by itself.
   that staged ordering does not prove a global optimum.
 - Every comparator-family learning-rate round has exactly four arms:
   `3e-5`, `1e-4`, `2e-4`, and `3e-4`.
-- Default counts are rederived as 198 declared/executed Phase-1 cells at three
-  seeds and a 414-cell Phase-2 pre-elision ceiling at two seeds: 176 main-chain
-  plus 238 family-chain. Phase-2 reports separately record the smaller realized
-  count after execution-signature and conditional rank-revisit elision.
+- Default counts are rederived as 195 declared/executed Phase-1 cells at three
+  seeds and a 410-cell Phase-2 pre-elision ceiling at two seeds: 176 main-chain
+  plus 234 family-chain. Phase-2 reports separately record the smaller realized
+  count after execution-signature, conditional rank-revisit, and conditional
+  non-token-TopK Appendix-runner-up elision.
 - Revisit nominations rank the union of every qualified 4M candidate in that
   family, deduplicate seed-independent resolved execution signatures while
   preserving aliases and metric spread before outcome ranking, retain exactly

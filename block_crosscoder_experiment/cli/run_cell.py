@@ -3428,6 +3428,14 @@ def validate_cell_config(cell: CellSpec) -> tuple[BSCConfig, TrainConfig]:
             "the shared engine currently supports only all_sites observation policy"
         )
     if (
+        values["model.selector"] == "learned_group_threshold"
+        and values["objective.auxiliary"] == "runner_up_blocks"
+    ):
+        raise CellExecutionError(
+            "Appendix-D runner-ups are undefined for learned Group-Lasso "
+            "support; use the primary Group-Lasso recipe or a hard-TopK carrier"
+        )
+    if (
         tuple(values["qualification.endpoint_paths"])
         != (
             "native_training_rule",
