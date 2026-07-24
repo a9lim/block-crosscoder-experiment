@@ -4289,6 +4289,42 @@ def test_frozen_fixed_rate_policy_is_independent_of_holdout_distortion(tmp_path)
     assert replay_plan["lower_name"] == "q4"
     assert replay_plan["upper_name"] == "q8"
 
+    # Current serialized rates may move the fixed budget beyond either edge of
+    # the frozen pair. Replay then uses the corresponding pure frozen endpoint
+    # rather than selecting a new holdout endpoint or emitting an invalid
+    # all-upper mixture.
+    upper_saturated = copy.deepcopy(rd)
+    upper_saturated["points"]["4"]["rate_bits_per_token"] = 1.0
+    upper_saturated["points"]["8"]["rate_bits_per_token"] = 2.0
+    replay = _selected_time_sharing_plans(
+        ctx,
+        rd=upper_saturated,
+        raw_space=holdout_raw,
+        deployment_artifact_size_bytes=1,
+        frozen_operating_policy=policy,
+    )
+    replay_plan = next(iter(replay.values()))
+    assert replay_plan["lower_name"] == "q8"
+    assert replay_plan["upper_name"] == "q8"
+    assert replay_plan["upper_tokens"] == 0
+    assert replay_plan["achieved_total_bits_per_token"] <= 6.0
+
+    lower_saturated = copy.deepcopy(rd)
+    lower_saturated["points"]["4"]["rate_bits_per_token"] = 5.0
+    lower_saturated["points"]["8"]["rate_bits_per_token"] = 2_000.0
+    replay = _selected_time_sharing_plans(
+        ctx,
+        rd=lower_saturated,
+        raw_space=holdout_raw,
+        deployment_artifact_size_bytes=1,
+        frozen_operating_policy=policy,
+    )
+    replay_plan = next(iter(replay.values()))
+    assert replay_plan["lower_name"] == "q4"
+    assert replay_plan["upper_name"] == "q4"
+    assert replay_plan["upper_tokens"] == 0
+    assert replay_plan["achieved_total_bits_per_token"] <= 6.0
+
 
 def test_phase2_evaluator_metric_schema_resolves_through_live_policy() -> None:
     validation = _selection_validation_metrics(

@@ -1387,6 +1387,47 @@ def _fixed_rate_lower_envelope(
     return hull
 
 
+def _expected_frozen_replay_schedule(
+    policy_row: Mapping[str, Any],
+    *,
+    point_by_name: Mapping[str, Mapping[str, Any]],
+    budget: float,
+    schedule_rate: float,
+    horizon: int,
+) -> tuple[list[str], int]:
+    """Return the maximal fitting replay within one frozen endpoint pair."""
+
+    frozen_names = [
+        str(policy_row["lower_name"]),
+        str(policy_row["upper_name"]),
+    ]
+    if frozen_names[0] == frozen_names[1]:
+        return frozen_names, 0
+    lower_rate = float(point_by_name[frozen_names[0]]["total_bits_per_token"])
+    upper_rate = float(point_by_name[frozen_names[1]]["total_bits_per_token"])
+    if upper_rate <= lower_rate:
+        raise ArtifactError(
+            "frozen fixed-rate mixture has nonincreasing endpoint rates"
+        )
+    unconstrained_upper_tokens = math.floor(
+        ((budget - schedule_rate - lower_rate) / (upper_rate - lower_rate))
+        * horizon
+    )
+    if unconstrained_upper_tokens <= 0:
+        if lower_rate + schedule_rate > budget + 1e-12:
+            raise ArtifactError(
+                "frozen fixed-rate lower endpoint exceeds its budget"
+            )
+        return [frozen_names[0], frozen_names[0]], 0
+    if unconstrained_upper_tokens >= horizon:
+        if upper_rate + schedule_rate > budget + 1e-12:
+            raise ArtifactError(
+                "frozen fixed-rate upper endpoint exceeds its budget"
+            )
+        return [frozen_names[1], frozen_names[1]], 0
+    return frozen_names, unconstrained_upper_tokens
+
+
 def _validate_fixed_rate_evidence(
     fixed_rate: Any,
     *,
@@ -1770,23 +1811,24 @@ def _validate_fixed_rate_evidence(
                 raise ArtifactError(
                     "frozen fixed-rate evidence has an invalid measurement contract"
                 )
-            if bracket[0] != bracket[1]:
-                lower_rate = float(lower["total_bits_per_token"])
-                upper_rate = float(upper["total_bits_per_token"])
-                if upper_rate <= lower_rate:
-                    raise ArtifactError(
-                        "frozen fixed-rate mixture has nonincreasing endpoint rates"
-                    )
-                expected_upper_tokens = math.floor(
-                    ((budget - schedule_rate - lower_rate) / (upper_rate - lower_rate))
-                    * horizon
+            policy_row = policy_rows.get(budget)
+            if not isinstance(policy_row, Mapping):
+                raise ArtifactError(
+                    "frozen fixed-rate policy omits an executed budget"
                 )
-                if upper_tokens != expected_upper_tokens or not (
-                    0 < expected_upper_tokens < horizon
-                ):
-                    raise ArtifactError(
-                        "frozen fixed-rate mixture is not the maximal fitting schedule"
-                    )
+            expected_names, expected_upper_tokens = (
+                _expected_frozen_replay_schedule(
+                    policy_row,
+                    point_by_name=point_by_name,
+                    budget=budget,
+                    schedule_rate=schedule_rate,
+                    horizon=horizon,
+                )
+            )
+            if bracket != expected_names or upper_tokens != expected_upper_tokens:
+                raise ArtifactError(
+                    "frozen fixed-rate replay is not the maximal fitting schedule"
+                )
         else:
             available_rate = budget - schedule_rate
             if available_rate < float(expected_hull[0]["total_bits_per_token"]):

@@ -673,8 +673,10 @@ exit is not evidence by itself.
 - Development evidence freezes one content-addressed lower-envelope endpoint
   identity pair at every exact budget. Confirmation and Phase 3 replay the
   deterministic worst-source-seed policy and cannot use holdout/final
-  distortion to choose new endpoints. Every eligible budget serializes and
-  prices its fixed 32-byte operating record, including a pure endpoint.
+  distortion to choose new endpoints. A replay whose current rate lies beyond
+  a frozen pair saturates to that pair's corresponding pure endpoint. Every
+  eligible budget serializes and prices its fixed 32-byte operating record,
+  including a pure endpoint.
 - Functional-dependence profiles are present before and after selection, but
   their coherence sum is descriptive and has no hard-coded monotone preference.
 - All-site and every site-only-to-all-site endpoints are emitted for masking

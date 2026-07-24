@@ -6502,6 +6502,33 @@ def test_fixed_rate_policy_rejects_self_rehashed_wrong_budget_grid():
         )
 
 
+def test_frozen_replay_validator_saturates_within_declared_pair():
+    policy_row = {"lower_name": "q4", "upper_name": "q8"}
+    upper_saturated = {
+        "q4": {"total_bits_per_token": 1.0},
+        "q8": {"total_bits_per_token": 2.0},
+    }
+    assert campaign_module._expected_frozen_replay_schedule(
+        policy_row,
+        point_by_name=upper_saturated,
+        budget=6.0,
+        schedule_rate=0.25,
+        horizon=1_000,
+    ) == (["q8", "q8"], 0)
+
+    lower_saturated = {
+        "q4": {"total_bits_per_token": 5.0},
+        "q8": {"total_bits_per_token": 2_000.0},
+    }
+    assert campaign_module._expected_frozen_replay_schedule(
+        policy_row,
+        point_by_name=lower_saturated,
+        budget=6.0,
+        schedule_rate=0.25,
+        horizon=1_000,
+    ) == (["q4", "q4"], 0)
+
+
 def test_phase1_qualification_recomputes_margins_from_raw_identification_metrics():
     cell = build_phase1_plan(seeds=(0,), smoke=True).cells[0]
     inputs = {

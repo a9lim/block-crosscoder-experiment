@@ -9983,22 +9983,32 @@ def _selected_time_sharing_plans(
             upper_tokens = math.floor(target_weight * horizon)
             if upper_tokens <= 0:
                 if frozen_rows:
-                    raise CellExecutionError(
-                        "frozen mixture no longer fits one upper-endpoint token"
-                    )
+                    if lower_rate + schedule_rate > budget + 1e-12:
+                        raise CellExecutionError(
+                            "frozen mixture lower endpoint exceeds its fixed-rate budget"
+                        )
                 upper = lower
                 upper_tokens = 0
                 weight = 0.0
                 achieved_rate = lower_rate + schedule_rate
             else:
                 if upper_tokens >= horizon:
-                    raise CellExecutionError(
-                        "time-sharing mixture selected no lower endpoint"
+                    if frozen_rows:
+                        lower = upper
+                        upper_tokens = 0
+                        weight = 0.0
+                        achieved_rate = upper_rate + schedule_rate
+                    else:
+                        raise CellExecutionError(
+                            "time-sharing mixture selected no lower endpoint"
+                        )
+                else:
+                    weight = upper_tokens / horizon
+                    achieved_rate = (
+                        (1.0 - weight) * lower_rate
+                        + weight * upper_rate
+                        + schedule_rate
                     )
-                weight = upper_tokens / horizon
-                achieved_rate = (
-                    (1.0 - weight) * lower_rate + weight * upper_rate + schedule_rate
-                )
         if achieved_rate > budget + 1e-12:
             raise CellExecutionError(
                 "selected operating record exceeded its fixed-rate budget"

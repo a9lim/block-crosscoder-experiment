@@ -787,8 +787,12 @@ not rebuild a hull from their own distortions: they replay the policy from the
 deterministic worst-scoring source seed, recomputing only the largest integer
 mixture that fits the current serialized rates. The 32-byte record is present
 and charged even when both endpoints are identical. A missing endpoint,
-changed quantizer identity, incomplete budget grid, or mixture that no longer
-fits fails rather than selecting a replacement from holdout/final evidence.
+changed quantizer identity, incomplete budget grid, or frozen lower endpoint
+that exceeds the budget fails rather than selecting a replacement from
+holdout/final evidence. If the current serialized rates put the budget at or
+beyond a frozen pair boundary, replay saturates to the corresponding pure
+frozen endpoint; this is the maximal fitting limit of the declared pair, not a
+holdout-selected replacement.
 
 The cell score is negative mean raw-space FVU over the three frozen budgets.
 Candidates need every seed and a passed scientific outcome. Rank by descending
