@@ -6281,10 +6281,30 @@ class Campaign:
                 raise CampaignError("Phase 3 has no adaptive campaign extension")
 
             if family_name is None:
-                source_stage = current.stages[-1]
-                if selection.source_stage != source_stage.name:
+                source_matches = [
+                    stage
+                    for stage in current.stages
+                    if stage.name == selection.source_stage
+                ]
+                if len(source_matches) != 1:
                     raise CampaignError(
-                        "selection does not come from the current terminal stage"
+                        "main-chain selection source is absent or ambiguous"
+                    )
+                source_stage = source_matches[0]
+                main_stage_names = (
+                    {
+                        blueprint.initial_stage.name,
+                        *(round_spec.name for round_spec in blueprint.rounds),
+                    }
+                    if isinstance(blueprint, Phase2Blueprint)
+                    else {
+                        *(stage.name for stage in blueprint.initial_stages),
+                        *(round_spec.name for round_spec in blueprint.rounds),
+                    }
+                )
+                if source_stage.name not in main_stage_names:
+                    raise CampaignError(
+                        "main-chain selection comes from a comparator-family stage"
                     )
                 source_policy = source_stage.selection_policy
             else:

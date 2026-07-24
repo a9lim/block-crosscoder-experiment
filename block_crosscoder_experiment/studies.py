@@ -9272,7 +9272,7 @@ def materialize_child_plan(
     blueprint: Phase1Blueprint | Phase2Blueprint,
     selection: FrozenSelection,
 ) -> StudyPlan:
-    """Append exactly the next fully resolved child stage to a plan prefix."""
+    """Append the next fully resolved child on the selection's named branch."""
 
     expected_phase = (
         Phase.PHASE1 if isinstance(blueprint, Phase1Blueprint) else Phase.PHASE2
@@ -9281,13 +9281,22 @@ def materialize_child_plan(
         raise StudyError("a staged blueprint cannot extend another phase")
     if selection.seeds != blueprint.seeds:
         raise StudyError("selection must cover every frozen blueprint seed")
-    source_stage = prefix.stages[-1]
-    try:
-        stage_blueprint = next(
-            item for item in blueprint.rounds if item.source_stage == source_stage.name
-        )
-    except StopIteration as exc:
-        raise StudyError("the plan prefix has no remaining child blueprint") from exc
+    source_matches = tuple(
+        stage for stage in prefix.stages if stage.name == selection.source_stage
+    )
+    if len(source_matches) != 1:
+        raise StudyError("selection source stage is absent or ambiguous in the plan")
+    source_stage = source_matches[0]
+    materialized_names = {stage.name for stage in prefix.stages}
+    stage_matches = tuple(
+        item
+        for item in blueprint.rounds
+        if item.source_stage == source_stage.name
+        and item.name not in materialized_names
+    )
+    if len(stage_matches) != 1:
+        raise StudyError("the selected branch has no unique remaining child blueprint")
+    stage_blueprint = stage_matches[0]
     by_id = {cell.cell_id: cell for cell in source_stage.cells}
     try:
         parents = tuple(by_id[cell_id] for cell_id in selection.cell_ids)
