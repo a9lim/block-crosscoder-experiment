@@ -1744,7 +1744,7 @@ def _row_interval(reader: StoreReader) -> dict[str, Any]:
     first: tuple[int, int] | None = None
     previous: tuple[int, int] | None = None
     count = 0
-    for _, row_ids in reader.sequential_batches_with_ids(65_536):
+    for row_ids in reader.sequential_row_id_batches(65_536):
         if row_ids.ndim != 2 or row_ids.shape[1] < 2:
             raise CellExecutionError(
                 f"store split {reader.dir} lacks (sequence, position) row identities"

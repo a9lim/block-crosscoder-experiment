@@ -1176,22 +1176,24 @@ threshold, included-block table, rotations, clipping bounds, quantizers, and
 side-information contract. Evaluation reloads both artifacts and performs a
 source-free round trip.
 
-Codec orientation is `second_moment_ordered_event_frame_v2`. Calibration orders
+Codec orientation is `second_moment_ordered_event_frame_v3`. Calibration orders
 active-code second-moment spectral clusters by descending eigenvalue. Separated
 one-dimensional clusters retain their principal axes; repeated or near-repeated
 clusters (adjacent relative eigengap at most `1e-6`) use a gauge-equivariant
 projected two-pass Gram--Schmidt frame over the active mean followed by active
-codes in immutable calibration-stream order. Non-null directions that those
-vectors cannot identify fail closed. A direction at or below `512` times fp64
-epsilon times the block's largest eigenvalue is calibration-null: its arbitrary
-orthonormal storage completion is harmless only because calibration forces its
-clip interval to exact `[0,0]`, so it contributes identically zero in every
-gauge. The codec serializes and revalidates both tolerances, minimum relative
-eigengap, near-degenerate block IDs/count, null block IDs/per-block dimensions,
-null-coordinate count, and maximum cluster/null dimensions. Gauge-rotated
-exact-isotropic, near-degenerate, and rank-deficient release fixtures must
-produce matching rate--distortion points; generic random simple-spectrum
-coverage is insufficient.
+codes in immutable calibration-stream order. Every accepted direction is also
+two-pass reorthogonalized against all earlier spectral clusters, closing the
+small inter-cluster drift that an ill-conditioned fp64 eigensystem can retain.
+Non-null directions that those vectors cannot identify fail closed. A direction
+at or below `512` times fp64 epsilon times the block's largest eigenvalue is
+calibration-null: its arbitrary orthonormal storage completion is harmless only
+because calibration forces its clip interval to exact `[0,0]`, so it contributes
+identically zero in every gauge. The codec serializes and revalidates both
+tolerances, minimum relative eigengap, near-degenerate block IDs/count, null
+block IDs/per-block dimensions, null-coordinate count, and maximum cluster/null
+dimensions. Gauge-rotated exact-isotropic, near-degenerate, rank-deficient, and
+ill-conditioned simple-spectrum release fixtures must produce matching
+rate--distortion points; generic random simple-spectrum coverage is insufficient.
 
 Quantizer division uses a safe denominator only to form a symbol.
 Reconstruction always multiplies by the exact serialized `hi-lo` span: a

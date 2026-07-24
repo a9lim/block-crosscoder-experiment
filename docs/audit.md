@@ -355,11 +355,13 @@ exit is not evidence by itself.
   codec thresholds/quantizers read calibration only.
 - Corrupt headers, shards, transforms, row order, or hashes fail closed.
 - Codec orientation uses the serialized
-  `second_moment_ordered_event_frame_v2` contract. Exact-isotropic and
-  near-degenerate gauge-rotation fixtures match at every priced quantizer.
-  Calibration-null directions are explicitly diagnosed and have exact zero
-  clip bounds; forged nonzero bounds are refused. Eigengap/cluster/null
-  diagnostics are present, and an unidentified non-null frame fails closed.
+  `second_moment_ordered_event_frame_v3` contract. Exact-isotropic and
+  near-degenerate gauge-rotation fixtures match at every priced quantizer, and
+  the complete frame is globally reorthogonalized for ill-conditioned
+  simple-spectrum moments. Calibration-null directions are explicitly diagnosed
+  and have exact zero clip bounds; forged nonzero bounds are refused.
+  Eigengap/cluster/null diagnostics are present, and an unidentified non-null
+  frame fails closed.
 
 ## 4. Checkpoint and campaign audit
 

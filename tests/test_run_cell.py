@@ -67,6 +67,7 @@ from block_crosscoder_experiment.cli.run_cell import (
     _production_precision_preflight,
     _resolve_real_store,
     _resolved_runtime_device,
+    _row_interval,
     _selection_validation_metrics,
     _selected_time_sharing_plans,
     _synthetic_batches,
@@ -210,6 +211,26 @@ def test_resolved_runtime_device_canonicalizes_implicit_cuda_index(
     assert _resolved_runtime_device("cuda") == torch.device("cuda:2")
     assert _resolved_runtime_device("cuda:1") == torch.device("cuda:1")
     assert _resolved_runtime_device("cpu") == torch.device("cpu")
+
+
+def test_row_interval_uses_identity_only_stream() -> None:
+    class Reader:
+        dir = Path("/identity-only")
+        n_tokens = 4
+
+        def sequential_row_id_batches(self, batch_size):
+            assert batch_size == 65_536
+            yield torch.tensor([[2, 3, 10], [2, 4, 11]], dtype=torch.int64)
+            yield torch.tensor([[3, 0, 12], [3, 1, 13]], dtype=torch.int64)
+
+        def sequential_batches_with_ids(self, batch_size):
+            raise AssertionError("row interval loaded activation payload")
+
+    assert _row_interval(Reader()) == {
+        "first": [2, 3],
+        "last": [3, 1],
+        "count": 4,
+    }
 
 
 @pytest.mark.parametrize(

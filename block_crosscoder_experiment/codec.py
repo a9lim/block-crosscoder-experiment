@@ -245,7 +245,17 @@ def _canonical_second_moment_frames(
                 # this subspace.  Keep eigh's orthonormal completion solely as
                 # a storage carrier; exact zero clip bounds below make its
                 # decoded contribution identically zero in every gauge.
-                canonical_columns.extend(spectral_basis.unbind(dim=1))
+                for spectral_column in spectral_basis.unbind(dim=1):
+                    vector = spectral_column
+                    for _ in range(2):
+                        for previous in canonical_columns:
+                            vector = vector - previous * torch.dot(previous, vector)
+                    norm = vector.norm()
+                    if not bool(norm > (256.0 * eps)):
+                        raise RuntimeError(
+                            "codec canonical null-frame completion lost rank"
+                        )
+                    canonical_columns.append(vector / norm)
                 null_coordinates[group, cluster_start:cluster_stop] = True
                 null_coordinate_count += dimension
                 null_dimensions[group] += dimension
@@ -265,14 +275,19 @@ def _canonical_second_moment_frames(
                 if not bool(candidate_norm > 0):
                     continue
                 vector = projector @ candidate
-                # Two MGS passes keep the serialized fp32 frame orthonormal
-                # even for a near-degenerate multi-axis cluster.
+                # Eigh may lose more than 1e-9 inter-cluster orthogonality for
+                # an ill-conditioned moment even when every eigenvalue is
+                # separated. Two global MGS passes retain the identified
+                # spectral directions while making the complete frame, not
+                # merely each repeated-eigenspace cluster, orthonormal.
                 for _ in range(2):
-                    for previous in cluster_columns:
+                    for previous in canonical_columns:
                         vector = vector - previous * torch.dot(previous, vector)
                 norm = vector.norm()
                 if bool(norm > (256.0 * eps * candidate_norm)):
-                    cluster_columns.append(vector / norm)
+                    column = vector / norm
+                    cluster_columns.append(column)
+                    canonical_columns.append(column)
                     if len(cluster_columns) == dimension:
                         break
             if len(cluster_columns) != dimension:
@@ -282,7 +297,6 @@ def _canonical_second_moment_frames(
                     f"eigenspace dimension {dimension}, identified "
                     f"{len(cluster_columns)}"
                 )
-            canonical_columns.extend(cluster_columns)
 
         basis = torch.stack(canonical_columns, dim=1)
         gram = basis.T @ basis
@@ -291,7 +305,7 @@ def _canonical_second_moment_frames(
         frames[group] = basis.T
 
     diagnostics: dict[str, object] = {
-        "canonical_orientation": "second_moment_ordered_event_frame_v2",
+        "canonical_orientation": "second_moment_ordered_event_frame_v3",
         "canonical_eigenspace_relative_tolerance": (
             _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE
         ),
@@ -729,7 +743,7 @@ class Codec:
         ):
             raise ValueError("codec excluded-event share disagrees with its counts")
         if (
-            self.meta["canonical_orientation"] != "second_moment_ordered_event_frame_v2"
+            self.meta["canonical_orientation"] != "second_moment_ordered_event_frame_v3"
             or self.meta["canonical_eigenspace_relative_tolerance"]
             != _CANONICAL_EIGENSPACE_RELATIVE_TOLERANCE
             or not isinstance(self.meta["canonical_near_degenerate_groups"], int)

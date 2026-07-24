@@ -507,6 +507,60 @@ def test_near_degenerate_second_moment_uses_ordered_event_frame():
     assert torch.allclose(second[0] @ gauge, first[0], atol=2e-7)
 
 
+def test_ill_conditioned_simple_spectrum_is_globally_reorthogonalized():
+    # Extracted from the Phase-2 vanilla seed-1 calibration failure. The
+    # separated eigenspaces are scientifically unambiguous, but eigh's raw
+    # frame can miss the codec's 1e-9 orthogonality bound on this moment.
+    moment = torch.tensor(
+        [
+            [
+                57.78935946836488,
+                48.148443042822436,
+                48.22853098565861,
+                54.397186275213315,
+            ],
+            [
+                48.148443042822436,
+                40.967257258597144,
+                40.52352136917549,
+                45.70544146981943,
+            ],
+            [
+                48.22853098565861,
+                40.52352136917549,
+                41.00475381874153,
+                45.630895776106165,
+            ],
+            [
+                54.397186275213315,
+                45.70544146981943,
+                45.630895776106165,
+                51.6674407686752,
+            ],
+        ],
+        dtype=torch.float64,
+    ).unsqueeze(0)
+    mean = torch.tensor(
+        [[7.475153427732289, 6.229779344484855, 6.286786988004193, 7.050416397885472]],
+        dtype=torch.float64,
+    )
+    codes = torch.tensor(
+        [[9.32923698425293, 6.369120121002197, 7.973727703094482, 7.729341983795166]]
+    )
+    frames, null, meta = codec_module._canonical_second_moment_frames(
+        moment,
+        mean,
+        codes,
+        torch.zeros(1, dtype=torch.long),
+        torch.ones(1, dtype=torch.bool),
+    )
+    gram = frames[0] @ frames[0].T
+    assert torch.allclose(gram, torch.eye(4, dtype=torch.float64), atol=1e-12, rtol=0)
+    assert not null.any()
+    assert meta["canonical_orientation"] == "second_moment_ordered_event_frame_v3"
+    assert meta["canonical_max_eigenspace_cluster"] == 1
+
+
 def test_calibration_null_subspace_is_exactly_dropped_in_every_gauge():
     cfg = BSCConfig(
         n_blocks=1,
