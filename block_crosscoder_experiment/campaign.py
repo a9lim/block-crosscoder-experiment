@@ -7705,6 +7705,15 @@ class Campaign:
             )
             event_cell = self._require_cell(str(event.get("cell_id", "")))
             if summary is None:
+                is_retry_marker = (
+                    event.get("previous") == RunState.FAILED.value
+                    and metadata == {"retry": True}
+                    and event.get("artifacts") == []
+                )
+                if is_retry_marker:
+                    # Retry moves the journal state back to the last durable
+                    # stage; it does not commit a second preparation artifact.
+                    continue
                 if event_cell.phase is not Phase.PHASE1:
                     raise ArtifactError(
                         "real-data prepared transition lacks activation identity metadata"

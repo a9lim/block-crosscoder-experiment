@@ -6389,6 +6389,17 @@ def test_real_data_preparations_pin_one_raw_capture_and_one_digest_per_view(
         == first_identity["raw_content_identity_sha256"]
     )
 
+    campaign.transition(
+        first.cell_id,
+        RunState.FAILED,
+        message="synthetic interruption after prepare",
+    )
+    assert campaign.retry(first.cell_id).state is RunState.PREPARED
+    campaign.activation_identity_path.unlink()
+    campaign.reconcile()
+    retry_rebuilt = json.loads(campaign.activation_identity_path.read_text())
+    assert retry_rebuilt == rebuilt
+
 
 def test_uncommitted_preparation_cannot_poison_activation_projection(tmp_path):
     plan, blueprint, phase1_decision = phase2_test_inputs(smoke=True)
