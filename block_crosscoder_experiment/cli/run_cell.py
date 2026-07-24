@@ -204,6 +204,68 @@ class CellExecutionError(RuntimeError):
     """A resolved cell cannot safely complete the requested stage."""
 
 
+def _amended_phase2_execution_binding(
+    campaign: Campaign,
+    active_plan: StudyPlan,
+    blueprint: Phase2Blueprint,
+) -> bool:
+    """Verify the append-only plan lineage rooted at an authenticated amendment."""
+
+    active_amendment = campaign._active_phase2_gate_amendment()
+    if active_amendment is None:
+        return False
+    amendment, _ref = active_amendment
+    if amendment["source_phase2_blueprint_id"] != blueprint.blueprint_id:
+        return False
+
+    adoption_matches: list[StudyPlan] = []
+    for history_path in campaign.plans_dir.glob("*.json"):
+        history_payload = _read_object(
+            history_path, label="immutable amendment plan history"
+        )
+        history = StudyPlan.from_manifest(history_payload)
+        if history.plan_id == amendment["source_plan_id_at_adoption"]:
+            if canonical_json(history_payload) != canonical_json(
+                history.to_manifest()
+            ):
+                return False
+            adoption_matches.append(history)
+    if len(adoption_matches) != 1:
+        return False
+    adoption_plan = adoption_matches[0]
+    if (
+        adoption_plan.phase is not Phase.PHASE2
+        or len(adoption_plan.stages) > len(active_plan.stages)
+        or active_plan.stages[: len(adoption_plan.stages)]
+        != adoption_plan.stages
+    ):
+        return False
+
+    events = campaign.events()
+    amendment_indices = [
+        index
+        for index, event in enumerate(events)
+        if event.get("event") == "design_amendment"
+        and (event.get("metadata") or {}).get("amendment_id")
+        == amendment["amendment_id"]
+    ]
+    if len(amendment_indices) != 1:
+        return False
+    lineage_tip = adoption_plan.plan_id
+    for event in events[amendment_indices[0] + 1 :]:
+        if event.get("event") != "plan_extension":
+            continue
+        metadata = event.get("metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("previous_plan_id") != lineage_tip
+            or not isinstance(metadata.get("plan_id"), str)
+        ):
+            return False
+        lineage_tip = str(metadata["plan_id"])
+    return lineage_tip == active_plan.plan_id
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -764,10 +826,11 @@ class _Context:
                         label="Phase-1 decision",
                     )
                 )
+                blueprint_payload = _read_object(
+                    self.root / "blueprint.json", label="Phase-2 blueprint"
+                )
                 blueprint = Phase2Blueprint.from_manifest(
-                    _read_object(
-                        self.root / "blueprint.json", label="Phase-2 blueprint"
-                    )
+                    blueprint_payload
                 )
                 smoke = self.cell.decision_map.get("runtime.smoke") is True
                 expected_blueprint = build_phase2_blueprint(
@@ -779,6 +842,22 @@ class _Context:
                     blueprint.seeds,
                     smoke=smoke,
                     phase1_decision=phase1_decision,
+                )
+                canonical_registration = (
+                    blueprint == expected_blueprint
+                    and canonical_json(blueprint.to_manifest())
+                    == canonical_json(blueprint_payload)
+                    and active_plan.stages[0]
+                    == expected_initial_plan.stages[0]
+                    and (
+                        extension_events
+                        or active_plan == expected_initial_plan
+                    )
+                )
+                amended_registration = _amended_phase2_execution_binding(
+                    campaign,
+                    active_plan,
+                    blueprint,
                 )
             except (
                 CampaignError,
@@ -795,16 +874,8 @@ class _Context:
                 ) from exc
             if (
                 active_plan.phase is not Phase.PHASE2
-                or blueprint != expected_blueprint
-                or canonical_json(blueprint.to_manifest())
-                != canonical_json(
-                    _read_object(
-                        self.root / "blueprint.json", label="Phase-2 blueprint"
-                    )
-                )
-                or active_plan.stages[0] != expected_initial_plan.stages[0]
                 or matching_cells != [self.cell]
-                or (not extension_events and active_plan != expected_initial_plan)
+                or not (canonical_registration or amended_registration)
                 or (
                     smoke and phase1_decision.get("authorizes_phase2_smoke") is not True
                 )

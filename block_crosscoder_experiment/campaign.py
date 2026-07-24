@@ -7441,6 +7441,19 @@ class Campaign:
         )
         if registration_index is None:
             raise ArtifactError("cell lacks its registration event")
+        prepared_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("event") == "transition"
+                and event.get("cell_id") == cell_id
+                and event.get("target") == RunState.PREPARED.value
+            ),
+            None,
+        )
+        pin_cutoff = (
+            registration_index if prepared_index is None else prepared_index
+        )
         if not self.implementation_identity_path.exists():
             raise ArtifactError(
                 "campaign lacks its registration-time implementation pin"
@@ -7483,8 +7496,13 @@ class Campaign:
                 )
             )
             applicable = [
-                item for item in successor_pins if item[0] < registration_index
+                item for item in successor_pins if item[0] < pin_cutoff
             ]
+            if prepared_index is None:
+                # A planned or prepare-failed cell has no scientific artifact
+                # bound to an older executor. It adopts the latest authenticated
+                # successor before its first durable PREPARED transition.
+                applicable = successor_pins
             if applicable:
                 _index, pinned_identity, expected_pinned_digest = max(
                     applicable, key=lambda item: item[0]
@@ -9636,9 +9654,11 @@ class Campaign:
             raise CampaignError(
                 "Phase-2 implementation amendment digest is invalid"
             )
-        if payload.get("reason") != (
-            "orchestration_only_branch_advance_fix_no_cell_kernel_change"
-        ):
+        allowed_reasons = {
+            "orchestration_only_branch_advance_fix_no_cell_kernel_change",
+            "authenticated_phase2_amendment_binding_repair_no_cell_kernel_change",
+        }
+        if payload.get("reason") not in allowed_reasons:
             raise CampaignError(
                 "Phase-2 implementation amendment reason is noncanonical"
             )
@@ -9740,7 +9760,7 @@ class Campaign:
                 "implementation_identity": implementation,
                 "implementation_identity_sha256": implementation_sha256,
                 "reason": (
-                    "orchestration_only_branch_advance_fix_no_cell_kernel_change"
+                    "authenticated_phase2_amendment_binding_repair_no_cell_kernel_change"
                 ),
             }
             payload = {
