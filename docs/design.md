@@ -28,8 +28,9 @@ The primary estimands are:
    planted factor's support, subspace, and coordinate;
 2. **real compression:** raw-activation distortion at a fixed, operational
    total rate;
-3. **operational sharing:** whether a code inferred from a site subset predicts
-   the held-out sites and remains stable under leave-one-site-out encoding;
+3. **cross-layer structure:** how the jointly inferred code depends on, and
+   contributes to, each site; site-only and leave-one-out views are descriptive
+   robustness probes rather than admission criteria;
 4. **manifold quality:** whether a factor is captured once rather than tiled,
    shattered, diluted, duplicated, or mixed with other factors.
 
@@ -523,9 +524,9 @@ decoder-weighted BatchTopK carrier, the scalar ReLU BatchTopK control, the
 evidence-bound `phase1_contract_bsc`, and
 `phase1_contract_source_only_control`. The latter differs only by inference
 from site 0 and is explicitly nonpromotable. It supplies the real source-only
-descriptive control without opening a topology-tuning round. It is reported,
-but it is not the later same-model partial-view guard and is not a matched-token
-selection gate. Only `phase1_contract_bsc` is
+descriptive control without opening a topology-tuning round. It is reported
+beside the common partial-view diagnostics but is not a matched-token selection
+gate. Only `phase1_contract_bsc` is
 eligible for the main-chain anchor selection; the other roots calibrate the
 comparison surface. The similarly named unbound preview recipe is usable only
 for count/resource inspection and cannot register a scientific campaign.
@@ -615,12 +616,12 @@ parent-retention rule because it measures interaction rather than choosing the
 globally smallest rank again. The confirmation round has no selection policy
 and cannot feed hyperparameter tuning. Panel freeze takes only the untouched
 scalar-RMS confirmation rerun. On every seed it must remain scientifically
-qualified, re-pass the full sharing guard, and degrade by at most `0.02` in
-fixed-rate score relative to its exact development parent. That `0.02` is a
-novel preregistered reproducibility tolerance—not a paper value—and each
-confirmation cell content-binds the `.01/.02/.05` sensitivity ladder. The
-frozen evidence reports every counterfactual pass set plus the result with the
-score tolerance removed; confirmation data never retunes the center.
+qualified and degrade by at most `0.02` in fixed-rate score relative to its
+exact development parent. That `0.02` is a novel preregistered reproducibility
+tolerance—not a paper value—and each confirmation cell content-binds the
+`.01/.02/.05` sensitivity ladder. Partial-view endpoints remain reported but
+do not enter confirmation pass/fail. Confirmation data never retunes the
+center.
 
 The seven frozen Phase-3 comparators are not copied from these 1M anchors.
 Each receives an independent, content-addressed conditional calibration chain
@@ -652,9 +653,10 @@ preserving every stage/candidate alias and metric spread in the ranked
 evidence. Deduplication happens before outcome ranking; the representative is
 the earliest declared source round, then candidate ID, so repeated center
 configurations receive no best-of-repeats advantage. Comparator
-families report the BSC sharing endpoints but do not use them as admission
-gates. It freshly reruns the overall development winner and strongest distinct
-resolved runner-up for 16M tokens, then selects one family comparator. This revisit
+families and the BSC main chain report the same partial-view endpoints without
+using them as admission gates. Each family freshly reruns the overall
+development winner and strongest distinct resolved runner-up for 16M tokens,
+then selects one family comparator. This revisit
 probes local order sensitivity; the staged search does not estimate every
 interaction or establish a global optimum. At seeds 0 and 1, the serialized
 blueprint declares a pre-elision ceiling of **176 main-chain cells** plus **234
@@ -692,46 +694,30 @@ map or decoder nuclear norm without a rounded full bf16 site tensor. It is
 serialized separately because casting the factors before contraction changes
 bf16 reduction order.
 
-Every adaptive main-chain Phase-2 selected-parent or revisit policy carries
-frozen sharing guards. Root-anchor policies are deliberately ungated baselines:
-the first sharing admission occurs at the first adaptive main-chain selection,
-where both parent- and root-relative evidence exists. Comparator-family
-policies continue to report the endpoints without using them for admission.
-For both site-only and leave-one-out inference, every
-seed must have worst-site decoded-coordinate Lin concordance at least `.80` on
-the support intersection. Concordance is computed in the gauge-invariant
-all-site decoder-Gram geometry, centers the paired coordinate streams, and adds
-their mean-offset energy to the denominator so a partial-view additive offset
-relative to the all-view code cannot look like agreement. The worst-site
-full-view-support intersection recall and
-the fraction of full-view decoded energy retained on that intersection must be
-at least `.75` and `.90`, respectively.
+Every real-model family, including the BSC main chain, is promoted under the
+same performance contract: complete seedwise scientific qualification and the
+fixed-rate raw-space FVU policy below. Standard acausal crosscoders infer one
+code jointly from all observed layers; common coordinates do not imply that
+each individual layer is an independently sufficient view. Site-only and
+leave-one-out FVU, support-IoU, decoder-Gram concordance, support-intersection
+recall, decoded-energy coverage, and functional dependence therefore remain
+common descriptive endpoints. Method-specific constraints such as Stiefel
+residuals remain hard validity checks only for methods that declare them.
 
-The existing safety gates remain conjunctive. Relative to the selected parent,
-mean site-only and mean leave-one-out held-out raw FVU may each degrade by at
-most `.02`, and each mean support-IoU endpoint may fall by at most `.05`.
-Relative to the root anchor, those two FVU means may each degrade by at most
-`.02`; their absolute values must each be at most `1.0`. The same-candidate
-all-view FVU advantage is still reported, but it is descriptive only: an ideal
-redundantly shared factor need not reconstruct better from all sites than from
-one sufficient site. This is not a comparison with the separately trained
-source-only anchor. Missing or nonfinite guard data fails before
-median/worst-seed aggregation. These tolerances are qualification constraints,
-not extra ranker weights.
+Partial-view evaluation reports the native fixed-count selector and the
+calibrated deployment selector separately. A future missing-view deployment
+claim must apply one common observation/fusion contract to every compared
+method and calibrate any pattern-specific threshold as priced side
+information; an all-site threshold under a changed score distribution is not
+an architecture test.
 
-No source paper supplies the project's winner-changing minimum-effect,
-noninferiority, or sharing cutoffs. They are **novel preregistered practical and
-safety policies**. Every applicable selection-policy content ID binds both that
-basis and the complete descriptive sensitivity surface:
+No source paper supplies the project's winner-changing minimum-effect or
+noninferiority cutoffs. They are **novel preregistered practical policies**.
+Every applicable selection-policy content ID binds both that basis and the
+complete descriptive sensitivity surface:
 
 - minimum effect: `0/.001/.002/.005`;
 - noninferiority: `.005/.01/.02`;
-- parent/root partial-view FVU degradation: `.01/.02/.05`;
-- support-IoU drop: `.02/.05/.10`;
-- coordinate concordance: `.50/.80/.90`;
-- support-intersection recall: `.50/.75/.90`;
-- decoded-energy coverage: `.75/.90/.95`;
-- absolute partial-view FVU: `.75/1.0/1.25`.
 - scalar-RMS confirmation score degradation: `.01/.02/.05`, center `.02`.
 
 The preregistered center thresholds determine eligibility. Every scientific
@@ -760,9 +746,12 @@ excluded by the frozen policy, and the excluded event share is a qualification
 guardrail rather than free compression.
 
 The frozen real-cell scientific-outcome guardrails require calibration mean
-support within `0.1` block of target and excluded selected-event fractions at
-or below `1%` on both calibration and evaluation. Promotion additionally
-requires a source-free raw inverse and eligibility at every fixed-rate budget.
+support within `0.1` block of target. Phase-2 excluded selected-event fractions
+are reported and their reconstruction cost is already present in measured
+fixed-rate distortion; they do not independently filter tuning candidates.
+Phase 1 retains its implementation guard, and Phase 3 retains its common
+publication reliability guard. Promotion additionally requires a source-free
+raw inverse and eligibility at every fixed-rate budget.
 
 The primary budgets are **at most 256, 384, and 512 total bits/token**. For each
 candidate:
@@ -848,12 +837,10 @@ The frozen panel has eight slots:
 Every comparator slot binds the derived winner of its Phase-2 family chain,
 the complete family selection IDs, its family blueprint ID, and its root
 recipe lineage. A 1M root anchor is not admissible as a Phase-3 comparator.
-Comparator-family calibration and revisit policies rank qualified cells by the
-same fixed-rate raw-FVU metric but do **not** require the BSC sharing-admission
-gate. Otherwise a baseline that intentionally lacks shared-coordinate
-inference could disappear before comparison. Every comparator still reports
-the identical partial-view concordance, support, energy, and FVU endpoints;
-those values are Phase-3 outcomes rather than family-admission filters.
+Comparator-family calibration, revisit policies, and the BSC main chain rank
+qualified cells by the same fixed-rate raw-FVU metric. Every method reports the
+identical partial-view concordance, support, energy, and FVU endpoints; those
+values are Phase-3 outcomes rather than family-admission filters.
 Every slot also serializes duplicate handling: the selected-finalist slot
 fails closed, while a comparator that duplicates it advances to the next
 ranked qualified nonduplicate in that comparator's already frozen universe.
@@ -1771,15 +1758,16 @@ multiply every paper anchor. Four mechanism families have passed intake:
    token-TopK and signed block-BatchTopK. Learned group thresholding remains a
    separate bundled method because it changes more than support allocation.
 
-**Partial-view coordinate concordance is implemented mandatory admission
-evidence**, not a future matrix cell. On the intersection of all-view and
+**Partial-view coordinate concordance is a common diagnostic**, not admission
+evidence and not a future matrix cell. On the intersection of all-view and
 partial-view supports, it compares codes through the decoder Gram
 $G_g=\sum_sD_g^sD_g^{s\top}$ using a centered Lin-style concordance with a
-mean-offset penalty. The gate consumes the worst observation-site concordance,
+mean-offset penalty. The report includes worst observation-site concordance,
 support-intersection recall, and decoded-energy coverage for both site-only and
 leave-one-out inference; per-block distributions remain reported diagnostics.
 This separates a failure to select the same block from a failure to infer the
-same coordinate once selected.
+same coordinate once selected. It does not presume that a jointly trained
+crosscoder must reconstruct global geometry from one local site.
 
 Per-block diagnostics use separate, serialized eligibility rules so support
 failures cannot vanish behind a concordance sample floor. Concordance requires
@@ -1788,8 +1776,8 @@ support-intersection recall is reported for every block/pattern with positive
 full-view support count; decoded-energy coverage is reported for every
 block/pattern with positive full-view decoded energy, including zero-
 intersection failures as zero coverage. Each distribution records eligible and
-ineligible counts per site. These distributions are diagnostic; the mandatory
-gate uses the unfiltered worst-site micro aggregates above.
+ineligible counts per site. The same descriptive status and reductions apply
+to BSC and every comparator.
 
 One related gauge-invariant diagnostic remains contingent:
 
@@ -1816,7 +1804,7 @@ than silently forgotten:
 | gated block support with a separate signed coordinate head | a scalar gate can decide whether a block exists while a vector head estimates its signed manifold coordinate, avoiding support/magnitude interference | this adapts scalar Gated SAE to a new multi-site block object, adds encoder parameters, and can make gate and decoded contribution disagree | after observing support errors despite good learned subspaces, compare exact parent, parameter-matched encoder control, and gated block arm at identical events/packets; require same-block support and aligned-coordinate gains |
 | SoftSAE-derived input-adaptive block count | examples may contain different numbers of active factors, so a learned per-token block budget could spend packets where complexity is high instead of relying on incidental BatchTopK variation | the source method is scalar and trains a large dynamic-sparsity MLP through Soft Top-K; a block adaptation must survive soft-to-hard mismatch, information hiding in tiny weights, and exact variable-length packet accounting | after the frozen 2-versus-8-factor stresses show a fixed-count failure, compare token-TopK, BatchTopK, learned threshold, and adaptive block count under the same mean **total packet-bit** budget, priced active-count field, and hard deployed selector |
 | heterogeneous block widths or hierarchical within-block sparsity | real factors need not share one intrinsic dimension, so a mixed-width dictionary could spend one coordinate on lines and several on higher-dimensional manifolds | ragged blocks change selector fairness, parameter capacity, active-count meaning, and packet amplitude length; coordinate-level masks add more side bits | use the truth-known mixed-rank DGP, match total and active coordinates plus exact packet rate to uniform-width winners, and report recovery separately by planted rank |
-| full-view-to-masked-view code consistency | matching the code inferred from partial sites to the all-site code may enforce functional cross-layer coordinates more directly than reconstruction masking alone | an agreement loss can collapse codes or erase genuine layer-local emergence, and doubles encoding work unless approximated | only if masking improves site-only FVU but code drift remains, add detached-all-site consistency with zero/frozen coefficient ladder and retain all identification and sharing guards |
+| full-view-to-masked-view code consistency | matching the code inferred from partial sites to the all-site code may enforce functional cross-layer coordinates more directly than reconstruction masking alone | an agreement loss can collapse codes or erase genuine layer-local emergence, and doubles encoding work unless approximated | only if masking improves site-only FVU but code drift remains, add detached-all-site consistency with a zero/frozen coefficient ladder and retain the common non-collapse, identification, and fixed-rate checks |
 | invariant site-profile smoothness or contiguity | features that emerge and transform across adjacent layers may have smoother site-energy profiles than unconstrained per-site maps | four pilot sites offer weak resolution, raw weight differences are gauge-dependent, and abrupt appearance/disappearance may be real | with a denser hook panel, compare zero versus a short ladder on an invariant decoder-energy/Gram profile against both smooth and step-change synthetic site maps |
 | OrtSAE-derived block-subspace incoherence | discouraging high overlap between decoder block subspaces could reduce duplicate blocks, absorption, and composite factors | scalar decoder cosine does not define the correct penalty for signed vector subspaces, and genuinely correlated factors must not be forced orthogonal | first observe excess duplicate/mixing pathology; then compare coefficient zero with a frozen ladder using a principal-angle/projector-overlap penalty on a truth-known DGP that independently varies true factor overlap |
 | Matryoshka nested block dictionaries | one ordered dictionary could preserve broad factors while providing usable prefixes at several capacity/rate points | prefix order breaks block-permutation symmetry and simultaneously changes capacity, loss weighting, and codec semantics | finalist-only comparison of nested group-aligned prefixes against independently trained equal-size dictionaries, reporting every prefix's identification and exact packet frontier |

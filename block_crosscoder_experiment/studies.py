@@ -11568,7 +11568,7 @@ def _development_selection_policy(
     *,
     eligible_recipe_names: tuple[str, ...] = (),
     retain_count: int = 1,
-    require_sharing_guard: bool = True,
+    require_sharing_guard: bool = False,
     required_control_variant: str | None = None,
     noninferiority_candidate_variant: str | None = None,
     control_noninferiority_absolute_tolerance: float | None = None,

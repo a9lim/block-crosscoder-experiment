@@ -11440,6 +11440,17 @@ def _qualify(
             recovery=recovery,
         )
     )
+    codec_exclusion_is_gate = ctx.cell.phase is not Phase.PHASE2
+    if not codec_exclusion_is_gate:
+        inapplicable_scientific_checks = {
+            **inapplicable_scientific_checks,
+            "codec_calibration_exclusion": (
+                "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
+            ),
+            "codec_evaluation_exclusion": (
+                "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
+            ),
+        }
     scientific_outcome_checks = {
         "support_target_calibration": (
             finite_number(calibration_record.get("threshold_abs_error"))
@@ -11448,13 +11459,19 @@ def _qualify(
         ),
         "codec_calibration_exclusion": (
             finite_number(calibration_excluded)
-            and float(calibration_excluded)
-            <= threshold_map["codec_excluded_calibration_event_fraction_max"]
+            and (
+                not codec_exclusion_is_gate
+                or float(calibration_excluded)
+                <= threshold_map["codec_excluded_calibration_event_fraction_max"]
+            )
         ),
         "codec_evaluation_exclusion": (
             finite_number(evaluation_excluded)
-            and float(evaluation_excluded)
-            <= threshold_map["codec_excluded_evaluation_event_fraction_max"]
+            and (
+                not codec_exclusion_is_gate
+                or float(evaluation_excluded)
+                <= threshold_map["codec_excluded_evaluation_event_fraction_max"]
+            )
         ),
         "phase1_identification": phase1_identification_passed,
         "production_precision_finite": precision_finite_passed,

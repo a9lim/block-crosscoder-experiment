@@ -1,5 +1,10 @@
 # Implementation preflight audit — 2026-07-22
 
+Historical note (2026-07-23): this audit accurately records the gate contract
+implemented and verified on 2026-07-22. Its Phase-2 sharing-gate findings are
+superseded by the common-gate review and remain here as provenance, not current
+normative design.
+
 Status: first- and second-pass remediation complete; definitive verification is
 recorded below. No scientific optimizer training had started when either audit
 was performed. The registered Jobe Phase-1 root contained only planned and

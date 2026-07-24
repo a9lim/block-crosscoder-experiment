@@ -24,7 +24,9 @@ The normative contract is [docs/design.md](docs/design.md); the live
 paper-to-code matrix is [docs/paper_comparison.md](docs/paper_comparison.md).
 The source procedure ledgers are
 [docs/papers/block_methods.md](docs/papers/block_methods.md) and
-[docs/papers/crosscoders.md](docs/papers/crosscoders.md).
+[docs/papers/crosscoders.md](docs/papers/crosscoders.md). The in-place Phase-2
+gate correction and evidence carry-forward boundary are recorded in
+[docs/phase2_gate_review_2026-07-23.md](docs/phase2_gate_review_2026-07-23.md).
 
 ## Decision rule
 
@@ -40,9 +42,9 @@ forbidden.
 Candidates are aggregated across a complete seed set by median, then by the
 worst seed, with content ID as the deterministic final tie-break.
 Before panel freeze, the untouched scalar-RMS confirmation rerun must re-pass
-qualification and sharing on every seed and remain within `0.02` fixed-rate
-score of its exact development parent. This novel tolerance carries an
-executed `.01/.02/.05` sensitivity report and an ungated descriptive result.
+qualification on every seed and remain within `0.02` fixed-rate score of its
+exact development parent. This novel tolerance carries an executed
+`.01/.02/.05` sensitivity report; partial-view behavior remains descriptive.
 
 Phase 1 fixes one rank-two factor in four dimensions, exactly one width-two
 learner block, and one active factor/block. Three one-site
@@ -66,17 +68,14 @@ ratio on the content-bound first training batch, with independent targets
 `0/.01/.03/.10`. The inspected decoder-only nuclear penalty remains a
 nonpromotable release diagnostic.
 
-Main-chain Phase-2 admission requires, for both site-only and leave-one-out inference, a
-worst-site decoded-coordinate Lin concordance of at least `.80` in the
-all-site decoder-Gram geometry, including the mean-offset penalty, plus
-worst-site support-intersection recall of at least `.75` and decoded-energy
-coverage of at least `.90`. Parent- and root-relative partial-view FVU,
-support-IoU, and absolute-FVU safety guards remain conjunctive. All-view FVU
-advantage is reported only as a descriptive quantity; redundancy can be a
-legitimate shared feature.
-Comparator-family calibration reports these same endpoints but does not gate
-on them, preserving deliberately non-sharing baselines for the frozen Phase-3
-comparison. Its top-two union deduplicates resolved non-replicate execution
+Main-chain BSC and comparator-family promotion use the same real-model
+performance contract: complete scientific qualification and raw-space FVU at
+the three fixed total-rate budgets. Site-only and leave-one-out FVU,
+decoder-Gram concordance, support intersection, energy coverage, and functional
+dependence remain common descriptive endpoints. They test optional
+missing-view robustness; they are not admission requirements for an acausal
+crosscoder inferred jointly from all sites.
+Comparator-family top-two unions deduplicate resolved non-replicate execution
 signatures while preserving every stage/candidate alias.
 Every comparator family independently calibrates the same four peak learning
 rates: `3e-5`, `1e-4`, `2e-4`, and `3e-4`.

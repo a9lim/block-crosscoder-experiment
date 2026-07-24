@@ -1226,6 +1226,16 @@ def _parser() -> argparse.ArgumentParser:
     select_family_root.add_argument("--family", required=True)
     select_family_root.add_argument("--out", type=Path)
 
+    amend_phase2_gates = subparsers.add_parser(
+        "amend-phase2-gates",
+        help=(
+            "adopt the corrected common Phase-2 promotion gates while retaining "
+            "all existing trial evidence"
+        ),
+    )
+    amend_phase2_gates.add_argument("--root", type=Path, required=True)
+    amend_phase2_gates.add_argument("--out", type=Path)
+
     advance = subparsers.add_parser(
         "advance",
         help="append the next blueprint round from an immutable frozen selection",
@@ -1394,6 +1404,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             _print(campaign.select_stage(args.stage, out=args.out))
         elif args.command == "select-family-root":
             _print(campaign.select_family_root(args.family, out=args.out))
+        elif args.command == "amend-phase2-gates":
+            _print(campaign.apply_phase2_gate_amendment(out=args.out))
         elif args.command == "nominate-family-revisit":
             _print(campaign.select_family_revisit_inputs(args.family, out=args.out))
         elif args.command == "freeze-phase1":

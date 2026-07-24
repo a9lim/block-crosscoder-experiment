@@ -11,6 +11,8 @@ model-comparison project.
 - `docs/paper_comparison.md` — exact source bridges and live conditional matrix;
 - `docs/papers/block_methods.md` and `docs/papers/crosscoders.md` — primary-source
   procedure ledgers;
+- `docs/phase2_gate_review_2026-07-23.md` — common-gate correction and
+  evidence carry-forward boundary;
 - `docs/audit.md` — launch and adversarial-review gates;
 - `docs/findings.md` — evidence-bound reporting format.
 
@@ -51,8 +53,9 @@ preview cannot authorize registration.
   real evidence, revisits rank after masking, evaluates the complete three-
   score by two-hard-selector interaction, and tests learned group thresholding
   only as a bundled method at three coefficients. Its source-only model is a
-  descriptive nonpromotable anchor, while the sharing guard compares all-view
-  with partial-view inference on the same candidate.
+  descriptive nonpromotable anchor. All-view, site-only, and leave-one-out
+  endpoints are common diagnostics for BSC and comparator families; partial
+  views never gate promotion.
 - A candidate must have every declared seed; aggregate candidates by median,
   then worst seed, then content ID.
 - Phase 1 selection uses the worst normalized truth-identification margin. FVU
@@ -66,21 +69,17 @@ preview cannot authorize registration.
 - Smoke selections and frozen panels are protocol-only. They may drive the next
   stage only when that next stage is also smoke, including a smoke Phase 3;
   they can never authorize or feed non-smoke scientific Phase 3.
-- Phase-2 sharing admission is conjunctive for both site-only and leave-one-out
-  inference: worst-site decoded-coordinate Lin concordance in the all-site
-  decoder-Gram geometry, with the mean-offset penalty, is at least `.80`;
-  worst-site support-intersection recall is at least `.75`; decoded-energy
-  coverage is at least `.90`; and the parent/root-relative partial-view FVU,
-  support-IoU, and absolute-FVU safety gates pass. All-view FVU advantage is
-  descriptive only.
-- Winner-changing practical-effect, noninferiority, and sharing thresholds are
-  novel preregistered project policies, not paper values. Applicable selection
-  policies content-bind the complete threshold-sensitivity grid, and each
-  scientific selection artifact reports the marginal counterfactual pass sets
-  without retuning the center policy.
-- Comparator-family calibration reports the same sharing endpoints but does
-  not require the BSC sharing gate; otherwise a deliberately non-sharing paper
-  or control method could be filtered out before the frozen comparison panel.
+- BSC and comparator promotion use the same real-model performance standard:
+  complete qualification plus fixed-rate raw-space FVU. Method-specific
+  invariants verify that a declared method was executed correctly; they do not
+  add a capability hurdle that controls are not required to clear.
+- Site-only and leave-one-out FVU, concordance, support intersection, energy
+  coverage, and functional dependence remain fully reported. Operational
+  missing-view robustness is a secondary claim, not part of the standard
+  acausal crosscoder contract.
+- Winner-changing minimum-effect and noninferiority thresholds are novel
+  preregistered project policies, not paper values. Applicable selection
+  policies content-bind their complete threshold-sensitivity grid.
 - Decoder norm is not specificity; decoder capacity is not used dimension;
   aggregate reconstruction is not manifold recovery.
 - Development, confirmation, and final evaluation are disjoint. Never tune on

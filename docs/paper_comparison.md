@@ -297,33 +297,25 @@ revisit uses ordinary parent retention and emits no rank children when the
 selected mask is Bernoulli zero.
 
 The nonselectable confirmation round does not tune a gauge. Panel freeze uses
-the scalar-RMS rerun and requires every seed to re-pass qualification and the
-sharing guard while remaining within `0.02` fixed-rate score of its exact
-development parent. This is a novel project reproducibility rule, content-
-bound in the confirmation cells with a `.01/.02/.05` marginal sensitivity
-report and an ungated descriptive result; it is not attributed to a paper.
+the scalar-RMS rerun and requires every seed to re-pass qualification while
+remaining within `0.02` fixed-rate score of its exact development parent. This
+is a novel project reproducibility rule, content-bound in the confirmation
+cells with a `.01/.02/.05` marginal sensitivity report; it is not attributed
+to a paper.
 
-Every selected-parent/revisit development policy also freezes conjunctive
-sharing admission. For both site-only and leave-one-out inference, the
-worst-site decoded-coordinate Lin concordance in the all-site decoder-Gram
-geometry, with a mean-offset penalty, must be at least `.80`. Worst-site
-support-intersection recall and full-view decoded-energy coverage on that
-intersection must be at least `.75` and `.90`, respectively. Parent-relative
-site-only and leave-one-out FVU degradations remain capped at `.02`, their mean
-support-IoU drops at `.05`, root-relative FVU degradation at `.02`, and absolute
-partial-view FVU at `1.0`. The same-candidate all-view FVU advantage is reported
-only descriptively, not gated: redundant shared factors need not exhibit
-positive reconstruction synergy. This is not a comparison with the separately
-trained source-only anchor. Missing guard data fails before candidate
-aggregation.
+BSC selected-parent/revisit policies and comparator-family policies use the
+same real-model performance admission: complete scientific qualification and
+fixed-rate raw-space FVU. Site-only and leave-one-out FVU, decoder-Gram
+concordance, support intersection, energy coverage, and functional dependence
+remain common descriptive endpoints. A standard acausal crosscoder uses joint
+evidence; independent sufficiency of every site is a separate robustness claim,
+not part of the source architecture.
 
-These winner-changing practical-effect, noninferiority, and sharing thresholds
-are novel preregistered project policies, not values from any paper. Each
-applicable policy content-binds the complete sensitivity grid: minimum effect
-`0/.001/.002/.005`; noninferiority `.005/.01/.02`; FVU degradation
-`.01/.02/.05`; support-IoU drop `.02/.05/.10`; concordance, intersection recall,
-and decoded-energy coverage `.50/.80/.90`, `.50/.75/.90`, and `.75/.90/.95`,
-respectively; and absolute FVU `.75/1.0/1.25`.
+The winner-changing practical-effect and noninferiority thresholds are novel
+preregistered project policies, not values from any paper. Each applicable
+policy content-binds the complete sensitivity grid: minimum effect
+`0/.001/.002/.005`; noninferiority `.005/.01/.02`; and confirmation score
+degradation `.01/.02/.05`.
 Each selection artifact reports marginal counterfactual pass sets from the
 authenticated measurements without retuning the center policy.
 
@@ -520,10 +512,10 @@ model, trainer, saved codec, masked evaluation, exact resume, transfer object,
 and blueprint tests bind this boundary. Other frontier ideas remain outside
 the executable matrix until they receive the same complete contract.
 
-Gauge-invariant partial-view coordinate concordance is now mandatory admission
-evidence, not a future live cell. Its decoder-Gram Lin concordance, support
-intersection recall, and decoded-energy coverage separate support drift from
-coordinate drift for both site-only and leave-one-out inference. A
+Gauge-invariant partial-view coordinate concordance is a common diagnostic,
+not admission evidence. Its decoder-Gram Lin concordance, support intersection
+recall, and decoded-energy coverage separate support drift from coordinate
+drift for both site-only and leave-one-out inference. A
 fixed-support restricted least-squares refit gap remains the highest-priority
 contingent diagnostic; it opens a new inference round only after at least `.05`
 aligned-code R2, `.01` FVU, or a method-order reversal.
@@ -541,10 +533,10 @@ priority if its trigger fires, not permission to tune on confirmation.
 
 | Rank | Candidate and lineage | Untried hypothesis, confounds, and minimal controls | Phase-1 discriminator | Phase-2 endpoint and burden | Decision |
 |---:|---|---|---|---|---|
-| 1 | input-adaptive block count; **adapted** from SoftSAE | predict per-token `k`, train through soft selection, deploy hard variable-count blocks; compare token-TopK, BatchTopK, and learned threshold under the same mean total packet bits, because matching mean blocks is unfair across widths; guard soft-weight information hiding and soft/hard mismatch | on mixed 2/4/8-factor examples, require better count calibration and worst-rank support/coordinate recovery without split/merge regression | exact fixed-rate FVU and sharing guards; active-count field and every selector byte priced; high burden because the source selector/MLP substantially increases training cost | highest-priority contingent round only if fixed-count robustness fails; not live now |
+| 1 | input-adaptive block count; **adapted** from SoftSAE | predict per-token `k`, train through soft selection, deploy hard variable-count blocks; compare token-TopK, BatchTopK, and learned threshold under the same mean total packet bits, because matching mean blocks is unfair across widths; guard soft-weight information hiding and soft/hard mismatch | on mixed 2/4/8-factor examples, require better count calibration and worst-rank support/coordinate recovery without split/merge regression | exact fixed-rate FVU plus common partial-view diagnostics; active-count field and every selector byte priced; high burden because the source selector/MLP substantially increases training cost | highest-priority contingent round only if fixed-count robustness fails; not live now |
 | 2 | separate block gate and signed coordinate head; **adapted** from Gated SAE | let a scalar head choose support and a vector head estimate coordinates; exact-parent and parameter-matched encoder controls are required because the extra head may buy reconstruction rather than better support | support precision/recall, same-block aligned-code R2, and gate/contribution disagreement on amplitude/SNR stresses | fixed-rate FVU at matched events/packets plus parameter/FLOP reporting; roughly one extra encoder head | contingent on support errors with already-good subspaces; not live now |
 | 3 | heterogeneous block widths or sparse-within-block coordinates; **novel** | allocate different intrinsic dimensions in one dictionary; uniform-width winners, equal total coordinates, equal active coordinates, and exact rate are all controls; ragged amplitudes and coordinate masks must be serialized | mixed planted rank with recovery reported separately for rank 1/2/4/8, including wrong-rank splitting | fixed-rate FVU with variable packet lengths; high model/codec implementation burden | scientifically strong but reserve until uniform-width Phase 1 establishes the failure |
-| 4 | all-site versus masked-site code consistency; **novel**, adjacent to FMX masking | add a detached full-view teacher/code-agreement loss after masking; zero coefficient and masking-only parent isolate the loss; guard collapse and true layer-local features | site-only aligned-code R2 and factor recovery on shared versus one-site-span controls | site-only/leave-one-out FVU and support IoU under the existing sharing guard; about two encoder passes | contingent only if masking improves reconstruction while code drift remains |
+| 4 | all-site versus masked-site code consistency; **novel**, adjacent to FMX masking | add a detached full-view teacher/code-agreement loss after masking; zero coefficient and masking-only parent isolate the loss; guard collapse and true layer-local features | site-only aligned-code R2 and factor recovery on shared versus one-site-span controls | site-only/leave-one-out FVU and support IoU as common diagnostics; about two encoder passes | contingent only if masking improves reconstruction while code drift remains |
 | 5 | block-subspace incoherence; **adapted** from OrtSAE | replace scalar decoder cosine with a principal-angle/projector-overlap penalty; coefficient zero and a short ladder; correlated-truth controls prevent orthogonalizing real cofeatures | duplicate/mixing fractions and recovery while independently varying true factor-subspace overlap | fixed-rate FVU plus block-overlap and feature-duplication diagnostics; stochastic pair sampling adds modest cost | contingent on observed duplication/absorption, not prophylactic |
 | 6 | quantization/entropy-aware fine-tuning; **adapted** from learned compression | optimize a rate-distortion surrogate without changing the selected topology; exact post-hoc-codec parent and a frozen small multiplier ladder; price learned entropy models and reject oracle relaxation gains | not an identification selector; at most verify truth recovery is retained after fine-tuning | actual integer-packet frontier, not surrogate rate; moderate post-selection cost | finalist-only appendix candidate, never an upstream selection axis |
 | 7 | nested block prefixes; **adapted** from Matryoshka SAE | one ordered dictionary serves several widths/capacities; compare every prefix with an independently trained equal-size model; prefix order, loss weights, and dictionary ID coding are confounds | broad/specific planted factor recovery at each prefix and feature-continuity mapping across prefixes | every prefix's exact packet frontier; multiple reconstructions increase training cost | broad-rate appendix candidate after one stable family wins |

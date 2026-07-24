@@ -32,17 +32,15 @@ exit is not evidence by itself.
   diagnostic.
 - A later child stage is byte-for-byte derivable from its blueprint and frozen
   selected parent; arbitrary child manifests are refused.
-- Winner-changing minimum-effect, noninferiority, and sharing thresholds are
-  explicitly novel preregistered project policies, not paper values. Every
+- Winner-changing minimum-effect and noninferiority thresholds are explicitly
+  novel preregistered project policies, not paper values. Every
   applicable policy content-binds its rationale and complete sensitivity grid;
   each scientific selection artifact executes the marginal counterfactual
   pass sets, and observed evidence cannot retune the center policy.
-- The bound sensitivity grid is exactly: minimum effect
-  `0/.001/.002/.005`; noninferiority `.005/.01/.02`; partial-view FVU
-  degradation `.01/.02/.05`; support-IoU drop `.02/.05/.10`; coordinate
-  concordance `.50/.80/.90`; support-intersection recall `.50/.75/.90`;
-  decoded-energy coverage `.75/.90/.95`; and absolute partial-view FVU
-  `.75/1.0/1.25`.
+- The bound winner-changing grid is exactly: minimum effect
+  `0/.001/.002/.005`, noninferiority `.005/.01/.02`, and scalar-RMS
+  confirmation degradation `.01/.02/.05`. Partial-view sensitivity surfaces
+  are descriptive and never alter eligibility.
 
 ## 2. Method audit
 
@@ -544,19 +542,12 @@ exit is not evidence by itself.
   runs the full three-score by two-hard-selector interaction and the separate
   bundled group-threshold method round. Its source-only BSC is a descriptive
   nonpromotable anchor.
-- Every main-chain Phase-2 selected-parent/revisit selection enforces the frozen sharing
-  guards for both site-only and leave-one-out inference: worst-site
-  decoded-coordinate Lin concordance in the all-site decoder-Gram geometry,
-  with mean-offset penalty, is at least `.80`; worst-site support-intersection
-  recall is at least `.75`; and decoded-energy coverage is at least `.90`.
-  Parent- and root-relative partial-view FVU, support-IoU, and absolute-FVU
-  safety gates remain conjunctive. Same-candidate all-view FVU advantage is
-  descriptive only and is not compared with the separately trained source-only
-  anchor. The initial factorization round additionally requires its exact
-  selected-parent carrier.
-- Comparator-family cells report those same sharing endpoints but family
-  calibration, nomination, and revisit do not require BSC sharing admission;
-  an intentionally non-sharing comparator remains available for Phase 3.
+- Every Phase-2 main-chain and comparator-family selection uses the same
+  performance admission: complete seedwise scientific qualification and the
+  fixed-rate raw-space FVU policy. Site-only and leave-one-out concordance,
+  support, energy, FVU, and functional-dependence endpoints are common
+  diagnostics, never winner-changing gates. The initial factorization round
+  additionally requires its exact selected-parent carrier.
 - Every main-chain development round outside the specialized initial
   factorization policy declares an exact selected parent. Materialization
   retains one cell per resolved execution-value signature and records every
@@ -564,10 +555,10 @@ exit is not evidence by itself.
   after improving the fixed-rate score by at least `0.002` on every seed and
   on the median and worst-seed aggregates; confirmation remains nonselectable.
 - Panel freeze consumes only the untouched scalar-RMS confirmation rerun. Each
-  seed must re-pass scientific qualification and the sharing guard and remain
-  within `0.02` fixed-rate score of its exact development parent. The cells
-  label this as a novel reproducibility rule and bind the complete
-  `.01/.02/.05` marginal sensitivity surface plus the ungated result.
+  seed must re-pass scientific qualification and remain within `0.02`
+  fixed-rate score of its exact development parent. The cells label this as a
+  novel reproducibility rule and bind the complete `.01/.02/.05` marginal
+  sensitivity surface. Partial-view diagnostics remain reported.
 - Phase-2 factorization first requires the full free-site carrier to remain
   within `0.01` of the exact selected parent, then advances the lowest of rank
   `1`, rank `2`, rank `4`, and full that remains within `0.01` of full on every

@@ -121,6 +121,12 @@ PHASE1_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase1-campaign-manifest-v3"
 PANEL_DECISION_PRODUCER_SCHEMA = "bsc-phase3-panel-decision-v2"
 PHASE2_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase2-campaign-manifest-v3"
 SELECTION_UNIVERSE_SCHEMA = "bsc-phase2-selection-universe-v3"
+PHASE2_GATE_AMENDMENT_SCHEMA = "bsc-phase2-common-gate-amendment-v1"
+PHASE2_GATE_AMENDMENT_ARTIFACT_KIND = "phase2_gate_amendment"
+PHASE2_CODEC_DIAGNOSTIC_CHECKS = frozenset(
+    {"codec_calibration_exclusion", "codec_evaluation_exclusion"}
+)
+_AUTO_PHASE2_GATE_AMENDMENT = object()
 PHASE2_CAMPAIGN_MANIFEST_KEYS = frozenset(
     {
         "schema",
@@ -654,8 +660,9 @@ def _confirmation_score_sensitivity_payload(
     thresholds: Sequence[float],
     *,
     smoke: bool,
+    require_sharing_guard: bool,
 ) -> dict[str, Any]:
-    """Vary only the score cutoff while holding every center gate fixed."""
+    """Vary only the score cutoff while holding applicable center gates fixed."""
 
     sensitivity_rows = []
     for threshold in thresholds:
@@ -666,7 +673,10 @@ def _confirmation_score_sensitivity_payload(
                 row["seed"]
                 for row in rows
                 if row.get("qualification_passed") is True
-                and row.get("sharing_guard_passed") is True
+                and (
+                    not require_sharing_guard
+                    or row.get("sharing_guard_passed") is True
+                )
                 and Campaign._meets_upper_bound(
                     float(row["score_degradation"]), float(threshold)
                 )
@@ -689,7 +699,10 @@ def _confirmation_score_sensitivity_payload(
             if smoke
             else all(
                 row.get("qualification_passed") is True
-                and row.get("sharing_guard_passed") is True
+                and (
+                    not require_sharing_guard
+                    or row.get("sharing_guard_passed") is True
+                )
                 for row in rows
             )
         ),
@@ -2015,9 +2028,28 @@ def _validate_qualification_payload(
         }
         if cell.phase is Phase.PHASE1
         and cell.decision_map.get("data.normalization") == "layer"
-        else {}
+        else (
+            {
+                "codec_calibration_exclusion": (
+                    "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
+                ),
+                "codec_evaluation_exclusion": (
+                    "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
+                ),
+            }
+            if cell.phase is Phase.PHASE2
+            else {}
+        )
     )
-    if dict(inapplicable_checks) != expected_inapplicable_checks:
+    # Pre-amendment Phase-2 qualifications used the same numeric thresholds
+    # but enforced the two codec-exclusion checks. They remain authenticated
+    # evidence; the campaign amendment reinterprets only those negative
+    # outcomes during selection.
+    legacy_phase2_strict = cell.phase is Phase.PHASE2 and not inapplicable_checks
+    if (
+        dict(inapplicable_checks) != expected_inapplicable_checks
+        and not legacy_phase2_strict
+    ):
         raise ArtifactError(
             "scientific_outcome inapplicability disagrees with the resolved cell"
         )
@@ -2702,6 +2734,7 @@ class Campaign:
         self.blueprint_path = self.root / "blueprint.json"
         self.phase1_decision_path = self.root / "phase1-decision.json"
         self.panel_decision_path = self.root / "panel-decision.json"
+        self.amendments_dir = self.root / "amendments"
         self.implementation_identity_path = self.root / "implementation-identity.json"
         self.implementation_identity_lock_path = self.root / ".implementation.lock"
         self.mutation_lock_path = self.root / ".mutation.lock"
@@ -4619,6 +4652,22 @@ class Campaign:
                     abs_tol=1e-12,
                 )
             )
+            if not confirmation_policy.require_sharing_guard:
+                expected_passed = qualification_passed and score_passed
+                if (
+                    row.get("sharing_guard") is not None
+                    or row.get("sharing_guard_passed") is not None
+                    or row.get("confirmation_score") != current_score
+                    or row.get("parent_score") != parent_score
+                    or row.get("score_degradation") != degradation
+                    or row.get("qualification_passed") is not qualification_passed
+                    or row.get("score_noninferiority_passed") is not score_passed
+                    or row.get("passed") is not expected_passed
+                ):
+                    raise CampaignError(
+                        "confirmation score-only noninferiority evidence is forged"
+                    )
+                continue
             guard = row.get("sharing_guard")
             if not isinstance(guard, Mapping):
                 raise CampaignError("confirmation lacks its sharing guard")
@@ -4824,6 +4873,7 @@ class Campaign:
             rows,
             PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY,
             smoke=smoke,
+            require_sharing_guard=confirmation_policy.require_sharing_guard,
         )
         if confirmation.get("score_degradation_sensitivity") != expected_sensitivity:
             raise CampaignError("confirmation score sensitivity evidence is forged")
@@ -6369,12 +6419,19 @@ class Campaign:
                         )
                     actual_metric = 0.0
                 else:
-                    if (
-                        qualification.get("scientific_outcome", {}).get("passed")
-                        is not True
-                    ):
+                    amendment = self._active_phase2_gate_amendment()
+                    interpretation = self._selection_qualification_interpretation(
+                        cell,
+                        qualification,
+                        None if amendment is None else amendment[0],
+                    )
+                    if interpretation["scientific_outcome_passed"] is not True:
                         raise CampaignError(
                             "selected parent failed its scientific outcome"
+                        )
+                    if interpretation["promotion_eligible"] is not True:
+                        raise CampaignError(
+                            "selected parent is not promotion eligible"
                         )
                     actual_metric = self._policy_metric(
                         qualification["selection_metrics"],
@@ -7349,22 +7406,58 @@ class Campaign:
         )
         if payload.get("implementation_sha256") != observed_digest:
             raise ArtifactError("preparation implementation digest is stale")
-        if not self.implementation_identity_path.exists():
-            raise ArtifactError(
-                "campaign lacks its registration-time implementation pin"
+        amendment = self._active_phase2_gate_amendment()
+        events = self._events_cached()
+        amendment_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("event") == "design_amendment"
+            ),
+            None,
+        )
+        registration_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("event") == "transition"
+                and event.get("previous") is None
+                and event.get("cell_id") == cell_id
+            ),
+            None,
+        )
+        uses_amended_implementation = bool(
+            amendment is not None
+            and amendment_index is not None
+            and registration_index is not None
+            and registration_index > amendment_index
+        )
+        if uses_amended_implementation:
+            assert amendment is not None
+            pinned_identity = amendment[0]["implementation_identity"]
+            expected_pinned_digest = amendment[0][
+                "implementation_identity_sha256"
+            ]
+        else:
+            if not self.implementation_identity_path.exists():
+                raise ArtifactError(
+                    "campaign lacks its registration-time implementation pin"
+                )
+            pinned = _read_json(self.implementation_identity_path)
+            if (
+                set(pinned)
+                != {
+                    "schema",
+                    "implementation_identity",
+                    "implementation_identity_sha256",
+                }
+                or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
+            ):
+                raise ArtifactError("campaign implementation pin is noncanonical")
+            pinned_identity = pinned.get("implementation_identity")
+            expected_pinned_digest = pinned.get(
+                "implementation_identity_sha256"
             )
-        pinned = _read_json(self.implementation_identity_path)
-        if (
-            set(pinned)
-            != {
-                "schema",
-                "implementation_identity",
-                "implementation_identity_sha256",
-            }
-            or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
-        ):
-            raise ArtifactError("campaign implementation pin is noncanonical")
-        pinned_identity = pinned.get("implementation_identity")
         if not isinstance(pinned_identity, Mapping):
             raise ArtifactError("campaign implementation pin lacks its identity")
         pinned_digest = _validate_implementation_identity(
@@ -7372,7 +7465,7 @@ class Campaign:
             scientific=False,
         )
         if (
-            pinned.get("implementation_identity_sha256") != pinned_digest
+            expected_pinned_digest != pinned_digest
             or pinned_digest != observed_digest
         ):
             raise ArtifactError(
@@ -8768,6 +8861,67 @@ class Campaign:
         }
 
     @staticmethod
+    def _selection_qualification_interpretation(
+        cell: CellSpec,
+        qualification: Mapping[str, Any],
+        gate_amendment: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        scientific_outcome = qualification.get("scientific_outcome")
+        scientific_passed = (
+            scientific_outcome.get("passed")
+            if isinstance(scientific_outcome, Mapping)
+            else None
+        )
+        promotion_eligible = qualification.get("promotion_eligible")
+        selection_mode = qualification.get("selection_eligibility_mode")
+        result = {
+            "scientific_outcome_passed": scientific_passed,
+            "promotion_eligible": promotion_eligible,
+            "selection_eligibility_mode": selection_mode,
+            "amended": False,
+            "amendment_id": None,
+            "original_failed_scientific_checks": [],
+        }
+        if gate_amendment is None or cell.phase is not Phase.PHASE2:
+            return result
+        Campaign._validate_phase2_gate_amendment_manifest(gate_amendment)
+        checks = (
+            scientific_outcome.get("checks")
+            if isinstance(scientific_outcome, Mapping)
+            else None
+        )
+        if not isinstance(checks, Mapping):
+            raise CampaignError(
+                f"qualification for {cell.cell_id} lacks scientific checks"
+            )
+        failed = sorted(name for name, passed in checks.items() if passed is not True)
+        result["amendment_id"] = gate_amendment["amendment_id"]
+        result["original_failed_scientific_checks"] = failed
+        if scientific_passed is True:
+            return result
+        can_reinterpret = bool(
+            failed
+            and set(failed).issubset(PHASE2_CODEC_DIAGNOSTIC_CHECKS)
+            and qualification.get("qualified") is True
+            and isinstance(qualification.get("checks"), Mapping)
+            and all(value is True for value in qualification["checks"].values())
+            and cell.decision_map.get("qualification.promotable") is True
+            and qualification.get("promotion_ineligible_reasons")
+            == ["scientific_outcome_failed"]
+            and qualification.get("selection_eligible_for_protocol_test") is False
+        )
+        if can_reinterpret:
+            result.update(
+                {
+                    "scientific_outcome_passed": True,
+                    "promotion_eligible": True,
+                    "selection_eligibility_mode": "scientific_promotion",
+                    "amended": True,
+                }
+            )
+        return result
+
+    @staticmethod
     def _selection_universe_from_evidence(
         stage_name: str,
         stage_cells: Sequence[CellSpec],
@@ -8777,6 +8931,7 @@ class Campaign:
         sharing_guard_for_cell: Callable[
             [CellSpec, Mapping[str, Any], SelectionPolicy], Mapping[str, Any]
         ],
+        gate_amendment: Mapping[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], bool]:
         """Replay a complete stage universe from authenticated qualifications.
 
@@ -8895,18 +9050,18 @@ class Campaign:
                     raise CampaignError(
                         f"qualified cell {cell.cell_id} lacks authenticated qualification evidence"
                     )
-                scientific_outcome = qualification.get("scientific_outcome")
-                scientific_passed = (
-                    scientific_outcome.get("passed")
-                    if isinstance(scientific_outcome, Mapping)
-                    else None
+                interpretation = Campaign._selection_qualification_interpretation(
+                    cell,
+                    qualification,
+                    gate_amendment,
                 )
+                scientific_passed = interpretation["scientific_outcome_passed"]
                 if scientific_passed is not True:
                     outcome_failure = True
-                promotion_eligible = qualification.get("promotion_eligible")
+                promotion_eligible = interpretation["promotion_eligible"]
                 if promotion_eligible is not True:
                     promotion_ineligible = True
-                selection_mode = qualification.get("selection_eligibility_mode")
+                selection_mode = interpretation["selection_eligibility_mode"]
                 if smoke_protocol_only and (
                     qualification.get("selection_eligible_for_protocol_test")
                     is not True
@@ -8928,18 +9083,19 @@ class Campaign:
                     if policy.require_sharing_guard and not smoke_protocol_only
                     else None
                 )
-                observations.append(
-                    {
-                        "cell_id": cell.cell_id,
-                        "seed": cell.seed,
-                        "metric": value,
-                        "sharing_guard": sharing_guard,
-                        "scientific_outcome_passed": scientific_passed,
-                        "promotion_eligible": promotion_eligible,
-                        "selection_eligibility_mode": selection_mode,
-                        "qualification_sha256": qualification_sha256,
-                    }
-                )
+                observation = {
+                    "cell_id": cell.cell_id,
+                    "seed": cell.seed,
+                    "metric": value,
+                    "sharing_guard": sharing_guard,
+                    "scientific_outcome_passed": scientific_passed,
+                    "promotion_eligible": promotion_eligible,
+                    "selection_eligibility_mode": selection_mode,
+                    "qualification_sha256": qualification_sha256,
+                }
+                if gate_amendment is not None:
+                    observation["qualification_interpretation"] = interpretation
+                observations.append(observation)
             if smoke_protocol_only and protocol_ineligible:
                 excluded.append(
                     {
@@ -8982,6 +9138,11 @@ class Campaign:
                 if item["sharing_guard"] is not None
                 and item["sharing_guard"].get("passed") is not True
             ]
+            sharing_gate_enforced = bool(
+                policy.require_sharing_guard
+                and not smoke_protocol_only
+                and gate_amendment is None
+            )
             values = [float(item["metric"]) for item in observations]
             candidate_record = {
                 "candidate_id": candidate_id,
@@ -9003,8 +9164,14 @@ class Campaign:
                 ),
                 "observations": observations,
             }
+            if gate_amendment is not None:
+                candidate_record["sharing_gate_enforced"] = sharing_gate_enforced
             sensitivity_population.append(candidate_record)
-            if failed_sharing_guards and not smoke_protocol_only:
+            if (
+                failed_sharing_guards
+                and not smoke_protocol_only
+                and sharing_gate_enforced
+            ):
                 excluded.append(
                     {
                         **candidate_record,
@@ -9069,6 +9236,9 @@ class Campaign:
         *,
         source_plan_id: str | None = None,
         policy_override: SelectionPolicy | None = None,
+        gate_amendment: Mapping[str, Any] | None | object = (
+            _AUTO_PHASE2_GATE_AMENDMENT
+        ),
     ) -> dict[str, Any]:
         """Compute a stage selection from the current complete live universe.
 
@@ -9087,6 +9257,34 @@ class Campaign:
         policy = stage.selection_policy if policy_override is None else policy_override
         if policy is None:
             raise CampaignError(f"stage {stage_name!r} has no selection policy")
+        active_amendment = self._active_phase2_gate_amendment()
+        if gate_amendment is _AUTO_PHASE2_GATE_AMENDMENT:
+            amendment_manifest = (
+                None if active_amendment is None else active_amendment[0]
+            )
+        elif gate_amendment is None:
+            amendment_manifest = None
+        elif isinstance(gate_amendment, Mapping):
+            amendment_manifest = self._validate_phase2_gate_amendment_manifest(
+                gate_amendment
+            )
+            if (
+                active_amendment is None
+                or amendment_manifest != active_amendment[0]
+            ):
+                raise CampaignError(
+                    "selection requested an amendment not active in this campaign"
+                )
+        else:
+            raise CampaignError("selection gate amendment argument is malformed")
+        amendment_envelope = (
+            None
+            if amendment_manifest is None
+            else {
+                "artifact_sha256": "sha256:" + active_amendment[1].sha256,
+                "manifest": amendment_manifest,
+            }
+        )
         normalized_evidence: dict[str, dict[str, Any]] = {}
         for cell in stage.cells:
             record = self.record(cell.cell_id)
@@ -9117,6 +9315,7 @@ class Campaign:
             policy,
             normalized_evidence,
             sharing_guard_for_cell=self._sharing_guard_result,
+            gate_amendment=amendment_manifest,
         )
         selected_candidates = _policy_retained_candidates(
             candidates,
@@ -9131,6 +9330,8 @@ class Campaign:
             "ranked_candidates": candidates,
             "excluded_candidates": excluded,
         }
+        if amendment_envelope is not None:
+            universe_payload["gate_amendment"] = amendment_envelope
         universe_sha256 = (
             "sha256:"
             + hashlib.sha256(
@@ -9168,6 +9369,8 @@ class Campaign:
                 "smoke_protocol_only" if smoke_protocol_only else "scientific_promotion"
             ),
         }
+        if amendment_envelope is not None:
+            body["gate_amendment"] = amendment_envelope
         payload = {
             **body,
             "selection_id": content_id(body, prefix="selection"),
@@ -9190,6 +9393,289 @@ class Campaign:
         )
         _write_immutable_json(destination, payload)
         return payload
+
+    @staticmethod
+    def _validate_phase2_gate_amendment_manifest(
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        expected_keys = {
+            "schema",
+            "amendment_id",
+            "source_phase2_blueprint_id",
+            "source_plan_id_at_adoption",
+            "journal_event_id_before_adoption",
+            "selection_policy_revision",
+            "qualification_reinterpretation",
+            "ratified_prior_selections",
+            "implementation_identity",
+            "implementation_identity_sha256",
+            "rationale",
+        }
+        if set(payload) != expected_keys:
+            raise CampaignError("Phase-2 gate amendment has a noncanonical field set")
+        if payload.get("schema") != PHASE2_GATE_AMENDMENT_SCHEMA:
+            raise CampaignError("Phase-2 gate amendment has the wrong schema")
+        if not isinstance(payload.get("source_phase2_blueprint_id"), str) or not str(
+            payload["source_phase2_blueprint_id"]
+        ).startswith("phase2-blueprint:"):
+            raise CampaignError("Phase-2 gate amendment lacks its blueprint binding")
+        if not isinstance(payload.get("source_plan_id_at_adoption"), str) or not str(
+            payload["source_plan_id_at_adoption"]
+        ).startswith("study:"):
+            raise CampaignError("Phase-2 gate amendment lacks its adoption plan")
+        prior_event_id = payload.get("journal_event_id_before_adoption")
+        if prior_event_id is not None and (
+            not isinstance(prior_event_id, str) or not prior_event_id
+        ):
+            raise CampaignError("Phase-2 gate amendment has an invalid journal cursor")
+        if payload.get("selection_policy_revision") != {
+            "common_promotion_contract": (
+                "integrity_complete_and_fixed_rate_raw_fvu_under_the_declared_"
+                "method_specific_validity_contract"
+            ),
+            "partial_view_role": "common_nonpromotional_diagnostic",
+            "sharing_gate_enforced": False,
+            "applies_to": "all_phase2_method_families",
+        }:
+            raise CampaignError("Phase-2 gate amendment has the wrong selection policy")
+        if payload.get("qualification_reinterpretation") != {
+            "allowed_original_failed_checks": sorted(
+                PHASE2_CODEC_DIAGNOSTIC_CHECKS
+            ),
+            "codec_exclusion_role": (
+                "diagnostic_because_excluded_events_are_priced_in_fixed_rate_distortion"
+            ),
+            "eligibility_rule": (
+                "integrity_complete_resolved_promotable_and_no_failed_scientific_"
+                "checks_outside_allowed_original_failed_checks"
+            ),
+        }:
+            raise CampaignError(
+                "Phase-2 gate amendment has the wrong qualification reinterpretation"
+            )
+        ratified = payload.get("ratified_prior_selections")
+        if not isinstance(ratified, list):
+            raise CampaignError("Phase-2 gate amendment lacks prior-selection evidence")
+        for row in ratified:
+            if (
+                not isinstance(row, Mapping)
+                or set(row)
+                != {
+                    "source_stage",
+                    "selection_artifact_sha256",
+                    "selection_ids",
+                    "selected_candidate_ids",
+                }
+                or not isinstance(row.get("source_stage"), str)
+                or not row["source_stage"]
+                or not isinstance(row.get("selection_artifact_sha256"), str)
+                or not str(row["selection_artifact_sha256"]).startswith("sha256:")
+                or not _is_sha256_hex(
+                    str(row["selection_artifact_sha256"]).removeprefix("sha256:")
+                )
+                or not isinstance(row.get("selection_ids"), list)
+                or not all(
+                    isinstance(item, str) and item.startswith("selection:")
+                    for item in row["selection_ids"]
+                )
+                or not isinstance(row.get("selected_candidate_ids"), list)
+                or not all(
+                    isinstance(item, str) and item.startswith("candidate:")
+                    for item in row["selected_candidate_ids"]
+                )
+            ):
+                raise CampaignError(
+                    "Phase-2 gate amendment has malformed prior-selection evidence"
+                )
+        implementation = payload.get("implementation_identity")
+        if not isinstance(implementation, Mapping):
+            raise CampaignError(
+                "Phase-2 gate amendment lacks its successor implementation identity"
+            )
+        observed_implementation_sha256 = _validate_implementation_identity(
+            implementation,
+            scientific=True,
+        )
+        if (
+            payload.get("implementation_identity_sha256")
+            != observed_implementation_sha256
+        ):
+            raise CampaignError(
+                "Phase-2 gate amendment implementation digest is invalid"
+            )
+        if payload.get("rationale") != (
+            "BSC receives deeper tuning as the target method, but promotion uses "
+            "the same reconstruction standard as controls; partial-view endpoints "
+            "measure cross-site behavior without presuming single-site sufficiency."
+        ):
+            raise CampaignError("Phase-2 gate amendment rationale is noncanonical")
+        body = dict(payload)
+        amendment_id = body.pop("amendment_id", None)
+        if amendment_id != content_id(body, prefix="phase2-gate-amendment"):
+            raise CampaignError("Phase-2 gate amendment content ID mismatch")
+        return dict(payload)
+
+    def _active_phase2_gate_amendment(
+        self,
+    ) -> tuple[dict[str, Any], ArtifactRef] | None:
+        matches = [
+            event
+            for event in self._events_cached()
+            if event.get("event") == "design_amendment"
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise CampaignError("campaign contains multiple Phase-2 gate amendments")
+        event = matches[0]
+        artifacts = event.get("artifacts")
+        if not isinstance(artifacts, list) or len(artifacts) != 1:
+            raise CampaignError("design-amendment event has invalid artifact evidence")
+        try:
+            ref = self._verify_artifact(ArtifactRef.from_dict(artifacts[0]))
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            raise CampaignError(f"invalid design-amendment artifact: {exc}") from exc
+        if ref.kind != PHASE2_GATE_AMENDMENT_ARTIFACT_KIND:
+            raise CampaignError("design-amendment event has the wrong artifact kind")
+        payload = self._validate_phase2_gate_amendment_manifest(
+            _read_json(ref.resolve(self.root))
+        )
+        metadata = event.get("metadata")
+        expected_metadata = {
+            "amendment_id": payload["amendment_id"],
+            "source_phase2_blueprint_id": payload["source_phase2_blueprint_id"],
+            "source_plan_id_at_adoption": payload["source_plan_id_at_adoption"],
+        }
+        if metadata != expected_metadata:
+            raise CampaignError("design-amendment journal binding mismatch")
+        blueprint = self._phase2_blueprint()
+        if payload["source_phase2_blueprint_id"] != blueprint.blueprint_id:
+            raise CampaignError("design amendment belongs to another blueprint")
+        return payload, ref
+
+    def apply_phase2_gate_amendment(
+        self,
+        *,
+        out: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Adopt the corrected common Phase-2 gate without discarding evidence."""
+
+        if self.plan.phase is not Phase.PHASE2:
+            raise CampaignError("the common-gate amendment applies only to Phase 2")
+        with self._registration_mutation():
+            existing = self._active_phase2_gate_amendment()
+            if existing is not None:
+                return existing[0]
+            blueprint = self._phase2_blueprint()
+            events = self._events_cached()
+            ratified: list[dict[str, Any]] = []
+            for event in events:
+                if event.get("event") != "plan_extension":
+                    continue
+                artifacts = event.get("artifacts")
+                if not isinstance(artifacts, list) or len(artifacts) != 1:
+                    raise CampaignError(
+                        "cannot ratify a malformed historical plan extension"
+                    )
+                ref = self._verify_artifact(ArtifactRef.from_dict(artifacts[0]))
+                if ref.kind != "stage_selection":
+                    continue
+                selection = _read_json(ref.resolve(self.root))
+                selected = selection.get("selected")
+                if not isinstance(selected, list) or not selected:
+                    raise CampaignError(
+                        "cannot ratify a historical selection without candidates"
+                    )
+                ratified.append(
+                    {
+                        "source_stage": str(selection["source_stage"]),
+                        "selection_artifact_sha256": "sha256:" + ref.sha256,
+                        "selection_ids": [
+                            str(item["selection_id"]) for item in selected
+                        ],
+                        "selected_candidate_ids": [
+                            str(item["candidate_id"]) for item in selected
+                        ],
+                    }
+                )
+            from .implementation import (  # noqa: PLC0415
+                implementation_identity,
+            )
+
+            implementation = implementation_identity()
+            implementation_sha256 = _validate_implementation_identity(
+                implementation,
+                scientific=True,
+            )
+            body = {
+                "schema": PHASE2_GATE_AMENDMENT_SCHEMA,
+                "source_phase2_blueprint_id": blueprint.blueprint_id,
+                "source_plan_id_at_adoption": self.plan.plan_id,
+                "journal_event_id_before_adoption": (
+                    None if not events else str(events[-1]["event_id"])
+                ),
+                "selection_policy_revision": {
+                    "common_promotion_contract": (
+                        "integrity_complete_and_fixed_rate_raw_fvu_under_the_declared_"
+                        "method_specific_validity_contract"
+                    ),
+                    "partial_view_role": "common_nonpromotional_diagnostic",
+                    "sharing_gate_enforced": False,
+                    "applies_to": "all_phase2_method_families",
+                },
+                "qualification_reinterpretation": {
+                    "allowed_original_failed_checks": sorted(
+                        PHASE2_CODEC_DIAGNOSTIC_CHECKS
+                    ),
+                    "codec_exclusion_role": (
+                        "diagnostic_because_excluded_events_are_priced_in_fixed_rate_distortion"
+                    ),
+                    "eligibility_rule": (
+                        "integrity_complete_resolved_promotable_and_no_failed_"
+                        "scientific_checks_outside_allowed_original_failed_checks"
+                    ),
+                },
+                "ratified_prior_selections": ratified,
+                "implementation_identity": implementation,
+                "implementation_identity_sha256": implementation_sha256,
+                "rationale": (
+                    "BSC receives deeper tuning as the target method, but promotion "
+                    "uses the same reconstruction standard as controls; partial-view "
+                    "endpoints measure cross-site behavior without presuming "
+                    "single-site sufficiency."
+                ),
+            }
+            payload = {
+                **body,
+                "amendment_id": content_id(body, prefix="phase2-gate-amendment"),
+            }
+            self._validate_phase2_gate_amendment_manifest(payload)
+            destination = _campaign_output_path(
+                self.root,
+                out,
+                self.amendments_dir / "phase2-common-gates.json",
+            )
+            _write_immutable_json(destination, payload)
+            ref = self._verify_artifact(
+                ArtifactRef.from_path(
+                    PHASE2_GATE_AMENDMENT_ARTIFACT_KIND,
+                    destination,
+                    root=self.root,
+                )
+            )
+            event = self._event(
+                "design_amendment",
+                "__campaign__",
+                message="adopted corrected common Phase-2 promotion gates",
+                metadata={
+                    "amendment_id": payload["amendment_id"],
+                    "source_phase2_blueprint_id": blueprint.blueprint_id,
+                    "source_plan_id_at_adoption": self.plan.plan_id,
+                },
+                artifacts=(ref,),
+            )
+            self._append_event_locked(event)
+            return payload
 
     def _phase2_blueprint(self) -> Phase2Blueprint:
         if self.plan.phase.value != "phase2" or not self.blueprint_path.is_file():
@@ -9993,7 +10479,11 @@ class Campaign:
             confirmation_score = self._policy_metric(selection_metrics, policy)
             parent_score = self._policy_metric(parent_metrics, policy)
             degradation = parent_score - confirmation_score
-            sharing_guard = self._sharing_guard_result(cell, selection_metrics, policy)
+            sharing_guard = (
+                self._sharing_guard_result(cell, selection_metrics, policy)
+                if policy.require_sharing_guard
+                else None
+            )
             qualification_passed = bool(
                 qualification.get("scientific_outcome", {}).get("passed") is True
                 and qualification.get("promotion_eligible") is True
@@ -10009,7 +10499,14 @@ class Campaign:
                     abs_tol=1e-12,
                 )
             )
-            sharing_passed = sharing_guard.get("passed") is True
+            sharing_passed = (
+                sharing_guard.get("passed") is True
+                if sharing_guard is not None
+                else None
+            )
+            passed = qualification_passed and score_passed and (
+                not policy.require_sharing_guard or sharing_passed is True
+            )
             per_seed.append(
                 {
                     "seed": cell.seed,
@@ -10028,7 +10525,7 @@ class Campaign:
                     "qualification_passed": qualification_passed,
                     "score_noninferiority_passed": score_passed,
                     "sharing_guard_passed": sharing_passed,
-                    "passed": qualification_passed and score_passed and sharing_passed,
+                    "passed": passed,
                 }
             )
         return {
@@ -10039,7 +10536,10 @@ class Campaign:
             "score_degradation_threshold_basis": threshold_basis,
             "score_degradation_sensitivity": (
                 _confirmation_score_sensitivity_payload(
-                    per_seed, score_sensitivity, smoke=smoke
+                    per_seed,
+                    score_sensitivity,
+                    smoke=smoke,
+                    require_sharing_guard=policy.require_sharing_guard,
                 )
             ),
             "policy": policy.to_dict(),
