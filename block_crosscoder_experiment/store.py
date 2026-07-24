@@ -1743,58 +1743,6 @@ class StoreReader:
     def _shard_tokens(self, shard: str | dict, *, verify: bool = False) -> torch.Tensor:
         return self._shard_payload(shard, verify=verify)[0]
 
-    def _shard_row_ids(self, shard: str | dict) -> torch.Tensor:
-        """Load one shard's identity tensor without materializing activations."""
-        from safetensors import safe_open
-
-        record = (
-            next(s for s in self.manifest["shards"] if s["file"] == shard)
-            if isinstance(shard, str)
-            else shard
-        )
-        name = record["file"]
-        path = self.dir / name
-        with safe_open(path, framework="pt", device="cpu") as f:
-            header = f.metadata()
-            expected_header = {
-                "whitener_hash": self.whitener_hash,
-                "split": self.manifest["split"],
-                "shard_index": str(record["index"]),
-                "n_tokens": str(record["n_tokens"]),
-                "sites": json.dumps(self.manifest["sites"]),
-                "d_model": str(self.manifest["d_model"]),
-                "dtype": "bfloat16",
-                "content_sha256": record["content_sha256"],
-                "row_ids_sha256": record["row_ids_sha256"],
-                "row_id_width": str(record["row_id_width"]),
-                "row_ids_dtype": ROW_IDS_DTYPE_NAME,
-                "meta": json.dumps(self.manifest.get("meta", {}), sort_keys=True),
-            }
-            mismatches = {
-                key: {"header": header.get(key), "manifest": value}
-                for key, value in expected_header.items()
-                if header.get(key) != value
-            }
-            if mismatches:
-                raise ValueError(
-                    f"shard header mismatch in {path}: "
-                    + json.dumps(mismatches, sort_keys=True)
-                )
-            keys = set(f.keys())
-            if keys != {"acts", "row_ids"}:
-                raise ValueError(f"shard tensor set mismatch in {path}: {sorted(keys)}")
-            row_ids = f.get_tensor("row_ids")
-        if (
-            tuple(row_ids.shape) != (record["n_tokens"], record["row_id_width"])
-            or row_ids.dtype != ROW_IDS_DTYPE
-        ):
-            raise ValueError(
-                f"row identity payload mismatch in {path}: "
-                f"shape={tuple(row_ids.shape)} dtype={row_ids.dtype}; expected "
-                f"({record['n_tokens']}, {record['row_id_width']})/{ROW_IDS_DTYPE}"
-            )
-        return row_ids
-
     def verify(self, *, expected_row_identity: Mapping[str, int] | None = None) -> int:
         """Re-hash every shard and optionally verify its exact row allocation."""
         if self.n_tokens <= 0 or not self.manifest["shards"]:
@@ -1927,28 +1875,6 @@ class StoreReader:
         if carry_x is not None and carry_x.shape[0]:
             assert carry_ids is not None
             yield carry_x, carry_ids
-
-    def sequential_row_id_batches(self, batch_size: int) -> Iterator[torch.Tensor]:
-        """Stored-order identities without loading the activation tensor."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        carry: torch.Tensor | None = None
-        for shard in self.manifest["shards"]:
-            row_ids = self._shard_row_ids(shard)
-            if carry is not None:
-                needed = batch_size - len(carry)
-                if len(row_ids) < needed:
-                    carry = torch.cat((carry, row_ids), dim=0)
-                    continue
-                yield torch.cat((carry, row_ids[:needed]), dim=0)
-                row_ids = row_ids[needed:]
-                carry = None
-            n_full = row_ids.shape[0] // batch_size * batch_size
-            for i in range(0, n_full, batch_size):
-                yield row_ids[i : i + batch_size]
-            carry = row_ids[n_full:] if row_ids.shape[0] > n_full else None
-        if carry is not None and carry.shape[0]:
-            yield carry
 
     def shuffled_batches(
         self,

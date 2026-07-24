@@ -213,24 +213,63 @@ def test_resolved_runtime_device_canonicalizes_implicit_cuda_index(
     assert _resolved_runtime_device("cpu") == torch.device("cpu")
 
 
-def test_row_interval_uses_identity_only_stream() -> None:
+def test_row_interval_uses_identity_only_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Reader:
         dir = Path("/identity-only")
         n_tokens = 4
 
-        def sequential_row_id_batches(self, batch_size):
-            assert batch_size == 65_536
-            yield torch.tensor([[2, 3, 10], [2, 4, 11]], dtype=torch.int64)
-            yield torch.tensor([[3, 0, 12], [3, 1, 13]], dtype=torch.int64)
-
         def sequential_batches_with_ids(self, batch_size):
             raise AssertionError("row interval loaded activation payload")
 
+    def identity_only_stream(reader, batch_size):
+        assert isinstance(reader, Reader)
+        assert batch_size == 65_536
+        yield torch.tensor([[2, 3, 10], [2, 4, 11]], dtype=torch.int64)
+        yield torch.tensor([[3, 0, 12], [3, 1, 13]], dtype=torch.int64)
+
+    monkeypatch.setattr(
+        run_cell_module,
+        "_sequential_row_id_batches",
+        identity_only_stream,
+    )
     assert _row_interval(Reader()) == {
         "first": [2, 3],
         "last": [3, 1],
         "count": 4,
     }
+
+
+def test_identity_only_stream_does_not_load_activation_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = torch.arange(1, 9 * 2 * 3 + 1).reshape(9, 2, 3).float()
+    row_ids = torch.stack((torch.arange(9), torch.arange(9) + 100), dim=1)
+    writer = ShardWriter(
+        tmp_path,
+        "train",
+        whitener_hash="row-only",
+        sites=(1, 2),
+        d_model=3,
+        tokens_per_shard=4,
+        free_space_floor_frac=0,
+    )
+    writer.add(values, row_ids)
+    writer.close()
+    reader = StoreReader(tmp_path, "train")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("row-only stream loaded activation payload")
+
+    monkeypatch.setattr(StoreReader, "_shard_payload", forbidden)
+    assert torch.equal(
+        torch.cat(
+            list(run_cell_module._sequential_row_id_batches(reader, batch_size=5))
+        ),
+        row_ids,
+    )
 
 
 @pytest.mark.parametrize(

@@ -1732,6 +1732,88 @@ def _apply_normalization(x: torch.Tensor, record: Mapping[str, Any]) -> torch.Te
     return result
 
 
+def _sequential_row_id_batches(
+    reader: StoreReader,
+    batch_size: int,
+) -> Iterator[torch.Tensor]:
+    """Read authenticated row identities without materializing activations.
+
+    This lives outside ``store.py`` deliberately: capture manifests bind that
+    producer module's complete source hash, while this is a campaign-consumer
+    optimization. The campaign has already authenticated the complete store;
+    the row-only pass still rechecks the shard container, header, shape, dtype,
+    and inexpensive row checksum against that immutable manifest.
+    """
+
+    from safetensors import safe_open
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    carry: torch.Tensor | None = None
+    manifest = reader.manifest
+    for record in manifest["shards"]:
+        path = reader.dir / record["file"]
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            header = handle.metadata()
+            expected_header = {
+                "whitener_hash": reader.whitener_hash,
+                "split": manifest["split"],
+                "shard_index": str(record["index"]),
+                "n_tokens": str(record["n_tokens"]),
+                "sites": json.dumps(manifest["sites"]),
+                "d_model": str(manifest["d_model"]),
+                "dtype": "bfloat16",
+                "content_sha256": record["content_sha256"],
+                "row_ids_sha256": record["row_ids_sha256"],
+                "row_id_width": str(record["row_id_width"]),
+                "row_ids_dtype": "int64",
+                "meta": json.dumps(manifest.get("meta", {}), sort_keys=True),
+            }
+            mismatches = {
+                key: {"header": header.get(key), "manifest": value}
+                for key, value in expected_header.items()
+                if header.get(key) != value
+            }
+            if mismatches:
+                raise CellExecutionError(
+                    f"shard header mismatch in {path}: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+            keys = set(handle.keys())
+            if keys != {"acts", "row_ids"}:
+                raise CellExecutionError(
+                    f"shard tensor set mismatch in {path}: {sorted(keys)}"
+                )
+            row_ids = handle.get_tensor("row_ids")
+        expected_shape = (record["n_tokens"], record["row_id_width"])
+        if tuple(row_ids.shape) != expected_shape or row_ids.dtype != torch.int64:
+            raise CellExecutionError(
+                f"row identity payload mismatch in {path}: "
+                f"shape={tuple(row_ids.shape)} dtype={row_ids.dtype}; expected "
+                f"{expected_shape}/torch.int64"
+            )
+        row_checksum = hashlib.sha256(
+            row_ids.contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+        if row_checksum != record["row_ids_sha256"]:
+            raise CellExecutionError(f"row identity checksum mismatch in shard {path}")
+
+        if carry is not None:
+            needed = batch_size - len(carry)
+            if len(row_ids) < needed:
+                carry = torch.cat((carry, row_ids), dim=0)
+                continue
+            yield torch.cat((carry, row_ids[:needed]), dim=0)
+            row_ids = row_ids[needed:]
+            carry = None
+        n_full = row_ids.shape[0] // batch_size * batch_size
+        for index in range(0, n_full, batch_size):
+            yield row_ids[index : index + batch_size]
+        carry = row_ids[n_full:] if row_ids.shape[0] > n_full else None
+    if carry is not None and carry.shape[0]:
+        yield carry
+
+
 def _row_interval(reader: StoreReader) -> dict[str, Any]:
     """Prove a split is strictly ordered and summarize its identity interval.
 
@@ -1744,7 +1826,7 @@ def _row_interval(reader: StoreReader) -> dict[str, Any]:
     first: tuple[int, int] | None = None
     previous: tuple[int, int] | None = None
     count = 0
-    for row_ids in reader.sequential_row_id_batches(65_536):
+    for row_ids in _sequential_row_id_batches(reader, 65_536):
         if row_ids.ndim != 2 or row_ids.shape[1] < 2:
             raise CellExecutionError(
                 f"store split {reader.dir} lacks (sequence, position) row identities"

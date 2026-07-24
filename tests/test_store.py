@@ -218,39 +218,9 @@ def test_writer_resume_rebuilds_exact_ordered_stream(tmp_path):
         observed_ids.append(ids)
     assert torch.equal(torch.cat(observed_x), values.to(torch.bfloat16))
     assert torch.equal(torch.cat(observed_ids), row_ids)
-    assert torch.equal(
-        torch.cat(list(reader.sequential_row_id_batches(5))),
-        row_ids,
-    )
     assert reader.verify() == 13
     assert manifest["format_version"] == 3
     assert manifest["row_ids_dtype"] == "int64"
-
-
-def test_row_id_stream_does_not_load_activation_payload(tmp_path, monkeypatch):
-    values = torch.arange(1, 9 * 2 * 3 + 1).reshape(9, 2, 3).float()
-    row_ids = torch.stack((torch.arange(9), torch.arange(9) + 100), dim=1)
-    writer = ShardWriter(
-        tmp_path,
-        "train",
-        whitener_hash="row-only",
-        sites=(1, 2),
-        d_model=3,
-        tokens_per_shard=4,
-        free_space_floor_frac=0,
-    )
-    writer.add(values, row_ids)
-    writer.close()
-    reader = StoreReader(tmp_path, "train")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("row-only stream loaded activation payload")
-
-    monkeypatch.setattr(reader, "_shard_payload", forbidden)
-    assert torch.equal(
-        torch.cat(list(reader.sequential_row_id_batches(5))),
-        row_ids,
-    )
 
 
 def test_writer_rejects_non_int64_row_ids_and_duplicate_sites(tmp_path):
