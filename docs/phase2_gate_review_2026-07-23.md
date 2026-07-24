@@ -51,7 +51,12 @@ Every post-amendment selection embeds the complete amendment manifest and
 artifact hash. New cells remain descendants of the existing campaign plan and
 use the amendment-pinned successor implementation identity. The runner
 schedules only cells newly materialized by corrected selections; it does not
-repeat an unchanged completed cell.
+repeat an unchanged completed cell. A later authenticated implementation
+amendment may repair evaluation or qualification orchestration for a cell
+already prepared under a predecessor, but it cannot change or resume that
+cell's preparation, training, or calibration kernel. The cell retains its
+original preparation and checkpoint provenance while the campaign journal
+binds the successor used for the read-only replay.
 
 The compact review export is retained at
 `/data/runs/archive/bsc-phase2-d84627e-pilot-evidence`. The full active campaign,

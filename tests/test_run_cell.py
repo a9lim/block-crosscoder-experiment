@@ -4326,6 +4326,58 @@ def test_frozen_fixed_rate_policy_is_independent_of_holdout_distortion(tmp_path)
     assert replay_plan["achieved_total_bits_per_token"] <= 6.0
 
 
+def test_phase2_preparation_successor_is_read_only_and_chain_authenticated():
+    prepared = implementation_module.implementation_identity()
+    current = {
+        **prepared,
+        "python_source_sha256": hashlib.sha256(
+            f"{prepared['python_source_sha256']}:successor".encode()
+        ).hexdigest(),
+    }
+    prepared_sha256 = run_cell_module._implementation_identity_sha256(prepared)
+    current_sha256 = run_cell_module._implementation_identity_sha256(current)
+    amendment = {
+        "predecessor_implementation_identity_sha256": prepared_sha256,
+        "implementation_identity": current,
+        "implementation_identity_sha256": current_sha256,
+    }
+    campaign = SimpleNamespace(
+        _phase2_implementation_amendments=lambda: ((amendment, None, 1),)
+    )
+    ctx = SimpleNamespace(
+        cell=SimpleNamespace(phase=Phase.PHASE2),
+        stage="evaluate",
+        campaign=campaign,
+    )
+    preparation = {
+        "implementation": prepared,
+        "implementation_sha256": prepared_sha256,
+    }
+    assert run_cell_module._phase2_preparation_successor_authorized(
+        ctx,
+        preparation,
+        current,
+    )
+
+    ctx.stage = "train"
+    assert not run_cell_module._phase2_preparation_successor_authorized(
+        ctx,
+        preparation,
+        current,
+    )
+    ctx.stage = "qualify"
+    assert not run_cell_module._phase2_preparation_successor_authorized(
+        ctx,
+        preparation,
+        {
+            **current,
+            "python_source_sha256": hashlib.sha256(
+                f"{current['python_source_sha256']}:unauthenticated".encode()
+            ).hexdigest(),
+        },
+    )
+
+
 def test_phase2_evaluator_metric_schema_resolves_through_live_policy() -> None:
     validation = _selection_validation_metrics(
         Phase.PHASE2,

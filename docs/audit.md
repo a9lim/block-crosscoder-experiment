@@ -434,7 +434,9 @@ exit is not evidence by itself.
   comparison with that pin, so no cell can win a first-preparation race and no
   launch pays an O(cells) scan. Every non-smoke phase requires
   the canonical executor and clean committed source; custom executor modules
-  are smoke-only.
+  are smoke-only. A Phase-2 implementation-amendment chain may authorize an
+  already prepared predecessor only for evaluation or qualification; prepare,
+  train, and calibrate continue to require the preparation's exact executor.
 - Implementation identity v2 binds the executable package bytes, exact imported
   dependency versions, Python/platform/Torch/CUDA build, numerical backend
   flags and environment, driver/cuDNN, and physical CUDA device identities.

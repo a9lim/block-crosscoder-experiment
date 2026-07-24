@@ -1347,6 +1347,43 @@ def _implementation_identity_sha256(identity: Mapping[str, Any]) -> str:
     return execution_identity_sha256(identity)
 
 
+def _phase2_preparation_successor_authorized(
+    ctx: _Context,
+    preparation: Mapping[str, Any],
+    current_implementation: Mapping[str, Any],
+) -> bool:
+    """Admit an authenticated post-prepare orchestration repair at read-only stages."""
+
+    if (
+        ctx.cell.phase is not Phase.PHASE2
+        or ctx.stage not in {"evaluate", "qualify"}
+    ):
+        return False
+    amendments = ctx.campaign._phase2_implementation_amendments()
+    if not amendments:
+        return False
+    latest = amendments[-1][0]
+    current_sha256 = _implementation_identity_sha256(current_implementation)
+    if (
+        latest.get("implementation_identity") != current_implementation
+        or latest.get("implementation_identity_sha256") != current_sha256
+    ):
+        return False
+    preparation_identity = preparation.get("implementation")
+    preparation_sha256 = preparation.get("implementation_sha256")
+    if (
+        not isinstance(preparation_identity, Mapping)
+        or preparation_sha256
+        != _implementation_identity_sha256(preparation_identity)
+    ):
+        return False
+    authenticated_predecessors = {
+        str(payload["predecessor_implementation_identity_sha256"])
+        for payload, _ref, _event_index in amendments
+    }
+    return preparation_sha256 in authenticated_predecessors
+
+
 def _positive_int(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise CellExecutionError(f"{name} must be a positive integer")
@@ -4222,12 +4259,26 @@ def _load_preparation(path: Path, ctx: _Context) -> dict[str, Any]:
         raise CellExecutionError("preparation artifact binding mismatch")
     current_implementation = _implementation_identity()
     if payload.get("implementation") != current_implementation:
-        raise CellExecutionError(
-            "implementation changed after prepare; create a new content-addressed "
-            "campaign cell before executing another stage"
-        )
-    if payload.get("implementation_sha256") != _implementation_identity_sha256(
-        current_implementation
+        try:
+            successor_authorized = _phase2_preparation_successor_authorized(
+                ctx,
+                payload,
+                current_implementation,
+            )
+        except (CampaignError, KeyError, OSError, TypeError, ValueError) as exc:
+            raise CellExecutionError(
+                f"cannot authenticate Phase-2 preparation successor: {exc}"
+            ) from exc
+        if not successor_authorized:
+            raise CellExecutionError(
+                "implementation changed after prepare; create a new content-addressed "
+                "campaign cell before executing another stage"
+            )
+    implementation = payload.get("implementation")
+    if (
+        not isinstance(implementation, Mapping)
+        or payload.get("implementation_sha256")
+        != _implementation_identity_sha256(implementation)
     ):
         raise CellExecutionError("preparation implementation digest mismatch")
     cache_key = (ctx.cell.cell_id, ctx.artifact_sha256(path))
