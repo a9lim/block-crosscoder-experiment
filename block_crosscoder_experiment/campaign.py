@@ -1922,8 +1922,23 @@ def _validate_fixed_rate_evidence(
             "upper_name": bracket[1],
             "upper_q": upper["q"],
         }
-        if policy is not None and policy_row != expected_policy_row:
-            raise ArtifactError("fixed-rate policy row differs from executed evidence")
+        if policy is not None:
+            if aggregation == "worst_seed_frozen_parent":
+                frozen_names = [
+                    str(policy_row["lower_name"]),
+                    str(policy_row["upper_name"]),
+                ]
+                expected_policy_row = {
+                    "budget_bits_per_token": budget,
+                    "lower_name": frozen_names[0],
+                    "lower_q": point_by_name[frozen_names[0]]["q"],
+                    "upper_name": frozen_names[1],
+                    "upper_q": point_by_name[frozen_names[1]]["q"],
+                }
+            if policy_row != expected_policy_row:
+                raise ArtifactError(
+                    "fixed-rate policy row differs from its endpoint evidence"
+                )
 
     eligible = bool(rows) and eligible_rows == len(rows)
     if fixed_rate.get("eligible") is not eligible:

@@ -6503,7 +6503,13 @@ def test_fixed_rate_policy_rejects_self_rehashed_wrong_budget_grid():
 
 
 def test_frozen_replay_validator_saturates_within_declared_pair():
-    policy_row = {"lower_name": "q4", "upper_name": "q8"}
+    policy_row = {
+        "budget_bits_per_token": 6.0,
+        "lower_name": "q4",
+        "lower_q": 4,
+        "upper_name": "q8",
+        "upper_q": 8,
+    }
     upper_saturated = {
         "q4": {"total_bits_per_token": 1.0},
         "q8": {"total_bits_per_token": 2.0},
