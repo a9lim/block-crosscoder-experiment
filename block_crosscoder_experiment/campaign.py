@@ -123,6 +123,8 @@ PHASE2_CAMPAIGN_MANIFEST_SCHEMA = "bsc-phase2-campaign-manifest-v3"
 SELECTION_UNIVERSE_SCHEMA = "bsc-phase2-selection-universe-v3"
 PHASE2_GATE_AMENDMENT_SCHEMA = "bsc-phase2-common-gate-amendment-v1"
 PHASE2_GATE_AMENDMENT_ARTIFACT_KIND = "phase2_gate_amendment"
+PHASE2_IMPLEMENTATION_AMENDMENT_SCHEMA = "bsc-phase2-implementation-amendment-v1"
+PHASE2_IMPLEMENTATION_AMENDMENT_ARTIFACT_KIND = "phase2_implementation_amendment"
 PHASE2_CODEC_DIAGNOSTIC_CHECKS = frozenset(
     {"codec_calibration_exclusion", "codec_evaluation_exclusion"}
 )
@@ -7426,16 +7428,7 @@ class Campaign:
         )
         if payload.get("implementation_sha256") != observed_digest:
             raise ArtifactError("preparation implementation digest is stale")
-        amendment = self._active_phase2_gate_amendment()
         events = self._events_cached()
-        amendment_index = next(
-            (
-                index
-                for index, event in enumerate(events)
-                if event.get("event") == "design_amendment"
-            ),
-            None,
-        )
         registration_index = next(
             (
                 index
@@ -7446,38 +7439,56 @@ class Campaign:
             ),
             None,
         )
-        uses_amended_implementation = bool(
-            amendment is not None
-            and amendment_index is not None
-            and registration_index is not None
-            and registration_index > amendment_index
-        )
-        if uses_amended_implementation:
-            assert amendment is not None
-            pinned_identity = amendment[0]["implementation_identity"]
-            expected_pinned_digest = amendment[0][
-                "implementation_identity_sha256"
-            ]
-        else:
-            if not self.implementation_identity_path.exists():
-                raise ArtifactError(
-                    "campaign lacks its registration-time implementation pin"
-                )
-            pinned = _read_json(self.implementation_identity_path)
-            if (
-                set(pinned)
-                != {
-                    "schema",
-                    "implementation_identity",
-                    "implementation_identity_sha256",
-                }
-                or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
-            ):
-                raise ArtifactError("campaign implementation pin is noncanonical")
-            pinned_identity = pinned.get("implementation_identity")
-            expected_pinned_digest = pinned.get(
-                "implementation_identity_sha256"
+        if registration_index is None:
+            raise ArtifactError("cell lacks its registration event")
+        if not self.implementation_identity_path.exists():
+            raise ArtifactError(
+                "campaign lacks its registration-time implementation pin"
             )
+        pinned = _read_json(self.implementation_identity_path)
+        if (
+            set(pinned)
+            != {
+                "schema",
+                "implementation_identity",
+                "implementation_identity_sha256",
+            }
+            or pinned.get("schema") != CAMPAIGN_IMPLEMENTATION_SCHEMA
+        ):
+            raise ArtifactError("campaign implementation pin is noncanonical")
+        pinned_identity = pinned.get("implementation_identity")
+        expected_pinned_digest = pinned.get("implementation_identity_sha256")
+        gate = self._active_phase2_gate_amendment()
+        if gate is not None:
+            gate_index = next(
+                index
+                for index, event in enumerate(events)
+                if event.get("event") == "design_amendment"
+            )
+            successor_pins: list[tuple[int, Mapping[str, Any], str]] = [
+                (
+                    gate_index,
+                    gate[0]["implementation_identity"],
+                    str(gate[0]["implementation_identity_sha256"]),
+                )
+            ]
+            successor_pins.extend(
+                (
+                    event_index,
+                    amendment_payload["implementation_identity"],
+                    str(amendment_payload["implementation_identity_sha256"]),
+                )
+                for amendment_payload, _ref, event_index in (
+                    self._phase2_implementation_amendments()
+                )
+            )
+            applicable = [
+                item for item in successor_pins if item[0] < registration_index
+            ]
+            if applicable:
+                _index, pinned_identity, expected_pinned_digest = max(
+                    applicable, key=lambda item: item[0]
+                )
         if not isinstance(pinned_identity, Mapping):
             raise ArtifactError("campaign implementation pin lacks its identity")
         pinned_digest = _validate_implementation_identity(
@@ -9572,6 +9583,200 @@ class Campaign:
         if payload["source_phase2_blueprint_id"] != blueprint.blueprint_id:
             raise CampaignError("design amendment belongs to another blueprint")
         return payload, ref
+
+    @staticmethod
+    def _validate_phase2_implementation_amendment_manifest(
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if set(payload) != {
+            "schema",
+            "amendment_id",
+            "gate_amendment_id",
+            "source_plan_id_at_adoption",
+            "journal_event_id_before_adoption",
+            "predecessor_implementation_identity_sha256",
+            "implementation_identity",
+            "implementation_identity_sha256",
+            "reason",
+        }:
+            raise CampaignError(
+                "Phase-2 implementation amendment has a noncanonical field set"
+            )
+        if payload.get("schema") != PHASE2_IMPLEMENTATION_AMENDMENT_SCHEMA:
+            raise CampaignError("Phase-2 implementation amendment has the wrong schema")
+        if not isinstance(payload.get("gate_amendment_id"), str) or not str(
+            payload["gate_amendment_id"]
+        ).startswith("phase2-gate-amendment:"):
+            raise CampaignError(
+                "Phase-2 implementation amendment lacks its gate binding"
+            )
+        if not isinstance(payload.get("source_plan_id_at_adoption"), str) or not str(
+            payload["source_plan_id_at_adoption"]
+        ).startswith("study:"):
+            raise CampaignError(
+                "Phase-2 implementation amendment lacks its plan binding"
+            )
+        prior_event_id = payload.get("journal_event_id_before_adoption")
+        if not isinstance(prior_event_id, str) or not prior_event_id:
+            raise CampaignError(
+                "Phase-2 implementation amendment lacks its journal cursor"
+            )
+        predecessor = payload.get("predecessor_implementation_identity_sha256")
+        if not _is_sha256_hex(predecessor):
+            raise CampaignError(
+                "Phase-2 implementation amendment predecessor is malformed"
+            )
+        implementation = payload.get("implementation_identity")
+        if not isinstance(implementation, Mapping):
+            raise CampaignError(
+                "Phase-2 implementation amendment lacks its implementation"
+            )
+        observed = _validate_implementation_identity(implementation, scientific=True)
+        if payload.get("implementation_identity_sha256") != observed:
+            raise CampaignError(
+                "Phase-2 implementation amendment digest is invalid"
+            )
+        if payload.get("reason") != (
+            "orchestration_only_branch_advance_fix_no_cell_kernel_change"
+        ):
+            raise CampaignError(
+                "Phase-2 implementation amendment reason is noncanonical"
+            )
+        body = dict(payload)
+        amendment_id = body.pop("amendment_id", None)
+        if amendment_id != content_id(
+            body, prefix="phase2-implementation-amendment"
+        ):
+            raise CampaignError(
+                "Phase-2 implementation amendment content ID mismatch"
+            )
+        return dict(payload)
+
+    def _phase2_implementation_amendments(
+        self,
+    ) -> tuple[tuple[dict[str, Any], ArtifactRef, int], ...]:
+        gate = self._active_phase2_gate_amendment()
+        if gate is None:
+            return ()
+        gate_payload, _gate_ref = gate
+        predecessor = str(gate_payload["implementation_identity_sha256"])
+        result: list[tuple[dict[str, Any], ArtifactRef, int]] = []
+        for index, event in enumerate(self._events_cached()):
+            if event.get("event") != "implementation_amendment":
+                continue
+            artifacts = event.get("artifacts")
+            if not isinstance(artifacts, list) or len(artifacts) != 1:
+                raise CampaignError(
+                    "implementation-amendment event has invalid artifact evidence"
+                )
+            ref = self._verify_artifact(ArtifactRef.from_dict(artifacts[0]))
+            if ref.kind != PHASE2_IMPLEMENTATION_AMENDMENT_ARTIFACT_KIND:
+                raise CampaignError(
+                    "implementation-amendment event has the wrong artifact kind"
+                )
+            payload = self._validate_phase2_implementation_amendment_manifest(
+                _read_json(ref.resolve(self.root))
+            )
+            if (
+                payload["gate_amendment_id"] != gate_payload["amendment_id"]
+                or payload["predecessor_implementation_identity_sha256"]
+                != predecessor
+            ):
+                raise CampaignError(
+                    "Phase-2 implementation amendments do not form one chain"
+                )
+            metadata = event.get("metadata")
+            if metadata != {
+                "amendment_id": payload["amendment_id"],
+                "gate_amendment_id": payload["gate_amendment_id"],
+                "source_plan_id_at_adoption": payload[
+                    "source_plan_id_at_adoption"
+                ],
+            }:
+                raise CampaignError(
+                    "implementation-amendment journal binding mismatch"
+                )
+            predecessor = str(payload["implementation_identity_sha256"])
+            result.append((payload, ref, index))
+        return tuple(result)
+
+    def apply_phase2_implementation_amendment(
+        self,
+        *,
+        out: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Pin a successor executor after a non-kernel orchestration repair."""
+
+        if self.plan.phase is not Phase.PHASE2:
+            raise CampaignError("implementation amendments apply only to Phase 2")
+        with self._registration_mutation():
+            gate = self._active_phase2_gate_amendment()
+            if gate is None:
+                raise CampaignError(
+                    "implementation amendment requires the common-gate amendment"
+                )
+            chain = self._phase2_implementation_amendments()
+            predecessor = (
+                str(gate[0]["implementation_identity_sha256"])
+                if not chain
+                else str(chain[-1][0]["implementation_identity_sha256"])
+            )
+            from .implementation import implementation_identity  # noqa: PLC0415
+
+            implementation = implementation_identity()
+            implementation_sha256 = _validate_implementation_identity(
+                implementation,
+                scientific=True,
+            )
+            if implementation_sha256 == predecessor:
+                return gate[0] if not chain else chain[-1][0]
+            events = self._events_cached()
+            body = {
+                "schema": PHASE2_IMPLEMENTATION_AMENDMENT_SCHEMA,
+                "gate_amendment_id": gate[0]["amendment_id"],
+                "source_plan_id_at_adoption": self.plan.plan_id,
+                "journal_event_id_before_adoption": str(events[-1]["event_id"]),
+                "predecessor_implementation_identity_sha256": predecessor,
+                "implementation_identity": implementation,
+                "implementation_identity_sha256": implementation_sha256,
+                "reason": (
+                    "orchestration_only_branch_advance_fix_no_cell_kernel_change"
+                ),
+            }
+            payload = {
+                **body,
+                "amendment_id": content_id(
+                    body, prefix="phase2-implementation-amendment"
+                ),
+            }
+            self._validate_phase2_implementation_amendment_manifest(payload)
+            destination = _campaign_output_path(
+                self.root,
+                out,
+                self.amendments_dir
+                / f"phase2-implementation-{implementation_sha256[:12]}.json",
+            )
+            _write_immutable_json(destination, payload)
+            ref = self._verify_artifact(
+                ArtifactRef.from_path(
+                    PHASE2_IMPLEMENTATION_AMENDMENT_ARTIFACT_KIND,
+                    destination,
+                    root=self.root,
+                )
+            )
+            event = self._event(
+                "implementation_amendment",
+                "__campaign__",
+                message="pinned successor Phase-2 orchestration implementation",
+                metadata={
+                    "amendment_id": payload["amendment_id"],
+                    "gate_amendment_id": payload["gate_amendment_id"],
+                    "source_plan_id_at_adoption": self.plan.plan_id,
+                },
+                artifacts=(ref,),
+            )
+            self._append_event_locked(event)
+            return payload
 
     def apply_phase2_gate_amendment(
         self,
