@@ -6,7 +6,7 @@ choice that follows. Content IDs and hashes are provenance, not findings; they
 are kept in the campaign artifacts and summarized only in the
 footnotes.[^provenance][^artifacts]
 
-The evidence cutoff is **2026-07-24 22:21 PDT**. Phase 1 and the Phase-2 BSC
+The evidence cutoff is **2026-07-25 01:29 PDT**. Phase 1 and the Phase-2 BSC
 main chain through confirmation are complete. Comparator-family calibration
 is still running, so the comparator results below are within-family
 development results, not a final cross-family ranking.
@@ -364,8 +364,19 @@ fixed-rate reconstruction.
 
 ### Activity calibration
 
+**Question.** At a fixed family architecture and width, how many active
+coordinates produce the best fixed-rate reconstruction?
+
+**Baseline and alternatives.** Each family reran its current activity setting
+beside the declared lower- and higher-activity alternatives. The Grassmannian
+round added here uses its selected width-4 parent at 32 active coordinates as
+the baseline.
+
 | Family | Active coordinates | Seed 0 | Seed 1 | Within-family read |
 |---|---:|---:|---:|---|
+| BSF Grassmannian | 16 | 0.636630 | 0.679368 | worst |
+| BSF Grassmannian | 32 | 0.554592 | 0.564405 | baseline |
+| BSF Grassmannian | 64 | 0.547015 | 0.550264 | adopt |
 | decoder-weighted BatchTopK | 16 | 0.347461 | 0.348243 | adopt |
 | decoder-weighted BatchTopK | 32 | 0.472189 | 0.473224 | worse |
 | decoder-weighted BatchTopK | 64 | 0.716090 | 0.716882 | worst |
@@ -385,16 +396,54 @@ fixed-rate reconstruction.
 | Anthropic dense-L1 | 32 | 0.925101 | 0.924799 | adopt |
 | Anthropic dense-L1 | 64 | 0.937342 | 0.937187 | worse |
 
-**Interpretation.** Activity is method-dependent. The two BatchTopK scalar
-controls strongly favor 16 coordinates; SASA and dense-L1 favor 32; Group
-Lasso improves monotonically through 64. BSC does not yet have a comparative
-activity result: 32 is the only seed-complete candidate.
+**Interpretation.** Activity is method-dependent. Grassmannian and Group Lasso
+improve through 64 coordinates; the two BatchTopK scalar controls strongly
+favor 16; SASA and dense-L1 favor 32. BSC does not yet have a comparative
+activity result: 32 is the only seed-complete candidate. Grassmannian adopts
+64, improving both seeds over its 32-coordinate baseline.
 
 The BSC failures were narrow invariant failures, not missing jobs. Activity
 16 seed 1 and activity 64 seed 1 exceeded the bound Stiefel Gram-residual
 limit of `0.002` at `0.00213562` and `0.00200106`. The earlier width-2 seed 0
 failed the same invariant at `0.00236131`. Therefore the current activity-32
 choice must not be described as beating 16 and 64.
+
+### Learning-rate calibration
+
+**Question.** After each family selected its early structural settings, which
+learning rate best converts those settings into reconstruction quality?
+
+**Baseline and alternatives.** The current family parent used `1e-4`. Each
+round compared `3e-5`, `1e-4`, `2e-4`, and `3e-4` at the same 4M-token budget.
+
+| Family | Learning rate | Seed 0 | Seed 1 | Within-family read |
+|---|---:|---:|---:|---|
+| decoder-weighted BatchTopK | `3e-5` | 0.452081 | 0.453606 | worst |
+| decoder-weighted BatchTopK | `1e-4` | 0.347461 | 0.348243 | baseline |
+| decoder-weighted BatchTopK | `2e-4` | 0.318504 | 0.317965 | second |
+| decoder-weighted BatchTopK | `3e-4` | 0.306748 | 0.306378 | adopt |
+| scalar ReLU BatchTopK | `3e-5` | 0.708557 | 0.708556 | worst |
+| scalar ReLU BatchTopK | `1e-4` | 0.501047 | 0.502784 | baseline |
+| scalar ReLU BatchTopK | `2e-4` | 0.405054 | 0.406821 | second |
+| scalar ReLU BatchTopK | `3e-4` | 0.366868 | 0.370329 | adopt |
+| BSC shared coordinates | `3e-5` | 0.511555 | 0.509196 | worse |
+| BSC shared coordinates | `1e-4` | 0.400999 | 0.402115 | retained by eligibility |
+| BSC shared coordinates | `2e-4` | failed | qualified | seed-incomplete |
+| BSC shared coordinates | `3e-4` | failed | failed | seed-incomplete |
+
+**Interpretation.** Both scalar BatchTopK controls improve monotonically over
+the tested range and adopt `3e-4`: decoder-weighted BatchTopK improves its mean
+from about `0.34785` to `0.30656`, and scalar ReLU improves from about
+`0.50192` to `0.36860`. The BSC family branch behaves differently. Its higher
+rates crossed the bound Stiefel Gram-residual limit: `2e-4` seed 0 reached
+`0.00203324`, while `3e-4` seeds 0/1 reached `0.00201709` and `0.002127`
+against the `0.002` limit.
+
+**Adopted.** The two scalar controls adopt `3e-4`. The BSC family branch
+provisionally retains `1e-4` because it is the best seed-complete candidate;
+this is not evidence that `1e-4` reconstructs better than the failed higher
+rates. Its difference from the main-chain BSC's successful `3e-4` result is a
+real path/configuration-sensitivity warning to revisit at 16M.
 
 ### Dense-L1 coefficient calibration
 
@@ -412,16 +461,16 @@ not evidence for a practically meaningful coefficient effect.
 
 | Family | Choices supported so far |
 |---|---|
-| BSC shared coordinates | width 4; activity 32 provisional because flanks failed |
-| BSF Grassmannian | width 4 |
+| BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed |
+| BSF Grassmannian | width 4; 64 active coordinates |
 | BSF Group Lasso | width 2; 64 active coordinates |
 | SASA | width 2; 32 active coordinates |
 | Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break |
-| decoder-weighted BatchTopK | 16 active coordinates |
-| scalar ReLU BatchTopK | 16 active coordinates |
+| decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4` |
+| scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4` |
 
-The next family rounds are learning-rate and coefficient/activity follow-ups.
-No comparator is frozen and no cross-family winner is declared yet.
+Group-Lasso, SASA, and dense-L1 follow-up rounds are still running. No
+comparator is frozen and no cross-family winner is declared yet.
 
 ## Limitations and open reads
 
