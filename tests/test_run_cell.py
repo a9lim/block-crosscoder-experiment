@@ -4378,6 +4378,59 @@ def test_phase2_preparation_successor_is_read_only_and_chain_authenticated():
     )
 
 
+def test_load_preparation_allows_git_provenance_only_commit_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = implementation_module.implementation_identity()
+    prepared["provenance"]["git"]["commit"] = "1" * 40
+    current = copy.deepcopy(prepared)
+    current["provenance"]["git"]["commit"] = "2" * 40
+    prepared_sha256 = run_cell_module._implementation_identity_sha256(prepared)
+    assert (
+        run_cell_module._implementation_identity_sha256(current)
+        == prepared_sha256
+    )
+    path = tmp_path / "preparation.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": run_cell_module.PREPARATION_SCHEMA,
+                "cell_id": "cell:test",
+                "implementation": prepared,
+                "implementation_sha256": prepared_sha256,
+            }
+        )
+    )
+    ctx = SimpleNamespace(
+        cell=SimpleNamespace(cell_id="cell:test"),
+        cell_path=tmp_path / "cell.json",
+        artifact_sha256=lambda _path: "a" * 64,
+    )
+    monkeypatch.setattr(
+        run_cell_module,
+        "_implementation_identity",
+        lambda: current,
+    )
+    monkeypatch.setattr(
+        run_cell_module,
+        "_phase2_preparation_successor_authorized",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provenance-only commit changes must not require an amendment"
+        ),
+    )
+    monkeypatch.setattr(
+        run_cell_module,
+        "_validate_preparation_contract",
+        lambda *_args, **_kwargs: None,
+    )
+
+    loaded = run_cell_module._load_preparation(path, ctx)
+
+    assert loaded["implementation"] == prepared
+    assert loaded["implementation_sha256"] == prepared_sha256
+
+
 def test_phase2_evaluator_metric_schema_resolves_through_live_policy() -> None:
     validation = _selection_validation_metrics(
         Phase.PHASE2,

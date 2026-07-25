@@ -4258,7 +4258,10 @@ def _load_preparation(path: Path, ctx: _Context) -> dict[str, Any]:
     ):
         raise CellExecutionError("preparation artifact binding mismatch")
     current_implementation = _implementation_identity()
-    if payload.get("implementation") != current_implementation:
+    current_implementation_sha256 = _implementation_identity_sha256(
+        current_implementation
+    )
+    if payload.get("implementation_sha256") != current_implementation_sha256:
         try:
             successor_authorized = _phase2_preparation_successor_authorized(
                 ctx,
