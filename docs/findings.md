@@ -42,15 +42,16 @@ set, or development-only result as a finding.
 
 ## Evidence status
 
-This ledger contains immutable evidence available at **2026-07-24 18:09 PDT**.
+This ledger contains immutable evidence available at **2026-07-24 22:21 PDT**.
 Phase 1 and the Phase-2 BSC main chain through `confirmation_16m` are complete.
 The seven independently calibrated comparator-family branches are still in
-development and are not ranked here. Their qualified 1M-token roots are
-recorded as starting evidence, and the completed BSC-family width decision is
-recorded, but no root score is treated as a final cross-family result.
+development and are not ranked across families here. Their qualified 1M-token
+roots and every selection-complete 4M calibration round through this cutoff
+are recorded below, but no development score is treated as a final
+cross-family result.
 Phase-2 paths below are relative to the operational campaign root
 `/data/runs/bsc-phase2-d84627e`; its live plan at this cutoff was
-`study:9311a523d5b001dac8b97cf31234f2cb26104d3f421e49a6b57b9aa4b9da5353`.
+`study:05585e79c42292241786f9809400b669980ef75107766557f5c5e653ec4058e8`.
 
 For Phase 2, every scalar score below is the mean raw-space FVU at exactly
 256, 384, and 512 total bits/token. Lower is better. The serialized selection
@@ -566,14 +567,225 @@ These are immutable 1M-token root measurements, not final comparator results:
 | decoder-weighted BatchTopK | `candidate:e85da4c4e9e2d647d4fa1fb01b8f154ba8c1821161ec055aaae476a114d58a8e` | 0.559838 / 0.560133 | `selection:e183c111a35249ac74e71507d644a25966b15dba45eb4b770f9a7da060ccae44` | `sha256:dbc6a23802c29ce60cf865009536c1b9986a4e884fe7fc371ee5584f79f1560f` |
 | scalar ReLU BatchTopK | `candidate:f0695a29d8e31ba2af392e8b3ddf4ac08722d0473f8d2fa313624486ce6433e9` | 0.769379 / 0.770003 | `selection:da9f21629c00360ee68f2f5a27fd00bb4e2968e9f90bec34ccbb3260c06aa8f8` | `sha256:5f9e599f213b02dd917b767d1fa41cfdaf34229f75e1da1b42ed91627374f346` |
 
-The BSC family has one additional completed width decision:
-`selection:8996c3a45b82efd6892186651701d290a927170068fd2027f50b138fffae5522`
-selected width 4
-`candidate:de4533cfab5a4a0afe8ae8a6b7446212c1f47047eb87f38fc19bcaf762c7b931`
-at seed FVU `0.400998614` / `0.402115301`, ahead of width 8
-(`0.438543479` / `0.440344899`) and scalar width 1 (`0.545655121` /
-`0.544671998`). Its artifact SHA-256 is
-`sha256:458b5ace3c62394c5019109ffb4e2b5888fa198e559ae779b5016f37cbf131c6`.
+## Comparator-family 4M calibration ledger
+
+These are immutable within-family development decisions, not final family
+results. Each branch remains conditional and must complete every declared
+4M round plus its fresh 16M winner/runner-up revisit before cross-family
+comparison. “Retained” means that the selected value reproduced its parent;
+it does not imply a new improvement.
+
+| Family and stage | Selected factor | Seed 0 / 1 FVU | Result |
+|---|---|---:|---|
+| BSC shared coordinates, width | width 4 | 0.400999 / 0.402115 | best complete candidate; width 8 and scalar width 1 were worse |
+| BSF Group Lasso, width | width 2 | 0.954693 / 0.954702 | modest improvement from the 1M root, but absolute reconstruction remained poor |
+| SASA, width | width 2 | 0.378765 / 0.381171 | strong improvement from the 1M root |
+| Anthropic dense-L1, activity | 32 coordinates | 0.925101 / 0.924799 | small improvement; absolute reconstruction remained poor |
+| BSF Grassmannian, width | width 4 | 0.554592 / 0.564405 | width 4 beat widths 2 and 8 |
+| decoder-weighted BatchTopK, activity | 16 coordinates | 0.347461 / 0.348243 | large monotone gain from lower nominal activity |
+| scalar-ReLU BatchTopK, activity | 16 coordinates | 0.501047 / 0.502784 | lower nominal activity was again strongly favored |
+| BSC shared coordinates, activity | 32 coordinates | 0.400999 / 0.402115 | parent retained; the 16- and 64-coordinate candidates were seed-incomplete |
+| BSF Group Lasso, activity | 64 coordinates | 0.946401 / 0.946282 | 64 coordinates beat 32 and 16, though absolute reconstruction remained poor |
+| SASA, activity | 32 coordinates | 0.378765 / 0.381171 | parent retained; 16 and 64 coordinates were worse |
+| Anthropic dense-L1, coefficient | `3e-6` | 0.925072 / 0.924810 | selected from an essentially flat panel; absolute reconstruction remained poor |
+
+The corresponding immutable selection records are:
+
+- BSC width:
+  `selection:8996c3a45b82efd6892186651701d290a927170068fd2027f50b138fffae5522`,
+  artifact
+  `selections/bsc_shared_coordinates-family_bsc_shared_coordinates_width_4m-current-1784940900.json`
+  with SHA-256
+  `sha256:458b5ace3c62394c5019109ffb4e2b5888fa198e559ae779b5016f37cbf131c6`;
+  selected
+  `candidate:de4533cfab5a4a0afe8ae8a6b7446212c1f47047eb87f38fc19bcaf762c7b931`.
+  Cells were
+  `cell:2c480f6868bbaaeadc45874a1321ecfe4f02fb73b9ab1eb0353062518cb9e0bc`
+  and
+  `cell:f20da72bdd388e099bcc368d8f0b548993c5cf10569a4c406f872b1ecc30ecb0`;
+  qualification SHA-256 digests were
+  `sha256:ed775213410da8bd61673e0bb2939850ced3222e563e64cb9b229f5826d374b1`
+  and
+  `sha256:d0f011464cb5ced58d4aceef36451039cdb418f935bf42f63499db65a6b5e9a1`.
+- BSF Group Lasso width:
+  `selection:686707e93d0e76be2a2dcc6318f39f66f6850f99d8fc2c3abbb839130788379e`,
+  artifact
+  `selections/bsf_group_lasso-family_bsf_group_lasso_width_4m-current-1784941615.json`
+  with SHA-256
+  `sha256:76100ea0ef72c333d3b2318713697b4435fa1eb15b412ed3759c76896571bc42`;
+  selected
+  `candidate:3afc3199fd19004a03b8ff1a47dda1a82d7c4ebc488df9cd6593ba197dd4cf8c`.
+  Cells were
+  `cell:0a3a9ba072cadb7bc388f760c38cf7372d11a68826d8e3524b516d3556daff45`
+  and
+  `cell:c8187b3326bebd94c52e8c7e0e21c054e107dbbabfce56f03cc0e88932232435`;
+  qualification digests were
+  `sha256:1022ddc0a6773768c6f1858a4fdc09b46fea16b88dd2772d096da8bb24787319`
+  and
+  `sha256:bbf7b2371797cffcc8659ad4896bea56ceacb9be13dc6892ae55c5f87ccf6fe8`.
+- SASA width:
+  `selection:cf80719d69b0a5d0d585a116acf785baa6c4c4c20325d2b2e00442d986d140a4`,
+  artifact
+  `selections/sasa-family_sasa_width_4m-current-1784942314.json` with
+  SHA-256
+  `sha256:cad9abb59295e10119e7b9c17fcd8d123de4f4660a2210409941752c99c44799`;
+  selected
+  `candidate:73d8924b8c376bb11e3782a55cf3949de374e4419640460a4e7aaf51991b9e54`.
+  Cells were
+  `cell:33e69cc6d378adc6d37315bb35b7ff6f8987f8453ac786db47763904a402180f`
+  and
+  `cell:80157452e81806afec94a0aa929d5086db31435563d1ae08deabb71049a6c3f7`;
+  qualification digests were
+  `sha256:7138e374f3e809af4927619ac5ae64629da6188d671ba57886ffffc04b9a34b9`
+  and
+  `sha256:1c0a7d32b6cccd7de446cae2db51cb3088fc9d7a7e0a445093c608f6b4a43981`.
+- Anthropic dense-L1 activity:
+  `selection:2a57ca744c9cab6c26ea2b1d8882a492c5dd7a04ed87903ba3ac9129c2915bed`,
+  artifact
+  `selections/anthropic_dense_l1-family_anthropic_dense_l1_activity_4m-current-1784943014.json`
+  with SHA-256
+  `sha256:1b7d292a0d4195fa1c0b4daf879ce07f1218d35684a202fb5b742ccfccf48cd8`;
+  selected
+  `candidate:dd5445d34ddc0a2c810fb87708e21525a97e23f774d169074fe046314294af5d`.
+  Cells were
+  `cell:0073c951e83b361a5be36be2c0a29055e449b957e95b88c872d2383da8a78580`
+  and
+  `cell:8ccda87db57afd442a000312878a3914549cb38cef477a9c2ec693cbb442be9b`;
+  qualification digests were
+  `sha256:4175d481e77e16838ccac983a8fdfd36e5e5764a3c3cad7ded9bf120a2e47deb`
+  and
+  `sha256:3395054283ce12a39edf59d6bccbcc1ee0d85e770129ca00f0fcd55ea9b64c5c`.
+- BSF Grassmannian width:
+  `selection:4a4215a852b2b131daf538926299c7af70f68d9a9c3f49c8110655ee784db30f`,
+  artifact
+  `selections/bsf_grassmannian-family_bsf_grassmannian_width_4m-20260724T2125.json`
+  with SHA-256
+  `sha256:57f67cca21d21e76db9bee60fdb9ab8e606a7de37e5f0092dd4143735dcc2594`;
+  selected
+  `candidate:477c219932ca0db7a4af1efc4b635b49d80a856450f2650ed3a27483c1efbc0a`.
+  Cells were
+  `cell:789776a1ded4d208b1e7eb72d9481ccb415a8551f183b13f082c4a8eb0acdd8d`
+  and
+  `cell:fa18551de7769e27fef22cb970e66dc49360fb639048e3fb658b9a0b8da9454f`;
+  qualification digests were
+  `sha256:c9977f3785b4e27b49c3f7f3967d7548bb5a00f7d33eb27ab734a684e735107e`
+  and
+  `sha256:43a041f2d9571c10e730cceb29e6161f0e04a905b9307ced933b786059232af1`.
+- Decoder-weighted BatchTopK activity:
+  `selection:46d4252ade916148824e6f99d1c8600f54ae8177ab07069e6ae34e347264be61`,
+  artifact
+  `selections/decoder_weighted_batchtopk-family_decoder_weighted_batchtopk_activity_4m-20260724T2125.json`
+  with SHA-256
+  `sha256:0ed9b1d18103a556c53a61f949f218bed26c38914b865c7f085e05f8d7b328f8`;
+  selected
+  `candidate:5c9772eeb04fc6b316fb3d003cdc118c483ed1e4a93e910c900992d612625bad`.
+  Cells were
+  `cell:9c97d88dd96861bb425b86c5fe46e4ada208d03103b38bd5175c41b0c5f7a909`
+  and
+  `cell:7e14f042baa6771f8ae06db59f73e838ac596233a27927f0845446ad551df447`;
+  qualification digests were
+  `sha256:88b9df5b70e8dc0ce1dc538b66b8c30824908429e229b9134e55c753d18fc7a9`
+  and
+  `sha256:e2adf6bf9077d934521a72a05118123f80dceede928b858537bd48e068bcb509`.
+- Scalar-ReLU BatchTopK activity:
+  `selection:5ab9aa015391386dd06eded8cb59dae1133723395e8aedf1194a93ec427bb532`,
+  artifact
+  `selections/scalar_relu_batchtopk-family_scalar_relu_batchtopk_activity_4m-20260724T2125.json`
+  with SHA-256
+  `sha256:dc9de4071bb43d7592a8563ad20b8d219b980b7a33240b7b378243b9e33bb676`;
+  selected
+  `candidate:308b2c900fc75a4d52d3e62e5927258bf53f0296ff8096347ce973b452591f84`.
+  Cells were
+  `cell:9800229ead731afc9e280bcad1a3eebc29153b0b7e76411f5505c15f9c792a4c`
+  and
+  `cell:b628ddcf0b1dacbdc47cea25ea7556fc9e4231999507e1890b33189ce152a308`;
+  qualification digests were
+  `sha256:8376627ae321f1d64806f72d2a9ead5e2abb018ebdedd5c2db0d3994a78162b8`
+  and
+  `sha256:d37a5430b9ece171e7c25daf43bf27955de723735f4cc10e30cf2817806fb277`.
+- BSC activity:
+  `selection:ca071f910b7040af97504a14a90c96b143b74bcfdef646b74b1a2afcf6355c53`,
+  artifact
+  `selections/bsc_shared_coordinates-family_bsc_shared_coordinates_activity_4m-20260724T2125.json`
+  with SHA-256
+  `sha256:3f338336818536f72bcd92b73c7f83e957f229a9d64ea16c4c6bceca0786787f`;
+  selected
+  `candidate:09a734346a17f4ba10a9d910b3470cf696598bea6d167a9944d7d36dc128a691`.
+  Cells were
+  `cell:42be54bd367ae9745cffe5f345604f5c6755806bc5752927df0d67227a1c6e88`
+  and
+  `cell:be57242a6bd204401b5f6485bca057f98ab81aa7758d434e8cc7ac58ac724fd1`;
+  qualification digests were
+  `sha256:df61d4673a9f8c495f3607b35012d45a1b546f757cac0f4285ed62d615ec6aa5`
+  and
+  `sha256:a72a6cc463dbf23dc1708dd06c221bc0f8c726da374bb0247f5147f218040771`.
+- BSF Group Lasso activity:
+  `selection:f71e041c0720d9c86e939eb2d670c89b6a229ed596d8208693e83fb1c83b7bae`,
+  artifact
+  `selections/bsf_group_lasso-family_bsf_group_lasso_activity_4m-20260724T2125.json`
+  with SHA-256
+  `sha256:85ed34b08b397f9c249eb2a55ee024370b9e4eb2f2e7fbe84ee511fcb6d0aec7`;
+  selected
+  `candidate:1ec18158b3d87adcd43eedefcc651f9aae95f6cb6206ebccb5276f0f5c51c712`.
+  Cells were
+  `cell:b102906b3ea74660857635bd79f4241fe66a01a29e716eaf633723d9188e0e0b`
+  and
+  `cell:119c809bbf42d541f82f628325011f02012a75a2ec78e6a897906796bb16da62`;
+  qualification digests were
+  `sha256:1baeb9648be4d4f4d94e6be5155de7f3dca3f5595c21bf17d29afa50234f0277`
+  and
+  `sha256:4094bea058386bf6b60cfa20b272371ef93418913507c2f2ca7d3f82f082bcf8`.
+- SASA activity:
+  `selection:28d94a33557d70a3f43deed752f0c08075f1686071e8ea96086aa9c66acd14f2`,
+  artifact
+  `selections/sasa-family_sasa_activity_4m-20260724T2153.json` with
+  SHA-256
+  `sha256:d59bff6380f5a8fec4a28afdd8da59335c09af4e78395c18a93ea0ca9b4004f3`;
+  selected
+  `candidate:cbd56f68faa162a35af20b4508f0c896c03b6cc409d68871bf8679749bd75ea9`.
+  Cells were
+  `cell:94aa94b436d69a7b90317514feaaed909c119dbc4937b7e0e8e737032032e562`
+  and
+  `cell:6095b045ce285b53c13c0d52acb94f2e640645a000bb060aa048ed5dc27d07a4`;
+  qualification digests were
+  `sha256:6eebacb69a5f0a9ba0d75127c6c3a0938ea5561eba718e20f83763a35b2e4a67`
+  and
+  `sha256:e088b5dece5e37c9ba29b6d1ba93cf6dfa2d13f02e9083b7e4ff8558f6827ab5`.
+- Anthropic dense-L1 coefficient:
+  `selection:a02f0e629b377de89d7816245508210e5dbe9c4b4dd7142ae36467c29e68f103`,
+  artifact
+  `selections/anthropic_dense_l1-family_anthropic_dense_l1_coefficient_4m-20260724T2158.json`
+  with SHA-256
+  `sha256:966494f8a5f48691a6b97f8c6281cd4f2066162bf2d0750a7e2fcf1cce3266e8`;
+  selected
+  `candidate:8348b518a23437d37817e797451e57f6a8fcd25c11763befc66459dd6db39ad8`.
+  Cells were
+  `cell:e63c8631aae935467ea79dad00c177e43c0be40f17752cfd70ac5cb4b4bb2184`
+  and
+  `cell:8924f25803d64adab2e5b9580f49bf1ca8390efd56b1d86626cc9962e2b0c93b`;
+  qualification digests were
+  `sha256:3cd0fdf19db9f748074700b9ef7d80e6f8fa384fb960d5a9ff3bf23e5891c724`
+  and
+  `sha256:8fc6c02de356c0768c7e2faeff16c4128330461f2f1ac7175bdf96fc043c3e9b`.
+  The median differences among coefficients `3e-6`, `1e-5`, and `3e-5`
+  were below `3e-5` FVU, so this is a deterministic within-panel selection,
+  not evidence of a practically meaningful coefficient effect.
+
+Comparator-family advancement used fresh immutable selection snapshots
+against each successive append-only plan. Those snapshots re-applied the same
+frozen policies to unchanged qualification evidence and retained the same
+candidates and metrics recorded above; their exact artifact paths and content
+IDs are bound in the six `extend` journal events that produced live plan
+`study:05585e79c42292241786f9809400b669980ef75107766557f5c5e653ec4058e8`.
+
+Three BSC-family training failures are part of the negative evidence, not
+missing observations. Width-2 seed 0 failed the bound Stiefel code-norm
+decoded-energy invariant at Gram residual `0.00236131` versus the `0.002`
+limit. In the later activity round, the 16-coordinate and 64-coordinate seed-1
+cells failed the same invariant at `0.00213562` and `0.00200106`.
+Consequently the activity-32 parent was the only seed-complete eligible
+candidate; its retention is not evidence that 32 was empirically superior to
+both flanking activity levels.
 
 ## Current limitations
 
