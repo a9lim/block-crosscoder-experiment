@@ -6,7 +6,7 @@ choice that follows. Content IDs and hashes are provenance, not findings; they
 are kept in the campaign artifacts and summarized only in the
 footnotes.[^provenance][^artifacts]
 
-The evidence cutoff is **2026-07-25 13:31 PDT**. Phase 1 and the Phase-2 BSC
+The evidence cutoff is **2026-07-25 15:35 PDT**. Phase 1 and the Phase-2 BSC
 main chain through confirmation are complete. Comparator-family calibration
 is still running, so the comparator results below are within-family
 development results, not a final cross-family ranking.
@@ -506,6 +506,29 @@ worsens both seeds, and cosine decay loses about `0.046`–`0.049` FVU.
 
 **Adopted.** Constant learning rate.
 
+### Grassmannian schedule calibration
+
+**Question.** After selecting width 4, 64 active coordinates, and LR `1e-4`,
+which schedule best trains the Grassmannian comparator?
+
+**Baseline and alternatives.** The learning-rate round used cosine decay to a
+minimum-rate ratio of `0.1`. The schedule round compared a constant rate,
+final-fifth linear decay, and cosine decay at the same 4M-token budget.
+
+| Schedule | Seed 0 | Seed 1 | Within-family read |
+|---|---:|---:|---|
+| constant | 0.527425 | 0.519631 | adopt |
+| final-fifth decay | 0.534878 | 0.531042 | second |
+| cosine decay | 0.555259 | 0.559218 | worst |
+
+**Interpretation.** Removing decay is a clear two-seed improvement. Relative
+to final-fifth decay, constant improves FVU by about `0.00745` in seed 0 and
+`0.01141` in seed 1; relative to cosine, the gains are about `0.02783` and
+`0.03959`. Thus the schedule inherited during learning-rate calibration was
+materially suboptimal for this family.
+
+**Adopted.** Constant learning rate.
+
 ### Group-Lasso coefficient calibration
 
 **Question.** Does stronger Group-Lasso pressure improve the selected
@@ -569,7 +592,7 @@ not evidence for a practically meaningful coefficient effect.
 | Family | Choices supported so far |
 |---|---|
 | BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed; constant schedule |
-| BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4` |
+| BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4`; constant schedule |
 | BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge |
 | SASA | width 2; 32 active coordinates; initial ratio `0.03` |
 | Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break; LR `3e-4` |
