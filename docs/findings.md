@@ -6,7 +6,7 @@ choice that follows. Content IDs and hashes are provenance, not findings; they
 are kept in the campaign artifacts and summarized only in the
 footnotes.[^provenance][^artifacts]
 
-The evidence cutoff is **2026-07-25 03:34 PDT**. Phase 1 and the Phase-2 BSC
+The evidence cutoff is **2026-07-25 11:31 PDT**. Phase 1 and the Phase-2 BSC
 main chain through confirmation are complete. Comparator-family calibration
 is still running, so the comparator results below are within-family
 development results, not a final cross-family ranking.
@@ -430,6 +430,10 @@ round compared `3e-5`, `1e-4`, `2e-4`, and `3e-4` at the same 4M-token budget.
 | BSC shared coordinates | `1e-4` | 0.400999 | 0.402115 | retained by eligibility |
 | BSC shared coordinates | `2e-4` | failed | qualified | seed-incomplete |
 | BSC shared coordinates | `3e-4` | failed | failed | seed-incomplete |
+| BSF Grassmannian | `3e-5` | 0.689111 | 0.690316 | worst |
+| BSF Grassmannian | `1e-4` | 0.547015 | 0.550264 | adopt |
+| BSF Grassmannian | `2e-4` | 0.563507 | 0.546668 | seed-discordant |
+| BSF Grassmannian | `3e-4` | 0.583864 | 0.544035 | seed-discordant |
 | Anthropic dense-L1 | `3e-5` | 0.938885 | 0.939382 | worst |
 | Anthropic dense-L1 | `1e-4` | 0.925072 | 0.924810 | baseline |
 | Anthropic dense-L1 | `2e-4` | 0.918056 | 0.917556 | second |
@@ -440,17 +444,61 @@ the tested range and adopt `3e-4`: decoder-weighted BatchTopK improves its mean
 from about `0.34785` to `0.30656`, and scalar ReLU improves from about
 `0.50192` to `0.36860`. Dense-L1 also improves monotonically, though it
 remains in a much higher-FVU regime: its mean falls from about `0.92494` at
-the baseline to `0.91534` at `3e-4`. The BSC family branch behaves
-differently. Its higher rates crossed the bound Stiefel Gram-residual limit:
-`2e-4` seed 0 reached `0.00203324`, while `3e-4` seeds 0/1 reached
+the baseline to `0.91534` at `3e-4`. Grassmannian is seed-discordant above
+`1e-4`: seeds 0 and 1 move in opposite directions, and the seed-0 degradation
+dominates the common median-then-worst rule. The BSC family branch behaves
+differently again. Its higher rates crossed the bound Stiefel Gram-residual
+limit: `2e-4` seed 0 reached `0.00203324`, while `3e-4` seeds 0/1 reached
 `0.00201709` and `0.002127` against the `0.002` limit.
 
-**Adopted.** The two scalar controls and dense-L1 adopt `3e-4`. The BSC
-family branch provisionally retains `1e-4` because it is the best
-seed-complete candidate; this is not evidence that `1e-4` reconstructs better
-than the failed higher rates. Its difference from the main-chain BSC's
-successful `3e-4` result is a real path/configuration-sensitivity warning to
-revisit at 16M.
+**Adopted.** The two scalar controls and dense-L1 adopt `3e-4`;
+Grassmannian adopts the stable `1e-4`. The BSC family branch provisionally
+retains `1e-4` because it is the best seed-complete candidate; this is not
+evidence that `1e-4` reconstructs better than the failed higher rates. Its
+difference from the main-chain BSC's successful `3e-4` result is a real
+path/configuration-sensitivity warning to revisit at 16M.
+
+### BSC family schedule calibration
+
+**Question.** On the independently calibrated family path, does learning-rate
+decay improve the width-four, 32-active-coordinate BSC parent?
+
+**Baseline and alternatives.** Constant `1e-4` was compared with final-fifth
+linear decay and cosine decay, holding the 4M-token budget fixed.
+
+| Schedule | Seed 0 | Seed 1 | Within-family read |
+|---|---:|---:|---|
+| constant | 0.400999 | 0.402115 | adopt |
+| final-fifth decay | 0.403183 | 0.406940 | worse |
+| cosine decay | 0.446923 | 0.450922 | much worse |
+
+**Interpretation.** Unlike the main-chain near miss at a different selected
+parent, decay is unambiguously harmful on this family path. Final-fifth decay
+worsens both seeds, and cosine decay loses about `0.046`–`0.049` FVU.
+
+**Adopted.** Constant learning rate.
+
+### Group-Lasso coefficient calibration
+
+**Question.** Does stronger Group-Lasso pressure improve the selected
+width-two, 64-active-coordinate comparator?
+
+**Baseline and alternatives.** Coefficients `3e-4`, `1e-3`, and `3e-3` were
+compared at the same architecture, optimizer, and 4M-token budget.
+
+| Coefficient | Seed 0 | Seed 1 | Within-family read |
+|---:|---:|---:|---|
+| `3e-4` | 0.946475 | 0.946385 | worst |
+| `1e-3` | 0.946401 | 0.946282 | second |
+| `3e-3` | 0.946193 | 0.946093 | adopt |
+
+**Interpretation.** The ordering is consistent across seeds, but the complete
+effect is tiny: increasing the coefficient across a factor of ten improves
+FVU by only about `0.00028`–`0.00029`. This does not repair Group Lasso's
+poor absolute reconstruction.
+
+**Adopted.** Coefficient `3e-3` as the complete numerical winner, without a
+claim of practically meaningful coefficient sensitivity.
 
 ### SASA coefficient calibration
 
@@ -492,18 +540,19 @@ not evidence for a practically meaningful coefficient effect.
 
 | Family | Choices supported so far |
 |---|---|
-| BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed |
-| BSF Grassmannian | width 4; 64 active coordinates |
-| BSF Group Lasso | width 2; 64 active coordinates; coefficient comparison being repaired after an orchestration-only interruption |
+| BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed; constant schedule |
+| BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4` |
+| BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge |
 | SASA | width 2; 32 active coordinates; initial ratio `0.03` |
 | Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break; LR `3e-4` |
 | decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4` |
 | scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4` |
 
-The Group-Lasso coefficient round had four cells interrupted before training
-by a concurrent plan-extension binding check; those exact cells are being
-resumed against the stable plan. No comparator is frozen and no cross-family
-winner is declared yet.
+The Group-Lasso coefficient round required exact resumptions after an
+orchestration-only plan-binding interruption; all six cells now qualify, and
+the reported numbers come from their preserved original checkpoints and
+evaluations. No comparator is frozen and no cross-family winner is declared
+yet.
 
 ## Limitations and open reads
 
