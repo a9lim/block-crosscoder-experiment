@@ -4402,9 +4402,11 @@ def test_load_preparation_allows_git_provenance_only_commit_change(
             }
         )
     )
+    cell_path = tmp_path / "cell.json"
+    cell_path.write_text("{}")
     ctx = SimpleNamespace(
         cell=SimpleNamespace(cell_id="cell:test"),
-        cell_path=tmp_path / "cell.json",
+        cell_path=cell_path,
         artifact_sha256=lambda _path: "a" * 64,
     )
     monkeypatch.setattr(
