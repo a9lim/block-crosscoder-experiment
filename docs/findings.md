@@ -6,7 +6,7 @@ choice that follows. Content IDs and hashes are provenance, not findings; they
 are kept in the campaign artifacts and summarized only in the
 footnotes.[^provenance][^artifacts]
 
-The evidence cutoff is **2026-07-25 11:31 PDT**. Phase 1 and the Phase-2 BSC
+The evidence cutoff is **2026-07-25 13:31 PDT**. Phase 1 and the Phase-2 BSC
 main chain through confirmation are complete. Comparator-family calibration
 is still running, so the comparator results below are within-family
 development results, not a final cross-family ranking.
@@ -458,6 +458,34 @@ evidence that `1e-4` reconstructs better than the failed higher rates. Its
 difference from the main-chain BSC's successful `3e-4` result is a real
 path/configuration-sensitivity warning to revisit at 16M.
 
+### Batch-size calibration
+
+**Question.** At their selected activity and learning rate, how large should
+the BatchTopK comparison pool be for the two scalar controls?
+
+**Baseline and alternatives.** Each control compared 2,048, 4,096, and 8,192
+batch tokens at the same 4M-token budget. For decoder-weighted BatchTopK,
+2,048 was already the selected learning-rate parent. For scalar ReLU
+BatchTopK, the learning-rate round had used 8,192.
+
+| Family | Batch tokens | Seed 0 | Seed 1 | Within-family read |
+|---|---:|---:|---:|---|
+| decoder-weighted BatchTopK | 2,048 | 0.306748 | 0.306378 | retain |
+| decoder-weighted BatchTopK | 4,096 | 0.311629 | 0.312291 | worse |
+| decoder-weighted BatchTopK | 8,192 | 0.336055 | 0.326738 | worse and seed-skewed |
+| scalar ReLU BatchTopK | 2,048 | 0.315028 | 0.314415 | adopt |
+| scalar ReLU BatchTopK | 4,096 | 0.329433 | 0.330948 | second |
+| scalar ReLU BatchTopK | 8,192 | 0.366868 | 0.370329 | prior parent; worst |
+
+**Interpretation.** Both controls prefer the smallest tested pool. The
+decoder-weighted result confirms its selected 2,048-token parent and worsens
+as the pool grows. Scalar ReLU changes much more: moving from its 8,192-token
+parent to 2,048 improves FVU by about `0.05184` in seed 0 and `0.05591` in
+seed 1. The agreement across seeds makes this a substantive calibration
+result rather than a tie-break.
+
+**Adopted.** Batch 2,048 for both scalar BatchTopK controls.
+
 ### BSC family schedule calibration
 
 **Question.** On the independently calibrated family path, does learning-rate
@@ -545,8 +573,8 @@ not evidence for a practically meaningful coefficient effect.
 | BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge |
 | SASA | width 2; 32 active coordinates; initial ratio `0.03` |
 | Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break; LR `3e-4` |
-| decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4` |
-| scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4` |
+| decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
+| scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
 
 The Group-Lasso coefficient round required exact resumptions after an
 orchestration-only plan-binding interruption; all six cells now qualify, and
