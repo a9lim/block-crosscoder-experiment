@@ -4,9 +4,10 @@ This is the scientific report for the BSC campaign. It is organized around
 the questions asked, the methods compared, the observed data, and the design
 choice that follows.
 
-The evidence cutoff is **2026-07-25 20:19 PDT**. Phase 1 is complete. Phase 2
-is in deadline-mode BSC boundary refinement. Comparator development is paused
-until the BSC finalist, confirmation, and feature geometry are complete.
+The evidence cutoff is **2026-07-26 09:48 PDT**. Phase 1 is complete. The
+deadline-critical Phase 2 BSC path is complete through two-seed 16M
+development, untouched confirmation, and controlled feature-geometry
+analysis. Comparator development remains paused.
 
 For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 256, 384, and 512 total-bit/token budgets; lower is better. Tables show seeds
@@ -14,36 +15,43 @@ For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 
 ## Bottom line
 
-Phase 1 showed that the BSC method can recover the planted shared vector
-factor rather than merely reconstructing its support. On real GPT-2
-activations, architecture and selector tuning reduced the 4M development FVU
-substantially. The newly adopted final-fifth schedule plus a 1,024-token
-BatchTopK pool now scores `0.290124774` and `0.291712653` on seeds 0 and 1,
-respectively, against `0.296505` and `0.297540` for the final-fifth,
-2,048-token parent. The mean improves from `0.297022500` to `0.290918713`.
-The 512-token boundary arm is running before warmup is tuned.
+Phase 1 showed that the BSC method can recover a planted shared vector factor
+rather than merely reconstructing its support. On real GPT-2 activations,
+architecture, selector, and optimizer tuning produced a two-seed 16M
+development FVU of **`0.241956` / `0.243194`**. The exact selected
+configuration then reproduced on untouched confirmation at
+**`0.237138` / `0.238543`**: both confirmation seeds improved, rather than
+merely staying within tolerance.
 
-The current boundary-refined BSC configuration is:
+The feature analysis also produced a real geometric result. Raw GPT-2 month
+centroids preserve calendar order at every captured layer and change from an
+open arc at blocks 3/5/7 into a closed ring at block 9. The learned BSC does
+not force that geometry into one seed-invariant ideal circle: the strongest
+joint month block is an arc in seed 0 and a distorted closed cycle in seed 1,
+with strongly non-random calendar path length in both.
+
+The selected BSC configuration is:
 
 | Surface | Adopted value | Why |
 |---|---|---|
 | model and sites | GPT-2 Small residual-pre blocks 3/5/7/9 | frozen real-model pilot contract |
-| normalization | scalar RMS | retained deployable gauge; fresh confirmation is pending |
+| normalization | scalar RMS | retained deployable gauge; reproduced on untouched confirmation |
 | encoder | joint untied linear, no bias, availability-rescaled site sum | tied Grassmann variants failed; removing initialization preconditioning was too small an improvement |
 | decoder | free-scale-controlled, no bias, concatenated-L2 block geometry | selected parent remained strongest valid architecture |
 | site factorization | rank 4 | noninferior to the full carrier and preferred by parsimony |
 | code | signed, 2,048 groups × width 4, 8 active blocks | width 4 won; 32 active coordinates remains the only fully qualified BSC activity setting so far |
 | score and selector | decoded energy + block BatchTopK | clear improvement over token-TopK and other score functions |
 | site masking | none | every positive masking treatment was worse |
-| optimizer | fused Adam, LR `3e-4`; batch 1,024 incumbent, 512 under test | batch 1,024 beat the final-fifth batch-2,048 parent in both seeds, so the lower boundary must be closed |
+| optimizer | fused Adam, LR `3e-4`, batch 512 | 512 beat 1,024 in both seeds; 256 then lost in both seeds, bracketing the local optimum |
 | schedule | final-fifth linear decay to zero | better than constant in both seeds |
-| warmup | 2% parent; 0% deferred until batch selection | warmup must be tuned only after the BatchTopK pool is fixed |
+| warmup | 0% | clearly better than 2% in both seeds, so the conditional 1% arm was elided |
 | regularizer | none | current finalist setting; not independently re-ablated under the boundary-refined optimizer |
 | auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window | current finalist setting; not independently re-ablated under the boundary-refined optimizer |
-| train budget | 16M unique rows and optimizer-token presentations | finalist pending |
+| train budget | 16M unique rows and optimizer-token presentations | qualified in both development and untouched confirmation seeds |
 
-This is not yet a frozen finalist. The batch boundary and then warmup must
-resolve, followed by fresh 16M development and scalar-RMS confirmation runs.
+This is the deadline-selected Phase 2 finalist. It is a two-seed development
+result with two-seed confirmation, not yet the five-seed Phase 3 publication
+panel.
 
 ## Phase 1: does BSC identify a shared vector factor?
 
@@ -131,8 +139,9 @@ the parent. Increasing width hurt reconstruction at a fixed total rate, while
 several capacity/activity changes were numerically unstable enough to fail
 the complete-seed contract.
 
-**Adopted.** Keep the preconditioned joint-untied carrier at width 4 and treat
-32 active coordinates as provisional pending a complete activity comparison.
+**Adopted.** Keep the preconditioned joint-untied carrier at width 4 and 32
+active coordinates. The activity alternatives remained seed-incomplete, so
+the complete parent is retained for the finalist.
 
 ### Site factorization and missing-site training
 
@@ -222,53 +231,129 @@ carrier into a strong reconstruction model?
 | LR revisit | `1e-4` | 0.352483 | 0.351713 | reject |
 | LR revisit | `3e-5` | 0.457663 | 0.456957 | reject |
 | final-fifth batch boundary | 2,048 parent | 0.296505 | 0.297540 | baseline |
-| final-fifth batch boundary | 1,024 | 0.290125 | 0.291713 | current incumbent |
-| final-fifth batch boundary | 512 | running | queued | lower-boundary test |
-| final-fifth warmup boundary | 0% | deferred | deferred | run only after batch selection |
+| final-fifth batch boundary | 1,024 | 0.290125 | 0.291713 | better |
+| final-fifth batch boundary | 512 | 0.287781 | 0.289787 | adopt |
+| final-fifth batch boundary | 256 | 0.291038 | 0.290427 | worse; closes the lower boundary |
+| final-fifth warmup boundary | 2% | 0.287781 | 0.289787 | baseline at selected batch |
+| final-fifth warmup boundary | 0% | 0.282590 | 0.281399 | adopt |
 
 **Interpretation.** Optimization, not architectural complexity, produced the
 largest improvement in the main chain. The higher learning rate and smaller
 BatchTopK comparison pool were robust in both seeds. The original fixed ladder
 stopped while learning rate, batch size, and warmup were still winning at
 tested boundaries. Final-fifth improves both seeds over constant. Reducing the
-BatchTopK pool from 2,048 to 1,024 improves FVU by `0.006380` and `0.005827`.
+BatchTopK pool from 2,048 to 1,024 improved FVU by `0.006380` and `0.005827`;
+512 improved by a further `0.002343` and `0.001926`. The next halving to 256
+lost `0.003257` and `0.000640`, so 512 is the first bracketed batch optimum.
+At batch 512, removing warmup improved FVU by `0.005192` and `0.008388`.
 
-**Adopted so far.** Adam at `3e-4` and final-fifth linear decay. Batch 1,024 is
-the incumbent, not yet the final choice. After batch is fixed, 0% warmup will
-be compared with the corresponding 2% parent; 1% runs only if 0% is tied or
-worse.
+**Adopted.** Adam at `3e-4`, batch 512, zero warmup, and final-fifth linear
+decay. Because 0% warmup clearly won both seeds, the conditional 1% arm was
+not needed.
 
-After batch and warmup resolve, the active path trains two 16M development
-cells with no regularizer and the SASA-style frequency-dead residual
-auxiliary, followed by two-seed scalar-RMS confirmation.
+### Full-budget development
+
+**Question.** Does the boundary-selected optimizer still deliver when the BSC
+is trained at the full 16M-row budget?
+
+| Evidence | Seed 0 | Seed 1 | Mean |
+|---|---:|---:|---:|
+| 4M selected parent | 0.282590 | 0.281399 | 0.281994 |
+| 16M development finalist | 0.241956 | 0.243194 | **0.242575** |
+
+**Interpretation.** Scaling the selected path from 4M to 16M improves FVU by
+`0.040633` and `0.038205`. Both cells qualified with the exact same
+architecture, scalar-RMS view, optimizer, no-regularizer setting, and
+frequency-dead residual auxiliary.
+
+**Adopted.** The two-seed 16M model is the Phase 2 development finalist.
 
 ## Confirmation on untouched data
 
 **Question.** Does the boundary-refined, final-fifth BSC reproduce on untouched
 scalar-RMS confirmation data?
 
-**Status.** Pending. Scalar RMS will run for both seeds after the 16M
-development finalist completes.
+| Evidence | Seed 0 | Seed 1 | Mean |
+|---|---:|---:|---:|
+| 16M development | 0.241956 | 0.243194 | 0.242575 |
+| untouched confirmation | 0.237138 | 0.238543 | **0.237841** |
+
+**Interpretation.** Confirmation improves on development by `0.004819` and
+`0.004650` FVU. The result therefore clears the most important deadline gate:
+the selected BSC is not a development-only numerical winner.
+
+**Adopted.** Confirm the exact 16M configuration for the presentation and
+carry it forward as the Phase 2 finalist.
 
 ## Feature geometry across layers
 
 **Question.** What shape do semantic manifolds take in the selected shared
 BSC code, and does that geometry change across GPT-2 layers?
 
-**Planned read.** The presentation analysis will pair controlled concept sets,
-including the twelve months, with the finalist's layer activations and shared
-block coordinates. It will produce consistently aligned 2D and 3D views for
-blocks 3, 5, 7, and 9 and for the joint BSC code. Ring structure will be
-measured rather than inferred from appearance: cyclic-neighbor preservation,
-closure, ring-versus-arc fit, and separation from a generic clustered
-alternative will accompany the plots.
+**Probe.** Twelve neutral prompt templates were crossed with all twelve
+single-token month names. At each month token, the analysis captured the four
+selected GPT-2 residual streams, subtracted each template's across-month mean,
+and averaged over templates. Raw residual panels use layerwise PCA followed by
+orthogonal Procrustes alignment to block 9. BSC panels use each layer's
+contribution to one learned width-four block in its native shared coordinate
+system; layers are never rotated independently. Each seed selects its own most
+month-responsive block using month contrast, absolute response energy, and
+actual BatchTopK selection frequency.[^geometry]
 
-**Interpretation boundary.** A ring in some layers but not others is a
-substantive developmental-geometry result. The analysis will preserve that
-layer dependence and will not force a circular projection when the learned
-geometry is an arc, cluster, fold, or diffuse cloud.
+**Raw GPT-2 geometry.**
 
-**Status.** Pending the finalist checkpoint.
+| Layer | Calendar-neighbor recall | Closure ratio | Cyclic distance correlation | Cycle-path p | Read |
+|---|---:|---:|---:|---:|---|
+| block 3 | 0.875 | 1.790 | 0.863 | <0.0001 | arc |
+| block 5 | 0.875 | 1.924 | 0.882 | <0.0001 | arc |
+| block 7 | 0.917 | 1.895 | 0.873 | <0.0001 | arc |
+| block 9 | 0.917 | 1.722 | 0.860 | <0.0001 | ring |
+
+The striking result is not “months form a ring” simpliciter. Calendar order is
+already strong at block 3, but December-to-January remains an open seam through
+blocks 3/5/7. The seam closes enough to meet the declared ring read only at
+block 9. Meanwhile, the variance captured by the first two dimensions rises
+from 39.2% to 43.4%.
+
+![Raw GPT-2 month geometry across layers](figures/phase2/month_raw_residual_layers_2d.png)
+
+**Learned BSC geometry.** The highest-response block is active in 100% of the
+probe rows under the trained BatchTopK selector in both seeds, but the
+factorization is not identical across random initializations.
+
+| Read | Seed 0, block 1681 | Seed 1, block 1631 |
+|---|---:|---:|
+| joint geometry | arc | distorted cycle |
+| calendar-neighbor recall | 0.417 | 0.583 |
+| closure ratio | 2.514 | 1.338 |
+| cyclic distance correlation | 0.305 | 0.394 |
+| cycle-path p | 0.00115 | <0.0001 |
+
+Seed 0 remains an arc at all four per-layer encoder contributions. Seed 1 is a
+distorted closed cycle at blocks 3/5/7, then reopens into an arc at block 9.
+The 3D views show that these are not artifacts of independently chosen 2D
+rotations: the BSC panels share one width-four projection basis within each
+seed.
+
+![Per-layer BSC month geometry in 2D](figures/phase2/month_bsc_layers_2d.png)
+
+![Per-layer BSC month geometry in 3D](figures/phase2/month_bsc_layers_3d.png)
+
+![Joint BSC month geometry](figures/phase2/month_bsc_joint_2d.png)
+
+![Top month-responsive BSC feature blocks](figures/phase2/month_bsc_feature_gallery_2d.png)
+
+**Interpretation.** The positive result is calendar topology rather than a
+perfect Euclidean circle. Raw GPT-2 residuals show a clean layer-dependent
+arc-to-ring transition. The BSC discovers blocks whose calendar traversal is
+far shorter than random label orderings and whose activation survives hard
+selection, but independent seeds choose different block bases and express the
+cycle as an arc or a distorted loop. BSC therefore preserves meaningful
+manifold structure without making a seed-stable, canonical-circle claim.
+
+The complete 2D/3D coordinates, top-block rankings, selection frequencies, and
+metric definitions are retained in
+[`month_geometry_metrics.json`](figures/phase2/month_geometry_metrics.json).
 
 ## Comparator-family development
 
@@ -546,16 +631,23 @@ cross-family winner is declared yet.
   five-seed publication claim.
 - The main chain is path-dependent. Family revisits test local order
   sensitivity but cannot make the search exhaustive.
-- Comparator roots use different architectures and source recipes. Only the
-  completed fresh 16M revisits will support the final comparison.
+- Comparator roots use different architectures and source recipes. Comparator
+  development is paused, so this report selects a BSC configuration but does
+  not declare a final cross-method winner.
 - High all-site reconstruction does not prove causal identifiability,
   semantic monosemanticity, or recovery of a global manifold.
 - Decoder norm is not specificity, decoder capacity is not used dimension,
   and aggregate reconstruction is not manifold recovery.
-- Feature-geometry plots are not yet findings. They will be generated from
-  the frozen finalist and paired activation/code rows after Phase 2 reaches a
-  terminal state.
+- The month probe is controlled and replicated across two trained seeds, but
+  it is exploratory rather than a preregistered semantic benchmark. Its
+  categorical shape labels summarize declared metrics; they do not prove a
+  unique latent ontology.
+- Deadline mode deferred broad campaign replay and control-family completion.
+  The exact winning BSC path, untouched confirmation, plot inputs, and rendered
+  figures were checked; broader protocol validation remains post-deadline work.
 
 [^metric]: Each cell evaluates the measured lower convex rate-distortion envelope at 256, 384, and 512 total bits/token, including fixed-width packet bits and amortized deployable-codec bytes. The schedule is executed on paired raw rows and never extrapolated. Development selection uses seeds 0 and 1, median then worst seed, and complete scientific qualification.
 
 [^setup]: Capture uses `openai-community/gpt2` revision `607a30d783dfa663caf39e06633721c8d4cfcd7e`, OpenWebText revision `b4325f019c648b1641a1784748667e8b74e5e064`, byte BPE, context length 128, and residual-pre hooks at blocks 3, 5, 7, and 9. Split sizes are 250k normalization-fit, 250k codec-calibration, 1M development, 1M confirmation, and 16M training rows, allocated by whole packed sequences. Forward and stored activation precision are bf16.
+
+[^geometry]: Calendar-neighbor recall asks whether each month's two nearest projected neighbors are its calendar neighbors. Closure is the December-to-January distance divided by the mean of the other calendar edges. The cycle-path p-value compares the closed calendar traversal with 20,000 fixed-seed random label permutations. The exploratory `ring` label requires neighbor recall at least 0.625, p at most 0.05, closure at most 1.75, and radial coefficient of variation at most 0.35; `arc` denotes a significant cycle with an open closure.
