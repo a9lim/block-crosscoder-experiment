@@ -4,10 +4,11 @@ This is the scientific report for the BSC campaign. It is organized around
 the questions asked, the methods compared, the observed data, and the design
 choice that follows.
 
-The evidence cutoff is **2026-07-26 09:48 PDT**. Phase 1 is complete. The
+The evidence cutoff is **2026-07-26 14:31 PDT**. Phase 1 is complete. The
 deadline-critical Phase 2 BSC path is complete through two-seed 16M
 development, untouched confirmation, and controlled feature-geometry
-analysis. Comparator development remains paused.
+analysis. The six comparator families have completed their declared
+same-hardware 4M calibration paths. No 16M comparator panel was run.
 
 For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 256, 384, and 512 total-bit/token budgets; lower is better. Tables show seeds
@@ -29,6 +30,11 @@ open arc at blocks 3/5/7 into a closed ring at block 9. The learned BSC does
 not force that geometry into one seed-invariant ideal circle: the strongest
 joint month block is an arc in seed 0 and a distorted closed cycle in seed 1,
 with strongly non-random calendar path length in both.
+
+All six control families also completed their declared 4M calibration. Their
+terminal within-family winners span FVU from about `0.301` for the two scalar
+BatchTopK controls to about `0.942` for Group Lasso. These are tuned
+development controls, not a direct 16M cross-method leaderboard.
 
 The selected BSC configuration is:
 
@@ -358,9 +364,10 @@ metric definitions are retained in
 ## Comparator-family development
 
 These branches ask a different question from the BSC main chain: how strong
-does each comparator become after receiving its own appropriate tuning?
-Scores cannot yet be compared as final method results because the branches
-are at different points in their calibration paths.
+does each comparator become after receiving its own appropriate tuning? All
+six declared 4M calibration paths are now selection-complete. Their scores
+describe tuned development controls; they are not final method results because
+the controls were not retrained at 16M or evaluated on confirmation.
 
 ### 1M starting baselines
 
@@ -611,19 +618,53 @@ carrier. Lengthening the dead window is actively harmful, losing about
 mean spread is about `1.6e-5` FVU. `3e-6` is the deterministic selected value,
 not evidence for a practically meaningful coefficient effect.
 
-### Current within-family choices
+### Schedule calibration for the remaining scalar controls
 
-| Family | Choices supported so far |
-|---|---|
-| BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4`; constant schedule |
-| BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge; LR `3e-4` |
-| SASA | width 2; 32 active coordinates; initial ratio `0.03`; frequency-dead residual auxiliary at weight `1/32` with a 1k window |
-| Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break; LR `3e-4` |
-| decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
-| scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
+**Question.** After activity, learning rate, and BatchTopK pool size were
+calibrated, which schedule best trains dense-L1 and the two scalar BatchTopK
+controls?
 
-All six Group-Lasso coefficient cells qualify. No comparator is frozen and no
-cross-family winner is declared yet.
+**Baseline and alternatives.** Each family compared a constant learning rate,
+final-fifth linear decay to zero, and cosine decay at the same 4M-token budget.
+All eighteen cells qualified.
+
+| Family | Schedule | Seed 0 | Seed 1 | Within-family read |
+|---|---|---:|---:|---|
+| Anthropic dense-L1 | constant | 0.903007 | 0.900963 | adopt |
+| Anthropic dense-L1 | final-fifth decay | 0.906638 | 0.905093 | second |
+| Anthropic dense-L1 | cosine decay | 0.915838 | 0.914834 | worst |
+| decoder-weighted BatchTopK | constant | 0.306748 | 0.306378 | second |
+| decoder-weighted BatchTopK | final-fifth decay | 0.301524 | 0.303207 | adopt |
+| decoder-weighted BatchTopK | cosine decay | 0.317660 | 0.319659 | worst |
+| scalar ReLU BatchTopK | constant | 0.304947 | 0.303965 | second |
+| scalar ReLU BatchTopK | final-fifth decay | 0.300033 | 0.301688 | adopt |
+| scalar ReLU BatchTopK | cosine decay | 0.318259 | 0.318039 | worst |
+
+**Interpretation.** Schedule preference is method-dependent. Dense-L1 favors
+constant rate, improving over final-fifth by `0.003632` and `0.004131` FVU.
+Both BatchTopK controls favor final-fifth decay: it improves the
+decoder-weighted control over constant by `0.005223` and `0.003171`, and the
+scalar-ReLU control by `0.004915` and `0.002278`. Cosine is clearly worst for
+all three families.
+
+**Adopted.** Constant rate for dense-L1; final-fifth linear decay for both
+scalar BatchTopK controls.
+
+### Selected 4M control configurations
+
+| Family | Adopted 4M configuration | Seed 0 | Seed 1 |
+|---|---|---:|---:|
+| BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4`; batch 8,192; 5% warmup; constant | 0.527425 | 0.519631 |
+| BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3`; LR `3e-4`; batch 8,192; 5% warmup; cosine to 10% LR | 0.942353 | 0.942001 |
+| SASA | width 2; 32 active coordinates; initial ratio `0.03`; LR `2e-4`; batch 4,096; 5% warmup; final-fifth decay; frequency-dead auxiliary weight `1/32`, 1k window | 0.371954 | 0.374356 |
+| Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6`; LR `3e-4`; batch 4,096; 5% warmup; constant | 0.903007 | 0.900963 |
+| decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048; 5% warmup; final-fifth decay | 0.301524 | 0.303207 |
+| scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048; 5% warmup; final-fifth decay | 0.300033 | 0.301688 |
+
+These are the authoritative within-family 4M selections. No cross-family
+winner is declared: doing so would require a separately authorized common
+budget and evaluation panel, which is outside this completed calibration
+pass.
 
 ## Limitations and open reads
 
@@ -631,9 +672,10 @@ cross-family winner is declared yet.
   five-seed publication claim.
 - The main chain is path-dependent. Family revisits test local order
   sensitivity but cannot make the search exhaustive.
-- Comparator roots use different architectures and source recipes. Comparator
-  development is paused, so this report selects a BSC configuration but does
-  not declare a final cross-method winner.
+- Comparator roots use different architectures and source recipes. Their 4M
+  tuning is complete, but they were not retrained at the BSC finalist's 16M
+  budget or evaluated on confirmation, so this report does not declare a final
+  cross-method winner.
 - High all-site reconstruction does not prove causal identifiability,
   semantic monosemanticity, or recovery of a global manifold.
 - Decoder norm is not specificity, decoder capacity is not used dimension,
@@ -642,9 +684,10 @@ cross-family winner is declared yet.
   it is exploratory rather than a preregistered semantic benchmark. Its
   categorical shape labels summarize declared metrics; they do not prove a
   unique latent ontology.
-- Deadline mode deferred broad campaign replay and control-family completion.
-  The exact winning BSC path, untouched confirmation, plot inputs, and rendered
-  figures were checked; broader protocol validation remains post-deadline work.
+- Deadline mode deferred broad campaign replay. The exact winning BSC path,
+  untouched confirmation, plot inputs, rendered figures, and terminal 4M
+  control selections were checked; broader protocol validation remains
+  post-deadline work.
 
 [^metric]: Each cell evaluates the measured lower convex rate-distortion envelope at 256, 384, and 512 total bits/token, including fixed-width packet bits and amortized deployable-codec bytes. The schedule is executed on paired raw rows and never extrapolated. Development selection uses seeds 0 and 1, median then worst seed, and complete scientific qualification.
 
