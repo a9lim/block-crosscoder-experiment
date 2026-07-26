@@ -42,7 +42,10 @@ from block_crosscoder_experiment.campaign import (
 from block_crosscoder_experiment.activation_identity import (
     activation_content_identity,
 )
-from block_crosscoder_experiment.cli.matrix import main as matrix_main
+from block_crosscoder_experiment.cli.matrix import (
+    _finalist_optimizer_aux_variants,
+    main as matrix_main,
+)
 from block_crosscoder_experiment.studies import (
     CellSpec,
     FrozenPanelEntry,
@@ -4877,6 +4880,35 @@ def test_advance_rechecks_cumulative_storage_before_appending(
         ]
     )
     assert Campaign(tmp_path).plan.stages[-1].name == blueprint.rounds[0].name
+
+
+def test_finalist_optimizer_aux_audit_is_the_complete_crossed_grid():
+    variants = _finalist_optimizer_aux_variants()
+    resolved = {
+        (
+            variant.name,
+            next(
+                decision.value
+                for decision in variant.decisions
+                if decision.name == "optimizer.learning_rate"
+            ),
+            next(
+                decision.value
+                for decision in variant.decisions
+                if decision.name == "auxiliary.coefficient"
+            ),
+        )
+        for variant in variants
+    }
+    assert resolved == {
+        ("lr_3e_minus_4__aux_none", 3e-4, 0.0),
+        ("lr_3e_minus_4__aux_1_over_32", 3e-4, 1 / 32),
+        ("lr_3e_minus_4__aux_one", 3e-4, 1.0),
+        ("lr_6e_minus_4__aux_none", 6e-4, 0.0),
+        ("lr_6e_minus_4__aux_1_over_32", 6e-4, 1 / 32),
+        ("lr_6e_minus_4__aux_one", 6e-4, 1.0),
+    }
+    assert len({variant.variant_id for variant in variants}) == 6
 
 
 def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(

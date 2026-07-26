@@ -27,6 +27,7 @@ from block_crosscoder_experiment.cli.data import (
     validate_transform_artifact_manifest,
 )
 from block_crosscoder_experiment.campaign import (
+    ArtifactRef,
     Campaign,
     CampaignError,
     CampaignRunner,
@@ -37,10 +38,14 @@ from block_crosscoder_experiment.store import NORMALIZATION_MODES, StoreReader, 
 from block_crosscoder_experiment.studies import (
     Budget,
     BudgetExceeded,
+    ChildVariant,
     FrozenSelection,
     Phase,
     Phase1Blueprint,
     Phase2Blueprint,
+    StageBlueprint,
+    StageSpec,
+    StudyPlan,
     StudyError,
     build_phase1_blueprint,
     build_phase1_plan,
@@ -51,9 +56,12 @@ from block_crosscoder_experiment.studies import (
     estimate_activation_store,
     estimate_plan,
     enforce_plan_resources,
+    derive_child_cell,
     materialize_child_plan,
     materialize_family_child_plan,
     materialize_family_revisit_plan,
+    merge_decisions,
+    novel,
 )
 
 _VERIFICATION_PROBE_BYTES = 64 * 1024
@@ -1049,6 +1057,302 @@ def _frozen_selection(
     return matches[0]
 
 
+def _finalist_optimizer_aux_variants() -> tuple[ChildVariant, ...]:
+    """Cross the two unresolved finalist axes under the adopted optimizer."""
+
+    variants: list[ChildVariant] = []
+    for learning_rate, learning_rate_label in (
+        (3e-4, "3e_minus_4"),
+        (6e-4, "6e_minus_4"),
+    ):
+        for auxiliary_label, auxiliary_decisions in (
+            (
+                "none",
+                (
+                    novel(
+                        "factor.auxiliary",
+                        "none",
+                        rationale="test the final optimizer without revival",
+                        ablation="compare zero, 1/32, and one auxiliary weight",
+                    ),
+                    novel(
+                        "objective.auxiliary",
+                        "none",
+                        rationale="disable residual re-encoding exactly",
+                        ablation="compare the complete frequency-dead residual bundle",
+                    ),
+                    novel(
+                        "auxiliary.count",
+                        1,
+                        rationale="retain the positive inert routing sentinel",
+                        ablation="active auxiliary arms use the selected eight blocks",
+                    ),
+                    novel(
+                        "auxiliary.coefficient",
+                        0.0,
+                        rationale="make auxiliary absence exact",
+                        ablation="compare zero, 1/32, and one",
+                    ),
+                    novel(
+                        "auxiliary.dead_frequency",
+                        0.0,
+                        rationale="disable dead-frequency filtering with no auxiliary",
+                        ablation="active arms retain the selected frequency threshold",
+                    ),
+                    novel(
+                        "auxiliary.dead_window_tokens",
+                        4096,
+                        rationale="retain an inert one-batch deadness sentinel",
+                        ablation="active arms retain the selected one-thousand-token window",
+                    ),
+                ),
+            ),
+            (
+                "1_over_32",
+                (
+                    novel(
+                        "factor.auxiliary",
+                        "sasa_dead_residual_aux",
+                        rationale="retain the selected frequency-dead residual method",
+                        ablation="compare no auxiliary and source weight",
+                    ),
+                    novel(
+                        "objective.auxiliary",
+                        "frequency_dead_residual",
+                        rationale="re-encode detached residual through frequency-dead blocks",
+                        ablation="compare the no-auxiliary carrier",
+                    ),
+                    novel(
+                        "auxiliary.count",
+                        8,
+                        rationale="match the selected block-event budget",
+                        ablation="report auxiliary event rate",
+                    ),
+                    novel(
+                        "auxiliary.coefficient",
+                        1 / 32,
+                        rationale="test the previously declared low auxiliary weight",
+                        ablation="compare zero and one",
+                    ),
+                    novel(
+                        "auxiliary.dead_frequency",
+                        1e-4,
+                        rationale="retain the selected SASA frequency criterion",
+                        ablation="vary only in a dedicated deadness study",
+                    ),
+                    novel(
+                        "auxiliary.dead_window_tokens",
+                        1000,
+                        rationale="retain the selected SASA token window",
+                        ablation="the prior long-window arm was already rejected",
+                    ),
+                ),
+            ),
+            (
+                "one",
+                (
+                    novel(
+                        "factor.auxiliary",
+                        "sasa_dead_residual_aux",
+                        rationale="retain the selected frequency-dead residual method",
+                        ablation="compare no auxiliary and low weight",
+                    ),
+                    novel(
+                        "objective.auxiliary",
+                        "frequency_dead_residual",
+                        rationale="re-encode detached residual through frequency-dead blocks",
+                        ablation="compare the no-auxiliary carrier",
+                    ),
+                    novel(
+                        "auxiliary.count",
+                        8,
+                        rationale="match the selected block-event budget",
+                        ablation="report auxiliary event rate",
+                    ),
+                    novel(
+                        "auxiliary.coefficient",
+                        1.0,
+                        rationale="retain SASA's source-relative auxiliary weight",
+                        ablation="compare zero and 1/32",
+                    ),
+                    novel(
+                        "auxiliary.dead_frequency",
+                        1e-4,
+                        rationale="retain the selected SASA frequency criterion",
+                        ablation="vary only in a dedicated deadness study",
+                    ),
+                    novel(
+                        "auxiliary.dead_window_tokens",
+                        1000,
+                        rationale="retain the selected SASA token window",
+                        ablation="the prior long-window arm was already rejected",
+                    ),
+                ),
+            ),
+        ):
+            variant_name = f"lr_{learning_rate_label}__aux_{auxiliary_label}"
+            variants.append(
+                ChildVariant(
+                    variant_name,
+                    merge_decisions(
+                        (
+                            novel(
+                                "factor.finalist_gap_audit",
+                                variant_name,
+                                rationale="bind the complete crossed finalist audit arm",
+                                ablation="compare every declared learning-rate and auxiliary combination",
+                            ),
+                            novel(
+                                "optimizer.learning_rate",
+                                learning_rate,
+                                rationale="close the remaining learning-rate boundary",
+                                ablation="compare 3e-4 with 6e-4 at every auxiliary weight",
+                            ),
+                        ),
+                        auxiliary_decisions,
+                    ),
+                )
+            )
+    return tuple(variants)
+
+
+def _append_finalist_optimizer_aux_audit(
+    campaign: Campaign,
+    *,
+    selection_path: Path,
+) -> StudyPlan:
+    """Append the post-confirmation 4M finalist gap audit.
+
+    This is an explicit protocol amendment, not a replay of the frozen Phase-2
+    blueprint.  It binds the already-selected 16M development finalist and
+    keeps confirmation evidence out of every tuning decision.
+    """
+
+    current = campaign.plan
+    if current.phase is not Phase.PHASE2:
+        raise StudyError("the finalist gap audit belongs only to Phase 2")
+    stage_name = "bsc_finalist_optimizer_aux_4m"
+    if any(stage.name == stage_name for stage in current.stages):
+        raise StudyError(f"{stage_name} is already materialized")
+    resolved_selection_path = selection_path
+    if not resolved_selection_path.is_absolute():
+        resolved_selection_path = campaign.root / resolved_selection_path
+    selection = _frozen_selection(resolved_selection_path)
+    if selection.source_stage != "bsc_final_16m":
+        raise StudyError("the finalist audit must bind the selected 16M development stage")
+    source_matches = [
+        stage for stage in current.stages if stage.name == selection.source_stage
+    ]
+    if len(source_matches) != 1:
+        raise StudyError("the selected 16M development stage is absent or ambiguous")
+    source_stage = source_matches[0]
+    if source_stage.selection_policy is None:
+        raise StudyError("the selected 16M development stage has no selection policy")
+    by_id = {cell.cell_id: cell for cell in source_stage.cells}
+    try:
+        parents = tuple(
+            sorted((by_id[cell_id] for cell_id in selection.cell_ids), key=lambda c: c.seed)
+        )
+    except KeyError as exc:
+        raise StudyError("the finalist selection names a cell outside its source stage") from exc
+    if tuple(cell.seed for cell in parents) != selection.seeds:
+        raise StudyError("the finalist selection seed order does not match its source cells")
+    if any(cell.candidate_id != selection.candidate_id for cell in parents):
+        raise StudyError("the finalist selection does not identify one candidate")
+
+    expected_parent_values = {
+        "optimizer.name": "adam",
+        "optimizer.learning_rate": 3e-4,
+        "optimizer.batch_tokens": 512,
+        "optimizer.warmup_fraction": 0.0,
+        "optimizer.schedule": "warmup_then_final_fifth_linear",
+        "optimizer.final_decay_fraction": 0.2,
+        "objective.regularizer": "none",
+        "objective.auxiliary": "frequency_dead_residual",
+        "auxiliary.coefficient": 1.0,
+    }
+    for parent in parents:
+        mismatches = {
+            name: parent.decision_map.get(name)
+            for name, expected in expected_parent_values.items()
+            if parent.decision_map.get(name) != expected
+        }
+        if mismatches:
+            raise StudyError(
+                "the 16M parent is not the selected finalist configuration: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+
+    blueprint = _registered_blueprint(campaign)
+    if not isinstance(blueprint, Phase2Blueprint):
+        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
+    stage_blueprint = StageBlueprint(
+        name=stage_name,
+        source_stage=source_stage.name,
+        source_policy_id=selection.policy_id,
+        train_tokens=4_000_000,
+        split="development",
+        variants=_finalist_optimizer_aux_variants(),
+        selection_policy=source_stage.selection_policy,
+        role="phase_local_tuning",
+        advancement="empirical_selection",
+    )
+    cells = tuple(
+        derive_child_cell(
+            parent,
+            parent_cells=parents,
+            selection=selection,
+            stage_blueprint=stage_blueprint,
+            variant=variant,
+            source_plan_id=current.plan_id,
+            source_blueprint_id=blueprint.blueprint_id,
+        )
+        for variant in stage_blueprint.variants
+        for parent in parents
+    )
+    child_stage = StageSpec(
+        stage_name,
+        cells,
+        depends_on=(source_stage.name,),
+        selection_policy=source_stage.selection_policy,
+    )
+    extended = StudyPlan(
+        name=current.name,
+        phase=current.phase,
+        stages=(*current.stages, child_stage),
+    )
+
+    frozen_evidence = _read_object(resolved_selection_path)
+    evidence_ref = ArtifactRef.from_path(
+        "stage_selection",
+        resolved_selection_path,
+        root=campaign.root,
+    )
+    journal_sha256 = (
+        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
+    )
+    campaign._commit_plan_extension(
+        current=current,
+        plan=extended,
+        child_stage=child_stage,
+        evidence_ref=evidence_ref,
+        frozen_evidence=frozen_evidence,
+        live_evidence=lambda: _read_object(resolved_selection_path),
+        journal_sha256=journal_sha256,
+        message="appended crossed 4M finalist optimizer and auxiliary audit",
+        metadata={
+            "previous_plan_id": current.plan_id,
+            "plan_id": extended.plan_id,
+            "stage": stage_name,
+            "branch": "bsc_finalist_gap_audit",
+            "source_stage": source_stage.name,
+            "selection_id": selection.selection_id,
+            "development_only": True,
+        },
+    )
+    return extended
+
+
 def _registered_blueprint(campaign: Campaign):
     payload = _read_object(campaign.blueprint_path)
     if campaign.plan.phase is Phase.PHASE1:
@@ -1251,6 +1555,21 @@ def _parser() -> argparse.ArgumentParser:
     amend_phase2_implementation.add_argument("--root", type=Path, required=True)
     amend_phase2_implementation.add_argument("--out", type=Path)
 
+    finalist_audit = subparsers.add_parser(
+        "advance-finalist-audit",
+        help=(
+            "append the crossed 4M learning-rate and auxiliary audit from the "
+            "selected 16M BSC development finalist"
+        ),
+    )
+    finalist_audit.add_argument("--root", type=Path, required=True)
+    finalist_audit.add_argument(
+        "--selection",
+        type=Path,
+        required=True,
+        help="selection artifact that bound the selected bsc_final_16m candidate",
+    )
+
     advance = subparsers.add_parser(
         "advance",
         help="append the next blueprint round from an immutable frozen selection",
@@ -1423,6 +1742,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             _print(campaign.apply_phase2_gate_amendment(out=args.out))
         elif args.command == "amend-phase2-implementation":
             _print(campaign.apply_phase2_implementation_amendment(out=args.out))
+        elif args.command == "advance-finalist-audit":
+            extended = _append_finalist_optimizer_aux_audit(
+                campaign,
+                selection_path=args.selection,
+            )
+            stage = extended.stages[-1]
+            _print(
+                {
+                    "plan_id": extended.plan_id,
+                    "appended_stage": stage.name,
+                    "cell_ids": [cell.cell_id for cell in stage.cells],
+                    "candidate_count": len(
+                        {cell.candidate_id for cell in stage.cells}
+                    ),
+                    "status": campaign.status(),
+                }
+            )
         elif args.command == "nominate-family-revisit":
             _print(campaign.select_family_revisit_inputs(args.family, out=args.out))
         elif args.command == "freeze-phase1":
