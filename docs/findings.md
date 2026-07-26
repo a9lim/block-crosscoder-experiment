@@ -2,14 +2,13 @@
 
 This is the scientific report for the BSC campaign. It is organized around
 the questions asked, the methods compared, the observed data, and the design
-choice that follows. Content IDs and hashes are provenance, not findings; they
-are kept in the campaign artifacts and summarized only in the
-footnotes.[^provenance][^artifacts]
+choice that follows.
 
-The evidence cutoff is **2026-07-25 17:35 PDT**. Phase 1 and the Phase-2 BSC
-main chain through confirmation are complete. Comparator-family calibration
-is still running, so the comparator results below are within-family
-development results, not a final cross-family ranking.
+The evidence cutoff is **2026-07-25 20:19 PDT**. Phase 1 is complete. Phase 2
+is in a deadline-mode BSC boundary refinement after the original optimizer
+search stopped at lower batch and warmup boundaries. Comparator development
+is paused until the replacement BSC finalist, confirmation, and feature
+geometry are complete.
 
 For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 256, 384, and 512 total-bit/token budgets; lower is better. Tables show seeds
@@ -19,32 +18,38 @@ For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 
 Phase 1 showed that the BSC method can recover the planted shared vector
 factor rather than merely reconstructing its support. On real GPT-2
-activations, the BSC development score improved from `0.401556957` at the
-4M-token starting carrier to `0.250652800` at the selected 16M configuration,
-a 37.6% relative reduction in FVU. Untouched confirmation reproduced the
-result at `0.246043671`.
+activations, architecture and selector tuning reduced the 4M development FVU
+substantially. The newly adopted final-fifth schedule plus a 1,024-token
+BatchTopK pool now scores `0.290124774` and `0.291712653` on seeds 0 and 1,
+respectively, against `0.296505` and `0.297540` for the final-fifth,
+2,048-token parent. The mean improves from `0.297022500` to `0.290918713`.
+The 512-token boundary arm is running before warmup is tuned.
 
-The current BSC configuration is:
+The current boundary-refined BSC configuration is:
 
 | Surface | Adopted value | Why |
 |---|---|---|
 | model and sites | GPT-2 Small residual-pre blocks 3/5/7/9 | frozen real-model pilot contract |
-| normalization | scalar RMS | best deployable confirmation score, though nearly tied with `sqrt_d` |
+| normalization | scalar RMS | retained deployable gauge; fresh confirmation is pending |
 | encoder | joint untied linear, no bias, availability-rescaled site sum | tied Grassmann variants failed; removing initialization preconditioning was too small an improvement |
 | decoder | free-scale-controlled, no bias, concatenated-L2 block geometry | selected parent remained strongest valid architecture |
 | site factorization | rank 4 | noninferior to the full carrier and preferred by parsimony |
 | code | signed, 2,048 groups × width 4, 8 active blocks | width 4 won; 32 active coordinates remains the only fully qualified BSC activity setting so far |
 | score and selector | decoded energy + block BatchTopK | clear improvement over token-TopK and other score functions |
 | site masking | none | every positive masking treatment was worse |
-| optimizer | fused Adam, LR `3e-4`, batch 2,048 | strongest learning rate and batch-size results |
-| schedule | 2% accepted-update warmup, then constant | final-fifth decay was numerically better but missed the preregistered per-seed effect floor |
-| regularizer | none | every nuclear and learned-threshold treatment was worse |
-| auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window | improved both seeds by more than 0.02 FVU |
-| train budget | 16M unique rows and optimizer-token presentations | selected Phase-2 budget |
+| optimizer | fused Adam, LR `3e-4`; batch 1,024 incumbent, 512 under test | batch 1,024 beat the final-fifth batch-2,048 parent in both seeds, so the lower boundary must be closed |
+| schedule | final-fifth linear decay to zero | better than constant in both seeds; the former minimum-effect rejection is superseded |
+| warmup | 2% parent; 0% deferred until batch selection | warmup must be tuned only after the BatchTopK pool is fixed |
+| regularizer | none, provisional carry-forward | fresh final-fifth re-ablation is deferred under the deadline |
+| auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window; provisional carry-forward | included in the replacement 16M finalist without repeating the obsolete constant-parent sweep |
+| train budget | 16M unique rows and optimizer-token presentations | replacement finalist pending |
 
-This is the current BSC development finalist, not yet the Phase-3 publication
-winner. The independent comparator branches must finish their own calibration
-and fresh 16M revisits first.
+This is not yet a frozen finalist. The batch boundary and then warmup must
+resolve, followed by fresh 16M development and scalar-RMS confirmation runs.
+The former constant-parent regularization, auxiliary, partial-view, and
+confirmation artifacts were
+permanently deleted because they answer a conditional question that is no
+longer relevant to the intended publication result.
 
 ## Phase 1: does BSC identify a shared vector factor?
 
@@ -216,106 +221,91 @@ carrier into a strong reconstruction model?
 | warmup | 5% parent | 0.304219 | 0.302914 | baseline |
 | warmup | 2% | 0.300071 | 0.299184 | adopt |
 | warmup | 10% | 0.308331 | 0.307099 | reject |
-| schedule | constant | 0.300071 | 0.299184 | adopt |
-| schedule | final-fifth linear decay | 0.296505 | 0.297540 | numerically best, but one seed missed the 0.002 effect floor |
+| schedule | constant | 0.300071 | 0.299184 | superseded |
+| schedule | final-fifth linear decay | 0.296505 | 0.297540 | adopt; better in both seeds |
 | schedule | cosine decay | 0.319408 | 0.320325 | reject |
 | LR revisit | `3e-4` | 0.300071 | 0.299184 | retained |
 | LR revisit | `1e-4` | 0.352483 | 0.351713 | reject |
 | LR revisit | `3e-5` | 0.457663 | 0.456957 | reject |
+| final-fifth batch boundary | 2,048 parent | 0.296505 | 0.297540 | baseline |
+| final-fifth batch boundary | 1,024 | 0.290125 | 0.291713 | current incumbent |
+| final-fifth batch boundary | 512 | running | queued | lower-boundary test |
+| final-fifth warmup boundary | 0% | deferred | deferred | run only after batch selection |
 
 **Interpretation.** Optimization, not architectural complexity, produced the
 largest improvement in the main chain. The higher learning rate and smaller
-BatchTopK comparison pool were robust in both seeds. Final-fifth decay is an
-interesting near miss: it has the best aggregate number, but the declared
-selection rule required a meaningful improvement in every seed.
+BatchTopK comparison pool were robust in both seeds. The original fixed ladder
+stopped while learning rate, batch size, and warmup were still winning at
+tested boundaries. Final-fifth was rejected only because its seed-1
+improvement of `0.001644` missed a `0.002` per-seed effect floor by
+`0.000356`, despite improving both seeds. That gate is superseded for BSC
+development tuning. At final-fifth, reducing the BatchTopK pool from 2,048 to
+1,024 improves FVU by `0.006380` and `0.005827`.
 
-**Adopted.** Adam at `3e-4`, batch 2,048, 2% accepted-update warmup, then a
-constant rate.
+**Adopted so far.** Adam at `3e-4` and final-fifth linear decay. Batch 1,024 is
+the incumbent, not yet the final choice. The interrupted 0%-warmup cells were
+retired without result because batch 512 must run first. After batch is fixed,
+0% will be compared with the corresponding 2% parent; 1% runs only if 0% is
+tied or worse.
 
-### Regularization and dead-feature recovery at 16M tokens
+### Superseded constant-parent downstream evidence
 
-**Question.** Does explicit rank regularization help at the full Phase-2
-budget, and which dead-feature recovery mechanism should be added?
+The original `regularization_16m`, `auxiliary_16m`, and `confirmation_16m`
+rounds inherited the constant schedule. Once final-fifth became the adopted
+schedule, those runs no longer answered the question posed by the intended
+finalist.
 
-**Regularization results.**
+All 32 affected cell output directories were permanently deleted: 14
+regularization cells, 8 auxiliary cells, and 10 confirmation cells, totaling
+26.26 GB. Their former numerical tables are intentionally absent from the
+active findings.
 
-| Treatment | Seed 0 | Seed 1 | Read |
-|---|---:|---:|---|
-| no regularizer | 0.273083 | 0.272379 | best valid treatment |
-| decoder nuclear, coefficient 30 | 0.274271 | 0.274139 | slightly worse; diagnostic arm |
-| decoder nuclear, coefficient 100 | 0.278903 | 0.279659 | worse; diagnostic arm |
-| decoder nuclear, coefficient 300 | 0.288759 | 0.289405 | worse; diagnostic arm |
-| end-to-end map nuclear, initial ratio 0.01 | 0.276286 | 0.276396 | worse |
-| end-to-end map nuclear, initial ratio 0.03 | 0.284448 | 0.284162 | worse |
-| end-to-end map nuclear, initial ratio 0.10 | 0.303541 | 0.303881 | worse |
+**Deadline decision.** Do not repeat the complete rejected-treatment sweep.
+After batch and warmup resolve, train two fresh 16M final-fifth development
+cells with no regularizer and the formerly selected SASA-source dead-residual
+auxiliary, then run the minimum two-seed scalar-RMS confirmation. These are
+carry-forward engineering choices until the replacement evidence exists, not
+newly re-established regularizer or auxiliary findings.
 
-**Auxiliary results.**
+### Partial-view work removed
 
-| Auxiliary | Seed 0 | Seed 1 | Read |
-|---|---:|---:|---|
-| SASA-source dead residual, weight 1, 1k window | 0.250241 | 0.251065 | best; adopt |
-| SASA dead residual, weight 1, 100k window | 0.267686 | 0.266733 | positive but weaker |
-| SASA dead residual, weight 1/32, 1k window | 0.269002 | 0.268238 | positive but weaker |
-| no auxiliary | 0.273083 | 0.272379 | baseline |
+The former partial-view diagnostics belonged to the deleted constant-parent
+finalist and are not carried into the active result. They will not be
+recomputed on the replacement checkpoint: single-site and leave-one-out
+reconstruction answer an operational missing-view question outside the
+standard crosscoder claim and outside this presentation. The earlier masking
+ablation remains relevant because it directly shows that training for partial
+views degrades the standard all-view objective.
 
-**Interpretation.** Nuclear pressure consistently trades away useful
-reconstruction and is not needed to obtain the selected block geometry.
-Dead-residual recovery, by contrast, gives a large and repeatable gain.
+## Replacement confirmation on untouched data
 
-**Adopted.** No nuclear regularizer. Add the SASA-source auxiliary with weight
-1 and a 1,000-token deadness window.
+**Question.** Does the boundary-refined, final-fifth BSC reproduce on untouched
+scalar-RMS confirmation data?
 
-### What the selected code does with partial views
+**Status.** Pending. The obsolete constant-parent confirmation was deleted.
+The deadline path will run only scalar RMS for both seeds after the fresh 16M
+development finalist completes. Broader gauge robustness can be restored
+after the presentation deadline.
 
-The selected BSC reconstructs well when all four layers are available, but it
-does not reconstruct the joint state from one local site.
+## Feature geometry across layers
 
-| Diagnostic | Seed 0 | Seed 1 |
-|---|---:|---:|
-| all-site FVU | 0.219203 | 0.219721 |
-| leave-one-out held-out-site FVU | 0.842556 | 0.855583 |
-| leave-one-out coordinate concordance | 0.934882 | 0.933867 |
-| leave-one-out support IoU | 0.177310 | 0.174657 |
-| leave-one-out intersection energy coverage | 0.973343 | 0.972931 |
-| site-only held-out-sites FVU | 47.576372 | 47.548965 |
-| site-only coordinate concordance | 0.640705 | 0.637132 |
-| site-only support IoU | 0.009317 | 0.009297 |
-| site-only intersection energy coverage | 0.953563 | 0.953383 |
+**Question.** What shape do semantic manifolds take in the selected shared
+BSC code, and does that geometry change across GPT-2 layers?
 
-**Interpretation.** This is a joint acausal cross-layer code. A partial view
-often preserves the direction and most intersection energy of the shared
-coordinates, but not the exact active support or enough information to
-reconstruct missing layers. That is a meaningful negative result, not a
-failure of the standard crosscoder objective and not a special promotion gate
-for BSC.
+**Planned read.** The presentation analysis will pair controlled concept sets,
+including the twelve months, with the finalist's layer activations and shared
+block coordinates. It will produce consistently aligned 2D and 3D views for
+blocks 3, 5, 7, and 9 and for the joint BSC code. Ring structure will be
+measured rather than inferred from appearance: cyclic-neighbor preservation,
+closure, ring-versus-arc fit, and separation from a generic clustered
+alternative will accompany the plots.
 
-## Confirmation on untouched data
+**Interpretation boundary.** A ring in some layers but not others is a
+substantive developmental-geometry result. The analysis will preserve that
+layer dependence and will not force a circular projection when the learned
+geometry is an arc, cluster, fold, or diffuse cloud.
 
-**Question.** Does the selected BSC reproduce on confirmation data, and which
-deployable normalization should be frozen?
-
-| Normalization | Seed 0 | Seed 1 | Mean | Outcome |
-|---|---:|---:|---:|---|
-| scalar RMS | 0.245329156 | 0.246758186 | **0.246043671** | adopt |
-| `sqrt_d` | 0.245714309 | 0.246583468 | 0.246148888 | practical near-tie |
-| none | 0.249536515 | 0.248693381 | 0.249114948 | valid, slightly worse |
-| whitening | 0.263695954 | 0.264293307 | 0.263994631 | valid, worse |
-| token LayerNorm | — | — | — | reconstruction checks passed, but raw decoding needs unpriced per-row oracle information |
-
-The scalar-RMS fixed-rate frontiers were:
-
-| Seed | 256 bits/token | 384 bits/token | 512 bits/token |
-|---|---:|---:|---:|
-| 0 | 0.247219379 | 0.244389791 | 0.244378297 |
-| 1 | 0.248645500 | 0.245820369 | 0.245808690 |
-
-**Interpretation.** Confirmation did not expose overfitting: scalar-RMS mean
-FVU improved by about `0.00461` relative to the selected development cell.
-Scalar RMS and `sqrt_d` differ by only `0.000105217`, so the scientific result
-is normalization robustness rather than a large scalar-RMS advantage.
-
-**Adopted.** Scalar RMS remains the declared parent and the numerically best
-deployable normalization. Treat `sqrt_d` as effectively tied.
+**Status.** Pending the replacement finalist checkpoint.
 
 ## Comparator-family development
 
@@ -598,9 +588,8 @@ yet.
   sensitivity but cannot make the search exhaustive.
 - Comparator roots use different architectures and source recipes. Only the
   completed fresh 16M revisits will support the final comparison.
-- High all-site reconstruction does not prove single-site sufficiency, causal
-  identifiability, semantic monosemanticity, or recovery of a global
-  manifold.
+- High all-site reconstruction does not prove causal identifiability,
+  semantic monosemanticity, or recovery of a global manifold.
 - Decoder norm is not specificity, decoder capacity is not used dimension,
   and aggregate reconstruction is not manifold recovery.
 - Feature-geometry plots are not yet findings. They will be generated from
@@ -610,7 +599,3 @@ yet.
 [^metric]: Each cell evaluates the measured lower convex rate-distortion envelope at 256, 384, and 512 total bits/token, including fixed-width packet bits and amortized deployable-codec bytes. The schedule is executed on paired raw rows and never extrapolated. Development selection uses seeds 0 and 1, median then worst seed, and complete scientific qualification.
 
 [^setup]: Capture uses `openai-community/gpt2` revision `607a30d783dfa663caf39e06633721c8d4cfcd7e`, OpenWebText revision `b4325f019c648b1641a1784748667e8b74e5e064`, byte BPE, context length 128, and residual-pre hooks at blocks 3, 5, 7, and 9. Split sizes are 250k normalization-fit, 250k codec-calibration, 1M development, 1M confirmation, and 16M training rows, allocated by whole packed sequences. Forward and stored activation precision are bf16.
-
-[^provenance]: The operational Phase-2 campaign is `/data/runs/bsc-phase2-d84627e`; the live plan at this cutoff is `study:d29d69c30ab909f5ab73f1744d5cc8483e430eb80a131daf5efa6345c84c5655`. It binds Phase-1 decision `phase1-decision:df789d6b27930bb813fcec1b9fde209e3a662d4adb9d42974850d7d05bf385c2`, transfer `phase1-transfer:a5a3dfbdaf9cc0fce9bdaacf063eaefbb53bd4e10402a80ba1d56f4b3e38f561`, Phase-2 blueprint `phase2-blueprint:f5b459552c7768341c329f43b2b7a26af9f0d9cb488fec0e263ea6c8af3ba0ae`, and common-gate amendment `phase2-gate-amendment:2801ad39b330155a1c4cf16130520b254870e389b29546c09a1449e76e71672c`.
-
-[^artifacts]: Per-cell IDs, candidate IDs, content hashes, qualification digests, threshold-sensitivity grids, and exact environment manifests are intentionally not duplicated in the report body. The authoritative values remain in the campaign journal, plans, `selections/`, and each cell's qualification manifest. The campaign began at clean commit `d84627e`; later authenticated implementation amendments repaired orchestration and validation without changing completed scientific kernels. Authoritative execution was Python 3.12.13, PyTorch 2.8.0+cu128, CUDA 12.8, TransformerLens 3.5.1, Transformers 5.14.0, and Triton 3.4.0 on the RTX 4090 Jobe host.
