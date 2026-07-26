@@ -623,7 +623,7 @@ tolerance—not a paper value—and each confirmation cell content-binds the
 do not enter confirmation pass/fail. Confirmation data never retunes the
 center.
 
-The seven frozen Phase-3 comparators are not copied from these 1M anchors.
+The six frozen Phase-3 comparators are not copied from these 1M anchors.
 Each receives an independent, content-addressed conditional calibration chain
 under the same fixed-rate policy. All branches are appended to one authenticated
 Phase-2 DAG: every child names its scientific parent stage and exact parent cell
@@ -631,7 +631,6 @@ IDs even when another family's stage is most recent in the journal.
 
 | Family | Family-specific development rounds before the top-two revisit |
 |---|---|
-| shared-coordinate BSC | width; activity; learning rate; schedule |
 | BSF Grassmannian | width; activity; learning rate; schedule |
 | BSF Group Lasso | width; activity; L2,1 coefficient; learning rate; schedule |
 | SASA | width; activity; initial map-penalty ratio `0/.01/.03/.10`; dead-residual Aux; learning rate; schedule |
@@ -659,8 +658,8 @@ development winner and strongest distinct resolved runner-up for 16M tokens,
 then selects one family comparator. This revisit
 probes local order sensitivity; the staged search does not estimate every
 interaction or establish a global optimum. At seeds 0 and 1, the serialized
-blueprint declares a pre-elision ceiling of **176 main-chain cells** plus **234
-family-calibration cells**, for **410 total**. The 176 comprise 18 anchors and
+blueprint declares a pre-elision ceiling of **176 main-chain cells** plus **202
+control-family cells**, for **378 total**. The 176 comprise 18 anchors and
 158 declared cells across the 15 rounds from `architecture_4m` through
 `confirmation_16m`. The realized count is lower: execution-equivalent
 parent/center variants are deterministically elided, and a zero-Bernoulli-mask
@@ -827,16 +826,15 @@ canonical representative, aliases, and observed metric spread. Thus neither a
 winner moved into an excluded list nor a forged nomination score can steer the
 panel merely by rehashing it.
 
-The frozen panel has eight slots:
+The frozen panel has seven slots:
 
 1. the exact derived Phase-2 finalist;
-2. independently calibrated shared-coordinate BSC mechanism comparator;
-3. BSF Grassmannian;
-4. BSF Group Lasso;
-5. SASA;
-6. independently calibrated Anthropic dense-L1 comparator;
-7. adapted decoder-weighted BatchTopK mechanism comparator;
-8. scalar ReLU BatchTopK control.
+2. BSF Grassmannian;
+3. BSF Group Lasso;
+4. SASA;
+5. independently calibrated Anthropic dense-L1 comparator;
+6. adapted decoder-weighted BatchTopK mechanism comparator;
+7. scalar ReLU BatchTopK control.
 
 Every comparator slot binds the derived winner of its Phase-2 family chain,
 the complete family selection IDs, its family blueprint ID, and its root
@@ -1827,10 +1825,10 @@ identification/fixed-rate endpoints, and have a bounded declared role.
 The deferred candidates either require a measured trigger, introduce an
 unpriced second representation or alignment map, or change the ontology and
 evaluation contract. They are promising conditional follow-ups, not free
-degrees of freedom to add to the present 15-cell Phase 1, 410-cell Phase-2
-pre-elision ceiling, and 48-cell Phase 3 (the last count is eight refusal-gate
-cells plus 40 final cells). Phase-2 execution-equivalent and conditionally
-vacuous cells are removed at materialization and recorded, so 410 is not an
+degrees of freedom to add to the present 15-cell Phase 1, 378-cell Phase-2
+pre-elision ceiling, and 42-cell Phase 3 (the last count is seven refusal-gate
+cells plus 35 final cells). Phase-2 execution-equivalent and conditionally
+vacuous cells are removed at materialization and recorded, so 378 is not an
 executed-cell claim.
 
 The relevant Phase-1 order is `site_factorization_identification`,

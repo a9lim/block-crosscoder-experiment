@@ -328,7 +328,6 @@ are at different points in their calibration paths.
 
 | Family | Seed 0 | Seed 1 | Mean |
 |---|---:|---:|---:|
-| BSC shared coordinates | 0.538981 | 0.537344 | 0.538163 |
 | BSF Grassmannian | 0.813115 | 0.821469 | 0.817292 |
 | BSF Group Lasso | 0.966073 | 0.966031 | 0.966052 |
 | SASA | 0.550638 | 0.547401 | 0.549020 |
@@ -343,10 +342,6 @@ methods at the root would be misleading.
 
 | Family | Width | Seed 0 | Seed 1 | Within-family read |
 |---|---:|---:|---:|---|
-| BSC | 1 | 0.545655 | 0.544672 | worse |
-| BSC | 2 | failed | qualified | seed-incomplete |
-| BSC | 4 | 0.400999 | 0.402115 | adopt |
-| BSC | 8 | 0.438543 | 0.440345 | worse |
 | BSF Grassmannian | 2 | 0.565261 | 0.574003 | second |
 | BSF Grassmannian | 4 | 0.554592 | 0.564405 | adopt |
 | BSF Grassmannian | 8 | 0.647661 | 0.652169 | worse |
@@ -357,9 +352,9 @@ methods at the root would be misleading.
 | SASA | 4 | 0.385355 | 0.387029 | second |
 | SASA | 8 | 0.426618 | 0.427655 | worse |
 
-**Interpretation.** Every block method preferred a relatively narrow block.
-BSC and Grassmannian selected width 4; Group Lasso and SASA selected width 2.
-The result argues against assuming that more coordinates per block buy better
+**Interpretation.** Every block control preferred a relatively narrow block.
+Grassmannian selected width 4; Group Lasso and SASA selected width 2. The
+result argues against assuming that more coordinates per block buy better
 fixed-rate reconstruction.
 
 ### Activity calibration
@@ -383,9 +378,6 @@ the baseline.
 | scalar ReLU BatchTopK | 16 | 0.501047 | 0.502784 | adopt |
 | scalar ReLU BatchTopK | 32 | 0.581384 | 0.581395 | worse |
 | scalar ReLU BatchTopK | 64 | 0.770880 | 0.771770 | worst |
-| BSC | 16 | qualified | failed | seed-incomplete |
-| BSC | 32 | 0.400999 | 0.402115 | retained by eligibility |
-| BSC | 64 | qualified | failed | seed-incomplete |
 | BSF Group Lasso | 16 | 0.972832 | 0.972830 | worst |
 | BSF Group Lasso | 32 | 0.954693 | 0.954702 | second |
 | BSF Group Lasso | 64 | 0.946401 | 0.946282 | adopt |
@@ -398,15 +390,8 @@ the baseline.
 
 **Interpretation.** Activity is method-dependent. Grassmannian and Group Lasso
 improve through 64 coordinates; the two BatchTopK scalar controls strongly
-favor 16; SASA and dense-L1 favor 32. BSC does not yet have a comparative
-activity result: 32 is the only seed-complete candidate. Grassmannian adopts
-64, improving both seeds over its 32-coordinate baseline.
-
-The BSC failures were narrow invariant failures, not missing jobs. Activity
-16 seed 1 and activity 64 seed 1 exceeded the bound Stiefel Gram-residual
-limit of `0.002` at `0.00213562` and `0.00200106`. The earlier width-2 seed 0
-failed the same invariant at `0.00236131`. Therefore the current activity-32
-choice must not be described as beating 16 and 64.
+favor 16; SASA and dense-L1 favor 32. Grassmannian adopts 64, improving both
+seeds over its 32-coordinate baseline.
 
 ### Learning-rate calibration
 
@@ -426,10 +411,6 @@ round compared `3e-5`, `1e-4`, `2e-4`, and `3e-4` at the same 4M-token budget.
 | scalar ReLU BatchTopK | `1e-4` | 0.501047 | 0.502784 | baseline |
 | scalar ReLU BatchTopK | `2e-4` | 0.405054 | 0.406821 | second |
 | scalar ReLU BatchTopK | `3e-4` | 0.366868 | 0.370329 | adopt |
-| BSC shared coordinates | `3e-5` | 0.511555 | 0.509196 | worse |
-| BSC shared coordinates | `1e-4` | 0.400999 | 0.402115 | retained by eligibility |
-| BSC shared coordinates | `2e-4` | failed | qualified | seed-incomplete |
-| BSC shared coordinates | `3e-4` | failed | failed | seed-incomplete |
 | BSF Grassmannian | `3e-5` | 0.689111 | 0.690316 | worst |
 | BSF Grassmannian | `1e-4` | 0.547015 | 0.550264 | adopt |
 | BSF Grassmannian | `2e-4` | 0.563507 | 0.546668 | seed-discordant |
@@ -452,17 +433,10 @@ the baseline to `0.91534` at `3e-4`. Group Lasso also improves monotonically
 through `3e-4`, but only from about `0.94614` to `0.94218`; tuning the rate
 does not repair its poor absolute reconstruction. Grassmannian is
 seed-discordant above `1e-4`: seeds 0 and 1 move in opposite directions, and
-the seed-0 degradation dominates the common median-then-worst rule. The BSC
-family branch behaves differently again. Its higher rates crossed the bound
-Stiefel Gram-residual limit: `2e-4` seed 0 reached `0.00203324`, while `3e-4`
-seeds 0/1 reached `0.00201709` and `0.002127` against the `0.002` limit.
+the seed-0 degradation dominates the common median-then-worst rule.
 
 **Adopted.** The two scalar controls, Group Lasso, and dense-L1 adopt `3e-4`;
-Grassmannian adopts the stable `1e-4`. The BSC family branch provisionally
-retains `1e-4` because it is the best seed-complete candidate; this is not
-evidence that `1e-4` reconstructs better than the failed higher rates. Its
-difference from the main-chain BSC's successful `3e-4` result is a real
-path/configuration-sensitivity warning to revisit at 16M.
+Grassmannian adopts the stable `1e-4`.
 
 ### Batch-size calibration
 
@@ -491,26 +465,6 @@ seed 1. The agreement across seeds makes this a substantive calibration
 result rather than a tie-break.
 
 **Adopted.** Batch 2,048 for both scalar BatchTopK controls.
-
-### BSC family schedule calibration
-
-**Question.** On the independently calibrated family path, does learning-rate
-decay improve the width-four, 32-active-coordinate BSC parent?
-
-**Baseline and alternatives.** Constant `1e-4` was compared with final-fifth
-linear decay and cosine decay, holding the 4M-token budget fixed.
-
-| Schedule | Seed 0 | Seed 1 | Within-family read |
-|---|---:|---:|---|
-| constant | 0.400999 | 0.402115 | adopt |
-| final-fifth decay | 0.403183 | 0.406940 | worse |
-| cosine decay | 0.446923 | 0.450922 | much worse |
-
-**Interpretation.** Unlike the main-chain near miss at a different selected
-parent, decay is unambiguously harmful on this family path. Final-fifth decay
-worsens both seeds, and cosine decay loses about `0.046`–`0.049` FVU.
-
-**Adopted.** Constant learning rate.
 
 ### Grassmannian schedule calibration
 
@@ -623,7 +577,6 @@ not evidence for a practically meaningful coefficient effect.
 
 | Family | Choices supported so far |
 |---|---|
-| BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed; constant schedule |
 | BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4`; constant schedule |
 | BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge; LR `3e-4` |
 | SASA | width 2; 32 active coordinates; initial ratio `0.03`; frequency-dead residual auxiliary at weight `1/32` with a 1k window |

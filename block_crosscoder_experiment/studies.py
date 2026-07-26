@@ -159,9 +159,9 @@ BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v5"
 PHASE3_PROVISIONED_STORAGE_BYTES = 1_000_000_000_000
 PHASE3_STORAGE_CEILING_BYTES = int(PHASE3_PROVISIONED_STORAGE_BYTES * 0.85)
 PHASE3_PRODUCTION_STABILITY_TOKENS = 262_144
-PHASE3_PANEL_SLOTS = 8
+PHASE3_PANEL_SLOTS = 7
 PHASE3_TRAINING_TOKEN_CEILING = (
-    4_000_000_000 + PHASE3_PANEL_SLOTS * PHASE3_PRODUCTION_STABILITY_TOKENS
+    3_500_000_000 + PHASE3_PANEL_SLOTS * PHASE3_PRODUCTION_STABILITY_TOKENS
 )
 PHASE3_PARAMETER_CEILING = 400_000_000
 PHASE3_VRAM_CEILING_BYTES = 22_000_000_000
@@ -12000,11 +12000,8 @@ def _family_aux_variants(family: str) -> tuple[ChildVariant, ...]:
     raise StudyError(f"no auxiliary calibration surface for family {family!r}")
 
 
-def _comparator_family_blueprints(
-    bsc_root: Recipe = BSC_FACTOR_CONTESTS[2],
-) -> tuple[ComparatorFamilyBlueprint, ...]:
+def _comparator_family_blueprints() -> tuple[ComparatorFamilyBlueprint, ...]:
     roots = {
-        "bsc_shared_coordinates": bsc_root,
         "bsf_grassmannian": PAPER_RECIPES["bsf_grassmannian_primary"],
         "bsf_group_lasso": PAPER_RECIPES["bsf_group_lasso_primary"],
         "sasa": SASA_PAPER,
@@ -12013,7 +12010,6 @@ def _comparator_family_blueprints(
         "scalar_relu_batchtopk": CONTROL_SCALAR_RELU,
     }
     widths = {
-        "bsc_shared_coordinates": (1, 2, 4, 8),
         "bsf_grassmannian": (2, 4, 8),
         "bsf_group_lasso": (2, 4, 8),
         "sasa": (2, 4, 8),
@@ -13767,7 +13763,7 @@ def build_phase2_blueprint(
         phase1_transfer_id=phase1_transfer_id,
         initial_stage=initial_stage,
         rounds=tuple(rounds),
-        comparator_families=_comparator_family_blueprints(bsc_root),
+        comparator_families=_comparator_family_blueprints(),
     )
 
 
@@ -14116,11 +14112,6 @@ def _production_stability_overrides(recipe: Recipe) -> tuple[Decision, ...]:
 def _phase3_comparator_recipes() -> tuple[tuple[str, str, Recipe], ...]:
     return (
         (
-            "bsc_shared_coordinates",
-            "mechanism_comparator",
-            _phase2_preview_root_recipe(),
-        ),
-        (
             "bsf_grassmannian",
             "paper_comparator",
             PAPER_RECIPES["bsf_grassmannian_primary"],
@@ -14154,7 +14145,7 @@ def build_phase3_blueprint(
         raise StudyError("Phase-3 blueprint seeds must be sorted")
     comparator_families = {
         family.name: family
-        for family in _comparator_family_blueprints(_phase2_preview_root_recipe())
+        for family in _comparator_family_blueprints()
     }
     entries = (
         {}
@@ -14184,12 +14175,7 @@ def build_phase3_blueprint(
             or not root_id.startswith("recipe:")
         ):
             raise StudyError("frozen comparator lacks calibrated family lineage")
-        root_name = (
-            "phase1_contract_bsc"
-            if slot_name == "bsc_shared_coordinates"
-            else recipe.name
-        )
-        return root_name, root_id, family_id
+        return recipe.name, root_id, family_id
 
     slots = (
         Phase3PanelSlot("selected_finalist", "selected_finalist", "fail"),

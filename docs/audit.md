@@ -573,15 +573,15 @@ exit is not evidence by itself.
   round precedes the schedule round, and the peak learning-rate ladder is
   rerun after batch, warmup, and schedule are fixed; source-step warmups remain
   confined to exact paper anchors.
-- Each of the seven Phase-3 comparator families has its own content-addressed
+- Each of the six Phase-3 comparator families has its own content-addressed
   root selection, conditional calibration rounds, and fresh winner/runner-up
   revisit. Counts are derived from the serialized blueprint, and reports state
   that staged ordering does not prove a global optimum.
 - Every comparator-family learning-rate round has exactly four arms:
   `3e-5`, `1e-4`, `2e-4`, and `3e-4`.
 - Default counts are rederived as 15 declared/executed Phase-1 cells at three
-  seeds and a 410-cell Phase-2 pre-elision ceiling at two seeds: 176 main-chain
-  plus 234 family-chain. Phase-2 reports separately record the smaller realized
+  seeds and a 378-cell Phase-2 pre-elision ceiling at two seeds: 176 main-chain
+  plus 202 control-family. Phase-2 reports separately record the smaller realized
   count after execution-signature, conditional rank-revisit, and conditional
   non-token-TopK Appendix-runner-up elision.
 - Revisit nominations rank the union of every qualified 4M candidate in that
@@ -612,7 +612,7 @@ exit is not evidence by itself.
   forging a nomination metric is refused.
 - Non-smoke Phase 3 requires the exact preregistered seed tuple
   `(0,1,2,3,4)`. Caller-supplied production seed reductions cannot turn the
-  48-cell publishable panel into a smaller canonical campaign.
+  42-cell publishable panel into a smaller canonical campaign.
 - Phase 2 uses its declared bf16 forward precision but has no matrix-level
   fp32/bf16 parity claim. The executable parity-and-short-run stability gate is
   Phase-3-only.

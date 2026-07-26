@@ -24,7 +24,7 @@ model-comparison project.
 2. Phase 2 uses a pinned GPT-2 Small four-hook capture and owns model-, hook-,
    scale-, optimizer-, and rate-dependent tuning on development evidence,
    followed by confirmation.
-3. Phase 3 freezes one Phase-2 finalist plus seven declared comparators and
+3. Phase 3 freezes one Phase-2 finalist plus six declared comparators and
    trains the five-seed Gemma publication panel without further tuning.
 
 Later conditional stages do not exist until a complete, hash-bound selection
@@ -87,8 +87,8 @@ preview cannot authorize registration.
 - The default Phase-1 blueprint declares and executes 15 cells at seeds 0/1/2:
   three one-site instruments, three multisite carriers, and nine confirmation
   cells.
-  The Phase-2 blueprint has a 410-cell pre-elision ceiling at seeds 0/1: 176
-  main-chain plus 234 family-chain cells. Materialization deterministically
+  The active Phase-2 design has a 378-cell pre-elision ceiling at seeds 0/1:
+  176 main-chain plus 202 control-family cells. Materialization deterministically
   records and elides execution-equivalent parent/center cells; if zero
   Bernoulli masking wins, the rank revisit emits only its exact parent, and
   the Appendix-D runner-up arm is elided unless the selected parent uses fixed

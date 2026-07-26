@@ -457,7 +457,7 @@ def test_scientific_seed_contracts_reject_noncanonical_tuples_and_keep_counts():
     assert phase1.seeds == (0, 1, 2)
     assert phase1.projected_cells == 15
     assert phase2.seeds == (0, 1)
-    assert phase2.declared_cell_ceiling == 410
+    assert phase2.declared_cell_ceiling == 378
 
     for builder in (build_phase1_blueprint, build_phase1_plan):
         with pytest.raises(StudyError, match="exact preregistered seeds"):
@@ -540,7 +540,7 @@ def test_phase1_non_smoke_sample_roles_are_separate_and_executable():
     assert previous_stop == 20_000
 
 
-def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chains():
+def test_phase2_blueprint_has_main_chain_and_control_family_calibration_chains():
     blueprint = build_phase2_blueprint()
     prefix = build_phase2_plan()
     assert len(prefix.cells) == 18
@@ -552,7 +552,7 @@ def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chai
             for family in blueprint.comparator_families
         )
     )
-    assert blueprint.declared_cell_ceiling == expected == 410
+    assert blueprint.declared_cell_ceiling == expected == 378
     assert [(item.name, len(item.variants)) for item in blueprint.rounds] == [
         ("architecture_4m", 5),
         ("capacity_4m", 9),
@@ -602,7 +602,6 @@ def test_phase2_blueprint_has_main_chain_and_independent_family_calibration_chai
     assert blueprint.rounds[-1].selection_policy is None
     families = {family.name: family for family in blueprint.comparator_families}
     assert set(families) == {
-        "bsc_shared_coordinates",
         "bsf_grassmannian",
         "bsf_group_lasso",
         "sasa",
@@ -1210,7 +1209,7 @@ def test_every_stage_variant_materializes_and_adversarial_parent_routes_resolve(
 
 def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():
     blueprint = build_phase3_blueprint()
-    assert blueprint.projected_cells == 48
+    assert blueprint.projected_cells == 42
     assert blueprint.content_payload()["resource_contract"]["estimator"] == (
         ESTIMATOR_VERSION
     )
@@ -1244,13 +1243,13 @@ def test_phase3_is_a_blueprint_until_a_frozen_panel_decision_is_supplied():
     )
     assert restored_decision == decision
     plan = build_phase3_plan(panel_decision=decision)
-    assert len(plan.cells) == 48
+    assert len(plan.cells) == 42
     preflight = plan.stages[0]
     frozen_panel = plan.stages[1]
     assert preflight.name == "production_stability_preflight"
-    assert len(preflight.cells) == PHASE3_PANEL_SLOTS == 8
+    assert len(preflight.cells) == PHASE3_PANEL_SLOTS == 7
     assert frozen_panel.name == "frozen_panel"
-    assert len(frozen_panel.cells) == 40
+    assert len(frozen_panel.cells) == 35
     assert frozen_panel.depends_on == (preflight.name,)
     assert frozen_panel.gate is not None
     assert frozen_panel.gate.minimum_count == PHASE3_PANEL_SLOTS

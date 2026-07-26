@@ -319,7 +319,7 @@ degradation `.01/.02/.05`.
 Each selection artifact reports marginal counterfactual pass sets from the
 authenticated measurements without retuning the center policy.
 
-Seven independent comparator-family chains branch from their own anchor
+Six independent comparator-family chains branch from their own anchor
 selection. Width/activity are calibrated for block families; Group Lasso
 calibrates its coefficient; SASA calibrates its
 `0/.01/.03/.10` initial map-penalty ratios and source Aux bundles; Anthropic
@@ -337,8 +337,8 @@ winner and strongest distinct resolved runner-up,
 followed by a one-winner family selection. This probes local path/order sensitivity but does not
 claim a global optimum. Phase 3 consumes those content-addressed family
 selections, never the root anchors. At seeds 0 and 1 the blueprint derives
-a pre-elision ceiling of **176 main-chain cells** and **234 family cells**,
-**410 total**, computed from the manifest. The main chain has 18 anchors and
+a pre-elision ceiling of **176 main-chain cells** and **202 control-family cells**,
+**378 total**, computed from the manifest. The main chain has 18 anchors and
 158 declared cells in 15 rounds from architecture through confirmation.
 Execution-equivalent parent/center cells are deterministically elided, and the
 rank revisit conditionally loses four children when Bernoulli-zero masking
@@ -354,13 +354,12 @@ fixed budget cannot promote.
 
 ## 6. Frozen Phase-3 panel
 
-The Phase-2 evidence producer freezes one exact selected recipe and seven
+The Phase-2 evidence producer freezes one exact selected recipe and six
 comparators:
 
 | Slot | Role |
 |---|---|
 | selected finalist | exact Phase-2-derived recipe |
-| shared-coordinate BSC | mechanism comparator |
 | BSF Grassmannian | paper comparator |
 | BSF Group Lasso | paper comparator |
 | SASA | paper comparator |
@@ -386,7 +385,7 @@ total bits/token. Those budgets are the exact fourfold transfer of the pilot
 `256/384/512` frontier, preregistered from the nominal active-coordinate ratio
 `128/32`; the preflight also requires nonzero packet coverage and at least two
 distinct nonzero frontier endpoints. Phase 3 therefore contains
-eight preflight cells plus 40 final cells; no Phase-3 row has a selection
+seven preflight cells plus 35 final cells; no Phase-3 row has a selection
 policy.
 The resource envelope uses estimator schema
 `dense-linear-memory-v20-e8cd28faf7b38d6e64f0426000de174679f4c01413ec6647fa6b997219978e55`. Its guarded
