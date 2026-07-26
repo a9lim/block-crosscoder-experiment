@@ -10,6 +10,7 @@ authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
     "datasets",
     "huggingface-hub",
+    "matplotlib",
     "numpy",
     "sae-lens",
     "safetensors",
