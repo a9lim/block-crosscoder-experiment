@@ -107,7 +107,7 @@ def _pca_basis(rows: np.ndarray, n_components: int) -> tuple[np.ndarray, np.ndar
     basis = vh[:n].T
     if n < n_components:
         basis = np.pad(basis, ((0, 0), (0, n_components - n)))
-    variance = singular.square()
+    variance = np.square(singular)
     explained = variance / max(float(variance.sum()), np.finfo(float).eps)
     explained = np.pad(explained[:n_components], (0, max(0, n_components - n)))
     return basis, explained
@@ -115,7 +115,7 @@ def _pca_basis(rows: np.ndarray, n_components: int) -> tuple[np.ndarray, np.ndar
 
 def _shape_normalize(points: np.ndarray) -> tuple[np.ndarray, float]:
     centered = points - points.mean(axis=0, keepdims=True)
-    rms = math.sqrt(float(np.mean(np.sum(centered.square(), axis=-1))))
+    rms = math.sqrt(float(np.mean(np.sum(np.square(centered), axis=-1))))
     if rms <= np.finfo(float).eps:
         return centered, 0.0
     return centered / rms, rms
@@ -134,9 +134,9 @@ def _circle_radial_cv(points: np.ndarray) -> float:
     x = points[:, 0]
     y = points[:, 1]
     design = np.column_stack((2 * x, 2 * y, np.ones_like(x)))
-    rhs = x.square() + y.square()
+    rhs = np.square(x) + np.square(y)
     center_x, center_y, _ = np.linalg.lstsq(design, rhs, rcond=None)[0]
-    radii = np.sqrt((x - center_x).square() + (y - center_y).square())
+    radii = np.sqrt(np.square(x - center_x) + np.square(y - center_y))
     return float(radii.std() / max(float(radii.mean()), np.finfo(float).eps))
 
 
@@ -305,9 +305,9 @@ def _response_ranking(
 ) -> tuple[np.ndarray, list[dict[str, float | int]]]:
     centered = joint - joint.mean(axis=1, keepdims=True)
     month_means = centered.mean(axis=0)
-    between = np.mean(month_means.square(), axis=(0, 2))
+    between = np.mean(np.square(month_means), axis=(0, 2))
     within = np.mean(
-        (centered - month_means[None, ...]).square(),
+        np.square(centered - month_means[None, ...]),
         axis=(0, 1, 3),
     )
     contrast = between / np.maximum(between + within, np.finfo(float).eps)
