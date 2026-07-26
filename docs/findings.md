@@ -6,7 +6,7 @@ choice that follows. Content IDs and hashes are provenance, not findings; they
 are kept in the campaign artifacts and summarized only in the
 footnotes.[^provenance][^artifacts]
 
-The evidence cutoff is **2026-07-25 15:35 PDT**. Phase 1 and the Phase-2 BSC
+The evidence cutoff is **2026-07-25 17:35 PDT**. Phase 1 and the Phase-2 BSC
 main chain through confirmation are complete. Comparator-family calibration
 is still running, so the comparator results below are within-family
 development results, not a final cross-family ranking.
@@ -434,6 +434,10 @@ round compared `3e-5`, `1e-4`, `2e-4`, and `3e-4` at the same 4M-token budget.
 | BSF Grassmannian | `1e-4` | 0.547015 | 0.550264 | adopt |
 | BSF Grassmannian | `2e-4` | 0.563507 | 0.546668 | seed-discordant |
 | BSF Grassmannian | `3e-4` | 0.583864 | 0.544035 | seed-discordant |
+| BSF Group Lasso | `3e-5` | 0.947895 | 0.947836 | worst |
+| BSF Group Lasso | `1e-4` | 0.946193 | 0.946093 | baseline |
+| BSF Group Lasso | `2e-4` | 0.943768 | 0.943541 | second |
+| BSF Group Lasso | `3e-4` | 0.942353 | 0.942001 | adopt |
 | Anthropic dense-L1 | `3e-5` | 0.938885 | 0.939382 | worst |
 | Anthropic dense-L1 | `1e-4` | 0.925072 | 0.924810 | baseline |
 | Anthropic dense-L1 | `2e-4` | 0.918056 | 0.917556 | second |
@@ -444,14 +448,16 @@ the tested range and adopt `3e-4`: decoder-weighted BatchTopK improves its mean
 from about `0.34785` to `0.30656`, and scalar ReLU improves from about
 `0.50192` to `0.36860`. Dense-L1 also improves monotonically, though it
 remains in a much higher-FVU regime: its mean falls from about `0.92494` at
-the baseline to `0.91534` at `3e-4`. Grassmannian is seed-discordant above
-`1e-4`: seeds 0 and 1 move in opposite directions, and the seed-0 degradation
-dominates the common median-then-worst rule. The BSC family branch behaves
-differently again. Its higher rates crossed the bound Stiefel Gram-residual
-limit: `2e-4` seed 0 reached `0.00203324`, while `3e-4` seeds 0/1 reached
-`0.00201709` and `0.002127` against the `0.002` limit.
+the baseline to `0.91534` at `3e-4`. Group Lasso also improves monotonically
+through `3e-4`, but only from about `0.94614` to `0.94218`; tuning the rate
+does not repair its poor absolute reconstruction. Grassmannian is
+seed-discordant above `1e-4`: seeds 0 and 1 move in opposite directions, and
+the seed-0 degradation dominates the common median-then-worst rule. The BSC
+family branch behaves differently again. Its higher rates crossed the bound
+Stiefel Gram-residual limit: `2e-4` seed 0 reached `0.00203324`, while `3e-4`
+seeds 0/1 reached `0.00201709` and `0.002127` against the `0.002` limit.
 
-**Adopted.** The two scalar controls and dense-L1 adopt `3e-4`;
+**Adopted.** The two scalar controls, Group Lasso, and dense-L1 adopt `3e-4`;
 Grassmannian adopts the stable `1e-4`. The BSC family branch provisionally
 retains `1e-4` because it is the best seed-complete candidate; this is not
 evidence that `1e-4` reconstructs better than the failed higher rates. Its
@@ -575,6 +581,32 @@ gives back most of that gain.
 **Adopted.** Initial ratio `0.03`, as the complete numerical winner under the
 common seed aggregation rule.
 
+### SASA auxiliary calibration
+
+**Question.** Does the selected SASA carrier benefit from its source
+dead-residual auxiliary, and if so at what weight and dead-window length?
+
+**Baseline and alternatives.** The source bridge uses a frequency-dead
+residual auxiliary at weight 1 with a 1,000-token window. The round compared
+that parent with no auxiliary, weight `1/32` at the same window, and weight 1
+with a 100,000-token window.
+
+| Auxiliary | Seed 0 | Seed 1 | Within-family read |
+|---|---:|---:|---|
+| weight `1/32`, 1k window | 0.371954 | 0.374356 | adopt |
+| none | 0.376418 | 0.377397 | second |
+| source: weight 1, 1k window | 0.378765 | 0.381171 | baseline |
+| weight 1, 100k window | 0.397010 | 0.399535 | worst |
+
+**Interpretation.** A small auxiliary weight helps both seeds, improving the
+source parent by about `0.00681` FVU in each. Removing the auxiliary entirely
+also beats the source parent, so weight 1 is too strong on this calibrated
+carrier. Lengthening the dead window is actively harmful, losing about
+`0.01825`–`0.01836` against the source.
+
+**Adopted.** Frequency-dead residual auxiliary at weight `1/32`, with the
+1,000-token dead window.
+
 ### Dense-L1 coefficient calibration
 
 | Coefficient | Seed 0 | Seed 1 | Mean |
@@ -593,8 +625,8 @@ not evidence for a practically meaningful coefficient effect.
 |---|---|
 | BSC shared coordinates | width 4; activity 32 provisional because flanks failed; family LR `1e-4` provisional because higher rates failed; constant schedule |
 | BSF Grassmannian | width 4; 64 active coordinates; LR `1e-4`; constant schedule |
-| BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge |
-| SASA | width 2; 32 active coordinates; initial ratio `0.03` |
+| BSF Group Lasso | width 2; 64 active coordinates; coefficient `3e-3` by a very small numerical edge; LR `3e-4` |
+| SASA | width 2; 32 active coordinates; initial ratio `0.03`; frequency-dead residual auxiliary at weight `1/32` with a 1k window |
 | Anthropic dense-L1 | 32 active coordinates; coefficient `3e-6` by a negligible tie-break; LR `3e-4` |
 | decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
 | scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
