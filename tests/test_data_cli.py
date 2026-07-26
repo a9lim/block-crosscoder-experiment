@@ -1625,6 +1625,61 @@ def test_incremental_storage_preflight_credits_only_verified_inputs(
         _verified_existing_input_storage()
 
 
+def test_storage_preflight_skips_missing_historical_campaign_artifacts(
+    tmp_path, monkeypatch
+):
+    campaign_root = tmp_path / "campaign"
+    campaign_root.mkdir()
+    (campaign_root / "plan.json").write_text("{}")
+    live = campaign_root / "live.bin"
+    live.write_bytes(b"still here")
+    missing = campaign_root / "retired.bin"
+
+    class FakeArtifact:
+        def __init__(self, path):
+            self.path = path
+
+        def verify(self, root):
+            del root
+            if not self.path.is_file():
+                raise FileNotFoundError(self.path)
+
+        def resolve(self, root):
+            del root
+            return self.path
+
+    class FakeCampaign:
+        def __init__(self, root):
+            del root
+
+        def records(self):
+            return (
+                SimpleNamespace(
+                    artifact_map={
+                        "live": FakeArtifact(live),
+                        "retired": FakeArtifact(missing),
+                    }
+                ),
+            )
+
+    monkeypatch.setattr(matrix_module, "Campaign", FakeCampaign)
+    monkeypatch.setattr(
+        matrix_module,
+        "_verified_existing_input_storage",
+        lambda **kwargs: {"verified_existing_input_bytes": 0, "inputs": []},
+    )
+    monkeypatch.setattr(
+        matrix_module.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=10_000, used=0, free=10_000),
+    )
+
+    preflight = _storage_preflight(campaign_root, 1_000)
+
+    assert preflight["verified_existing_campaign_artifact_bytes"] == live.stat().st_size
+    assert preflight["credited_existing_campaign_artifact_bytes"] == live.stat().st_size
+
+
 def test_matrix_store_receipt_rechecks_content_when_stat_receipt_is_refreshed(
     tmp_path, monkeypatch
 ):

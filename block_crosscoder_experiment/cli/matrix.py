@@ -557,8 +557,16 @@ def _storage_preflight(
         existing_campaign = Campaign(root)
         for record in existing_campaign.records():
             for artifact in record.artifact_map.values():
-                artifact.verify(root)
-                campaign_artifact_files.add(artifact.resolve(root).resolve())
+                try:
+                    artifact.verify(root)
+                    resolved = artifact.resolve(root).resolve()
+                except (CampaignError, OSError):
+                    # Existing campaign artifacts are inspected here only to
+                    # earn storage credit.  Externally retired or lost
+                    # artifacts earn no credit; the scientific gates still
+                    # verify every artifact they actually consume.
+                    continue
+                campaign_artifact_files.add(resolved)
     campaign_artifact_bytes = sum(
         path.stat().st_size for path in campaign_artifact_files
     )
