@@ -1039,6 +1039,8 @@ def _frozen_selection(
 ) -> FrozenSelection:
     payload = _read_object(path)
     candidates = payload.get("selected")
+    if candidates is None and isinstance(payload.get("selection"), dict):
+        candidates = [payload["selection"]]
     if not isinstance(candidates, list) or not candidates:
         raise StudyError("selection artifact has no frozen candidates")
     try:

@@ -44,6 +44,7 @@ from block_crosscoder_experiment.activation_identity import (
 )
 from block_crosscoder_experiment.cli.matrix import (
     _finalist_optimizer_aux_variants,
+    _frozen_selection,
     main as matrix_main,
 )
 from block_crosscoder_experiment.studies import (
@@ -4909,6 +4910,29 @@ def test_finalist_optimizer_aux_audit_is_the_complete_crossed_grid():
         ("lr_6e_minus_4__aux_one", 6e-4, 1.0),
     }
     assert len({variant.variant_id for variant in variants}) == 6
+
+
+def test_frozen_selection_reads_deadline_selection_envelope(tmp_path):
+    selection = FrozenSelection(
+        source_stage="bsc_final_16m",
+        policy_id="selection-policy:" + "1" * 64,
+        candidate_id="candidate:" + "2" * 64,
+        cell_ids=("cell:" + "3" * 64,),
+        seeds=(0,),
+        metric_values=(-0.25,),
+        qualification_sha256s=("sha256:" + "4" * 64,),
+        selection_universe_sha256="sha256:" + "5" * 64,
+    )
+    path = tmp_path / "deadline-selection.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "bsc-deadline-selection-v1",
+                "selection": selection.to_dict(),
+            }
+        )
+    )
+    assert _frozen_selection(path) == selection
 
 
 def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
