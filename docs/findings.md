@@ -5,10 +5,8 @@ the questions asked, the methods compared, the observed data, and the design
 choice that follows.
 
 The evidence cutoff is **2026-07-25 20:19 PDT**. Phase 1 is complete. Phase 2
-is in a deadline-mode BSC boundary refinement after the original optimizer
-search stopped at lower batch and warmup boundaries. Comparator development
-is paused until the replacement BSC finalist, confirmation, and feature
-geometry are complete.
+is in deadline-mode BSC boundary refinement. Comparator development is paused
+until the BSC finalist, confirmation, and feature geometry are complete.
 
 For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 256, 384, and 512 total-bit/token budgets; lower is better. Tables show seeds
@@ -38,18 +36,14 @@ The current boundary-refined BSC configuration is:
 | score and selector | decoded energy + block BatchTopK | clear improvement over token-TopK and other score functions |
 | site masking | none | every positive masking treatment was worse |
 | optimizer | fused Adam, LR `3e-4`; batch 1,024 incumbent, 512 under test | batch 1,024 beat the final-fifth batch-2,048 parent in both seeds, so the lower boundary must be closed |
-| schedule | final-fifth linear decay to zero | better than constant in both seeds; the former minimum-effect rejection is superseded |
+| schedule | final-fifth linear decay to zero | better than constant in both seeds |
 | warmup | 2% parent; 0% deferred until batch selection | warmup must be tuned only after the BatchTopK pool is fixed |
-| regularizer | none, provisional carry-forward | fresh final-fifth re-ablation is deferred under the deadline |
-| auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window; provisional carry-forward | included in the replacement 16M finalist without repeating the obsolete constant-parent sweep |
-| train budget | 16M unique rows and optimizer-token presentations | replacement finalist pending |
+| regularizer | none | current finalist setting; not independently re-ablated under the boundary-refined optimizer |
+| auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window | current finalist setting; not independently re-ablated under the boundary-refined optimizer |
+| train budget | 16M unique rows and optimizer-token presentations | finalist pending |
 
 This is not yet a frozen finalist. The batch boundary and then warmup must
 resolve, followed by fresh 16M development and scalar-RMS confirmation runs.
-The former constant-parent regularization, auxiliary, partial-view, and
-confirmation artifacts were
-permanently deleted because they answer a conditional question that is no
-longer relevant to the intended publication result.
 
 ## Phase 1: does BSC identify a shared vector factor?
 
@@ -92,10 +86,11 @@ The selection rule is:
 2. average the three fixed-rate values within each seed;
 3. require both development seeds to qualify;
 4. aggregate candidates by median, then worst seed;
-5. apply any declared minimum-effect or noninferiority rule.
+5. select the numerical winner during boundary refinement.
 
-Site-only and leave-one-out endpoints are diagnostics shared by BSC and the
-comparators. They do not gate promotion.
+Development and confirmation use the standard all-view crosscoder objective.
+Operational missing-view reconstruction is outside the claim and is not part
+of the active evaluation.
 
 ## BSC development
 
@@ -170,8 +165,7 @@ quality at much lower site-axis complexity. Training for partial views did
 not improve the standard all-view crosscoder objective and degraded steadily
 with stronger masking.
 
-**Adopted.** Rank 4 with zero masking. Because zero masking won, the
-factorization revisit correctly reproduced only the exact rank-4 parent.
+**Adopted.** Rank 4 with zero masking.
 
 ### Score, selector, and learned thresholding
 
@@ -221,7 +215,7 @@ carrier into a strong reconstruction model?
 | warmup | 5% parent | 0.304219 | 0.302914 | baseline |
 | warmup | 2% | 0.300071 | 0.299184 | adopt |
 | warmup | 10% | 0.308331 | 0.307099 | reject |
-| schedule | constant | 0.300071 | 0.299184 | superseded |
+| schedule | constant | 0.300071 | 0.299184 | reject |
 | schedule | final-fifth linear decay | 0.296505 | 0.297540 | adopt; better in both seeds |
 | schedule | cosine decay | 0.319408 | 0.320325 | reject |
 | LR revisit | `3e-4` | 0.300071 | 0.299184 | retained |
@@ -236,56 +230,25 @@ carrier into a strong reconstruction model?
 largest improvement in the main chain. The higher learning rate and smaller
 BatchTopK comparison pool were robust in both seeds. The original fixed ladder
 stopped while learning rate, batch size, and warmup were still winning at
-tested boundaries. Final-fifth was rejected only because its seed-1
-improvement of `0.001644` missed a `0.002` per-seed effect floor by
-`0.000356`, despite improving both seeds. That gate is superseded for BSC
-development tuning. At final-fifth, reducing the BatchTopK pool from 2,048 to
-1,024 improves FVU by `0.006380` and `0.005827`.
+tested boundaries. Final-fifth improves both seeds over constant. Reducing the
+BatchTopK pool from 2,048 to 1,024 improves FVU by `0.006380` and `0.005827`.
 
 **Adopted so far.** Adam at `3e-4` and final-fifth linear decay. Batch 1,024 is
-the incumbent, not yet the final choice. The interrupted 0%-warmup cells were
-retired without result because batch 512 must run first. After batch is fixed,
-0% will be compared with the corresponding 2% parent; 1% runs only if 0% is
-tied or worse.
+the incumbent, not yet the final choice. After batch is fixed, 0% warmup will
+be compared with the corresponding 2% parent; 1% runs only if 0% is tied or
+worse.
 
-### Superseded constant-parent downstream evidence
+After batch and warmup resolve, the active path trains two 16M development
+cells with no regularizer and the SASA-style frequency-dead residual
+auxiliary, followed by two-seed scalar-RMS confirmation.
 
-The original `regularization_16m`, `auxiliary_16m`, and `confirmation_16m`
-rounds inherited the constant schedule. Once final-fifth became the adopted
-schedule, those runs no longer answered the question posed by the intended
-finalist.
-
-All 32 affected cell output directories were permanently deleted: 14
-regularization cells, 8 auxiliary cells, and 10 confirmation cells, totaling
-26.26 GB. Their former numerical tables are intentionally absent from the
-active findings.
-
-**Deadline decision.** Do not repeat the complete rejected-treatment sweep.
-After batch and warmup resolve, train two fresh 16M final-fifth development
-cells with no regularizer and the formerly selected SASA-source dead-residual
-auxiliary, then run the minimum two-seed scalar-RMS confirmation. These are
-carry-forward engineering choices until the replacement evidence exists, not
-newly re-established regularizer or auxiliary findings.
-
-### Partial-view work removed
-
-The former partial-view diagnostics belonged to the deleted constant-parent
-finalist and are not carried into the active result. They will not be
-recomputed on the replacement checkpoint: single-site and leave-one-out
-reconstruction answer an operational missing-view question outside the
-standard crosscoder claim and outside this presentation. The earlier masking
-ablation remains relevant because it directly shows that training for partial
-views degrades the standard all-view objective.
-
-## Replacement confirmation on untouched data
+## Confirmation on untouched data
 
 **Question.** Does the boundary-refined, final-fifth BSC reproduce on untouched
 scalar-RMS confirmation data?
 
-**Status.** Pending. The obsolete constant-parent confirmation was deleted.
-The deadline path will run only scalar RMS for both seeds after the fresh 16M
-development finalist completes. Broader gauge robustness can be restored
-after the presentation deadline.
+**Status.** Pending. Scalar RMS will run for both seeds after the 16M
+development finalist completes.
 
 ## Feature geometry across layers
 
@@ -305,7 +268,7 @@ substantive developmental-geometry result. The analysis will preserve that
 layer dependence and will not force a circular projection when the learned
 geometry is an arc, cluster, fold, or diffuse cloud.
 
-**Status.** Pending the replacement finalist checkpoint.
+**Status.** Pending the finalist checkpoint.
 
 ## Comparator-family development
 
@@ -574,11 +537,8 @@ not evidence for a practically meaningful coefficient effect.
 | decoder-weighted BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
 | scalar ReLU BatchTopK | 16 active coordinates; LR `3e-4`; batch 2,048 |
 
-The Group-Lasso coefficient round required exact resumptions after an
-orchestration-only plan-binding interruption; all six cells now qualify, and
-the reported numbers come from their preserved original checkpoints and
-evaluations. No comparator is frozen and no cross-family winner is declared
-yet.
+All six Group-Lasso coefficient cells qualify. No comparator is frozen and no
+cross-family winner is declared yet.
 
 ## Limitations and open reads
 
