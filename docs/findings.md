@@ -4,13 +4,14 @@ This is the scientific report for the BSC campaign. It is organized around
 the questions asked, the methods compared, the observed data, and the design
 choice that follows.
 
-The evidence cutoff is **2026-07-26 17:38 PDT**. Phase 1 is complete. The
+The evidence cutoff is **2026-07-26 19:32 PDT**. Phase 1 is complete. The
 deadline-critical Phase 2 BSC path is complete through two-seed 16M
 development, untouched confirmation, and controlled feature-geometry
 analysis. A post-confirmation development audit has now crossed the remaining
-learning-rate and auxiliary-weight choices; its required upper learning-rate
-boundary is still running. The six comparator families have completed their
-declared same-hardware 4M calibration paths. No 16M comparator panel was run.
+learning-rate and auxiliary-weight choices and closed the upper learning-rate
+boundary. Its final none-vs-map-nuclear regularizer comparison is now running.
+The six comparator families have completed their declared same-hardware 4M
+calibration paths. No 16M comparator panel was run.
 
 For Phase 2, every FVU value is the raw per-seed score averaged over the exact
 256, 384, and 512 total-bit/token budgets; lower is better. Tables show seeds
@@ -41,11 +42,10 @@ development controls, not a direct 16M cross-method leaderboard.
 A subsequent 4M audit found a further development improvement. Crossing
 learning rates `3e-4` and `6e-4` with auxiliary weights 0, `1/32`, and 1
 selected **`6e-4` plus weight 1** at **`0.263365` / `0.259766`**, improving
-the exact `3e-4` plus weight-1 replay in both seeds. Because `6e-4` is the
-upper tested point, `1.2e-3` is now running before the learning rate can be
-called bracketed. The confirmed 16M model therefore remains the current
-presentation model until this development audit closes and any changed winner
-is retrained.
+the exact `3e-4` plus weight-1 replay in both seeds. Doubling again to
+`1.2e-3` worsened FVU to **`0.271906` / `0.289441`**, bracketing `6e-4`.
+The confirmed 16M model remains the current presentation model until the
+regularizer audit closes and the changed winner is retrained.
 
 The currently confirmed BSC configuration, with the active audit status
 noted, is:
@@ -60,10 +60,10 @@ noted, is:
 | code | signed, 2,048 groups × width 4, 8 active blocks | width 4 won; 32 active coordinates remains the only fully qualified BSC activity setting so far |
 | score and selector | decoded energy + block BatchTopK | clear improvement over token-TopK and other score functions |
 | site masking | none | every positive masking treatment was worse |
-| optimizer | fused Adam, batch 512; confirmed 16M LR `3e-4`; 4M audit leader LR `6e-4` | 512 beat 1,024 and 256 lost; `6e-4` beat `3e-4` under all three auxiliary settings, with `1.2e-3` pending |
+| optimizer | fused Adam, batch 512; confirmed 16M LR `3e-4`; audited 4M LR `6e-4` | `6e-4` beat `3e-4` under all three auxiliary settings; `1.2e-3` then lost in both seeds |
 | schedule | final-fifth linear decay to zero | better than constant in both seeds |
 | warmup | 0% | clearly better than 2% in both seeds, so the conditional 1% arm was elided |
-| regularizer | none | current finalist setting; direct none-vs-map-nuclear audit follows the learning-rate boundary |
+| regularizer | none | current finalist setting; direct none-vs-map-nuclear audit is running |
 | auxiliary | SASA-style frequency-dead residual, weight 1, AuxK 8, `1e-4` dead frequency, 1,000-token window | re-ablated at both `3e-4` and `6e-4`; weight 1 won against zero and `1/32` in every seed |
 | train budget | 16M unique rows and optimizer-token presentations | qualified in both development and untouched confirmation seeds |
 
@@ -289,6 +289,7 @@ regularizer, and the selected BSC architecture.
 | `6e-4` | 0 | 0.279534 | 0.279670 | improves both seeds over `3e-4` |
 | `6e-4` | `1/32` | 0.277604 | 0.277322 | improves both seeds over `3e-4` |
 | `6e-4` | 1 | **0.263365** | **0.259766** | numerical winner |
+| `1.2e-3` | 1 | 0.271906 | 0.289441 | worse in both seeds; closes upper boundary |
 
 **Interpretation.** The auxiliary result is decisive and consistent: weight 1
 beats `1/32` and zero at both learning rates and in both seeds. At `6e-4`,
@@ -297,11 +298,11 @@ learning-rate result is also consistent across the complete interaction
 surface: `6e-4` beats `3e-4` at every auxiliary weight in both seeds. On the
 winning weight-1 arm, the improvements are `0.001619` and `0.002898`.
 
-**Current decision.** Adopt weight 1 for the remaining finalist audit.
-`6e-4` is the current numerical learning-rate winner, but not yet the final
-adoption because it won at the upper boundary. A two-seed `1.2e-3` arm is
-running. If it loses, `6e-4` is bracketed; if it wins, the geometric boundary
-search continues. Confirmation evidence is not used for this choice.
+**Adopted.** Weight 1 and learning rate `6e-4` for the remaining finalist
+audit. The next geometric boundary, `1.2e-3`, loses by `0.008541` and
+`0.029675` FVU, so `6e-4` is bracketed between the inferior `3e-4` and
+`1.2e-3` settings. The larger seed-1 failure also shows that the boundary is
+not a marginal tie. Confirmation evidence was not used for this choice.
 
 ### Full-budget development
 
@@ -312,14 +313,14 @@ is trained at the full 16M-row budget?
 |---|---:|---:|---:|
 | boundary-selected 4M no-auxiliary parent | 0.282590 | 0.281399 | 0.281994 |
 | 4M replay of confirmed `3e-4`, weight-1 configuration | 0.264984 | 0.262664 | 0.263824 |
-| current 4M audit leader: `6e-4`, weight 1 | 0.263365 | 0.259766 | **0.261565** |
+| adopted 4M audit winner: `6e-4`, weight 1 | 0.263365 | 0.259766 | **0.261565** |
 | confirmed 16M development finalist: `3e-4`, weight 1 | 0.241956 | 0.243194 | **0.242575** |
 
 **Interpretation.** The original 4M boundary parent did not yet include the
 auxiliary, so it is not an exact scaling control for the 16M finalist. The
 post-confirmation audit supplies the missing exact 4M replay: at `3e-4` and
 weight 1, moving from 4M to 16M improves FVU by `0.023027` and `0.019470`.
-The new 4M `6e-4` leader is promising but has not yet been trained at 16M.
+The new 4M `6e-4` winner has not yet been trained at 16M.
 
 **Current decision.** The two-seed `3e-4` 16M model remains the confirmed
 Phase 2 development finalist. Retrain at 16M only after the learning-rate and
@@ -724,9 +725,9 @@ pass.
 - Phase 2 has two seeds. It is appropriate for conditional tuning, not a
   five-seed publication claim.
 - The main chain is path-dependent. The crossed finalist audit closes the
-  learning-rate/auxiliary interaction, but the `1.2e-3` upper boundary and
-  subsequent none-vs-map-nuclear regularizer comparison are still pending.
-  The search is structured rather than exhaustive.
+  learning-rate/auxiliary interaction and brackets the learning rate, but the
+  final none-vs-map-nuclear regularizer comparison is still pending. The
+  search is structured rather than exhaustive.
 - Comparator roots use different architectures and source recipes. Their 4M
   tuning is complete, but they were not retrained at the BSC finalist's 16M
   budget or evaluated on confirmation, so this report does not declare a final
