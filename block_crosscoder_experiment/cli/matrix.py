@@ -1355,6 +1355,153 @@ def _append_finalist_optimizer_aux_audit(
     return extended
 
 
+def _append_finalist_learning_rate_boundary(
+    campaign: Campaign,
+    *,
+    selection_path: Path,
+    stage_name: str,
+    learning_rate: float,
+) -> StudyPlan:
+    """Append one higher learning-rate boundary candidate from an audit winner."""
+
+    current = campaign.plan
+    if current.phase is not Phase.PHASE2:
+        raise StudyError("the finalist learning-rate boundary belongs only to Phase 2")
+    if any(stage.name == stage_name for stage in current.stages):
+        raise StudyError(f"{stage_name} is already materialized")
+    resolved_selection_path = selection_path
+    if not resolved_selection_path.is_absolute():
+        resolved_selection_path = campaign.root / resolved_selection_path
+    selection = _frozen_selection(resolved_selection_path)
+    source_matches = [
+        stage for stage in current.stages if stage.name == selection.source_stage
+    ]
+    if len(source_matches) != 1:
+        raise StudyError("the selected finalist audit stage is absent or ambiguous")
+    source_stage = source_matches[0]
+    if not source_stage.name.startswith("bsc_finalist_"):
+        raise StudyError("the boundary parent must come from a finalist audit stage")
+    if source_stage.selection_policy is None:
+        raise StudyError("the selected finalist audit stage has no selection policy")
+    by_id = {cell.cell_id: cell for cell in source_stage.cells}
+    try:
+        parents = tuple(
+            sorted(
+                (by_id[cell_id] for cell_id in selection.cell_ids),
+                key=lambda cell: cell.seed,
+            )
+        )
+    except KeyError as exc:
+        raise StudyError("the boundary selection names a cell outside its source stage") from exc
+    if tuple(cell.seed for cell in parents) != selection.seeds:
+        raise StudyError("the boundary selection seed order does not match its cells")
+    for parent in parents:
+        values = parent.decision_map
+        expected = {
+            "optimizer.name": "adam",
+            "optimizer.batch_tokens": 512,
+            "optimizer.warmup_fraction": 0.0,
+            "optimizer.schedule": "warmup_then_final_fifth_linear",
+            "optimizer.final_decay_fraction": 0.2,
+            "objective.regularizer": "none",
+        }
+        mismatches = {
+            name: values.get(name)
+            for name, expected_value in expected.items()
+            if values.get(name) != expected_value
+        }
+        if mismatches:
+            raise StudyError(
+                "the boundary parent is not on the selected optimizer carrier: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+
+    blueprint = _registered_blueprint(campaign)
+    if not isinstance(blueprint, Phase2Blueprint):
+        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
+    variant = ChildVariant(
+        f"learning_rate_{str(learning_rate).replace('.', 'p').replace('-', 'm')}",
+        (
+            novel(
+                "factor.finalist_gap_audit",
+                f"learning_rate_boundary_{learning_rate}",
+                rationale="bind the next higher finalist learning-rate boundary",
+                ablation="continue geometrically only while the boundary wins",
+            ),
+            novel(
+                "optimizer.learning_rate",
+                learning_rate,
+                rationale="close the upper learning-rate boundary after 6e-4 won",
+                ablation="compare directly with the selected lower boundary",
+            ),
+        ),
+    )
+    stage_blueprint = StageBlueprint(
+        name=stage_name,
+        source_stage=source_stage.name,
+        source_policy_id=selection.policy_id,
+        train_tokens=4_000_000,
+        split="development",
+        variants=(variant,),
+        selection_policy=source_stage.selection_policy,
+        role="phase_local_tuning",
+        advancement="empirical_selection",
+    )
+    cells = tuple(
+        derive_child_cell(
+            parent,
+            parent_cells=parents,
+            selection=selection,
+            stage_blueprint=stage_blueprint,
+            variant=variant,
+            source_plan_id=current.plan_id,
+            source_blueprint_id=blueprint.blueprint_id,
+        )
+        for parent in parents
+    )
+    child_stage = StageSpec(
+        stage_name,
+        cells,
+        depends_on=(source_stage.name,),
+        selection_policy=source_stage.selection_policy,
+    )
+    extended = StudyPlan(
+        name=current.name,
+        phase=current.phase,
+        stages=(*current.stages, child_stage),
+    )
+    frozen_evidence = _read_object(resolved_selection_path)
+    evidence_ref = ArtifactRef.from_path(
+        "stage_selection",
+        resolved_selection_path,
+        root=campaign.root,
+    )
+    journal_sha256 = (
+        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
+    )
+    campaign._commit_plan_extension(
+        current=current,
+        plan=extended,
+        child_stage=child_stage,
+        evidence_ref=evidence_ref,
+        frozen_evidence=frozen_evidence,
+        live_evidence=lambda: _read_object(resolved_selection_path),
+        journal_sha256=journal_sha256,
+        message=f"appended finalist learning-rate boundary {learning_rate}",
+        metadata={
+            "previous_plan_id": current.plan_id,
+            "plan_id": extended.plan_id,
+            "stage": stage_name,
+            "branch": "bsc_finalist_gap_audit",
+            "source_stage": source_stage.name,
+            "selection_id": selection.selection_id,
+            "learning_rate": learning_rate,
+            "development_only": True,
+        },
+    )
+    return extended
+
+
 def _registered_blueprint(campaign: Campaign):
     payload = _read_object(campaign.blueprint_path)
     if campaign.plan.phase is Phase.PHASE1:
@@ -1572,6 +1719,19 @@ def _parser() -> argparse.ArgumentParser:
         help="selection artifact that bound the selected bsc_final_16m candidate",
     )
 
+    finalist_lr_boundary = subparsers.add_parser(
+        "advance-finalist-lr-boundary",
+        help="append one higher 4M learning-rate boundary from the finalist audit winner",
+    )
+    finalist_lr_boundary.add_argument("--root", type=Path, required=True)
+    finalist_lr_boundary.add_argument("--selection", type=Path, required=True)
+    finalist_lr_boundary.add_argument("--stage", required=True)
+    finalist_lr_boundary.add_argument(
+        "--learning-rate",
+        type=_positive_float,
+        required=True,
+    )
+
     advance = subparsers.add_parser(
         "advance",
         help="append the next blueprint round from an immutable frozen selection",
@@ -1759,6 +1919,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                         {cell.candidate_id for cell in stage.cells}
                     ),
                     "status": campaign.status(),
+                }
+            )
+        elif args.command == "advance-finalist-lr-boundary":
+            extended = _append_finalist_learning_rate_boundary(
+                campaign,
+                selection_path=args.selection,
+                stage_name=args.stage,
+                learning_rate=args.learning_rate,
+            )
+            stage = extended.stages[-1]
+            _print(
+                {
+                    "plan_id": extended.plan_id,
+                    "appended_stage": stage.name,
+                    "cell_ids": [cell.cell_id for cell in stage.cells],
+                    "learning_rate": args.learning_rate,
                 }
             )
         elif args.command == "nominate-family-revisit":
