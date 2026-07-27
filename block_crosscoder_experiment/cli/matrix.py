@@ -1502,6 +1502,268 @@ def _append_finalist_learning_rate_boundary(
     return extended
 
 
+def _finalist_regularizer_variants() -> tuple[ChildVariant, ...]:
+    """Return the exact none-vs-best-prior-promotable regularizer audit."""
+
+    common_none = (
+        novel(
+            "objective.regularizer_coefficient",
+            0.0,
+            rationale="bind the zero-coefficient carrier",
+            ablation="compare the calibrated map-nuclear bundle",
+        ),
+        novel(
+            "objective.regularizer_schedule",
+            "always",
+            rationale="retain the executable regularizer schedule",
+            ablation="schedule variants require a separate audit",
+        ),
+        novel(
+            "objective.regularizer_target",
+            None,
+            rationale="remove activity targeting from the finalist audit",
+            ablation="named target penalties require a separate bundle",
+        ),
+        novel(
+            "regularizer.sv_eps",
+            0.0,
+            rationale="use exact singular values",
+            ablation="positive smoothing is a separate numerical arm",
+        ),
+    )
+    return (
+        ChildVariant(
+            "no_regularizer",
+            merge_decisions(
+                common_none,
+                (
+                    novel(
+                        "factor.finalist_gap_audit",
+                        "regularizer_none",
+                        rationale="bind the unregularized finalist control",
+                        ablation="compare map nuclear at one-percent initial-loss ratio",
+                    ),
+                    novel(
+                        "factor.regularization",
+                        "none",
+                        rationale="retain the current finalist objective",
+                        ablation="compare the strongest prior promotable regularizer",
+                    ),
+                    novel(
+                        "objective.regularizer",
+                        "none",
+                        rationale="disable spectral regularization exactly",
+                        ablation="compare the complete map-nuclear bundle",
+                    ),
+                    novel(
+                        "objective.regularizer_coefficient_mode",
+                        "absolute",
+                        rationale="remove data-derived coefficient fitting",
+                        ablation="the map-nuclear arm calibrates an initial-loss ratio",
+                    ),
+                    novel(
+                        "objective.regularizer_target_initial_ratio",
+                        None,
+                        rationale="remove inherited ratio calibration",
+                        ablation="compare the declared one-percent ratio",
+                    ),
+                    novel(
+                        "objective.regularizer_calibration_contract",
+                        "not_applicable",
+                        rationale="the zero penalty consumes no calibration rows",
+                        ablation="the map-nuclear arm binds its exact fit contract",
+                    ),
+                    novel(
+                        "objective.regularizer_reduction",
+                        "native",
+                        rationale="retain the neutral executable reduction",
+                        ablation="the map-nuclear arm uses summed block penalties",
+                    ),
+                ),
+            ),
+        ),
+        ChildVariant(
+            "map_nuclear_initial_ratio_0p01",
+            merge_decisions(
+                common_none,
+                (
+                    novel(
+                        "factor.finalist_gap_audit",
+                        "regularizer_map_nuclear_initial_ratio_0p01",
+                        rationale="bind the strongest prior promotable regularizer arm",
+                        ablation="compare the exact unregularized finalist",
+                    ),
+                    novel(
+                        "factor.regularization",
+                        "map_nuclear",
+                        rationale="penalize the end-to-end site map spectrum",
+                        ablation="compare no regularizer under the final optimizer",
+                    ),
+                    novel(
+                        "objective.regularizer",
+                        "end_to_end_map_nuclear",
+                        rationale="retain the promotable map-nuclear objective",
+                        ablation="compare the unregularized carrier",
+                    ),
+                    novel(
+                        "objective.regularizer_coefficient_mode",
+                        "initial_loss_ratio",
+                        rationale="calibrate the penalty dimensionlessly",
+                        ablation="compare exact zero",
+                    ),
+                    novel(
+                        "objective.regularizer_target_initial_ratio",
+                        0.01,
+                        rationale="retest the strongest prior promotable regularizer setting",
+                        ablation="the earlier 0.03 and 0.10 settings were worse",
+                    ),
+                    novel(
+                        "objective.regularizer_calibration_contract",
+                        "post_init_train_prefix_true_observation_fp32_v1",
+                        rationale="retain the exact prior coefficient-fit contract",
+                        ablation="compare the no-calibration zero carrier",
+                    ),
+                    novel(
+                        "objective.regularizer_reduction",
+                        "sum_blocks",
+                        rationale="retain the declared map-nuclear reduction",
+                        ablation="alternative reductions require coefficient rescaling",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _append_finalist_regularizer_audit(
+    campaign: Campaign,
+    *,
+    selection_path: Path,
+) -> StudyPlan:
+    """Append the 4M none-vs-map-nuclear finalist regularizer audit."""
+
+    current = campaign.plan
+    stage_name = "bsc_finalist_regularizer_4m"
+    if current.phase is not Phase.PHASE2:
+        raise StudyError("the finalist regularizer audit belongs only to Phase 2")
+    if any(stage.name == stage_name for stage in current.stages):
+        raise StudyError(f"{stage_name} is already materialized")
+    resolved_selection_path = selection_path
+    if not resolved_selection_path.is_absolute():
+        resolved_selection_path = campaign.root / resolved_selection_path
+    selection = _frozen_selection(resolved_selection_path)
+    source_matches = [
+        stage for stage in current.stages if stage.name == selection.source_stage
+    ]
+    if len(source_matches) != 1:
+        raise StudyError("the selected finalist optimizer stage is absent or ambiguous")
+    source_stage = source_matches[0]
+    if source_stage.name != "bsc_finalist_optimizer_aux_4m":
+        raise StudyError("the regularizer audit must bind the crossed optimizer winner")
+    if source_stage.selection_policy is None:
+        raise StudyError("the selected finalist stage has no selection policy")
+    by_id = {cell.cell_id: cell for cell in source_stage.cells}
+    try:
+        parents = tuple(
+            sorted(
+                (by_id[cell_id] for cell_id in selection.cell_ids),
+                key=lambda cell: cell.seed,
+            )
+        )
+    except KeyError as exc:
+        raise StudyError("the regularizer selection names a cell outside its stage") from exc
+    for parent in parents:
+        values = parent.decision_map
+        expected = {
+            "optimizer.learning_rate": 6e-4,
+            "optimizer.batch_tokens": 512,
+            "optimizer.warmup_fraction": 0.0,
+            "optimizer.schedule": "warmup_then_final_fifth_linear",
+            "objective.auxiliary": "frequency_dead_residual",
+            "auxiliary.coefficient": 1.0,
+            "objective.regularizer": "none",
+        }
+        mismatches = {
+            name: values.get(name)
+            for name, expected_value in expected.items()
+            if values.get(name) != expected_value
+        }
+        if mismatches:
+            raise StudyError(
+                "the regularizer parent is not the crossed finalist winner: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
+
+    blueprint = _registered_blueprint(campaign)
+    if not isinstance(blueprint, Phase2Blueprint):
+        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
+    variants = _finalist_regularizer_variants()
+    stage_blueprint = StageBlueprint(
+        name=stage_name,
+        source_stage=source_stage.name,
+        source_policy_id=selection.policy_id,
+        train_tokens=4_000_000,
+        split="development",
+        variants=variants,
+        selection_policy=source_stage.selection_policy,
+        role="phase_local_tuning",
+        advancement="empirical_selection",
+    )
+    cells = tuple(
+        derive_child_cell(
+            parent,
+            parent_cells=parents,
+            selection=selection,
+            stage_blueprint=stage_blueprint,
+            variant=variant,
+            source_plan_id=current.plan_id,
+            source_blueprint_id=blueprint.blueprint_id,
+        )
+        for variant in variants
+        for parent in parents
+    )
+    child_stage = StageSpec(
+        stage_name,
+        cells,
+        depends_on=(source_stage.name,),
+        selection_policy=source_stage.selection_policy,
+    )
+    extended = StudyPlan(
+        name=current.name,
+        phase=current.phase,
+        stages=(*current.stages, child_stage),
+    )
+    frozen_evidence = _read_object(resolved_selection_path)
+    evidence_ref = ArtifactRef.from_path(
+        "stage_selection",
+        resolved_selection_path,
+        root=campaign.root,
+    )
+    journal_sha256 = (
+        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
+    )
+    campaign._commit_plan_extension(
+        current=current,
+        plan=extended,
+        child_stage=child_stage,
+        evidence_ref=evidence_ref,
+        frozen_evidence=frozen_evidence,
+        live_evidence=lambda: _read_object(resolved_selection_path),
+        journal_sha256=journal_sha256,
+        message="appended 4M finalist regularizer audit",
+        metadata={
+            "previous_plan_id": current.plan_id,
+            "plan_id": extended.plan_id,
+            "stage": stage_name,
+            "branch": "bsc_finalist_gap_audit",
+            "source_stage": source_stage.name,
+            "selection_id": selection.selection_id,
+            "development_only": True,
+        },
+    )
+    return extended
+
+
 def _registered_blueprint(campaign: Campaign):
     payload = _read_object(campaign.blueprint_path)
     if campaign.plan.phase is Phase.PHASE1:
@@ -1732,6 +1994,13 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    finalist_regularizer = subparsers.add_parser(
+        "advance-finalist-regularizer-audit",
+        help="append the 4M none-vs-map-nuclear finalist regularizer audit",
+    )
+    finalist_regularizer.add_argument("--root", type=Path, required=True)
+    finalist_regularizer.add_argument("--selection", type=Path, required=True)
+
     advance = subparsers.add_parser(
         "advance",
         help="append the next blueprint round from an immutable frozen selection",
@@ -1935,6 +2204,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "appended_stage": stage.name,
                     "cell_ids": [cell.cell_id for cell in stage.cells],
                     "learning_rate": args.learning_rate,
+                }
+            )
+        elif args.command == "advance-finalist-regularizer-audit":
+            extended = _append_finalist_regularizer_audit(
+                campaign,
+                selection_path=args.selection,
+            )
+            stage = extended.stages[-1]
+            _print(
+                {
+                    "plan_id": extended.plan_id,
+                    "appended_stage": stage.name,
+                    "cell_ids": [cell.cell_id for cell in stage.cells],
+                    "candidate_count": len(
+                        {cell.candidate_id for cell in stage.cells}
+                    ),
                 }
             )
         elif args.command == "nominate-family-revisit":

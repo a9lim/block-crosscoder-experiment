@@ -44,6 +44,7 @@ from block_crosscoder_experiment.activation_identity import (
 )
 from block_crosscoder_experiment.cli.matrix import (
     _finalist_optimizer_aux_variants,
+    _finalist_regularizer_variants,
     _frozen_selection,
     main as matrix_main,
 )
@@ -4933,6 +4934,23 @@ def test_frozen_selection_reads_deadline_selection_envelope(tmp_path):
         )
     )
     assert _frozen_selection(path) == selection
+
+
+def test_finalist_regularizer_audit_retests_only_none_and_best_prior_arm():
+    variants = _finalist_regularizer_variants()
+    resolved = {
+        variant.name: {decision.name: decision.value for decision in variant.decisions}
+        for variant in variants
+    }
+    assert set(resolved) == {
+        "no_regularizer",
+        "map_nuclear_initial_ratio_0p01",
+    }
+    assert resolved["no_regularizer"]["objective.regularizer"] == "none"
+    map_nuclear = resolved["map_nuclear_initial_ratio_0p01"]
+    assert map_nuclear["objective.regularizer"] == "end_to_end_map_nuclear"
+    assert map_nuclear["objective.regularizer_coefficient_mode"] == "initial_loss_ratio"
+    assert map_nuclear["objective.regularizer_target_initial_ratio"] == 0.01
 
 
 def test_phase2_freeze_builds_a_verified_seed_complete_phase3_panel(
