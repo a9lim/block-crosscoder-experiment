@@ -126,8 +126,10 @@ analysis package.
   splits. Derived views preserve the raw row stream exactly.
 - Site dimensions and ordered hook names are part of every cell/store binding;
   padding is structural and masked.
-- Checkpoints, stores, reports, generated references, logs, and evaluations are
-  ignored local artifacts. Committed `data/` contains placeholders only.
+- Checkpoints, stores, full reports, generated references, logs, and evaluations
+  are ignored local artifacts. Compact public evidence summaries live under
+  committed `data/summary/`; publication figures live under `docs/figures/` and
+  are indexed by `figures/README.md`.
 - Every promotion is an immutable content-addressed decision artifact.
 - The campaign never garbage-collects a recorded final checkpoint or store.
   Deletion or archival is an external operational action; missing recorded

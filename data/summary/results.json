@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "evidence_cutoff": "2026-07-26",
+  "status": "phase1-complete-phase2-bsc-path-complete-controls-4m-only",
+  "phase1": {
+    "seeds": [0, 1, 2],
+    "shared_coordinate_carrier_worst_normalized_identification_margin": [0.9996, 1.0, 0.9976],
+    "matched_confirmation": "passed-all-seeds",
+    "support_only_control": "failed-as-intended-all-seeds",
+    "site_span_one_control": "failed-conjunctive-full-factor-gate-all-seeds"
+  },
+  "phase2_confirmed_16m_model": {
+    "development_fvu": [0.241956, 0.243194],
+    "untouched_confirmation_fvu": [0.237138, 0.238543],
+    "seeds": [0, 1],
+    "configuration_note": "3e-4 learning rate recipe; remains the presentation model until the audited 6e-4 recipe is retrained and confirmed"
+  },
+  "phase2_post_confirmation_development_audit": {
+    "selected_learning_rate": 0.0006,
+    "selected_auxiliary_weight": 1.0,
+    "selected_regularizer": "none",
+    "four_million_token_fvu": [0.263365, 0.259766],
+    "upper_boundary_0_0012_fvu": [0.271906, 0.289441],
+    "map_nuclear_fvu": [0.262976, 0.261097],
+    "seeds": [0, 1],
+    "claim_boundary": "development audit only; 16M retrain and untouched confirmation pending"
+  },
+  "phase2_blueprint": {
+    "declared_pre_elision_cell_ceiling": 378,
+    "main_chain_cells": 176,
+    "comparator_family_cells": 202,
+    "realized_count_is_evidence_dependent": true
+  },
+  "feature_geometry": {
+    "raw_month_centroids": "calendar order preserved at all four GPT-2 residual sites; open arc at blocks 3/5/7 and closed ring at block 9",
+    "bsc_joint_month_block": "strongly non-random calendar path length in both seeds; arc in seed 0 and distorted closed cycle in seed 1",
+    "claim_boundary": "topology is supported; a seed-invariant ideal circle is not"
+  },
+  "controls": {
+    "families_completed_at_4m": 6,
+    "sixteen_million_token_control_panel_completed": false,
+    "claim_boundary": "within-family calibrated development controls, not a direct 16M cross-method leaderboard"
+  },
+  "limitations": [
+    "no five-seed Gemma Phase 3 publication panel",
+    "audited 6e-4 BSC recipe has not been retrained and confirmed at 16M",
+    "no 16M comparator panel",
+    "missing-view behavior is descriptive and outside the promotion claim"
+  ],
+  "sources": [
+    "docs/findings.md",
+    "docs/figures/phase2/month_geometry_metrics.json",
+    "docs/design.md"
+  ]
+}

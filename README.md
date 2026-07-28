@@ -27,6 +27,10 @@ The source procedure ledgers are
 [docs/papers/crosscoders.md](docs/papers/crosscoders.md). The in-place Phase-2
 gate correction and evidence carry-forward boundary are recorded in
 [docs/phase2_gate_review_2026-07-23.md](docs/phase2_gate_review_2026-07-23.md).
+Current results and limits are in [docs/findings.md](docs/findings.md), with a
+compact machine-readable record at
+[data/summary/results.json](data/summary/results.json) and a figure index at
+[figures/README.md](figures/README.md).
 
 ## Decision rule
 
@@ -85,8 +89,8 @@ fp32/bf16 parity-and-short-run stability gate is a Phase-3-only preflight; the
 pilot does not claim to have passed that later production-shape gate.
 
 At the default seeds, Phase 1 declares and executes **15 cells**. Phase 2 has
-a **410-cell pre-elision ceiling**: 176 main-chain cells and 234 independently
-calibrated comparator-family cells. At materialization, execution-equivalent
+a **378-cell pre-elision ceiling**: 176 main-chain cells and 202
+comparator-family cells. At materialization, execution-equivalent
 parent/center variants are deterministically elided and recorded. The rank
 revisit keeps only its parent when zero Bernoulli masking wins, so the realized
 Phase-2 count is lower and evidence-dependent. The Appendix-D runner-up arm is

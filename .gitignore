@@ -7,7 +7,12 @@ data/**
 !data/evidence/
 data/evidence/**
 !data/evidence/.gitkeep
-figures/
+!data/summary/
+!data/summary/**
+figures/**
+!figures/README.md
+!figures/public/
+!figures/public/**
 tmp/
 
 # Python
