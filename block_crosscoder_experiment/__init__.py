@@ -14,6 +14,7 @@ from .gram import (
     site_frobenius_shares,
     site_singular_values,
 )
+from .artifact import BSCArtifact, load_artifact
 from .model import (
     BlockCrosscoder,
     BSCConfig,
@@ -34,6 +35,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BSCConfig",
+    "BSCArtifact",
     "BSCOutput",
     "BlockCrosscoder",
     "DeadTracker",
@@ -52,6 +54,7 @@ __all__ = [
     "gram_residual",
     "init_decoder_stack",
     "map_nuclear_penalty",
+    "load_artifact",
     "project_block_frobenius_",
     "retract_",
     "site_frobenius_shares",

@@ -104,10 +104,11 @@ Do not add paper-specific scripts or a parallel analysis package.
 - Generated stores, checkpoints, evaluations, and logs are local and ignored.
   Commit compact evidence under `data/summary/` and figures under
   `docs/figures/`.
-- Maintainer machines use shared plain Python 3.12. External reviewers may use
-  the disposable `.venv` workflow in `docs/reviewer_setup.md`; do not assume
-  they share the maintainer environment.
-- Run training and capture on `jobe` with plain `python`.
+- Maintainer machines use shared plain Python 3.12. The reviewer install in
+  `docs/reviewer_setup.md` declares every capture and CUDA dependency in one
+  package command; do not send reviewers through a separate CPU environment.
+- Run maintainer training and capture on `jobe` when it is available. The
+  reviewer replication command may use any compatible Linux/NVIDIA device.
 - Phase 1 uses fp32. Real-model capture uses its declared bf16 precision; fp16
   stores are unsupported.
 - Recheck storage and memory headroom before a large run. Resource ceilings are
@@ -116,8 +117,8 @@ Do not add paper-specific scripts or a parallel analysis package.
 ## Verification
 
 Match verification to the change. Prefer focused checks of model math, data
-splits, selection, ordinary resume, and the touched CLI surface. For a
-cross-cutting campaign change, run one tiny CPU cell through prepare, train,
-calibrate, evaluate, and qualify. Use `compileall` and `git diff --check`
-before publication. A full legacy suite is not required when its remaining
-failures exercise removed defensive behavior.
+splits, selection, ordinary resume, and the touched CLI surface. Reviewer-path
+changes should validate the resolved formula, install surface, and artifact
+loader; actual CUDA execution is authoritative when compatible hardware is
+available. Do not substitute a CPU tour for that claim. Use `compileall` and
+`git diff --check` before publication.

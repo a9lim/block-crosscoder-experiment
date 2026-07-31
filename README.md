@@ -90,87 +90,42 @@ Compact result tables live in `data/summary/`; publication figures live in
 
 ## Quick start
 
-For a fresh reviewer machine, use Python 3.12 in an isolated environment:
+The reviewer path has one job: produce the selected BSC artifact on a
+Linux/NVIDIA CUDA machine. With Python 3.12 installed, this single shell
+command installs every runtime dependency and runs the replication:
 
 ```bash
-git clone https://github.com/a9lim/block-crosscoder-experiment.git
-cd block-crosscoder-experiment
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[review]"
-bsc review
+python3.12 -m pip install "block-crosscoder-experiment @ git+https://github.com/a9lim/block-crosscoder-experiment.git" && bsc replicate
 ```
 
-`bsc review` is download-free and runs the real training, codec, evaluation,
-campaign, selection, and confirmation code on tiny CPU data. It also loads
-and estimates the Phase-2 and Phase-3 definitions. The command prints and
-retains its artifact directory for inspection.
+`bsc replicate` downloads the pinned GPT-2 Small and OpenWebText inputs,
+captures residual-pre activations at blocks 3/5/7/9, fits scalar-RMS
+normalization, trains the selected formula for 16M tokens, calibrates its
+deployable codec, and writes:
 
-See [`docs/reviewer_setup.md`](docs/reviewer_setup.md) for native
-macOS/Linux and Windows/WSL notes, the optional test suite, Hugging Face
-access, CUDA installation, real activation capture, storage sizing, and the
-full experiment path.
+- `bsc-16m/bsc-16m.pt` — the usable model, codec, and normalization;
+- `bsc-16m/result.json` — the training and evaluation result.
 
-To inspect the individual commands instead:
+The formula is the audited 4M development winner extrapolated to 16M at the
+reviewer's request: LR `6e-4`, batch 512, no warmup, final-fifth decay, and
+the weight-1 frequency-dead auxiliary. This exact 16M extrapolation was not
+previously run or confirmed; the artifact and result say so directly.
 
-```bash
-bsc --help
-bsc matrix estimate --phase phase1 --smoke
-bsc matrix plan --phase phase1 --smoke --root /tmp/bsc-phase1-smoke
-bsc matrix run --root /tmp/bsc-phase1-smoke --limit 1
-bsc matrix status --root /tmp/bsc-phase1-smoke
-```
-
-The cell lifecycle is deliberately ordinary:
-
-```text
-planned → prepared → running → trained → calibrated → evaluated → qualified
-```
-
-Each cell directory contains `cell.json`, `state.json`, and an `outputs/`
-directory. Rerunning with `--resume` continues a failed or interrupted cell
-from the latest completed stage.
-
-After a complete Phase 1:
-
-```bash
-bsc matrix freeze-phase1 --root RUN_ROOT
-```
-
-The resulting decision JSON can be reviewed, edited if necessary, and passed
-to Phase 2:
-
-```bash
-bsc matrix plan \
-  --phase phase2 \
-  --phase1-decision RUN_ROOT/decisions/phase2-authorization.json \
-  --root PHASE2_ROOT
-```
-
-Use `bsc data --help` for activation capture and aligned derived views, and
-`bsc matrix --help` for selection and phase advancement commands.
+See [`docs/reviewer_setup.md`](docs/reviewer_setup.md) for the hardware and
+storage expectation, resume behavior, exact formula, and artifact-loading
+example.
 
 ## Execution notes
 
-- Phase 1 runs in fp32.
-- Phase 2 capture uses its declared bf16 forward precision; fp16 activation
-  stores are not supported.
-- Training and capture belong on the CUDA machine; local CPU smoke runs cover
-  platform-independent behavior.
-- The portable installation needs only NumPy, safetensors, and PyTorch.
-  Install `.[full]` for model capture and figures, and `.[cuda]` for the
-  Linux/NVIDIA kernels.
-- Resource estimates remain refusal gates because they prevent an accidental
-  oversized run, not because artifacts are considered hostile.
-- The campaign never launches scientific training implicitly. Planning,
-  running, selecting, and advancing are separate commands.
-
-## Focused verification
-
-The retained checks cover the claims that could change an experimental result:
-model math, training behavior, codec round-trips, split separation, selection,
-ordinary resume, and one end-to-end smoke cell.
+- The command requires Python 3.12, Linux, a bf16-capable NVIDIA GPU, internet
+  access, and roughly 215 GiB of temporary working data plus free-space
+  headroom.
+- GPT-2 Small and OpenWebText are public; no Hugging Face login is required.
+- Interrupted work is retained. Continue it with `bsc replicate --resume`.
+- Successful runs remove raw activations and campaign intermediates by
+  default. Add `--keep-work` if those are useful.
+- `bsc replicate --dry-run` prints the resolved formula and resource estimate
+  without downloading data or requiring CUDA.
 
 ## License
 

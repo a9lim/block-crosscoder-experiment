@@ -130,6 +130,7 @@ from block_crosscoder_experiment.studies import (
     Phase3Blueprint,
     PHASE2_INELIGIBLE_SELECTION_SCORE,
     PHASE2_SELECTION_METRIC_KEY,
+    WINNING_FORMULA_STAGE,
     StudyError,
     StudyPlan,
     build_phase1_blueprint,
@@ -649,7 +650,10 @@ class _Context:
             != self.campaign.cell_manifest_path(self.cell.cell_id).resolve()
         ):
             raise CellExecutionError("cell is not part of the active campaign plan")
-        if self.cell.phase is Phase.PHASE2:
+        if (
+            self.cell.phase is Phase.PHASE2
+            and self.cell.stage != WINNING_FORMULA_STAGE
+        ):
             decision = Campaign.phase1_decision_from_manifest(
                 _read_object(self.root / "phase1-decision.json", label="Phase-1 decision")
             )

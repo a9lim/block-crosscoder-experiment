@@ -18,9 +18,9 @@ COMMANDS: dict[str, tuple[str, str]] = {
         "block_crosscoder_experiment.cli.run_cell",
         "execute one resolved cell stage",
     ),
-    "review": (
-        "block_crosscoder_experiment.cli.review",
-        "run the portable download-free reviewer walkthrough",
+    "replicate": (
+        "block_crosscoder_experiment.cli.replicate",
+        "train the selected 16M BSC formula on CUDA",
     ),
 }
 

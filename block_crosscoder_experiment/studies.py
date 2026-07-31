@@ -185,6 +185,8 @@ PHASE2_INELIGIBLE_SELECTION_SCORE = -1.0e30
 PHASE2_CONFIRMATION_THRESHOLD_BASIS = (
     "novel_preregistered_confirmation_reproducibility_guard_not_a_paper_value"
 )
+WINNING_FORMULA_STAGE = "winning_formula_16m"
+WINNING_FORMULA_TRAIN_TOKENS = 16_000_000
 SELECTION_THRESHOLD_BASIS = (
     "novel_preregistered_practical_effect_and_safety_guardrails_not_paper_values"
 )
@@ -13463,6 +13465,104 @@ def _phase2_preview_root_recipe() -> Recipe:
     )
 
 
+def build_winning_formula_plan(seed: int = 0) -> StudyPlan:
+    """Build one direct 16M extrapolation of the audited 4M BSC winner.
+
+    This is the reviewer-facing replication path, not another conditional
+    search stage.  It deliberately applies the reported winning deltas to one
+    resolved Phase-2 cell and evaluates it on development evidence.  The
+    changed 6e-4 recipe has not yet been confirmed at 16M.
+    """
+
+    if seed < 0:
+        raise StudyError("winning-formula seed must be non-negative")
+    variants = {
+        stage: {variant.name: variant for variant in choices}
+        for stage, choices in _phase2_round_variants()
+    }
+    base = _phase2_preview_root_recipe()
+    recipe = Recipe(
+        name="winning_formula_bsc",
+        source=base.source,
+        variant="audited_4m_formula_extrapolated_to_16m",
+        decisions=merge_decisions(
+            base.decisions,
+            variants["site_factorization_4m"]["site_rank_4"].decisions,
+            variants["site_masking_4m"]["site_mask_0"].decisions,
+            variants["hard_selector_score_interaction_4m"][
+                "score_decoded_energy__signed_batchtopk"
+            ].decisions,
+            variants["schedule_4m"]["schedule_final_fifth"].decisions,
+            variants["regularization_16m"]["no_regularizer_no_aux"].decisions,
+            variants["auxiliary_16m"]["sasa_source"].decisions,
+        ),
+    )
+    direct_overrides = (
+        novel(
+            "optimizer.learning_rate",
+            6e-4,
+            rationale=(
+                "extend the audited 4M development winner to the requested "
+                "16M replication budget"
+            ),
+            ablation="the reported 3e-4 and 1.2e-3 arms bracket this rate at 4M",
+        ),
+        novel(
+            "optimizer.batch_tokens",
+            512,
+            rationale="replicate the audited BatchTopK comparison-pool optimum",
+            ablation="the reported 256 and 1,024 arms bracket this batch size",
+        ),
+        novel(
+            "optimizer.warmup_fraction",
+            0.0,
+            rationale="replicate the audited zero-warmup winner",
+            ablation="the reported two-percent arm was worse in both seeds",
+        ),
+        engineering(
+            "optimizer.warmup_steps",
+            0,
+            rationale="zero warmup uses zero accepted optimizer updates",
+        ),
+        engineering(
+            "source.phase1_decision_id",
+            "direct-replication",
+            rationale="direct winner replication does not replay the staged search",
+        ),
+        engineering(
+            "source.phase1_transfer_id",
+            "direct-replication",
+            rationale="direct winner replication uses the already selected formula",
+        ),
+        engineering(
+            "protocol.hyperparameter_tuning",
+            False,
+            rationale="the reviewer command trains one fixed formula without selection",
+        ),
+    )
+    cell = _cell(
+        recipe,
+        phase=Phase.PHASE2,
+        stage=WINNING_FORMULA_STAGE,
+        seed=seed,
+        overrides=merge_decisions(
+            _pilot_overrides(
+                recipe,
+                train_tokens=WINNING_FORMULA_TRAIN_TOKENS,
+                split="development",
+            ),
+            direct_overrides,
+        ),
+    )
+    return enforce_plan_resources(
+        StudyPlan(
+            "winning_formula_16m",
+            Phase.PHASE2,
+            (StageSpec(WINNING_FORMULA_STAGE, (cell,)),),
+        )
+    )
+
+
 def _phase2_source_only_diagnostic(root: Recipe) -> Recipe:
     return Recipe(
         name="phase1_contract_source_only_control",
@@ -14366,6 +14466,8 @@ __all__ = [
     "PHASE2_CONFIRMATION_SCORE_DEGRADATION_MAX",
     "PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY",
     "PHASE2_CONFIRMATION_THRESHOLD_BASIS",
+    "WINNING_FORMULA_STAGE",
+    "WINNING_FORMULA_TRAIN_TOKENS",
     "PHASE3_COMPUTE_CEILING_FLOPS",
     "PHASE1_TRANSFER_SCHEMA",
     "PHASE3_MIN_SUSTAINED_FLOPS",
@@ -14406,6 +14508,7 @@ __all__ = [
     "build_phase2_blueprint",
     "build_phase3_plan",
     "build_phase3_blueprint",
+    "build_winning_formula_plan",
     "build_plan",
     "canonical_json",
     "engineering",
