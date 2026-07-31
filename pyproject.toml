@@ -3,19 +3,29 @@ name = "block-crosscoder-experiment"
 version = "0.1.0"
 description = "Phased paper-bridge experiments for block-sparse crosscoders."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = "CC-BY-SA-4.0"
 license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
-    "datasets",
-    "huggingface-hub",
-    "matplotlib",
-    "numpy",
-    "sae-lens",
-    "safetensors",
-    "torch",
-    "transformers",
+    "numpy>=1.26,<3",
+    "safetensors>=0.4,<1",
+    "torch>=2.8,<3",
+]
+
+[project.optional-dependencies]
+full = [
+    "datasets>=4,<6",
+    "huggingface-hub>=0.34,<2",
+    "matplotlib>=3.8,<4",
+    "sae-lens>=6,<7",
+    "transformers>=4.55,<6",
+]
+cuda = [
+    "triton>=3.4,<4; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+review = [
+    "pytest>=8,<10",
 ]
 
 [project.scripts]

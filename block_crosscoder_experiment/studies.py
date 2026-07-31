@@ -7172,8 +7172,8 @@ def _source_contract_defaults(
             ),
             engineering(
                 "data.tokenizer_contract",
-                "model_revision_tokenizer",
-                rationale="load the tokenizer directly from the selected model revision",
+                "gpt2-byte-bpe-files-v1",
+                rationale="use the reviewed GPT-2 tokenizer format at the selected revision",
             ),
             engineering(
                 "data.normalization_fit_split",
@@ -7341,8 +7341,8 @@ def _source_contract_defaults(
         ),
         engineering(
             "data.tokenizer_contract",
-            "model_revision_tokenizer",
-            rationale="load the tokenizer directly from the selected model revision",
+            "gemma3-tokenizer-files-v1",
+            rationale="use the reviewed Gemma tokenizer format at the selected revision",
         ),
         engineering(
             "data.normalization_fit_split",

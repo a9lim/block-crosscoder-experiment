@@ -655,6 +655,13 @@ class _Context:
             )
             if decision.get("go") is not True:
                 raise CellExecutionError("Phase 2 requires a reviewed Phase-1 go decision")
+            if (
+                decision.get("smoke") is True
+                and self.cell.decision_map["runtime.smoke"] is not True
+            ):
+                raise CellExecutionError(
+                    "a smoke Phase-1 decision can open only a smoke Phase-2 cell"
+                )
         elif self.cell.phase is Phase.PHASE3:
             Campaign.panel_decision_from_manifest(
                 _read_object(self.root / "panel-decision.json", label="panel decision")
@@ -2314,7 +2321,7 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
     base = Path(configured).resolve()
     if store_view_policy == "single_bf16_raw_view_on_the_fly_invertible_normalization":
         return _resolve_single_raw_store(values, base)
-    if store_view_policy != "content_addressed_derived_view":
+    if store_view_policy != "derived_views":
         raise CellExecutionError(
             f"unsupported real data.store_view_policy {store_view_policy!r}"
         )
@@ -2370,7 +2377,7 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
     derived_train_view = train_manifest.get("meta", {}).get("derived_view") is True
     if not derived_train_view:
         raise CellExecutionError(
-            "content_addressed_derived_view policy requires a persisted derived "
+            "derived_views policy requires a persisted derived "
             "normalization view, including for the identity normalization"
         )
     if normalization != "none" or derived_train_view:

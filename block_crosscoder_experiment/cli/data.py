@@ -3041,7 +3041,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--tokenizer-contract",
         choices=tuple(TOKENIZER_CONTRACT_FILES),
         required=True,
-        help="ordered tokenizer-file hash contract bound by the study plan",
+        help="tokenizer format expected for the selected model",
     )
     cap.add_argument(
         "--store-contract-version",

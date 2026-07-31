@@ -653,6 +653,10 @@ def _build_plan_and_blueprint(args: argparse.Namespace):
         if args.phase1_decision is not None:
             phase1_manifest = _read_object(args.phase1_decision)
             phase1_manifest = Campaign.phase1_decision_from_manifest(phase1_manifest)
+            if phase1_manifest.get("smoke") is True and not args.smoke:
+                raise StudyError(
+                    "a smoke Phase-1 decision can open only a smoke Phase-2 plan"
+                )
         blueprint = build_phase2_blueprint(
             (0, 1) if seeds is None else seeds,
             smoke=args.smoke,

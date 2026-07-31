@@ -104,7 +104,9 @@ Do not add paper-specific scripts or a parallel analysis package.
 - Generated stores, checkpoints, evaluations, and logs are local and ignored.
   Commit compact evidence under `data/summary/` and figures under
   `docs/figures/`.
-- Use shared plain Python 3.12; do not create a project venv.
+- Maintainer machines use shared plain Python 3.12. External reviewers may use
+  the disposable `.venv` workflow in `docs/reviewer_setup.md`; do not assume
+  they share the maintainer environment.
 - Run training and capture on `jobe` with plain `python`.
 - Phase 1 uses fp32. Real-model capture uses its declared bf16 precision; fp16
   stores are unsupported.

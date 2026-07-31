@@ -90,22 +90,33 @@ Compact result tables live in `data/summary/`; publication figures live in
 
 ## Quick start
 
-Use the shared Python 3.12 environment:
+For a fresh reviewer machine, use Python 3.12 in an isolated environment:
 
 ```bash
-python -m pip install -e .
+git clone https://github.com/a9lim/block-crosscoder-experiment.git
+cd block-crosscoder-experiment
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[review]"
+bsc review
+```
+
+`bsc review` is download-free and runs the real training, codec, evaluation,
+campaign, selection, and confirmation code on tiny CPU data. It also loads
+and estimates the Phase-2 and Phase-3 definitions. The command prints and
+retains its artifact directory for inspection.
+
+See [`docs/reviewer_setup.md`](docs/reviewer_setup.md) for native
+macOS/Linux and Windows/WSL notes, the optional test suite, Hugging Face
+access, CUDA installation, real activation capture, storage sizing, and the
+full experiment path.
+
+To inspect the individual commands instead:
+
+```bash
 bsc --help
-```
-
-Preview a tiny Phase-1 plan:
-
-```bash
 bsc matrix estimate --phase phase1 --smoke
-```
-
-Run one schema-complete smoke cell:
-
-```bash
 bsc matrix plan --phase phase1 --smoke --root /tmp/bsc-phase1-smoke
 bsc matrix run --root /tmp/bsc-phase1-smoke --limit 1
 bsc matrix status --root /tmp/bsc-phase1-smoke
@@ -147,6 +158,9 @@ Use `bsc data --help` for activation capture and aligned derived views, and
   stores are not supported.
 - Training and capture belong on the CUDA machine; local CPU smoke runs cover
   platform-independent behavior.
+- The portable installation needs only NumPy, safetensors, and PyTorch.
+  Install `.[full]` for model capture and figures, and `.[cuda]` for the
+  Linux/NVIDIA kernels.
 - Resource estimates remain refusal gates because they prevent an accidental
   oversized run, not because artifacts are considered hostile.
 - The campaign never launches scientific training implicitly. Planning,

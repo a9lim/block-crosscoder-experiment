@@ -1011,6 +1011,12 @@ class Campaign:
         if plan.phase is not Phase.PHASE1:
             raise CampaignError("freeze-phase1 requires a Phase-1 campaign")
         blueprint = Phase1Blueprint.from_manifest(_read_json(self.blueprint_path))
+        smoke_values = {
+            bool(cell.decision_map["runtime.smoke"]) for cell in plan.cells
+        }
+        if len(smoke_values) != 1:
+            raise CampaignError("Phase-1 campaign mixes smoke and scientific cells")
+        smoke = smoke_values.pop()
         records = {record.cell_id: record for record in self.records()}
         cells: list[dict[str, Any]] = []
         for cell in plan.cells:
@@ -1034,7 +1040,7 @@ class Campaign:
         ]
         if not baseline:
             raise CampaignError("Phase-1 confirmation has no baseline carrier")
-        go = all(
+        scientific_go = all(
             isinstance(self._qualification(records[cell.cell_id]).get("scientific_outcome"), Mapping)
             and self._qualification(records[cell.cell_id])["scientific_outcome"].get("passed")
             is True
@@ -1054,7 +1060,7 @@ class Campaign:
             "cells": cells,
             "selection_chain": selection_chain,
             "confirmation": {
-                "go": go,
+                "go": scientific_go,
                 "scope_narrowing": dict(scope_narrowing or {}),
             },
         }
@@ -1062,7 +1068,9 @@ class Campaign:
         payload = {
             "schema": PHASE1_DECISION_SCHEMA,
             "decision_id": f"phase1-decision:{plan.name}",
-            "go": go,
+            "go": scientific_go or smoke,
+            "scientific_go": scientific_go,
+            "smoke": smoke,
             "phase1_campaign_manifest": campaign_manifest,
             "phase1_transfer": transfer,
         }
