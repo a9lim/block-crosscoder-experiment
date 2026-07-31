@@ -1,50 +1,36 @@
 """Plan and operate the declarative three-phase BSC campaign.
 
-This command intentionally does not promote cells.  Promotion consumes an
-explicit, hash-bound decision artifact through the campaign API after review.
+Selections and phase transitions are explicit JSON files intended for review.
+The operator may edit or replace them before continuing.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import hashlib
 import json
 import os
 import shutil
 import signal
 import sys
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
-from block_crosscoder_experiment.cli.data import (
-    DEFAULT_FREE_SPACE_FLOOR_FRAC,
-    expected_capture_allocation,
-    expected_capture_source_contract,
-    validate_capture_manifest,
-    validate_derived_view_manifest,
-    validate_transform_artifact_manifest,
-)
+from block_crosscoder_experiment.cli.data import DEFAULT_FREE_SPACE_FLOOR_FRAC
 from block_crosscoder_experiment.campaign import (
-    ArtifactRef,
     Campaign,
     CampaignError,
     CampaignRunner,
     RunSummary,
 )
-from block_crosscoder_experiment.durability import durable_mkdir, durable_replace
-from block_crosscoder_experiment.store import NORMALIZATION_MODES, StoreReader, Whitener
+from block_crosscoder_experiment.store import NORMALIZATION_MODES, StoreReader
 from block_crosscoder_experiment.studies import (
     Budget,
     BudgetExceeded,
-    ChildVariant,
     FrozenSelection,
     Phase,
     Phase1Blueprint,
     Phase2Blueprint,
-    StageBlueprint,
-    StageSpec,
     StudyPlan,
     StudyError,
     build_phase1_blueprint,
@@ -56,15 +42,10 @@ from block_crosscoder_experiment.studies import (
     estimate_activation_store,
     estimate_plan,
     enforce_plan_resources,
-    derive_child_cell,
     materialize_child_plan,
     materialize_family_child_plan,
     materialize_family_revisit_plan,
-    merge_decisions,
-    novel,
 )
-
-_VERIFICATION_PROBE_BYTES = 64 * 1024
 
 
 def _nonnegative_int(value: str) -> int:
@@ -132,133 +113,6 @@ def _nearest_existing_parent(path: Path) -> Path:
     return candidate
 
 
-def _canonical_hash(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _write_verification_receipt(path: Path, payload: dict[str, object]) -> None:
-    durable_mkdir(path.parent, parents=True, exist_ok=True)
-    body = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        durable_replace(temporary, path, file_already_synced=True)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def _verify_store_with_receipt(
-    reader: StoreReader,
-    *,
-    cache_root: Path | None,
-) -> None:
-    if cache_root is None:
-        reader.verify()
-        return
-    split_dir = reader.dir
-    manifest_path = split_dir / "split.json"
-
-    def stat_record(path: Path) -> dict[str, int | str]:
-        status = path.stat()
-        return {
-            "path": str(path.resolve()),
-            "size_bytes": status.st_size,
-            "mtime_ns": status.st_mtime_ns,
-            "ctime_ns": status.st_ctime_ns,
-            "device": status.st_dev,
-            "inode": status.st_ino,
-        }
-
-    def content_probe(path: Path) -> dict[str, int | str]:
-        size = path.stat().st_size
-        length = min(size, _VERIFICATION_PROBE_BYTES)
-        offset_span = size - length
-        offset_seed = hashlib.sha256(
-            f"{manifest_file_sha256}:{path.name}".encode("utf-8")
-        ).digest()
-        offset = (
-            int.from_bytes(offset_seed[:8], "big") % (offset_span + 1)
-            if offset_span
-            else 0
-        )
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            body = handle.read(length)
-        if len(body) != length:
-            raise StudyError(f"short verification probe read from {path}")
-        return {
-            "path": str(path.resolve()),
-            "offset": offset,
-            "length": length,
-            "sha256": hashlib.sha256(body).hexdigest(),
-        }
-
-    manifest_file_sha256 = _sha256(manifest_path)
-    shard_paths = [
-        split_dir / str(record["file"]) for record in reader.manifest["shards"]
-    ]
-    fingerprint = {
-        "manifest": stat_record(manifest_path),
-        "shards": [stat_record(path) for path in shard_paths],
-    }
-    probes = [content_probe(path) for path in shard_paths]
-    key = _canonical_hash(
-        {
-            "root": str(split_dir.parent.resolve()),
-            "split": split_dir.name,
-            "manifest_sha256": manifest_file_sha256,
-        }
-    )
-    receipt_path = cache_root / f"{key}.json"
-    expected = {
-        "schema": "bsc-store-verification-receipt-v2",
-        "root": str(split_dir.parent.resolve()),
-        "split": split_dir.name,
-        "manifest_sha256": manifest_file_sha256,
-        "manifest_content_sha256": reader.manifest.get("manifest_sha256"),
-        "content_stream_sha256": reader.manifest.get("content_stream_sha256"),
-        "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
-        "n_tokens": reader.n_tokens,
-        "stat_fingerprint": fingerprint,
-        "content_probes": probes,
-    }
-    if receipt_path.is_file():
-        try:
-            existing = json.loads(receipt_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            existing = None
-        if existing == expected:
-            return
-    reader.verify()
-    _write_verification_receipt(receipt_path, expected)
-
-
 def _configured_input_roots(
     explicit_roots: Sequence[Path] = (),
 ) -> tuple[Path, ...]:
@@ -284,254 +138,43 @@ def _configured_input_roots(
     return tuple(roots)
 
 
-def _verified_existing_input_storage(
+def _existing_input_storage(
     *,
-    verification_cache_root: Path | None = None,
     plan=None,
     input_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
-    """Hash-verify configured immutable inputs and count their physical bytes.
-
-    Only files reached through a verified split or transform manifest count.
-    Merely pointing an environment variable at a directory never buys storage
-    credit, and overlapping environment roots are deduplicated by resolved path.
-    """
+    """Count ordinary files under the activation roots selected by the operator."""
 
     if plan is not None and plan.phase is Phase.PHASE1:
         return {
-            "verified_existing_input_bytes": 0,
+            "existing_input_bytes": 0,
             "inputs": [],
-            "plan_input_contract": "stateless_phase1_no_input_credit",
+            "plan_input_contract": "stateless_phase1",
         }
 
-    expected_source: dict[str, object] | None = None
-    expected_source_hash: str | None = None
-    expected_split_plan: dict[str, dict[str, int]] | None = None
-    expected_split_order: tuple[str, ...] | None = None
-    expected_normalizations: set[str] | None = None
-    if plan is not None:
-        cells = [cell for stage in plan.stages for cell in stage.cells]
-        if not cells:
-            raise StudyError("cannot price inputs for an empty materialized plan")
-        contracts = []
-        allocations = []
-        for cell in cells:
-            values = cell.decision_map
-            try:
-                contracts.append(expected_capture_source_contract(values))
-                allocations.append(expected_capture_allocation(values))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"cannot resolve plan-bound activation input for {cell.cell_id}: {exc}"
-                ) from exc
-        expected_source = contracts[0]
-        expected_split_order, expected_split_plan = allocations[0]
-        if any(contract != expected_source for contract in contracts[1:]) or any(
-            allocation != allocations[0] for allocation in allocations[1:]
-        ):
-            raise StudyError(
-                "materialized plan does not share one immutable capture contract"
-            )
-        expected_source_hash = _canonical_hash(expected_source)
-        expected_normalizations = {
-            str(cell.decision_map["data.normalization"]) for cell in cells
-        }
-
-    counted_files: set[Path] = set()
+    counted: set[Path] = set()
     records: list[dict[str, object]] = []
     for root in _configured_input_roots(input_roots):
         if not root.is_dir():
             raise StudyError(f"configured activation input is not a directory: {root}")
-        split_manifests = sorted(root.rglob("split.json"))
-        view_manifests = sorted(root.rglob("view.json"))
-        transform_manifests = sorted(root.rglob("transform.json"))
-        root_files: set[Path] = set()
-        verified_splits: list[str] = []
-        verified_transforms: list[str] = []
-        eligible_capture_files: set[Path] = set()
-        eligible_split_envelopes: dict[Path, tuple[str, dict[str, object]]] = {}
-        for capture_path in root.rglob("capture.json"):
-            try:
-                capture = json.loads(capture_path.read_text())
-                if not isinstance(capture, dict):
-                    raise ValueError("manifest must be an object")
-                validate_capture_manifest(capture)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"invalid capture manifest {capture_path}: {exc}"
-                ) from exc
-            if expected_source is None or (
-                capture.get("source") == expected_source
-                and capture.get("split_order") == list(expected_split_order or ())
-                and capture.get("split_plan") == expected_split_plan
-            ):
-                eligible_capture_files.add(capture_path.resolve())
-                for split in capture["split_order"]:
-                    eligible_split_envelopes[
-                        (capture_path.parent / split).resolve()
-                    ] = ("raw", dict(capture["splits"][split]))
-        for view_path in view_manifests:
-            try:
-                view = json.loads(view_path.read_text())
-                if not isinstance(view, dict):
-                    raise ValueError("manifest must be an object")
-                view = validate_derived_view_manifest(view)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"invalid derived-view manifest {view_path}: {exc}"
-                ) from exc
-            eligible_view = expected_source is None or (
-                view["source_capture"]["source"] == expected_source
-                and view["source_capture"]["split_order"]
-                == list(expected_split_order or ())
-                and view["source_capture"]["split_plan"] == expected_split_plan
-                and view["mode"] in (expected_normalizations or set())
-            )
-            if not eligible_view:
-                continue
-            whitener_path = view_path.parent / "whitener.pt"
-            if (
-                not whitener_path.is_file()
-                or _sha256(whitener_path) != view["whitener_sha256"]
-            ):
-                raise StudyError(f"derived-view whitener is unverified at {view_path}")
-            root_files.update((view_path.resolve(), whitener_path.resolve()))
-            for split in view["split_order"]:
-                split_dir = (view_path.parent / split).resolve()
-                if split_dir in eligible_split_envelopes:
-                    raise StudyError(
-                        f"multiple root envelopes claim activation split {split_dir}"
-                    )
-                eligible_split_envelopes[split_dir] = (
-                    "derived",
-                    dict(view["splits"][split]),
-                )
-        for manifest_path in split_manifests:
-            split_dir = manifest_path.parent
-            envelope = eligible_split_envelopes.get(split_dir.resolve())
-            if envelope is None:
-                continue
-            try:
-                reader = StoreReader(split_dir.parent, split_dir.name)
-                _verify_store_with_receipt(
-                    reader,
-                    cache_root=verification_cache_root,
-                )
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"unverified activation split at {split_dir}: {exc}"
-                ) from exc
-            envelope_kind, envelope_record = envelope
-            if envelope_kind == "raw":
-                envelope_matches = (
-                    _sha256(manifest_path) == envelope_record["manifest_file_sha256"]
-                    and reader.manifest.get("manifest_sha256")
-                    == envelope_record["manifest_sha256"]
-                    and reader.manifest.get("content_stream_sha256")
-                    == envelope_record["content_stream_sha256"]
-                    and reader.manifest.get("row_stream_sha256")
-                    == envelope_record["row_stream_sha256"]
-                    and reader.n_tokens == envelope_record["n_tokens"]
-                )
-            else:
-                envelope_matches = (
-                    reader.manifest.get("manifest_sha256")
-                    == envelope_record["manifest_sha256"]
-                    and reader.manifest.get("content_stream_sha256")
-                    == envelope_record["content_stream_sha256"]
-                    and reader.manifest.get("row_stream_sha256")
-                    == envelope_record["row_stream_sha256"]
-                    and reader.n_tokens == envelope_record["n_tokens"]
-                )
-            if not envelope_matches:
-                raise StudyError(
-                    f"activation split differs from its root envelope: {split_dir}"
-                )
-            meta = reader.manifest.get("meta", {})
-            eligible = expected_source is None
-            if expected_source is not None and expected_split_plan is not None:
-                allocation = expected_split_plan.get(split_dir.name)
-                source_matches = meta.get("source_hash") == expected_source_hash
-                if not source_matches and str(reader.whitener_hash) == (
-                    f"raw:{expected_source_hash}"
-                ):
-                    source_matches = True
-                eligible = bool(
-                    allocation is not None
-                    and source_matches
-                    and meta.get("split_requested_tokens")
-                    == allocation["requested_tokens"]
-                    and meta.get("split_actual_tokens") == allocation["actual_tokens"]
-                    and reader.n_tokens == allocation["actual_tokens"]
-                )
-                normalization = meta.get("normalization")
-                if meta.get("derived_view") is True:
-                    eligible = eligible and normalization in expected_normalizations
-            if eligible:
-                root_files.add(manifest_path.resolve())
-                for shard in reader.manifest["shards"]:
-                    root_files.add((split_dir / shard["file"]).resolve())
-                verified_splits.append(str(split_dir.relative_to(root)))
-        for manifest_path in transform_manifests:
-            try:
-                manifest = json.loads(manifest_path.read_text())
-                if not isinstance(manifest, dict):
-                    raise ValueError("manifest must be an object")
-                validate_transform_artifact_manifest(manifest)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"invalid transform manifest {manifest_path}: {exc}"
-                ) from exc
-            transform_path = manifest_path.parent / "whitener.pt"
-            if not transform_path.is_file() or manifest.get(
-                "whitener_sha256"
-            ) != _sha256(transform_path):
-                raise StudyError(
-                    f"unverified transform artifact at {manifest_path.parent}"
-                )
-            try:
-                transform = Whitener.load(transform_path)
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"unverified transform artifact at {manifest_path.parent}: {exc}"
-                ) from exc
-            if transform.hash != manifest.get("transform_hash"):
-                raise StudyError(f"transform hash mismatch at {manifest_path.parent}")
-            eligible = expected_source is None or (
-                manifest.get("source_hash") == expected_source_hash
-                and manifest.get("mode") in expected_normalizations
-                and manifest.get("source_fit_requested_tokens")
-                == (expected_split_plan or {})
-                .get("normalization_fit", {})
-                .get("requested_tokens")
-            )
-            if eligible:
-                root_files.update((manifest_path.resolve(), transform_path.resolve()))
-                verified_transforms.append(str(manifest_path.parent.relative_to(root)))
-        root_files.update(eligible_capture_files)
-        if expected_source is None and not verified_splits and not verified_transforms:
-            raise StudyError(
-                f"configured input contains no verified split or transform artifact: {root}"
-            )
-        new_files = root_files - counted_files
-        byte_count = sum(path.stat().st_size for path in new_files)
-        counted_files.update(root_files)
+        files = {
+            path.resolve()
+            for path in root.rglob("*")
+            if path.is_file() and ".store-verification" not in path.parts
+        }
+        new_files = files - counted
+        counted.update(files)
         records.append(
             {
                 "root": str(root),
-                "verified_bytes": byte_count,
-                "splits": verified_splits,
-                "transforms": verified_transforms,
-                "eligible_for_plan": bool(root_files),
+                "bytes": sum(path.stat().st_size for path in new_files),
+                "files": len(files),
             }
         )
     return {
-        "verified_existing_input_bytes": sum(
-            path.stat().st_size for path in counted_files
-        ),
+        "existing_input_bytes": sum(path.stat().st_size for path in counted),
         "inputs": records,
     }
-
 
 def _estimated_plan_input_storage_bytes(plan) -> int:
     """Return the exact activation-store portion of ``estimate_plan(plan)``."""
@@ -542,7 +185,7 @@ def _estimated_plan_input_storage_bytes(plan) -> int:
     raw_stores: dict[tuple[object, ...], int] = {}
     for store_bytes, key in (estimate_activation_store(cell) for cell in plan.cells):
         stores[key] = max(stores.get(key, 0), store_bytes)
-        if key[12] == "content_addressed_derived_view":
+        if key[12] == "derived_views":
             raw_key = (*key[:13], "raw_source_view", *key[14:])
             raw_stores[raw_key] = max(raw_stores.get(raw_key, 0), store_bytes)
     return sum(stores.values()) + sum(raw_stores.values())
@@ -555,8 +198,7 @@ def _storage_preflight(
     plan=None,
     input_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
-    existing = _verified_existing_input_storage(
-        verification_cache_root=root / ".store-verification",
+    existing = _existing_input_storage(
         plan=plan,
         input_roots=input_roots,
     )
@@ -569,10 +211,7 @@ def _storage_preflight(
                     artifact.verify(root)
                     resolved = artifact.resolve(root).resolve()
                 except (CampaignError, OSError):
-                    # Existing campaign artifacts are inspected here only to
-                    # earn storage credit.  Externally retired or lost
-                    # artifacts earn no credit; the scientific gates still
-                    # verify every artifact they actually consume.
+                    # Missing outputs simply do not earn storage credit.
                     continue
                 campaign_artifact_files.add(resolved)
     campaign_artifact_bytes = sum(
@@ -583,13 +222,13 @@ def _storage_preflight(
         (
             _estimated_plan_input_storage_bytes(plan)
             if plan is not None
-            else int(existing["verified_existing_input_bytes"])
+            else int(existing["existing_input_bytes"])
         ),
     )
     estimated_campaign_bytes = estimated_storage_bytes - estimated_input_bytes
     input_credit = min(
         estimated_input_bytes,
-        int(existing["verified_existing_input_bytes"]),
+        int(existing["existing_input_bytes"]),
     )
     campaign_artifact_credit = min(
         estimated_campaign_bytes,
@@ -668,7 +307,7 @@ def _storage_preflight(
         "estimated_input_storage_bytes": estimated_input_bytes,
         "estimated_campaign_artifact_bytes": estimated_campaign_bytes,
         **existing,
-        "verified_existing_campaign_artifact_bytes": campaign_artifact_bytes,
+        "existing_campaign_artifact_bytes": campaign_artifact_bytes,
         "credited_existing_input_bytes": input_credit,
         "credited_existing_campaign_artifact_bytes": campaign_artifact_credit,
         "credited_existing_storage_bytes": credited,
@@ -735,165 +374,57 @@ def _resolve_phase2_view_dispatch(
     view_root: Path,
     cells: dict[str, object],
 ) -> dict[str, Path]:
-    """Resolve and manifest-check each cell's exact normalization view.
-
-    Payload checks remain the cell executor's responsibility.  This preflight
-    is intentionally cheap enough to run before every campaign invocation: it
-    validates complete self-hashed manifests, exact file sets, the frozen
-    Whitener, and cross-mode row-stream identity without rereading all payload
-    bytes before any campaign state transition occurs.
-    """
+    """Resolve each cell to the normalization directory chosen by the operator."""
 
     root = view_root.expanduser().resolve()
     if not root.is_dir():
         raise StudyError(f"Phase-2 --view-root is not a directory: {root}")
-    by_mode: dict[
-        str,
-        tuple[Path, dict[str, tuple[object, ...]], dict[str, int], str],
-    ] = {}
+
+    checked: dict[str, tuple[Path, dict[str, tuple[int, tuple[int, ...], int]]]] = {}
     dispatched: dict[str, Path] = {}
     for cell_id, cell in cells.items():
         values = cell.decision_map
         mode = str(values["data.normalization"])
         if mode not in NORMALIZATION_MODES:
             raise StudyError(f"cell {cell_id} has unsupported normalization {mode!r}")
-        declared_items = tuple(values["data.split_sizes"])
-        declared = {str(name): int(tokens) for name, tokens in declared_items}
-        if mode not in by_mode:
+        declared = {
+            str(name): int(tokens) for name, tokens in values["data.split_sizes"]
+        }
+        if mode not in checked:
             mode_root = root / mode
             if not mode_root.is_dir():
                 raise StudyError(f"Phase-2 view {mode!r} does not exist under {root}")
-            view_manifest_path = mode_root / "view.json"
-            try:
-                view_manifest = json.loads(view_manifest_path.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                raise StudyError(
-                    f"Phase-2 view {mode!r} lacks a valid root manifest: {exc}"
-                ) from exc
-            if not isinstance(view_manifest, dict):
-                raise StudyError(
-                    f"Phase-2 view {mode!r} root manifest is not an object"
-                )
-            try:
-                view_manifest = validate_derived_view_manifest(view_manifest)
-            except (TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"Phase-2 view {mode!r} has an invalid root manifest: {exc}"
-                ) from exc
-            expected_order, expected_plan = expected_capture_allocation(values)
-            expected_source = expected_capture_source_contract(values)
-            source_capture = view_manifest["source_capture"]
-            if (
-                view_manifest.get("mode") != mode
-                or view_manifest.get("split_order") != list(declared)
-                or (
-                    source_capture.get("source") != expected_source
-                    or source_capture.get("split_order") != list(expected_order)
-                    or source_capture.get("split_plan") != expected_plan
-                )
-            ):
-                raise StudyError(f"Phase-2 view {mode!r} has a divergent root manifest")
-            expected_root_entries = set(declared) | {"whitener.pt", "view.json"}
-            actual_root_entries = {path.name for path in mode_root.iterdir()}
-            if actual_root_entries != expected_root_entries:
-                raise StudyError(
-                    f"Phase-2 view {mode!r} root entries differ from its manifest"
-                )
-            transform_path = mode_root / "whitener.pt"
-            if not transform_path.is_file():
-                raise StudyError(f"Phase-2 view {mode!r} lacks whitener.pt")
-            try:
-                transform = Whitener.load(transform_path)
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise StudyError(
-                    f"Phase-2 view {mode!r} has an invalid whitener: {exc}"
-                ) from exc
-            if transform.mode != mode:
-                raise StudyError(
-                    f"Phase-2 view {mode!r} contains transform mode {transform.mode!r}"
-                )
-            if transform.hash != view_manifest.get("transform_hash") or _sha256(
-                transform_path
-            ) != view_manifest.get("whitener_sha256"):
-                raise StudyError(
-                    f"Phase-2 view {mode!r} transform differs from its root manifest"
-                )
-            available = {
-                path.name
-                for path in mode_root.iterdir()
-                if path.is_dir() and (path / "split.json").is_file()
-            }
-            if available != set(declared):
-                raise StudyError(
-                    f"Phase-2 view {mode!r} split set differs from the cell: "
-                    f"expected={sorted(declared)}, actual={sorted(available)}"
-                )
-            signatures: dict[str, tuple[object, ...]] = {}
+            signatures: dict[str, tuple[int, tuple[int, ...], int]] = {}
             for split, requested in declared.items():
-                try:
-                    reader = StoreReader(
-                        mode_root,
-                        split,
-                        expected_whitener_hash=transform.hash,
-                    )
-                except (OSError, KeyError, TypeError, ValueError) as exc:
+                if not (mode_root / split / "split.json").is_file():
+                    raise StudyError(f"Phase-2 view {mode!r} lacks split {split!r}")
+                reader = StoreReader(mode_root, split)
+                if reader.n_tokens < requested:
                     raise StudyError(
-                        f"Phase-2 view {mode!r}/{split} has an invalid manifest: {exc}"
-                    ) from exc
-                meta = reader.manifest.get("meta", {})
-                if (
-                    meta.get("derived_view") is not True
-                    or meta.get("normalization") != mode
-                    or meta.get("split_requested_tokens") != requested
-                    or reader.n_tokens < requested
-                ):
-                    raise StudyError(
-                        f"Phase-2 view {mode!r}/{split} does not bind its cell contract"
-                    )
-                root_record = view_manifest["splits"].get(split)
-                if not isinstance(root_record, dict) or any(
-                    root_record.get(key) != expected
-                    for key, expected in {
-                        "manifest_sha256": reader.manifest["manifest_sha256"],
-                        "content_stream_sha256": reader.manifest[
-                            "content_stream_sha256"
-                        ],
-                        "row_stream_sha256": reader.manifest["row_stream_sha256"],
-                        "n_tokens": reader.n_tokens,
-                    }.items()
-                ):
-                    raise StudyError(
-                        f"Phase-2 view {mode!r}/{split} differs from its root manifest"
+                        f"Phase-2 view {mode!r}/{split} has {reader.n_tokens} rows; "
+                        f"{requested} are required"
                     )
                 signatures[split] = (
                     reader.n_tokens,
-                    reader.manifest["row_stream_sha256"],
-                    tuple(reader.manifest["sites"]),
+                    tuple(reader.site_dims),
                     reader.d_model,
                 )
-            by_mode[mode] = (
-                mode_root,
-                signatures,
-                declared,
-                str(source_capture["capture_content_sha256"]),
-            )
-        elif by_mode[mode][2] != declared:
+            checked[mode] = (mode_root, signatures)
+        elif set(checked[mode][1]) != set(declared):
             raise StudyError(
-                f"cells using Phase-2 view {mode!r} declare different split contracts"
+                f"cells using Phase-2 view {mode!r} declare different split roles"
             )
-        dispatched[cell_id] = by_mode[mode][0]
+        dispatched[cell_id] = checked[mode][0]
 
-    mode_items = list(by_mode.items())
-    if mode_items:
-        reference_mode, (_, reference, _, reference_capture) = mode_items[0]
-        for mode, (_, signatures, _, capture_identity) in mode_items[1:]:
-            if signatures != reference or capture_identity != reference_capture:
+    if checked:
+        reference_mode, (_, reference) = next(iter(checked.items()))
+        for mode, (_, signatures) in list(checked.items())[1:]:
+            if signatures != reference:
                 raise StudyError(
-                    f"Phase-2 views {reference_mode!r} and {mode!r} do not share "
-                    "one exact content-addressed raw capture"
+                    f"Phase-2 views {reference_mode!r} and {mode!r} have "
+                    "different row counts or geometry"
                 )
     return dispatched
-
 
 def _run_with_optional_view_dispatch(
     campaign: Campaign,
@@ -986,14 +517,12 @@ def _add_phase(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--phase1-decision",
         type=Path,
-        help=(
-            "required authenticated Phase-1 go/no-go decision when registering Phase 2"
-        ),
+        help="reviewed Phase-1 go/no-go decision required for Phase 2",
     )
     parser.add_argument(
         "--panel-decision",
         type=Path,
-        help="required hash-bound Phase-2 panel decision for Phase 3",
+        help="reviewed Phase-2 panel decision required for Phase 3",
     )
 
 
@@ -1059,711 +588,6 @@ def _frozen_selection(
     return matches[0]
 
 
-def _finalist_optimizer_aux_variants() -> tuple[ChildVariant, ...]:
-    """Cross the two unresolved finalist axes under the adopted optimizer."""
-
-    variants: list[ChildVariant] = []
-    for learning_rate, learning_rate_label in (
-        (3e-4, "3e_minus_4"),
-        (6e-4, "6e_minus_4"),
-    ):
-        for auxiliary_label, auxiliary_decisions in (
-            (
-                "none",
-                (
-                    novel(
-                        "factor.auxiliary",
-                        "none",
-                        rationale="test the final optimizer without revival",
-                        ablation="compare zero, 1/32, and one auxiliary weight",
-                    ),
-                    novel(
-                        "objective.auxiliary",
-                        "none",
-                        rationale="disable residual re-encoding exactly",
-                        ablation="compare the complete frequency-dead residual bundle",
-                    ),
-                    novel(
-                        "auxiliary.count",
-                        1,
-                        rationale="retain the positive inert routing sentinel",
-                        ablation="active auxiliary arms use the selected eight blocks",
-                    ),
-                    novel(
-                        "auxiliary.coefficient",
-                        0.0,
-                        rationale="make auxiliary absence exact",
-                        ablation="compare zero, 1/32, and one",
-                    ),
-                    novel(
-                        "auxiliary.dead_frequency",
-                        0.0,
-                        rationale="disable dead-frequency filtering with no auxiliary",
-                        ablation="active arms retain the selected frequency threshold",
-                    ),
-                    novel(
-                        "auxiliary.dead_window_tokens",
-                        4096,
-                        rationale="retain an inert one-batch deadness sentinel",
-                        ablation="active arms retain the selected one-thousand-token window",
-                    ),
-                ),
-            ),
-            (
-                "1_over_32",
-                (
-                    novel(
-                        "factor.auxiliary",
-                        "sasa_dead_residual_aux",
-                        rationale="retain the selected frequency-dead residual method",
-                        ablation="compare no auxiliary and source weight",
-                    ),
-                    novel(
-                        "objective.auxiliary",
-                        "frequency_dead_residual",
-                        rationale="re-encode detached residual through frequency-dead blocks",
-                        ablation="compare the no-auxiliary carrier",
-                    ),
-                    novel(
-                        "auxiliary.count",
-                        8,
-                        rationale="match the selected block-event budget",
-                        ablation="report auxiliary event rate",
-                    ),
-                    novel(
-                        "auxiliary.coefficient",
-                        1 / 32,
-                        rationale="test the previously declared low auxiliary weight",
-                        ablation="compare zero and one",
-                    ),
-                    novel(
-                        "auxiliary.dead_frequency",
-                        1e-4,
-                        rationale="retain the selected SASA frequency criterion",
-                        ablation="vary only in a dedicated deadness study",
-                    ),
-                    novel(
-                        "auxiliary.dead_window_tokens",
-                        1000,
-                        rationale="retain the selected SASA token window",
-                        ablation="the prior long-window arm was already rejected",
-                    ),
-                ),
-            ),
-            (
-                "one",
-                (
-                    novel(
-                        "factor.auxiliary",
-                        "sasa_dead_residual_aux",
-                        rationale="retain the selected frequency-dead residual method",
-                        ablation="compare no auxiliary and low weight",
-                    ),
-                    novel(
-                        "objective.auxiliary",
-                        "frequency_dead_residual",
-                        rationale="re-encode detached residual through frequency-dead blocks",
-                        ablation="compare the no-auxiliary carrier",
-                    ),
-                    novel(
-                        "auxiliary.count",
-                        8,
-                        rationale="match the selected block-event budget",
-                        ablation="report auxiliary event rate",
-                    ),
-                    novel(
-                        "auxiliary.coefficient",
-                        1.0,
-                        rationale="retain SASA's source-relative auxiliary weight",
-                        ablation="compare zero and 1/32",
-                    ),
-                    novel(
-                        "auxiliary.dead_frequency",
-                        1e-4,
-                        rationale="retain the selected SASA frequency criterion",
-                        ablation="vary only in a dedicated deadness study",
-                    ),
-                    novel(
-                        "auxiliary.dead_window_tokens",
-                        1000,
-                        rationale="retain the selected SASA token window",
-                        ablation="the prior long-window arm was already rejected",
-                    ),
-                ),
-            ),
-        ):
-            variant_name = f"lr_{learning_rate_label}__aux_{auxiliary_label}"
-            variants.append(
-                ChildVariant(
-                    variant_name,
-                    merge_decisions(
-                        (
-                            novel(
-                                "factor.finalist_gap_audit",
-                                variant_name,
-                                rationale="bind the complete crossed finalist audit arm",
-                                ablation="compare every declared learning-rate and auxiliary combination",
-                            ),
-                            novel(
-                                "optimizer.learning_rate",
-                                learning_rate,
-                                rationale="close the remaining learning-rate boundary",
-                                ablation="compare 3e-4 with 6e-4 at every auxiliary weight",
-                            ),
-                        ),
-                        auxiliary_decisions,
-                    ),
-                )
-            )
-    return tuple(variants)
-
-
-def _append_finalist_optimizer_aux_audit(
-    campaign: Campaign,
-    *,
-    selection_path: Path,
-) -> StudyPlan:
-    """Append the post-confirmation 4M finalist gap audit.
-
-    This is an explicit protocol amendment, not a replay of the frozen Phase-2
-    blueprint.  It binds the already-selected 16M development finalist and
-    keeps confirmation evidence out of every tuning decision.
-    """
-
-    current = campaign.plan
-    if current.phase is not Phase.PHASE2:
-        raise StudyError("the finalist gap audit belongs only to Phase 2")
-    stage_name = "bsc_finalist_optimizer_aux_4m"
-    if any(stage.name == stage_name for stage in current.stages):
-        raise StudyError(f"{stage_name} is already materialized")
-    resolved_selection_path = selection_path
-    if not resolved_selection_path.is_absolute():
-        resolved_selection_path = campaign.root / resolved_selection_path
-    selection = _frozen_selection(resolved_selection_path)
-    if selection.source_stage != "bsc_final_16m":
-        raise StudyError("the finalist audit must bind the selected 16M development stage")
-    source_matches = [
-        stage for stage in current.stages if stage.name == selection.source_stage
-    ]
-    if len(source_matches) != 1:
-        raise StudyError("the selected 16M development stage is absent or ambiguous")
-    source_stage = source_matches[0]
-    if source_stage.selection_policy is None:
-        raise StudyError("the selected 16M development stage has no selection policy")
-    by_id = {cell.cell_id: cell for cell in source_stage.cells}
-    try:
-        parents = tuple(
-            sorted((by_id[cell_id] for cell_id in selection.cell_ids), key=lambda c: c.seed)
-        )
-    except KeyError as exc:
-        raise StudyError("the finalist selection names a cell outside its source stage") from exc
-    if tuple(cell.seed for cell in parents) != selection.seeds:
-        raise StudyError("the finalist selection seed order does not match its source cells")
-    if any(cell.candidate_id != selection.candidate_id for cell in parents):
-        raise StudyError("the finalist selection does not identify one candidate")
-
-    expected_parent_values = {
-        "optimizer.name": "adam",
-        "optimizer.learning_rate": 3e-4,
-        "optimizer.batch_tokens": 512,
-        "optimizer.warmup_fraction": 0.0,
-        "optimizer.schedule": "warmup_then_final_fifth_linear",
-        "optimizer.final_decay_fraction": 0.2,
-        "objective.regularizer": "none",
-        "objective.auxiliary": "frequency_dead_residual",
-        "auxiliary.coefficient": 1.0,
-    }
-    for parent in parents:
-        mismatches = {
-            name: parent.decision_map.get(name)
-            for name, expected in expected_parent_values.items()
-            if parent.decision_map.get(name) != expected
-        }
-        if mismatches:
-            raise StudyError(
-                "the 16M parent is not the selected finalist configuration: "
-                + json.dumps(mismatches, sort_keys=True)
-            )
-
-    blueprint = _registered_blueprint(campaign)
-    if not isinstance(blueprint, Phase2Blueprint):
-        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
-    stage_blueprint = StageBlueprint(
-        name=stage_name,
-        source_stage=source_stage.name,
-        source_policy_id=selection.policy_id,
-        train_tokens=4_000_000,
-        split="development",
-        variants=_finalist_optimizer_aux_variants(),
-        selection_policy=source_stage.selection_policy,
-        role="phase_local_tuning",
-        advancement="empirical_selection",
-    )
-    cells = tuple(
-        derive_child_cell(
-            parent,
-            parent_cells=parents,
-            selection=selection,
-            stage_blueprint=stage_blueprint,
-            variant=variant,
-            source_plan_id=current.plan_id,
-            source_blueprint_id=blueprint.blueprint_id,
-        )
-        for variant in stage_blueprint.variants
-        for parent in parents
-    )
-    child_stage = StageSpec(
-        stage_name,
-        cells,
-        depends_on=(source_stage.name,),
-        selection_policy=source_stage.selection_policy,
-    )
-    extended = StudyPlan(
-        name=current.name,
-        phase=current.phase,
-        stages=(*current.stages, child_stage),
-    )
-
-    frozen_evidence = _read_object(resolved_selection_path)
-    evidence_ref = ArtifactRef.from_path(
-        "stage_selection",
-        resolved_selection_path,
-        root=campaign.root,
-    )
-    journal_sha256 = (
-        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
-    )
-    campaign._commit_plan_extension(
-        current=current,
-        plan=extended,
-        child_stage=child_stage,
-        evidence_ref=evidence_ref,
-        frozen_evidence=frozen_evidence,
-        live_evidence=lambda: _read_object(resolved_selection_path),
-        journal_sha256=journal_sha256,
-        message="appended crossed 4M finalist optimizer and auxiliary audit",
-        metadata={
-            "previous_plan_id": current.plan_id,
-            "plan_id": extended.plan_id,
-            "stage": stage_name,
-            "branch": "bsc_finalist_gap_audit",
-            "source_stage": source_stage.name,
-            "selection_id": selection.selection_id,
-            "development_only": True,
-        },
-    )
-    return extended
-
-
-def _append_finalist_learning_rate_boundary(
-    campaign: Campaign,
-    *,
-    selection_path: Path,
-    stage_name: str,
-    learning_rate: float,
-) -> StudyPlan:
-    """Append one higher learning-rate boundary candidate from an audit winner."""
-
-    current = campaign.plan
-    if current.phase is not Phase.PHASE2:
-        raise StudyError("the finalist learning-rate boundary belongs only to Phase 2")
-    if any(stage.name == stage_name for stage in current.stages):
-        raise StudyError(f"{stage_name} is already materialized")
-    resolved_selection_path = selection_path
-    if not resolved_selection_path.is_absolute():
-        resolved_selection_path = campaign.root / resolved_selection_path
-    selection = _frozen_selection(resolved_selection_path)
-    source_matches = [
-        stage for stage in current.stages if stage.name == selection.source_stage
-    ]
-    if len(source_matches) != 1:
-        raise StudyError("the selected finalist audit stage is absent or ambiguous")
-    source_stage = source_matches[0]
-    if not source_stage.name.startswith("bsc_finalist_"):
-        raise StudyError("the boundary parent must come from a finalist audit stage")
-    if source_stage.selection_policy is None:
-        raise StudyError("the selected finalist audit stage has no selection policy")
-    by_id = {cell.cell_id: cell for cell in source_stage.cells}
-    try:
-        parents = tuple(
-            sorted(
-                (by_id[cell_id] for cell_id in selection.cell_ids),
-                key=lambda cell: cell.seed,
-            )
-        )
-    except KeyError as exc:
-        raise StudyError("the boundary selection names a cell outside its source stage") from exc
-    if tuple(cell.seed for cell in parents) != selection.seeds:
-        raise StudyError("the boundary selection seed order does not match its cells")
-    for parent in parents:
-        values = parent.decision_map
-        expected = {
-            "optimizer.name": "adam",
-            "optimizer.batch_tokens": 512,
-            "optimizer.warmup_fraction": 0.0,
-            "optimizer.schedule": "warmup_then_final_fifth_linear",
-            "optimizer.final_decay_fraction": 0.2,
-            "objective.regularizer": "none",
-        }
-        mismatches = {
-            name: values.get(name)
-            for name, expected_value in expected.items()
-            if values.get(name) != expected_value
-        }
-        if mismatches:
-            raise StudyError(
-                "the boundary parent is not on the selected optimizer carrier: "
-                + json.dumps(mismatches, sort_keys=True)
-            )
-
-    blueprint = _registered_blueprint(campaign)
-    if not isinstance(blueprint, Phase2Blueprint):
-        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
-    variant = ChildVariant(
-        f"learning_rate_{str(learning_rate).replace('.', 'p').replace('-', 'm')}",
-        (
-            novel(
-                "factor.finalist_gap_audit",
-                f"learning_rate_boundary_{learning_rate}",
-                rationale="bind the next higher finalist learning-rate boundary",
-                ablation="continue geometrically only while the boundary wins",
-            ),
-            novel(
-                "optimizer.learning_rate",
-                learning_rate,
-                rationale="close the upper learning-rate boundary after 6e-4 won",
-                ablation="compare directly with the selected lower boundary",
-            ),
-        ),
-    )
-    stage_blueprint = StageBlueprint(
-        name=stage_name,
-        source_stage=source_stage.name,
-        source_policy_id=selection.policy_id,
-        train_tokens=4_000_000,
-        split="development",
-        variants=(variant,),
-        selection_policy=source_stage.selection_policy,
-        role="phase_local_tuning",
-        advancement="empirical_selection",
-    )
-    cells = tuple(
-        derive_child_cell(
-            parent,
-            parent_cells=parents,
-            selection=selection,
-            stage_blueprint=stage_blueprint,
-            variant=variant,
-            source_plan_id=current.plan_id,
-            source_blueprint_id=blueprint.blueprint_id,
-        )
-        for parent in parents
-    )
-    child_stage = StageSpec(
-        stage_name,
-        cells,
-        depends_on=(source_stage.name,),
-        selection_policy=source_stage.selection_policy,
-    )
-    extended = StudyPlan(
-        name=current.name,
-        phase=current.phase,
-        stages=(*current.stages, child_stage),
-    )
-    frozen_evidence = _read_object(resolved_selection_path)
-    evidence_ref = ArtifactRef.from_path(
-        "stage_selection",
-        resolved_selection_path,
-        root=campaign.root,
-    )
-    journal_sha256 = (
-        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
-    )
-    campaign._commit_plan_extension(
-        current=current,
-        plan=extended,
-        child_stage=child_stage,
-        evidence_ref=evidence_ref,
-        frozen_evidence=frozen_evidence,
-        live_evidence=lambda: _read_object(resolved_selection_path),
-        journal_sha256=journal_sha256,
-        message=f"appended finalist learning-rate boundary {learning_rate}",
-        metadata={
-            "previous_plan_id": current.plan_id,
-            "plan_id": extended.plan_id,
-            "stage": stage_name,
-            "branch": "bsc_finalist_gap_audit",
-            "source_stage": source_stage.name,
-            "selection_id": selection.selection_id,
-            "learning_rate": learning_rate,
-            "development_only": True,
-        },
-    )
-    return extended
-
-
-def _finalist_regularizer_variants() -> tuple[ChildVariant, ...]:
-    """Return the exact none-vs-best-prior-promotable regularizer audit."""
-
-    common_none = (
-        novel(
-            "objective.regularizer_coefficient",
-            0.0,
-            rationale="bind the zero-coefficient carrier",
-            ablation="compare the calibrated map-nuclear bundle",
-        ),
-        novel(
-            "objective.regularizer_schedule",
-            "always",
-            rationale="retain the executable regularizer schedule",
-            ablation="schedule variants require a separate audit",
-        ),
-        novel(
-            "objective.regularizer_target",
-            None,
-            rationale="remove activity targeting from the finalist audit",
-            ablation="named target penalties require a separate bundle",
-        ),
-        novel(
-            "regularizer.sv_eps",
-            0.0,
-            rationale="use exact singular values",
-            ablation="positive smoothing is a separate numerical arm",
-        ),
-    )
-    return (
-        ChildVariant(
-            "no_regularizer",
-            merge_decisions(
-                common_none,
-                (
-                    novel(
-                        "factor.finalist_gap_audit",
-                        "regularizer_none",
-                        rationale="bind the unregularized finalist control",
-                        ablation="compare map nuclear at one-percent initial-loss ratio",
-                    ),
-                    novel(
-                        "factor.regularization",
-                        "none",
-                        rationale="retain the current finalist objective",
-                        ablation="compare the strongest prior promotable regularizer",
-                    ),
-                    novel(
-                        "objective.regularizer",
-                        "none",
-                        rationale="disable spectral regularization exactly",
-                        ablation="compare the complete map-nuclear bundle",
-                    ),
-                    novel(
-                        "objective.regularizer_coefficient_mode",
-                        "absolute",
-                        rationale="remove data-derived coefficient fitting",
-                        ablation="the map-nuclear arm calibrates an initial-loss ratio",
-                    ),
-                    novel(
-                        "objective.regularizer_target_initial_ratio",
-                        None,
-                        rationale="remove inherited ratio calibration",
-                        ablation="compare the declared one-percent ratio",
-                    ),
-                    novel(
-                        "objective.regularizer_calibration_contract",
-                        "not_applicable",
-                        rationale="the zero penalty consumes no calibration rows",
-                        ablation="the map-nuclear arm binds its exact fit contract",
-                    ),
-                    novel(
-                        "objective.regularizer_reduction",
-                        "native",
-                        rationale="retain the neutral executable reduction",
-                        ablation="the map-nuclear arm uses summed block penalties",
-                    ),
-                ),
-            ),
-        ),
-        ChildVariant(
-            "map_nuclear_initial_ratio_0p01",
-            merge_decisions(
-                common_none,
-                (
-                    novel(
-                        "factor.finalist_gap_audit",
-                        "regularizer_map_nuclear_initial_ratio_0p01",
-                        rationale="bind the strongest prior promotable regularizer arm",
-                        ablation="compare the exact unregularized finalist",
-                    ),
-                    novel(
-                        "factor.regularization",
-                        "map_nuclear",
-                        rationale="penalize the end-to-end site map spectrum",
-                        ablation="compare no regularizer under the final optimizer",
-                    ),
-                    novel(
-                        "objective.regularizer",
-                        "end_to_end_map_nuclear",
-                        rationale="retain the promotable map-nuclear objective",
-                        ablation="compare the unregularized carrier",
-                    ),
-                    novel(
-                        "objective.regularizer_coefficient_mode",
-                        "initial_loss_ratio",
-                        rationale="calibrate the penalty dimensionlessly",
-                        ablation="compare exact zero",
-                    ),
-                    novel(
-                        "objective.regularizer_target_initial_ratio",
-                        0.01,
-                        rationale="retest the strongest prior promotable regularizer setting",
-                        ablation="the earlier 0.03 and 0.10 settings were worse",
-                    ),
-                    novel(
-                        "objective.regularizer_calibration_contract",
-                        "post_init_train_prefix_true_observation_fp32_v1",
-                        rationale="retain the exact prior coefficient-fit contract",
-                        ablation="compare the no-calibration zero carrier",
-                    ),
-                    novel(
-                        "objective.regularizer_reduction",
-                        "sum_blocks",
-                        rationale="retain the declared map-nuclear reduction",
-                        ablation="alternative reductions require coefficient rescaling",
-                    ),
-                ),
-            ),
-        ),
-    )
-
-
-def _append_finalist_regularizer_audit(
-    campaign: Campaign,
-    *,
-    selection_path: Path,
-) -> StudyPlan:
-    """Append the 4M none-vs-map-nuclear finalist regularizer audit."""
-
-    current = campaign.plan
-    stage_name = "bsc_finalist_regularizer_4m"
-    if current.phase is not Phase.PHASE2:
-        raise StudyError("the finalist regularizer audit belongs only to Phase 2")
-    if any(stage.name == stage_name for stage in current.stages):
-        raise StudyError(f"{stage_name} is already materialized")
-    resolved_selection_path = selection_path
-    if not resolved_selection_path.is_absolute():
-        resolved_selection_path = campaign.root / resolved_selection_path
-    selection = _frozen_selection(resolved_selection_path)
-    source_matches = [
-        stage for stage in current.stages if stage.name == selection.source_stage
-    ]
-    if len(source_matches) != 1:
-        raise StudyError("the selected finalist optimizer stage is absent or ambiguous")
-    source_stage = source_matches[0]
-    if source_stage.name != "bsc_finalist_optimizer_aux_4m":
-        raise StudyError("the regularizer audit must bind the crossed optimizer winner")
-    if source_stage.selection_policy is None:
-        raise StudyError("the selected finalist stage has no selection policy")
-    by_id = {cell.cell_id: cell for cell in source_stage.cells}
-    try:
-        parents = tuple(
-            sorted(
-                (by_id[cell_id] for cell_id in selection.cell_ids),
-                key=lambda cell: cell.seed,
-            )
-        )
-    except KeyError as exc:
-        raise StudyError("the regularizer selection names a cell outside its stage") from exc
-    for parent in parents:
-        values = parent.decision_map
-        expected = {
-            "optimizer.learning_rate": 6e-4,
-            "optimizer.batch_tokens": 512,
-            "optimizer.warmup_fraction": 0.0,
-            "optimizer.schedule": "warmup_then_final_fifth_linear",
-            "objective.auxiliary": "frequency_dead_residual",
-            "auxiliary.coefficient": 1.0,
-            "objective.regularizer": "none",
-        }
-        mismatches = {
-            name: values.get(name)
-            for name, expected_value in expected.items()
-            if values.get(name) != expected_value
-        }
-        if mismatches:
-            raise StudyError(
-                "the regularizer parent is not the crossed finalist winner: "
-                + json.dumps(mismatches, sort_keys=True)
-            )
-
-    blueprint = _registered_blueprint(campaign)
-    if not isinstance(blueprint, Phase2Blueprint):
-        raise StudyError("the registered campaign lacks a Phase-2 blueprint")
-    variants = _finalist_regularizer_variants()
-    stage_blueprint = StageBlueprint(
-        name=stage_name,
-        source_stage=source_stage.name,
-        source_policy_id=selection.policy_id,
-        train_tokens=4_000_000,
-        split="development",
-        variants=variants,
-        selection_policy=source_stage.selection_policy,
-        role="phase_local_tuning",
-        advancement="empirical_selection",
-    )
-    cells = tuple(
-        derive_child_cell(
-            parent,
-            parent_cells=parents,
-            selection=selection,
-            stage_blueprint=stage_blueprint,
-            variant=variant,
-            source_plan_id=current.plan_id,
-            source_blueprint_id=blueprint.blueprint_id,
-        )
-        for variant in variants
-        for parent in parents
-    )
-    child_stage = StageSpec(
-        stage_name,
-        cells,
-        depends_on=(source_stage.name,),
-        selection_policy=source_stage.selection_policy,
-    )
-    extended = StudyPlan(
-        name=current.name,
-        phase=current.phase,
-        stages=(*current.stages, child_stage),
-    )
-    frozen_evidence = _read_object(resolved_selection_path)
-    evidence_ref = ArtifactRef.from_path(
-        "stage_selection",
-        resolved_selection_path,
-        root=campaign.root,
-    )
-    journal_sha256 = (
-        _sha256(campaign.journal_path) if campaign.journal_path.is_file() else None
-    )
-    campaign._commit_plan_extension(
-        current=current,
-        plan=extended,
-        child_stage=child_stage,
-        evidence_ref=evidence_ref,
-        frozen_evidence=frozen_evidence,
-        live_evidence=lambda: _read_object(resolved_selection_path),
-        journal_sha256=journal_sha256,
-        message="appended 4M finalist regularizer audit",
-        metadata={
-            "previous_plan_id": current.plan_id,
-            "plan_id": extended.plan_id,
-            "stage": stage_name,
-            "branch": "bsc_finalist_gap_audit",
-            "source_stage": source_stage.name,
-            "selection_id": selection.selection_id,
-            "development_only": True,
-        },
-    )
-    return extended
-
-
 def _registered_blueprint(campaign: Campaign):
     payload = _read_object(campaign.blueprint_path)
     if campaign.plan.phase is Phase.PHASE1:
@@ -1799,7 +623,7 @@ def _checked_storage_extension(
             f"{preflight['additional_storage_bytes_required']} is not available on "
             "every bound destination filesystem: "
             f"{json.dumps(failed_filesystems, sort_keys=True)}; after crediting "
-            f"{preflight['credited_existing_storage_bytes']} bytes of hash-verified "
+            f"{preflight['credited_existing_storage_bytes']} bytes of existing "
             "configured inputs and existing campaign artifacts; choose a larger "
             "filesystem or pass "
             "--allow-insufficient-local-storage for planning only"
@@ -1873,9 +697,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    plan = subparsers.add_parser(
-        "plan", help="materialize and register an immutable plan"
-    )
+    plan = subparsers.add_parser("plan", help="materialize and register a plan")
     plan.add_argument("--root", type=Path, required=True)
     plan.add_argument(
         "--allow-insufficient-local-storage",
@@ -1916,26 +738,12 @@ def _parser() -> argparse.ArgumentParser:
         help="generic cell implementation module",
     )
 
-    status = subparsers.add_parser(
-        "status", help="show journal-derived campaign status"
-    )
+    status = subparsers.add_parser("status", help="show current campaign status")
     status.add_argument("--root", type=Path, required=True)
-
-    reconcile = subparsers.add_parser(
-        "reconcile",
-        help="remove stale locks and rebuild atomic snapshots from the journal",
-    )
-    reconcile.add_argument("--root", type=Path, required=True)
-    reconcile.add_argument(
-        "--stale-after",
-        type=_positive_float,
-        default=3600.0,
-        help="lock age in seconds after which explicit reconciliation removes it",
-    )
 
     select = subparsers.add_parser(
         "select",
-        help="apply a stage's frozen policy and bind the complete ranked universe",
+        help="rank a completed stage with its declared policy",
     )
     select.add_argument("--root", type=Path, required=True)
     select.add_argument("--stage", required=True)
@@ -1949,61 +757,9 @@ def _parser() -> argparse.ArgumentParser:
     select_family_root.add_argument("--family", required=True)
     select_family_root.add_argument("--out", type=Path)
 
-    amend_phase2_gates = subparsers.add_parser(
-        "amend-phase2-gates",
-        help=(
-            "adopt the corrected common Phase-2 promotion gates while retaining "
-            "all existing trial evidence"
-        ),
-    )
-    amend_phase2_gates.add_argument("--root", type=Path, required=True)
-    amend_phase2_gates.add_argument("--out", type=Path)
-
-    amend_phase2_implementation = subparsers.add_parser(
-        "amend-phase2-implementation",
-        help="pin a successor orchestration implementation after the gate amendment",
-    )
-    amend_phase2_implementation.add_argument("--root", type=Path, required=True)
-    amend_phase2_implementation.add_argument("--out", type=Path)
-
-    finalist_audit = subparsers.add_parser(
-        "advance-finalist-audit",
-        help=(
-            "append the crossed 4M learning-rate and auxiliary audit from the "
-            "selected 16M BSC development finalist"
-        ),
-    )
-    finalist_audit.add_argument("--root", type=Path, required=True)
-    finalist_audit.add_argument(
-        "--selection",
-        type=Path,
-        required=True,
-        help="selection artifact that bound the selected bsc_final_16m candidate",
-    )
-
-    finalist_lr_boundary = subparsers.add_parser(
-        "advance-finalist-lr-boundary",
-        help="append one higher 4M learning-rate boundary from the finalist audit winner",
-    )
-    finalist_lr_boundary.add_argument("--root", type=Path, required=True)
-    finalist_lr_boundary.add_argument("--selection", type=Path, required=True)
-    finalist_lr_boundary.add_argument("--stage", required=True)
-    finalist_lr_boundary.add_argument(
-        "--learning-rate",
-        type=_positive_float,
-        required=True,
-    )
-
-    finalist_regularizer = subparsers.add_parser(
-        "advance-finalist-regularizer-audit",
-        help="append the 4M none-vs-map-nuclear finalist regularizer audit",
-    )
-    finalist_regularizer.add_argument("--root", type=Path, required=True)
-    finalist_regularizer.add_argument("--selection", type=Path, required=True)
-
     advance = subparsers.add_parser(
         "advance",
-        help="append the next blueprint round from an immutable frozen selection",
+        help="append the next blueprint round from a reviewed selection",
     )
     advance.add_argument("--root", type=Path, required=True)
     advance.add_argument("--selection", type=Path, required=True)
@@ -2070,10 +826,7 @@ def _parser() -> argparse.ArgumentParser:
     freeze_phase1.add_argument(
         "--out",
         type=Path,
-        help=(
-            "immutable decision path (default: "
-            "ROOT/decisions/phase2-authorization.json)"
-        ),
+        help="decision path (default: ROOT/decisions/phase2-authorization.json)",
     )
 
     freeze_panel = subparsers.add_parser(
@@ -2084,7 +837,7 @@ def _parser() -> argparse.ArgumentParser:
     freeze_panel.add_argument(
         "--out",
         type=Path,
-        help="immutable decision path (default: ROOT/decisions/phase3-panel.json)",
+        help="decision path (default: ROOT/decisions/phase3-panel.json)",
     )
     return parser
 
@@ -2158,70 +911,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise SystemExit(1)
         elif args.command == "status":
             _print(campaign.status())
-        elif args.command == "reconcile":
-            _print(
-                {
-                    "reconcile": campaign.reconcile(args.stale_after),
-                    "status": campaign.status(),
-                }
-            )
         elif args.command == "select":
             _print(campaign.select_stage(args.stage, out=args.out))
         elif args.command == "select-family-root":
             _print(campaign.select_family_root(args.family, out=args.out))
-        elif args.command == "amend-phase2-gates":
-            _print(campaign.apply_phase2_gate_amendment(out=args.out))
-        elif args.command == "amend-phase2-implementation":
-            _print(campaign.apply_phase2_implementation_amendment(out=args.out))
-        elif args.command == "advance-finalist-audit":
-            extended = _append_finalist_optimizer_aux_audit(
-                campaign,
-                selection_path=args.selection,
-            )
-            stage = extended.stages[-1]
-            _print(
-                {
-                    "plan_id": extended.plan_id,
-                    "appended_stage": stage.name,
-                    "cell_ids": [cell.cell_id for cell in stage.cells],
-                    "candidate_count": len(
-                        {cell.candidate_id for cell in stage.cells}
-                    ),
-                    "status": campaign.status(),
-                }
-            )
-        elif args.command == "advance-finalist-lr-boundary":
-            extended = _append_finalist_learning_rate_boundary(
-                campaign,
-                selection_path=args.selection,
-                stage_name=args.stage,
-                learning_rate=args.learning_rate,
-            )
-            stage = extended.stages[-1]
-            _print(
-                {
-                    "plan_id": extended.plan_id,
-                    "appended_stage": stage.name,
-                    "cell_ids": [cell.cell_id for cell in stage.cells],
-                    "learning_rate": args.learning_rate,
-                }
-            )
-        elif args.command == "advance-finalist-regularizer-audit":
-            extended = _append_finalist_regularizer_audit(
-                campaign,
-                selection_path=args.selection,
-            )
-            stage = extended.stages[-1]
-            _print(
-                {
-                    "plan_id": extended.plan_id,
-                    "appended_stage": stage.name,
-                    "cell_ids": [cell.cell_id for cell in stage.cells],
-                    "candidate_count": len(
-                        {cell.candidate_id for cell in stage.cells}
-                    ),
-                }
-            )
         elif args.command == "nominate-family-revisit":
             _print(campaign.select_family_revisit_inputs(args.family, out=args.out))
         elif args.command == "freeze-phase1":

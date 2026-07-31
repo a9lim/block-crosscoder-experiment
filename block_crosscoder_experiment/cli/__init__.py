@@ -8,11 +8,11 @@ import sys
 COMMANDS: dict[str, tuple[str, str]] = {
     "matrix": (
         "block_crosscoder_experiment.cli.matrix",
-        "plan, estimate, run, and reconcile staged studies",
+        "plan, estimate, run, and select staged studies",
     ),
     "data": (
         "block_crosscoder_experiment.cli.data",
-        "capture raw activations and derive/verify aligned views",
+        "capture raw activations and derive aligned views",
     ),
     "cell": (
         "block_crosscoder_experiment.cli.run_cell",

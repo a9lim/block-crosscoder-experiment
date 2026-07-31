@@ -12,5 +12,5 @@ seed-invariant ideal circle.
 
 Machine-readable campaign headlines are in
 [`data/summary/results.json`](../data/summary/results.json). Full campaign
-stores, checkpoints, and evaluation bundles remain authenticated local
+stores, checkpoints, and evaluation bundles remain ordinary local
 artifacts and are intentionally not committed.

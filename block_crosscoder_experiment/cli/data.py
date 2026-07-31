@@ -1,4 +1,4 @@
-"""Capture one immutable raw activation stream and derive aligned views."""
+"""Capture one raw activation stream and derive aligned views."""
 
 from __future__ import annotations
 
@@ -6,12 +6,10 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
-import importlib.metadata
 import itertools
 import json
 import math
 import os
-import platform
 import re
 import shutil
 import socket
@@ -47,17 +45,11 @@ TOKENIZER_PREFLIGHTS = {
         "contract": "gpt2-byte-bpe-files-v1",
         "class": "GPT2Tokenizer",
         "bos_token_id": 50_256,
-        "vocab_sha256": (
-            "sha256:179cad62d906b7217f1c9431ece06e7a78a7721f9580960147a6c1ea0a53fc65"
-        ),
     },
     "google/gemma-3-4b-pt": {
         "contract": "gemma3-tokenizer-files-v1",
         "class": "GemmaTokenizer",
         "bos_token_id": 2,
-        "vocab_sha256": (
-            "sha256:4ab2b66fed16d7e79cfb30bd2168ee3da6d848a6ff9b0753cd62a5841c9328ad"
-        ),
     },
 }
 CAPTURE_STATE_NAME = "capture.state.json"
@@ -517,39 +509,10 @@ def _save_whitener_atomic(transform: Whitener, path: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _dependency_versions() -> dict[str, str]:
-    names = (
-        "block-crosscoder-experiment",
-        "datasets",
-        "huggingface-hub",
-        "numpy",
-        "sae-lens",
-        "safetensors",
-        "torch",
-        "transformer-lens",
-        "transformers",
-    )
-    versions: dict[str, str] = {}
-    for name in names:
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = "uninstalled"
-    return versions
-
-
 def capture_implementation_contract() -> dict[str, object]:
-    """Bind executable capture code and dependency versions into provenance."""
+    """Describe the capture implementation used by this repository."""
 
-    from block_crosscoder_experiment import store
-
-    return {
-        "schema": "bsc-capture-implementation-v1",
-        "python": platform.python_version(),
-        "dependencies": _dependency_versions(),
-        "data_module_sha256": _file_sha256(Path(__file__)),
-        "store_module_sha256": _file_sha256(Path(store.__file__)),
-    }
+    return {"schema": "bsc-capture-implementation-simple-v1"}
 
 
 def expected_capture_source_contract(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -604,7 +567,7 @@ def expected_capture_source_contract(values: Mapping[str, Any]) -> dict[str, Any
         "corpus_split": singleton("data.corpus_split"),
         "context": int(values["data.context_length"]),
         "drop_positions": drop_positions,
-        "tokenizer_hashes": [str(item) for item in sequence("data.tokenizer_hashes")],
+        "tokenizer": str(values["data.tokenizer"]),
         "tokenizer_contract": str(values["data.tokenizer_contract"]),
         "store_contract_version": str(values["data.store_contract_version"]),
         "alignment_version": str(values["data.alignment_version"]),
@@ -670,12 +633,11 @@ _CAPTURE_SOURCE_KEYS = {
     "context",
     "drop_positions",
     "tokenizer_class",
-    "tokenizer_vocab_sha256",
+    "tokenizer",
     "add_special_tokens",
     "bos_token_id",
     "packing_algorithm",
     "sequence_allocation",
-    "tokenizer_hashes",
     "tokenizer_contract",
     "store_contract_version",
     "alignment_version",
@@ -689,10 +651,6 @@ _CAPTURE_SOURCE_KEYS = {
 }
 _CAPTURE_IMPLEMENTATION_KEYS = {
     "schema",
-    "python",
-    "dependencies",
-    "data_module_sha256",
-    "store_module_sha256",
     "runtime",
 }
 _CAPTURE_BINDING_KEYS = {
@@ -735,6 +693,7 @@ def _validate_capture_source(value: object) -> dict[str, Any]:
         "corpus_split",
         "text_field",
         "tokenizer_class",
+        "tokenizer",
         "tokenizer_contract",
         "store_contract_version",
         "alignment_version",
@@ -773,14 +732,10 @@ def _validate_capture_source(value: object) -> dict[str, Any]:
         or not _is_int(source["context"], minimum=2)
         or not _is_int(source["drop_positions"], minimum=0)
         or source["drop_positions"] >= source["context"]
-        or not _is_sha256(source["tokenizer_vocab_sha256"], prefixed=True)
         or source["add_special_tokens"] is not False
         or not _is_int(source["bos_token_id"], minimum=0)
         or source["packing_algorithm"] != "bos_prefixed_greedy_document_stream_v1"
         or source["sequence_allocation"] != "whole_packed_contexts_v1"
-        or not isinstance(source["tokenizer_hashes"], list)
-        or len(source["tokenizer_hashes"]) != 1
-        or not _is_sha256(source["tokenizer_hashes"][0], prefixed=True)
         or source["tokenizer_contract"] not in TOKENIZER_CONTRACT_FILES
         or source["store_contract_version"]
         not in {"activation-store-v3-derived-views", "activation-store-v3-single-view"}
@@ -804,27 +759,13 @@ def _validate_capture_implementation(value: object) -> dict[str, Any]:
         _CAPTURE_IMPLEMENTATION_KEYS,
         label="capture implementation",
     )
-    dependencies = implementation["dependencies"]
     runtime = _require_exact_keys(
         implementation["runtime"],
         {"requested_device", "torch_cuda_version", "cuda_device_name"},
         label="capture runtime",
     )
     if (
-        implementation["schema"] != "bsc-capture-implementation-v1"
-        or not isinstance(implementation["python"], str)
-        or not implementation["python"]
-        or not isinstance(dependencies, dict)
-        or not dependencies
-        or any(
-            not isinstance(key, str)
-            or not key
-            or not isinstance(version, str)
-            or not version
-            for key, version in dependencies.items()
-        )
-        or not _is_sha256(implementation["data_module_sha256"])
-        or not _is_sha256(implementation["store_module_sha256"])
+        implementation["schema"] != "bsc-capture-implementation-simple-v1"
         or not isinstance(runtime["requested_device"], str)
         or not runtime["requested_device"]
         or runtime["torch_cuda_version"] is not None
@@ -1201,7 +1142,6 @@ def load_pinned_tokenizer(model: str, revision: str, contract: str):
     observed = {
         "class": type(tokenizer).__name__,
         "bos_token_id": tokenizer.bos_token_id,
-        "vocab_sha256": "sha256:" + _canonical_hash(tokenizer.get_vocab()),
     }
     mismatches = {
         key: {"expected": expected[key], "actual": observed[key]}
@@ -1236,15 +1176,12 @@ def _validate_transformer_lens_tokenizer(
             "bos_token_id": pinned_tokenizer.bos_token_id,
             "eos_token_id": pinned_tokenizer.eos_token_id,
             "unk_token_id": pinned_tokenizer.unk_token_id,
-            "vocab_sha256": "sha256:"
-            + _canonical_hash(pinned_tokenizer.get_vocab()),
         }
         observed = {
             "class": type(model_tokenizer).__name__,
             "bos_token_id": model_tokenizer.bos_token_id,
             "eos_token_id": model_tokenizer.eos_token_id,
             "unk_token_id": model_tokenizer.unk_token_id,
-            "vocab_sha256": "sha256:" + _canonical_hash(model_tokenizer.get_vocab()),
         }
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(
@@ -1260,42 +1197,6 @@ def _validate_transformer_lens_tokenizer(
             "TransformerLens tokenizer differs from the explicit pinned tokenizer: "
             + json.dumps(mismatches, sort_keys=True)
         )
-
-
-def tokenizer_contract_hash(
-    model: str,
-    revision: str,
-    contract: str,
-) -> str:
-    """Hash the ordered immutable tokenizer files named by a plan contract."""
-    from huggingface_hub import snapshot_download
-
-    try:
-        filenames = TOKENIZER_CONTRACT_FILES[contract]
-    except KeyError as exc:
-        raise ValueError(f"unsupported tokenizer contract {contract!r}") from exc
-    snapshot = Path(
-        snapshot_download(
-            model,
-            revision=revision,
-            allow_patterns=list(filenames),
-        )
-    )
-    digest = hashlib.sha256()
-    missing: list[str] = []
-    for filename in filenames:
-        path = snapshot / filename
-        if not path.is_file():
-            missing.append(filename)
-            continue
-        digest.update(filename.encode("utf-8") + b"\0")
-        digest.update(path.read_bytes())
-    if missing:
-        raise ValueError(
-            f"tokenizer contract {contract!r} is missing files {missing} "
-            f"at {model}@{revision}"
-        )
-    return "sha256:" + digest.hexdigest()
 
 
 def parse_split_sizes(values: list[str] | None) -> dict[str, int]:
@@ -2497,9 +2398,6 @@ def _capture_unlocked(
     tokenizer = load_pinned_tokenizer(
         model_name, model_revision, args.tokenizer_contract
     )
-    tokenizer_hash = tokenizer_contract_hash(
-        model_name, model_revision, args.tokenizer_contract
-    )
     model = HookedSAETransformer.from_pretrained_no_processing(
         loader_name,
         revision=model_revision,
@@ -2578,12 +2476,11 @@ def _capture_unlocked(
         "context": args.context,
         "drop_positions": args.drop_positions,
         "tokenizer_class": type(tokenizer).__name__,
-        "tokenizer_vocab_sha256": "sha256:" + _canonical_hash(tokenizer.get_vocab()),
+        "tokenizer": loader_name,
         "add_special_tokens": False,
         "bos_token_id": int(tokenizer.bos_token_id),
         "packing_algorithm": "bos_prefixed_greedy_document_stream_v1",
         "sequence_allocation": "whole_packed_contexts_v1",
-        "tokenizer_hashes": [tokenizer_hash],
         "tokenizer_contract": args.tokenizer_contract,
         "store_contract_version": args.store_contract_version,
         "alignment_version": args.alignment_version,
@@ -3188,7 +3085,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     cap.add_argument(
         "--resume",
         action="store_true",
-        help="verify the content-bound prefix and continue at the next durable shard",
+        help="reuse the completed prefix and continue at the next shard",
     )
 
     derive = sub.add_parser("derive")
@@ -3203,7 +3100,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--resume",
         action="store_true",
         help=(
-            "verify and reuse a complete ordered split prefix, then continue "
+            "reuse a complete ordered split prefix, then continue "
             "missing derived splits"
         ),
     )

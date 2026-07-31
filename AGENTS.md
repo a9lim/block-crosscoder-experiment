@@ -1,103 +1,82 @@
 # AGENTS.md
 
-This repository runs a staged experiment on **block-sparse crosscoders**: one
-sparse block support with signed vector coordinates shared across activation
-sites in a single model. It is not a general-purpose library and it is not a
-model-comparison project.
+This repository runs a staged scientific experiment on **block-sparse
+crosscoders**: one sparse block support with signed vector coordinates shared
+across activation sites in a single model. It is not a general-purpose library.
 
 ## Read first
 
-- `docs/design.md` — normative scientific, data, metric, and execution contract;
-- `docs/paper_comparison.md` — exact source bridges and live conditional matrix;
-- `docs/papers/block_methods.md` and `docs/papers/crosscoders.md` — primary-source
-  procedure ledgers;
-- `docs/phase2_gate_review_2026-07-23.md` — common-gate correction and
-  evidence carry-forward boundary;
-- `docs/audit.md` — launch and adversarial-review gates;
-- `docs/findings.md` — evidence-bound reporting format.
+- `README.md` — experiment overview and ordinary operating workflow
+- `docs/design.md` — scientific, data, metric, and execution contract
+- `docs/paper_comparison.md` — exact bridges to source methods
+- `docs/papers/` — primary-source procedure notes
+- `docs/findings.md` — evidence-bound reporting format
+
+## Operating model
+
+This is a trusted-operator experiment. Plans, selections, cell states, and
+phase decisions are readable JSON files. Treat them as editable working
+artifacts, not authenticated records. Prefer direct names and paths over
+checksums, content IDs, append-only journals, historical snapshots, redundant
+bindings, or forgery defenses.
+
+Keep only checks that can change a scientific conclusion or prevent an
+accidental resource overrun. Ordinary existence checks, schema checks, split
+separation, model/metric invariants, and resumable stage state are useful.
+Security-style checks against deliberate local editing are not.
+
+There should be one current plan, one current state file per cell, and one
+ordinary output path per artifact. An explicit rerun may replace outputs. Git
+is the history when history is needed.
 
 ## Three phases
 
-1. Phase 1 uses a tiny exactly matched truth-known synthetic contract to test
-   identification and the universal method semantics. It is not a synthetic
-   tuning phase and exports no numeric model or optimizer winner.
-2. Phase 2 uses a pinned GPT-2 Small four-hook capture and owns model-, hook-,
-   scale-, optimizer-, and rate-dependent tuning on development evidence,
-   followed by confirmation.
-3. Phase 3 freezes one Phase-2 finalist plus six declared comparators and
-   trains the five-seed Gemma publication panel without further tuning.
+1. **Phase 1:** truth-known synthetic identification. It tests universal method
+   semantics and exports no numeric model or optimizer winner.
+2. **Phase 2:** GPT-2 Small development and confirmation. It owns
+   model-, hook-, scale-, optimizer-, masking-, and rate-dependent tuning.
+3. **Phase 3:** one reviewed Phase-2 finalist plus six declared comparators,
+   trained at five seeds on Gemma with no further tuning.
 
-Later conditional stages do not exist until a complete, hash-bound selection
-artifact from the preceding stage is verified.
-Phase 2 additionally requires the complete authenticated Phase-1 go/no-go and
-`bsc-phase1-transfer-v3` envelope. Its blueprint binds both the Phase-1
-decision ID and transfer ID; prose, a cell ID, a copied metric, or an unbound
-preview cannot authorize registration.
+A reviewed decision JSON from the preceding phase opens the next phase. Smoke
+decisions may open only smoke descendants.
 
-## Evidence rules
+## Scientific rules
 
-- Every decision is `exact`, `adapted`, `engineering`, or `novel`.
-- Paper, inspected release, and local adaptation are separate recipes.
-- Adapted or novel scientific choices require a rationale and named ablation.
-- Use one/few-factor conditional rounds, not an incoherent Cartesian product.
-- Phase 1 fixes one rank-two factor in two dimensions, exactly one width-two
-  learner block, and one active factor/block. A one-site positive control
-  must pass before the four-site shared-coordinate carrier runs.
-- The four-site carrier renders the same coordinates through independent
-  orthogonal site dictionaries. Confirmation reruns it beside support-only and
-  one-site-span negative controls. Width, capacity, activity, architecture,
-  masking, score, selector, optimizer, regularizer, and rate choices belong to
-  Phase 2.
-- Phase 2 does not retune observation-site/evidence topology or missing-site
-  fusion. It does retune model architecture, site-axis rank, and masking on
-  real evidence, revisits rank after masking, evaluates the complete three-
-  score by two-hard-selector interaction, and tests learned group thresholding
-  only as a bundled method at three coefficients. Its source-only model is a
-  descriptive nonpromotable anchor. All-view, site-only, and leave-one-out
-  endpoints are common diagnostics for BSC and comparator families; partial
-  views never gate promotion.
-- A candidate must have every declared seed; aggregate candidates by median,
-  then worst seed, then content ID.
-- Phase 1 selection uses the worst normalized truth-identification margin. FVU
-  is a guardrail, not proof of factor recovery.
-- Phase 2 selection uses mean raw-space FVU at the exact 256, 384, and 512
-  total-bit/token budgets, including fixed-width packet bits and amortized
-  deployable-codec bytes. Use the lower convex envelope only, execute any
-  selected time-sharing schedule on paired raw rows, and never extrapolate.
-- Qualification records integrity-complete positive and negative results.
-  Scientific-outcome pass and promotion eligibility are distinct gates.
-- Smoke selections and frozen panels are protocol-only. They may drive the next
-  stage only when that next stage is also smoke, including a smoke Phase 3;
-  they can never authorize or feed non-smoke scientific Phase 3.
-- BSC and comparator promotion use the same real-model performance standard:
-  complete qualification plus fixed-rate raw-space FVU. Method-specific
-  invariants verify that a declared method was executed correctly; they do not
-  add a capability hurdle that controls are not required to clear.
-- Site-only and leave-one-out FVU, concordance, support intersection, energy
-  coverage, and functional dependence remain fully reported. Operational
-  missing-view robustness is a secondary claim, not part of the standard
-  acausal crosscoder contract.
-- Winner-changing minimum-effect and noninferiority thresholds are novel
-  preregistered project policies, not paper values. Applicable selection
-  policies content-bind their complete threshold-sensitivity grid.
+- Mark decisions as `exact`, `adapted`, `engineering`, or `novel`.
+- Keep paper recipes, inspected release behavior, and local adaptations
+  distinct.
+- Give adapted or novel scientific choices a rationale and named ablation.
+- Use conditional one/few-factor rounds rather than an incoherent Cartesian
+  product.
+- Phase 1 fixes one rank-two factor in two dimensions, one width-two learner
+  block, and one active factor. A one-site positive control precedes the
+  four-site carrier; support-only and one-site-span controls accompany
+  confirmation.
+- Phase 2 may tune architecture, site-axis rank, masking, selectors,
+  optimization, regularization, and rate choices. It does not tune on
+  confirmation.
+- Every candidate needs every declared seed. Aggregate by median, then worst
+  seed, then readable candidate name.
+- Phase 1 selects by worst normalized truth-identification margin. FVU is only
+  a guardrail there.
+- Phase 2 selects by mean raw-space FVU at exactly 256, 384, and 512
+  total bits/token. Include packet overhead and deployable codec bytes. Execute
+  time sharing on paired rows and never extrapolate.
+- Qualification means the cell produced complete usable evidence. Scientific
+  pass and promotion eligibility remain separate.
+- BSC and comparators share the same real-model performance standard.
+  Method-specific invariants confirm what ran; they do not create an extra
+  hurdle for the proposed method.
+- Report all-view, site-only, and leave-one-out endpoints. Missing-view
+  robustness is a secondary diagnostic, not a promotion gate.
+- Keep development, confirmation, and final evaluation disjoint.
 - Decoder norm is not specificity; decoder capacity is not used dimension;
   aggregate reconstruction is not manifold recovery.
-- Development, confirmation, and final evaluation are disjoint. Never tune on
-  confirmation or final evidence.
-- The default Phase-1 blueprint declares and executes 15 cells at seeds 0/1/2:
-  three one-site instruments, three multisite carriers, and nine confirmation
-  cells.
-  The active Phase-2 design has a 378-cell pre-elision ceiling at seeds 0/1:
-  176 main-chain plus 202 control-family cells. Materialization deterministically
-  records and elides execution-equivalent parent/center cells; if zero
-  Bernoulli masking wins, the rank revisit emits only its exact parent, and
-  the Appendix-D runner-up arm is elided unless the selected parent uses fixed
-  per-token TopK. Report the realized count, not the ceiling, as executed work.
 
 ## Code surface
 
-All implementation lives under `block_crosscoder_experiment/`; `bsc` is the
-only executable surface.
+`bsc` is the only executable surface:
 
 ```bash
 bsc matrix --help
@@ -105,62 +84,38 @@ bsc data --help
 bsc cell --help
 ```
 
-- `studies.py`: recipes, decisions, blueprints, selection policies, and resource
-  estimates;
-- `campaign.py`: append-only state machine, artifact verification, selection,
-  and frozen-panel production;
-- `phase1.py`: stateless truth-known generators;
-- `model.py`, `trainer.py`: shared model and training kernels;
-- `store.py`, `codec.py`, `evaluation.py`: immutable data, deployable codec,
-  raw-space rate–distortion, and shared-code endpoints;
-- `cli/`: the only command entry points.
+- `studies.py`: recipes, blueprints, selection policies, resource estimates
+- `campaign.py`: current state, stage transitions, selection, phase handoffs
+- `phase1.py`: truth-known generators
+- `model.py`, `trainer.py`: model and training kernels
+- `store.py`, `codec.py`, `evaluation.py`: data, deployable codec, metrics
+- `cli/`: command entry points
 
-Do not add paper-specific scripts, mutable promotion pointers, or a parallel
-analysis package.
+Do not add paper-specific scripts or a parallel analysis package.
 
-## Data and artifacts
+## Data and runtime
 
 - Capture raw activations once with whole-sequence split allocation and stable
-  `(sequence, position, token_id)` identities.
-- Fit normalization, encoder scale, and codec calibration only on their named
-  splits. Derived views preserve the raw row stream exactly.
-- Site dimensions and ordered hook names are part of every cell/store binding;
-  padding is structural and masked.
-- Checkpoints, stores, full reports, generated references, logs, and evaluations
-  are ignored local artifacts. Compact public evidence summaries live under
-  committed `data/summary/`; publication figures live under `docs/figures/` and
-  are indexed by `figures/README.md`.
-- Every promotion is an immutable content-addressed decision artifact.
-- The campaign never garbage-collects a recorded final checkpoint or store.
-  Deletion or archival is an external operational action; missing recorded
-  artifacts are detected by verification, and there is no retention journal
-  event to wait for or claim.
-
-## Runtime
-
-- Use shared plain Python 3.12; no project venv and no `uv`.
-- Training/capture run on `jobe`; use plain `python` there and pass
-  `PIP_CONSTRAINT=~/.venv/constraints.txt` for installations.
-- fp16 is forbidden in capture/store. Phase 1 uses fp32 reference execution and
-  Phase 2 uses its declared bf16 forward precision. The executable fp32/bf16
-  parity-and-stability preflight exists only in Phase 3.
-- Only declared Adam/AdamW recipes are scientific cells. No automatic optimizer
-  resolution is permitted.
-- Do not load evaluation checkpoints concurrently with training on the 24 GB
-  GPU.
-- Recheck `/data` headroom before launch. Planner token, parameter, peak-VRAM,
-  peak-host-RAM, storage, and compute ceilings are hard refusal gates.
+  `(sequence, position, token_id)` rows.
+- Fit normalization, encoder scale, and codec calibration only on named splits.
+  Derived views preserve row order exactly.
+- Ordered hook names and site dimensions remain part of the data contract.
+  Padding is structural and masked.
+- Generated stores, checkpoints, evaluations, and logs are local and ignored.
+  Commit compact evidence under `data/summary/` and figures under
+  `docs/figures/`.
+- Use shared plain Python 3.12; do not create a project venv.
+- Run training and capture on `jobe` with plain `python`.
+- Phase 1 uses fp32. Real-model capture uses its declared bf16 precision; fp16
+  stores are unsupported.
+- Recheck storage and memory headroom before a large run. Resource ceilings are
+  hard refusal gates.
 
 ## Verification
 
-Before calling the campaign launch-ready, run:
-
-```bash
-python -m pytest -q
-python -m compileall -q block_crosscoder_experiment
-git diff --check
-```
-
-Also run a schema-complete CPU cell through prepare, train, calibrate, evaluate,
-and qualify. Corrupt-artifact refusal, exact resume, selected-parent binding,
-and frozen-panel forgery tests must remain green.
+Match verification to the change. Prefer focused checks of model math, data
+splits, selection, ordinary resume, and the touched CLI surface. For a
+cross-cutting campaign change, run one tiny CPU cell through prepare, train,
+calibrate, evaluate, and qualify. Use `compileall` and `git diff --check`
+before publication. A full legacy suite is not required when its remaining
+failures exercise removed defensive behavior.

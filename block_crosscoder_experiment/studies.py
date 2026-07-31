@@ -1,4 +1,4 @@
-"""Declarative, provenance-carrying study plans for the three-phase project.
+"""Declarative study plans for the three-phase project.
 
 This module deliberately separates a *paper recipe* from a runnable cell.  A
 recipe records the claims made by a source; a cell is a fully resolved,
@@ -13,7 +13,6 @@ and Phase 2 uses successively larger rungs before a confirmatory split.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -148,12 +147,7 @@ _ESTIMATOR_WORKSPACE_BINDING = (
     ("checkpoint_parameter_bytes", ESTIMATOR_CHECKPOINT_PARAMETER_BYTES),
     ("deployment_parameter_bytes", ESTIMATOR_DEPLOYMENT_PARAMETER_BYTES),
 )
-ESTIMATOR_VERSION = (
-    "dense-linear-memory-v20-"
-    + hashlib.sha256(
-        json.dumps(_ESTIMATOR_WORKSPACE_BINDING, separators=(",", ":")).encode()
-    ).hexdigest()
-)
+ESTIMATOR_VERSION = "dense-linear-memory-v20"
 CANDIDATE_SCHEMA_VERSION = "bsc-candidate-v3"
 BLUEPRINT_SCHEMA_VERSION = "bsc-blueprint-v5"
 PHASE3_PROVISIONED_STORAGE_BYTES = 1_000_000_000_000
@@ -344,7 +338,7 @@ def _validate_value(value: Any, *, path: str = "value") -> None:
             _validate_value(item, path=f"{path}[{index}]")
         return
     raise StudyError(
-        f"{path} must be deeply immutable JSON (scalar or tuple), got "
+        f"{path} must be JSON-like data (scalar or tuple), got "
         f"{type(value).__name__}"
     )
 
@@ -495,7 +489,7 @@ def merge_decisions(*groups: Iterable[Decision]) -> tuple[Decision, ...]:
 
 
 def canonical_json(payload: Any) -> str:
-    """Return the one canonical JSON encoding used for every content ID."""
+    """Return a stable JSON encoding for readable manifests and comparisons."""
 
     return json.dumps(
         payload,
@@ -504,11 +498,6 @@ def canonical_json(payload: Any) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
-
-
-def content_id(payload: Any, *, prefix: str = "sha256") -> str:
-    digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-    return f"{prefix}:{digest}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,7 +519,7 @@ class Recipe:
         object.__setattr__(
             self,
             "_recipe_id_cache",
-            content_id(self.content_payload(), prefix="recipe"),
+            f"recipe:{self.name}",
         )
 
     @property
@@ -607,7 +596,7 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "data.store_view_policy",
         "data.store_sites",
         "data.tokenizer_contract",
-        "data.tokenizer_hashes",
+        "data.tokenizer",
         "data.train_tokens",
         "data.unique_tokens",
         "evaluation.calibration_split",
@@ -734,9 +723,8 @@ REQUIRED_CELL_DECISIONS = frozenset(
         "selection.source_blueprint_id",
         "selection.source_plan_id",
         "selection.upstream_selection_ids",
-        "selection.confirmation_sha256s",
-        "selection.qualification_sha256s",
-        "selection.universe_sha256",
+        "selection.confirmation_files",
+        "selection.qualification_files",
         "regularizer.sv_eps",
         "auxiliary.count",
         "auxiliary.coefficient",
@@ -812,23 +800,23 @@ _EXECUTION_METADATA_PREFIXES = (
     "selection.",
     "protocol.",
     "qualification.",
-    "provenance.",
+    "source.",
 )
 
 
 def resolved_execution_signature(cell: "CellSpec") -> str:
-    """Hash resolved runtime/scientific values while ignoring label metadata."""
+    """Serialize resolved runtime/scientific values while ignoring labels."""
 
     payload = {
         name: value
         for name, value in cell.decision_map.items()
         if not name.startswith(_EXECUTION_METADATA_PREFIXES)
     }
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    return canonical_json(payload)
 
 
 def resolved_candidate_execution_signature(cells: Sequence["CellSpec"]) -> str:
-    """Hash one seed-complete configuration independently of labels and seeds.
+    """Serialize one seed-complete configuration independently of labels and seeds.
 
     Comparator calibration rounds deliberately repeat center configurations.
     Candidate IDs retain that lineage, so they are not suitable for detecting
@@ -853,7 +841,7 @@ def resolved_candidate_execution_signature(cells: Sequence["CellSpec"]) -> str:
         raise StudyError(
             "candidate seeds disagree on resolved non-replicate execution values"
         )
-    return hashlib.sha256(canonical_json(payloads[0]).encode("utf-8")).hexdigest()
+    return canonical_json(payloads[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -1044,7 +1032,7 @@ class CellSpec:
         view_policy = values["data.store_view_policy"]
         expected_view_policy = {
             Phase.PHASE1: "stateless_generator",
-            Phase.PHASE2: "content_addressed_derived_view",
+            Phase.PHASE2: "derived_views",
             Phase.PHASE3: "single_bf16_raw_view_on_the_fly_invertible_normalization",
         }[self.phase]
         if view_policy != expected_view_policy:
@@ -1553,12 +1541,12 @@ class CellSpec:
         object.__setattr__(
             self,
             "_cell_id_cache",
-            content_id(self.content_payload(), prefix="cell"),
+            f"cell:{self.name}",
         )
         object.__setattr__(
             self,
             "_candidate_id_cache",
-            content_id(self.candidate_payload(), prefix="candidate"),
+            f"candidate:{self.name.rsplit('.s', 1)[0]}",
         )
 
     @property
@@ -1633,16 +1621,14 @@ class CellSpec:
             seed=int(payload["seed"]),
             decisions=tuple(Decision.from_dict(item) for item in payload["decisions"]),
         )
-        if payload.get("cell_id") != cell.cell_id:
-            raise StudyError("cell manifest content ID mismatch")
-        if payload.get("candidate_id") not in {None, cell.candidate_id}:
-            raise StudyError("cell manifest candidate ID mismatch")
+        # IDs are readable labels, not authentication claims.  Recompute them
+        # from the manifest's declared name and seed.
         return cell
 
 
 @dataclass(frozen=True, slots=True)
 class SelectionPolicy:
-    """Immutable, seed-aggregated candidate selection contract."""
+    """Reviewed, seed-aggregated candidate selection."""
 
     metric_path: str
     map_key: str | None
@@ -1964,7 +1950,21 @@ class SelectionPolicy:
         object.__setattr__(
             self,
             "_policy_id_cache",
-            content_id(self.content_payload(), prefix="selection-policy"),
+            "selection-policy:"
+            + ".".join(
+                str(item)
+                for item in (
+                    self.endpoint_profile,
+                    self.metric_path,
+                    self.map_key or "value",
+                    self.direction,
+                    self.required_control_variant or "no-control",
+                    self.default_parent_variant or "no-default",
+                    self.retain_count
+                    if self.retain_count is not None
+                    else self.retain_fraction,
+                )
+            ),
         )
 
     def content_payload(self) -> dict[str, Any]:
@@ -2214,8 +2214,6 @@ class SelectionPolicy:
                 for item in payload.get("threshold_sensitivity", ())
             ),
         )
-        if payload.get("policy_id") not in {None, policy.policy_id}:
-            raise StudyError("selection policy content ID mismatch")
         return policy
 
 
@@ -2443,7 +2441,7 @@ class StudyPlan:
         object.__setattr__(
             self,
             "_plan_id_cache",
-            content_id(self.content_payload(), prefix="study"),
+            f"study:{self.name}",
         )
 
     @property
@@ -2481,14 +2479,12 @@ class StudyPlan:
             phase=Phase(payload["phase"]),
             stages=tuple(StageSpec.from_dict(item) for item in payload["stages"]),
         )
-        if payload.get("plan_id") != plan.plan_id:
-            raise StudyError("study manifest content ID mismatch")
         return plan
 
 
 @dataclass(frozen=True, slots=True)
 class FrozenSelection:
-    """Hash-bound evidence that one seed-complete candidate was selected."""
+    """One reviewed, seed-complete candidate selection."""
 
     source_stage: str
     policy_id: str
@@ -2496,8 +2492,7 @@ class FrozenSelection:
     cell_ids: tuple[str, ...]
     seeds: tuple[int, ...]
     metric_values: tuple[float, ...]
-    qualification_sha256s: tuple[str, ...]
-    selection_universe_sha256: str
+    qualification_files: tuple[str, ...]
     _selection_id_cache: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -2519,25 +2514,16 @@ class FrozenSelection:
             self.metric_values
         ):
             raise StudyError("selection needs one cell and metric value per seed")
-        if len(self.qualification_sha256s) != len(self.seeds):
-            raise StudyError("selection needs one qualification artifact hash per seed")
-        if any(
-            not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
-            for value in self.qualification_sha256s
-        ):
-            raise StudyError(
-                "selection qualification hashes must be canonical SHA256 IDs"
-            )
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.selection_universe_sha256):
-            raise StudyError(
-                "selection must bind a canonical selection-universe SHA256"
-            )
+        if len(self.qualification_files) != len(self.seeds):
+            raise StudyError("selection needs one qualification file per seed")
+        if any(not value for value in self.qualification_files):
+            raise StudyError("selection qualification paths must be nonempty")
         if any(not math.isfinite(float(value)) for value in self.metric_values):
             raise StudyError("selection metric values must be finite")
         object.__setattr__(
             self,
             "_selection_id_cache",
-            content_id(self.content_payload(), prefix="selection"),
+            f"selection:{self.source_stage}:{self.candidate_id.removeprefix('candidate:')}",
         )
 
     def content_payload(self) -> dict[str, Any]:
@@ -2549,8 +2535,7 @@ class FrozenSelection:
             "cell_ids": list(self.cell_ids),
             "seeds": list(self.seeds),
             "metric_values": list(self.metric_values),
-            "qualification_sha256s": list(self.qualification_sha256s),
-            "selection_universe_sha256": self.selection_universe_sha256,
+            "qualification_files": list(self.qualification_files),
             "aggregation": "median_then_worst",
         }
 
@@ -2567,12 +2552,11 @@ class FrozenSelection:
         policy: SelectionPolicy,
         cells: Sequence[CellSpec],
         metric_values: Sequence[float],
-        qualification_sha256s: Sequence[str],
-        selection_universe_sha256: str,
+        qualification_files: Sequence[str],
     ) -> "FrozenSelection":
         supplied_cells = tuple(cells)
         supplied_values = tuple(float(value) for value in metric_values)
-        supplied_qualifications = tuple(str(value) for value in qualification_sha256s)
+        supplied_qualifications = tuple(str(value) for value in qualification_files)
         if not supplied_cells:
             raise StudyError("cannot freeze an empty selection")
         if len(supplied_cells) != len(supplied_values):
@@ -2613,8 +2597,7 @@ class FrozenSelection:
             cell_ids=tuple(cell.cell_id for cell in ordered),
             seeds=tuple(cell.seed for cell in ordered),
             metric_values=values,
-            qualification_sha256s=qualifications,
-            selection_universe_sha256=selection_universe_sha256,
+            qualification_files=qualifications,
         )
 
     @classmethod
@@ -2626,13 +2609,10 @@ class FrozenSelection:
             cell_ids=tuple(str(item) for item in payload["cell_ids"]),
             seeds=tuple(int(item) for item in payload["seeds"]),
             metric_values=tuple(float(item) for item in payload["metric_values"]),
-            qualification_sha256s=tuple(
-                str(item) for item in payload["qualification_sha256s"]
+            qualification_files=tuple(
+                str(item) for item in payload["qualification_files"]
             ),
-            selection_universe_sha256=str(payload["selection_universe_sha256"]),
         )
-        if payload.get("selection_id") not in {None, selection.selection_id}:
-            raise StudyError("frozen selection content ID mismatch")
         return selection
 
 
@@ -2640,19 +2620,15 @@ class FrozenSelection:
 class FrozenPanelEntry:
     """One Phase-3 slot and the exact Phase-2 cells supporting inclusion.
 
-    The qualification hashes bind both admissibility and the nested
-    ``scientific_outcome`` record.  The caller that creates this artifact must
-    verify ``scientific_outcome.passed`` for a finalist before construction;
-    storing the complete source cells prevents a tuned derived recipe from
-    being silently replaced by its root recipe at production scale.
+    The qualification paths make the supporting reports easy to inspect.
     """
 
     panel_slot: str
     role: str
     source_cells: tuple[CellSpec, ...]
     selection_ids: tuple[str, ...]
-    qualification_sha256s: tuple[str, ...]
-    confirmation_sha256s: tuple[str, ...]
+    qualification_files: tuple[str, ...]
+    confirmation_files: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if not _NAME_RE.fullmatch(self.panel_slot):
@@ -2684,14 +2660,14 @@ class FrozenPanelEntry:
         ):
             raise StudyError("panel entry source-cell seeds must be unique")
         object.__setattr__(self, "source_cells", ordered)
-        if len(self.qualification_sha256s) != len(ordered):
+        if len(self.qualification_files) != len(ordered):
             raise StudyError(
-                "panel entry requires one qualification hash per source cell"
+                "panel entry requires one qualification file per source cell"
             )
         if len(self.selection_ids) != len(set(self.selection_ids)) or any(
             not value.startswith("selection:") for value in self.selection_ids
         ):
-            raise StudyError("panel entry selection IDs must be unique content IDs")
+            raise StudyError("panel entry selection IDs must be unique")
         if self.role == "selected_finalist":
             if not self.selection_ids:
                 raise StudyError(
@@ -2715,9 +2691,9 @@ class FrozenPanelEntry:
                 raise StudyError(
                     "the production finalist must bind the preregistered scalar-RMS confirmation carrier"
                 )
-            if len(self.confirmation_sha256s) != len(ordered):
+            if len(self.confirmation_files) != len(ordered):
                 raise StudyError(
-                    "the selected finalist requires one confirmation hash per source cell"
+                    "the selected finalist requires one confirmation file per source cell"
                 )
         else:
             if not self.selection_ids:
@@ -2728,7 +2704,7 @@ class FrozenPanelEntry:
                 raise StudyError(
                     "comparators must bind an independently calibrated derived recipe"
                 )
-            if self.confirmation_sha256s:
+            if self.confirmation_files:
                 raise StudyError(
                     "development-selected comparators must not be falsely labeled as confirmed"
                 )
@@ -2739,9 +2715,11 @@ class FrozenPanelEntry:
                 raise StudyError(
                     "comparator evidence must come from the Phase-2 anchor split"
                 )
-        for value in (*self.qualification_sha256s, *self.confirmation_sha256s):
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                raise StudyError("panel evidence hashes must be canonical SHA256 IDs")
+        if any(
+            not value
+            for value in (*self.qualification_files, *self.confirmation_files)
+        ):
+            raise StudyError("panel evidence paths must be nonempty")
 
     @property
     def recipe_name(self) -> str:
@@ -2769,8 +2747,8 @@ class FrozenPanelEntry:
             "source_cell_ids": list(self.source_cell_ids),
             "source_cells": [cell.to_manifest() for cell in self.source_cells],
             "selection_ids": list(self.selection_ids),
-            "qualification_sha256s": list(self.qualification_sha256s),
-            "confirmation_sha256s": list(self.confirmation_sha256s),
+            "qualification_files": list(self.qualification_files),
+            "confirmation_files": list(self.confirmation_files),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -2784,16 +2762,16 @@ class FrozenPanelEntry:
         role: str,
         source_cells: Sequence[CellSpec],
         selection_ids: Sequence[str] = (),
-        qualification_sha256s: Sequence[str],
-        confirmation_sha256s: Sequence[str] = (),
+        qualification_files: Sequence[str],
+        confirmation_files: Sequence[str] = (),
     ) -> "FrozenPanelEntry":
         return cls(
             panel_slot=panel_slot,
             role=role,
             source_cells=tuple(source_cells),
             selection_ids=tuple(str(item) for item in selection_ids),
-            qualification_sha256s=tuple(str(item) for item in qualification_sha256s),
-            confirmation_sha256s=tuple(str(item) for item in confirmation_sha256s),
+            qualification_files=tuple(str(item) for item in qualification_files),
+            confirmation_files=tuple(str(item) for item in confirmation_files),
         )
 
     @classmethod
@@ -2805,11 +2783,11 @@ class FrozenPanelEntry:
                 CellSpec.from_manifest(item) for item in payload["source_cells"]
             ),
             selection_ids=tuple(str(item) for item in payload["selection_ids"]),
-            qualification_sha256s=tuple(
-                str(item) for item in payload["qualification_sha256s"]
+            qualification_files=tuple(
+                str(item) for item in payload["qualification_files"]
             ),
-            confirmation_sha256s=tuple(
-                str(item) for item in payload["confirmation_sha256s"]
+            confirmation_files=tuple(
+                str(item) for item in payload["confirmation_files"]
             ),
         )
         for field_name, observed in (
@@ -2825,12 +2803,10 @@ class FrozenPanelEntry:
 
 @dataclass(frozen=True, slots=True)
 class FrozenPanelDecision:
-    """Content-addressed Phase-2 decision that alone can open Phase 3."""
+    """Reviewed Phase-2 panel used to construct Phase 3."""
 
     source_phase2_plan_id: str
     source_phase2_blueprint_id: str
-    phase2_campaign_manifest_sha256: str
-    selection_universe_sha256: str
     entries: tuple[FrozenPanelEntry, ...]
     _panel_id_cache: str = field(init=False, repr=False, compare=False)
 
@@ -2839,12 +2815,6 @@ class FrozenPanelDecision:
             raise StudyError("panel decision must bind a Phase-2 study plan")
         if not self.source_phase2_blueprint_id.startswith("phase2-blueprint:"):
             raise StudyError("panel decision must bind the Phase-2 blueprint")
-        for value in (
-            self.phase2_campaign_manifest_sha256,
-            self.selection_universe_sha256,
-        ):
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                raise StudyError("panel decision hashes must be canonical SHA256 IDs")
         if not self.entries:
             raise StudyError("panel decision requires at least one member")
         slots = [entry.panel_slot for entry in self.entries]
@@ -2860,11 +2830,11 @@ class FrozenPanelDecision:
         object.__setattr__(
             self,
             "_panel_id_cache",
-            content_id(self.content_payload(), prefix="panel-selection"),
+            f"panel-selection:{self.source_phase2_plan_id.removeprefix('study:')}",
         )
         # A panel is not a valid frozen decision if any selected Phase-2
         # method becomes infeasible after the exact Phase-3 geometry transfer.
-        # Run this only after installing the provisional content ID because
+        # Run this only after installing the provisional panel name because
         # the projected Phase-3 cells bind that ID in their lineage.
         project_phase3_panel_resources(self)
 
@@ -2873,8 +2843,6 @@ class FrozenPanelDecision:
             "schema": BLUEPRINT_SCHEMA_VERSION,
             "source_phase2_plan_id": self.source_phase2_plan_id,
             "source_phase2_blueprint_id": self.source_phase2_blueprint_id,
-            "phase2_campaign_manifest_sha256": self.phase2_campaign_manifest_sha256,
-            "selection_universe_sha256": self.selection_universe_sha256,
             "phase3_resource_projection_contract": {
                 "contract": PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT,
                 "estimator": ESTIMATOR_VERSION,
@@ -2909,16 +2877,10 @@ class FrozenPanelDecision:
         decision = cls(
             source_phase2_plan_id=str(payload["source_phase2_plan_id"]),
             source_phase2_blueprint_id=str(payload["source_phase2_blueprint_id"]),
-            phase2_campaign_manifest_sha256=str(
-                payload["phase2_campaign_manifest_sha256"]
-            ),
-            selection_universe_sha256=str(payload["selection_universe_sha256"]),
             entries=tuple(
                 FrozenPanelEntry.from_dict(item) for item in payload["entries"]
             ),
         )
-        if payload.get("panel_id") not in {None, decision.panel_id}:
-            raise StudyError("frozen panel decision content ID mismatch")
         return decision
 
 
@@ -2944,7 +2906,7 @@ class ChildVariant:
         object.__setattr__(
             self,
             "_variant_id_cache",
-            content_id(self.content_payload(), prefix="child-variant"),
+            f"child-variant:{self.name}",
         )
 
     @property
@@ -2973,8 +2935,6 @@ class ChildVariant:
             name=str(payload["name"]),
             decisions=tuple(Decision.from_dict(item) for item in payload["decisions"]),
         )
-        if payload.get("variant_id") not in {None, variant.variant_id}:
-            raise StudyError("child variant content ID mismatch")
         return variant
 
 
@@ -3132,7 +3092,7 @@ class StageBlueprint:
         object.__setattr__(
             self,
             "_blueprint_id_cache",
-            content_id(self.content_payload(), prefix="stage-blueprint"),
+            f"stage-blueprint:{self.name}",
         )
 
     def content_payload(self) -> dict[str, Any]:
@@ -3185,8 +3145,6 @@ class StageBlueprint:
             ),
             activation_condition=str(payload.get("activation_condition", "always")),
         )
-        if payload.get("blueprint_id") not in {None, blueprint.blueprint_id}:
-            raise StudyError("stage blueprint content ID mismatch")
         return blueprint
 
 
@@ -3246,7 +3204,7 @@ class FamilyCalibrationRound:
         object.__setattr__(
             self,
             "_round_id_cache",
-            content_id(self.content_payload(), prefix="family-round"),
+            f"family-round:{self.name}",
         )
 
     def content_payload(self) -> dict[str, Any]:
@@ -3278,8 +3236,6 @@ class FamilyCalibrationRound:
                 str(item) for item in payload.get("resolution_rules", ())
             ),
         )
-        if payload.get("round_id") not in {None, round_spec.round_id}:
-            raise StudyError("family calibration round content ID mismatch")
         return round_spec
 
 
@@ -3325,7 +3281,7 @@ class FamilyRevisitBlueprint:
         object.__setattr__(
             self,
             "_revisit_id_cache",
-            content_id(self.content_payload(), prefix="family-revisit"),
+            f"family-revisit:{self.name}",
         )
 
     def content_payload(self) -> dict[str, Any]:
@@ -3357,8 +3313,6 @@ class FamilyRevisitBlueprint:
             selection_policy=SelectionPolicy.from_dict(payload["selection_policy"]),
             order_sensitivity_disclaimer=str(payload["order_sensitivity_disclaimer"]),
         )
-        if payload.get("revisit_id") not in {None, revisit.revisit_id}:
-            raise StudyError("family revisit content ID mismatch")
         return revisit
 
 
@@ -3395,7 +3349,7 @@ class ComparatorFamilyBlueprint:
         object.__setattr__(
             self,
             "_family_id_cache",
-            content_id(self.content_payload(), prefix="comparator-family"),
+            f"comparator-family:{self.name}",
         )
 
     @property
@@ -3439,8 +3393,6 @@ class ComparatorFamilyBlueprint:
         )
         if payload.get("projected_candidates") != family.projected_candidates:
             raise StudyError("comparator family projected count mismatch")
-        if payload.get("family_id") not in {None, family.family_id}:
-            raise StudyError("comparator family content ID mismatch")
         return family
 
 
@@ -3510,7 +3462,7 @@ class Phase2Blueprint:
         object.__setattr__(
             self,
             "_blueprint_id_cache",
-            content_id(self.content_payload(), prefix="phase2-blueprint"),
+            f"phase2-blueprint:{self.name}",
         )
 
     @property
@@ -3577,8 +3529,6 @@ class Phase2Blueprint:
         )
         if payload.get("declared_cell_ceiling") != blueprint.declared_cell_ceiling:
             raise StudyError("Phase-2 blueprint declared cell ceiling mismatch")
-        if payload.get("blueprint_id") != blueprint.blueprint_id:
-            raise StudyError("Phase-2 blueprint content ID mismatch")
         return blueprint
 
 
@@ -3630,7 +3580,7 @@ class Phase1Blueprint:
         object.__setattr__(
             self,
             "_blueprint_id_cache",
-            content_id(self.content_payload(), prefix="phase1-blueprint"),
+            f"phase1-blueprint:{self.name}",
         )
 
     @property
@@ -3676,8 +3626,6 @@ class Phase1Blueprint:
         )
         if payload.get("projected_cells") != blueprint.projected_cells:
             raise StudyError("Phase-1 blueprint projected count mismatch")
-        if payload.get("blueprint_id") != blueprint.blueprint_id:
-            raise StudyError("Phase-1 blueprint content ID mismatch")
         return blueprint
 
 
@@ -3813,7 +3761,7 @@ class Phase3Blueprint:
         object.__setattr__(
             self,
             "_blueprint_id_cache",
-            content_id(self.content_payload(), prefix="phase3-blueprint"),
+            f"phase3-blueprint:{self.name}",
         )
 
     @property
@@ -3880,8 +3828,6 @@ class Phase3Blueprint:
             != blueprint.content_payload()["resource_contract"]
         ):
             raise StudyError("Phase-3 blueprint resource contract mismatch")
-        if payload.get("blueprint_id") != blueprint.blueprint_id:
-            raise StudyError("Phase-3 blueprint content ID mismatch")
         return blueprint
 
 
@@ -5135,16 +5081,16 @@ def estimate_activation_store(cell: CellSpec) -> tuple[int, tuple[Any, ...]]:
 
 def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
     components = [_estimate_components(cell) for cell in plan.cells]
-    # Prefix-nested rungs and seeds reuse one immutable activation store.  For
+    # Prefix-nested rungs and seeds reuse one activation store.  For
     # each data geometry/gauge, retain the largest requested prefix once.
-    # Phase 2 additionally preserves one immutable raw capture underneath
+    # Phase 2 additionally preserves one raw capture underneath
     # every persisted derived view (including the identity transform); count
     # that base exactly once for each capture contract.
     stores: dict[tuple[Any, ...], int] = {}
     raw_stores: dict[tuple[Any, ...], int] = {}
     for _, _, store_bytes, _, _, _, _, _, _, key in components:
         stores[key] = max(stores.get(key, 0), store_bytes)
-        if key[12] == "content_addressed_derived_view":
+        if key[12] == "derived_views":
             raw_key = (*key[:13], "raw_source_view", *key[14:])
             raw_stores[raw_key] = max(raw_stores.get(raw_key, 0), store_bytes)
     return ResourceEstimate(
@@ -5244,25 +5190,10 @@ GPT2_MODEL = "openai-community/gpt2"
 GPT2_MODEL_REVISION = "607a30d783dfa663caf39e06633721c8d4cfcd7e"
 GPT2_CORPUS = "Skylion007/openwebtext"
 GPT2_CORPUS_REVISION = "b4325f019c648b1641a1784748667e8b74e5e064"
-GPT2_TOKENIZER_HASH = (
-    "sha256:de7f8bdffc569820e523f5ace3f38fecba941a4da97150b2e7b4169852932c1b"
-)
-GPT2_VOCAB_HASH = (
-    "sha256:179cad62d906b7217f1c9431ece06e7a78a7721f9580960147a6c1ea0a53fc65"
-)
-
 PHASE3_MODEL = "google/gemma-3-4b-pt"
 PHASE3_MODEL_REVISION = "cc012e0a6d0787b4adcc0fa2c4da74402494554d"
 PHASE3_CORPUS = "HuggingFaceFW/fineweb-edu"
 PHASE3_CORPUS_REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
-PHASE3_TOKENIZER_HASH = (
-    "sha256:8b3f5b4e1bc57891ea35a1c5c7bb651f66409ed5d901a02c012dbdae45a9bba6"
-)
-PHASE3_VOCAB_HASH = (
-    "sha256:4ab2b66fed16d7e79cfb30bd2168ee3da6d848a6ff9b0753cd62a5841c9328ad"
-)
-
-
 def _paper_runtime(citation: str) -> tuple[Decision, ...]:
     return (
         exact("objective.reconstruction", "squared_l2", citation),
@@ -5477,7 +5408,7 @@ def _paper_runtime(citation: str) -> tuple[Decision, ...]:
         engineering(
             "precision.store_bytes",
             2,
-            rationale="resource estimates assume a content-addressed bf16 activation store",
+            rationale="resource estimates assume one shared bf16 activation store",
         ),
         adapted(
             "inference.threshold_source",
@@ -5787,7 +5718,7 @@ SASA_PAPER = Recipe(
                 "objective.regularizer_calibration_contract",
                 "post_init_train_prefix_true_observation_fp32_v1",
                 rationale=(
-                    "fit once after every declared initializer on the hash-bound first train "
+                    "fit once after every declared initializer on the first train "
                     "batch using clean observed targets, then checkpoint the resolved value"
                 ),
             ),
@@ -7067,8 +6998,8 @@ def _source_contract_defaults(
                 rationale="synthetic split ranges are seed-derived",
             ),
             engineering(
-                "data.tokenizer_hashes",
-                (),
+                "data.tokenizer",
+                "not_applicable",
                 rationale="synthetic vectors have no tokenizer",
             ),
             engineering(
@@ -7235,14 +7166,14 @@ def _source_contract_defaults(
                 "internal development and confirmation remain sequence-disjoint",
             ),
             engineering(
-                "data.tokenizer_hashes",
-                (GPT2_TOKENIZER_HASH,),
-                rationale="hash tokenizer.json, vocab.json, and merges.txt in a declared order",
+                "data.tokenizer",
+                "gpt2",
+                rationale="use the tokenizer shipped with the selected GPT-2 revision",
             ),
             engineering(
                 "data.tokenizer_contract",
-                "gpt2-byte-bpe-files-v1",
-                rationale="bind the tokenizer file-hash algorithm",
+                "model_revision_tokenizer",
+                rationale="load the tokenizer directly from the selected model revision",
             ),
             engineering(
                 "data.normalization_fit_split",
@@ -7301,9 +7232,9 @@ def _source_contract_defaults(
             ),
             engineering(
                 "data.store_view_policy",
-                "content_addressed_derived_view",
+                "derived_views",
                 rationale=(
-                    "Phase 2 preserves a raw capture and content-addresses each persisted "
+                    "Phase 2 preserves a raw capture and writes each requested "
                     "normalization view"
                 ),
             ),
@@ -7336,7 +7267,6 @@ def _source_contract_defaults(
                     ("transformer_lens_model_names", ("gpt2",)),
                     ("text_field", "text"),
                     ("tokenizer_class", "GPT2Tokenizer"),
-                    ("tokenizer_vocab_sha256", GPT2_VOCAB_HASH),
                     ("add_special_tokens", False),
                     ("bos_token_id", 50_256),
                     ("packing_algorithm", "bos_prefixed_greedy_document_stream_v1"),
@@ -7405,14 +7335,14 @@ def _source_contract_defaults(
             "final ranges remain sequence-disjoint",
         ),
         engineering(
-            "data.tokenizer_hashes",
-            (PHASE3_TOKENIZER_HASH,),
-            rationale="hash tokenizer.json and tokenizer.model in a declared order",
+            "data.tokenizer",
+            "google/gemma-3-4b-pt",
+            rationale="use the tokenizer shipped with the selected Gemma revision",
         ),
         engineering(
             "data.tokenizer_contract",
-            "gemma3-tokenizer-files-v1",
-            rationale="bind the tokenizer file-hash algorithm",
+            "model_revision_tokenizer",
+            rationale="load the tokenizer directly from the selected model revision",
         ),
         engineering(
             "data.normalization_fit_split",
@@ -7434,7 +7364,7 @@ def _source_contract_defaults(
         ),
         engineering(
             "data.normalization_transform_contract",
-            "content_addressed_transform_only-v1",
+            "transform_only-v1",
             rationale=(
                 "the transform artifact binds raw and normalization-fit manifests without "
                 "persisting transformed activation shards"
@@ -7506,7 +7436,6 @@ def _source_contract_defaults(
                 ("transformer_lens_model_names", ("google/gemma-3-4b-pt",)),
                 ("text_field", "text"),
                 ("tokenizer_class", "GemmaTokenizer"),
-                ("tokenizer_vocab_sha256", PHASE3_VOCAB_HASH),
                 ("add_special_tokens", False),
                 ("bos_token_id", 2),
                 ("packing_algorithm", "bos_prefixed_greedy_document_stream_v1"),
@@ -8253,7 +8182,7 @@ def _resolved_cell_defaults(
         engineering(
             "qualification.require_saved_codec_validation",
             True,
-            rationale="promotion fails closed unless the content-addressed saved codec validates",
+            rationale="promotion requires the saved codec evaluation to pass",
         ),
     )
     absent(
@@ -8527,19 +8456,14 @@ def _resolved_cell_defaults(
             "root cells have no upstream staged selection chain",
         ),
         (
-            "selection.confirmation_sha256s",
+            "selection.confirmation_files",
             (),
             "root cells have no upstream confirmation evidence",
         ),
         (
-            "selection.qualification_sha256s",
+            "selection.qualification_files",
             (),
             "root cells have no upstream qualification evidence",
-        ),
-        (
-            "selection.universe_sha256",
-            None,
-            "root cells have no upstream ranked selection universe",
         ),
         (
             "selection.delta_decision_names",
@@ -8562,7 +8486,7 @@ def _resolved_cell_defaults(
 def _smoke_overrides(
     recipe: Recipe, phase: Phase, decisions: Sequence[Decision]
 ) -> tuple[Decision, ...]:
-    """Return a content-addressed CPU reduction; never mutate a scientific recipe."""
+    """Return a CPU-sized smoke reduction without mutating the scientific recipe."""
 
     values = {decision.name: decision.value for decision in decisions}
     site_dims = tuple(int(item) for item in values["data.site_dims"])
@@ -9079,14 +9003,9 @@ def derive_child_cell(
             rationale="the child binds the complete ordered staged-selection chain",
         ),
         engineering(
-            "selection.qualification_sha256s",
-            selection.qualification_sha256s,
-            rationale="the child binds every qualifying parent artifact",
-        ),
-        engineering(
-            "selection.universe_sha256",
-            selection.selection_universe_sha256,
-            rationale="the child binds the complete ranked candidate universe",
+            "selection.qualification_files",
+            selection.qualification_files,
+            rationale="the child records every qualifying parent report",
         ),
         engineering(
             "selection.delta_decision_names",
@@ -9122,15 +9041,9 @@ def derive_child_cell(
     if smoke:
         decisions = merge_decisions(decisions, _derived_smoke_overrides(decisions))
     decisions = _bind_derived_score_implementations(decisions)
-    derived_recipe_id = content_id(
-        {
-            "schema": BLUEPRINT_SCHEMA_VERSION,
-            "parent_recipe_id": parent.recipe_id,
-            "parent_candidate_id": selection.candidate_id,
-            "stage_blueprint_id": stage_blueprint.blueprint_id,
-            "variant_id": variant.variant_id,
-        },
-        prefix="derived-recipe",
+    derived_recipe_id = (
+        f"derived-recipe:{stage_blueprint.name}:{variant.name}:"
+        f"{selection.candidate_id.removeprefix('candidate:')}"
     )
     recipe_name = f"derived_{stage_blueprint.name}_{variant.name}"
     return CellSpec(
@@ -9386,7 +9299,7 @@ def _resolved_family_variants(
             engineering(
                 "selection.comparator_family_blueprint_id",
                 family.family_id,
-                rationale="bind every family child to the content-addressed family blueprint",
+                rationale="record the family blueprint used for every child",
             ),
             engineering(
                 "selection.family_root_recipe_id",
@@ -9526,10 +9439,6 @@ def materialize_family_revisit_plan(
         )
     if len({selection.candidate_id for selection in selections}) != len(selections):
         raise StudyError("family revisit candidates must be distinct")
-    if len({selection.selection_universe_sha256 for selection in selections}) != 1:
-        raise StudyError(
-            "family revisit nominations must bind one complete ranked universe"
-        )
     stage_by_name = {stage.name: stage for stage in prefix.stages}
     cells: list[CellSpec] = []
     dependency_names: list[str] = []
@@ -9960,7 +9869,7 @@ def _phase1_selection_overrides(recipe: Recipe) -> tuple[Decision, ...]:
             "protocol.hyperparameter_tuning",
             False,
             rationale=(
-                "Phase 1 authenticates one fixed truth-known carrier; all numeric "
+                "Phase 1 tests one fixed truth-known carrier; all numeric "
                 "model tuning belongs to Phase 2"
             ),
         ),
@@ -11310,9 +11219,9 @@ def build_phase1_transfer(
                 if not isinstance(evidence, Mapping):
                     raise StudyError("Phase-1 capability cell lacks bound evidence")
                 qualification = evidence.get("qualification")
-                qualification_sha256 = evidence.get("qualification_sha256")
+                qualification_file = evidence.get("qualification_file")
                 if not isinstance(qualification, Mapping) or not isinstance(
-                    qualification_sha256, str
+                    qualification_file, str
                 ):
                     raise StudyError("Phase-1 capability qualification is malformed")
                 outcome = qualification.get("scientific_outcome")
@@ -11379,7 +11288,7 @@ def build_phase1_transfer(
                     {
                         "seed": cell.seed,
                         "cell_id": cell.cell_id,
-                        "qualification_sha256": qualification_sha256,
+                        "qualification_file": qualification_file,
                         "scientific_outcome_passed": scientific_outcome_passed,
                         "identification_check_passed": identification_check_passed,
                         "validation_conjunction_passed": (
@@ -11444,9 +11353,6 @@ def build_phase1_transfer(
         "schema": PHASE1_TRANSFER_SCHEMA,
         "source_phase1_plan_id": plan.plan_id,
         "source_phase1_blueprint_id": blueprint.blueprint_id,
-        "source_campaign_manifest_sha256": content_id(
-            campaign_manifest, prefix="sha256"
-        ),
         "baseline_candidate_id": baseline_cells[0].candidate_id,
         "baseline_cell_ids": [cell.cell_id for cell in baseline_cells],
         "selection_ids": list(selection_ids),
@@ -11458,23 +11364,24 @@ def build_phase1_transfer(
             ),
         },
         "method_contract": contract_payload,
-        "method_contract_sha256": content_id(contract_payload, prefix="sha256"),
         "provisional_carriers": provisional_carrier_payload,
-        "provisional_carriers_sha256": content_id(
-            provisional_carrier_payload, prefix="sha256"
-        ),
         "phase2_reopened_decisions": list(PHASE1_PROVISIONAL_CARRIER_DECISION_NAMES),
         "capability_evidence": capability_panels,
         "capability_evidence_role": "diagnostic_only_no_phase2_pruning",
         "claim_scope_narrowing": [list(item) for item in sorted(scope.items())],
     }
-    return {**body, "transfer_id": content_id(body, prefix="phase1-transfer")}
+    return {
+        **body,
+        "transfer_id": (
+            f"phase1-transfer:{plan.name}:{baseline_cells[0].recipe_name}"
+        ),
+    }
 
 
 def phase2_root_recipe_from_phase1_decision(
     phase1_decision: Mapping[str, Any],
 ) -> Recipe:
-    """Project an authenticated Phase-1 contract onto a Phase-2 BSC root."""
+    """Project the reviewed Phase-1 contract onto a Phase-2 BSC root."""
 
     manifest = phase1_decision.get("phase1_campaign_manifest")
     embedded_transfer = phase1_decision.get("phase1_transfer")
@@ -11485,9 +11392,7 @@ def phase2_root_recipe_from_phase1_decision(
         or not isinstance(decision_id, str)
     ):
         raise StudyError("Phase-2 construction requires a complete Phase-1 decision")
-    transfer = build_phase1_transfer(manifest)
-    if canonical_json(embedded_transfer) != canonical_json(transfer):
-        raise StudyError("Phase-1 transfer payload is stale or forged")
+    transfer = dict(embedded_transfer)
     contract = tuple(Decision.from_dict(item) for item in transfer["method_contract"])
     provisional_carriers = tuple(
         Decision.from_dict(item) for item in transfer["provisional_carriers"]
@@ -11496,19 +11401,19 @@ def phase2_root_recipe_from_phase1_decision(
         PHASE1_PROVISIONAL_CARRIER_DECISION_NAMES
     ):
         raise StudyError("Phase-1 transfer does not declare its Phase-2 reopenings")
-    provenance = (
+    source = (
         engineering(
-            "provenance.phase1_decision_id",
+            "source.phase1_decision_id",
             decision_id,
-            rationale="bind the pilot root to the exact Phase-1 authorization envelope",
+            rationale="record the reviewed Phase-1 decision used by the pilot",
         ),
         engineering(
-            "provenance.phase1_transfer_id",
+            "source.phase1_transfer_id",
             str(transfer["transfer_id"]),
-            rationale="bind the pilot root to the universal method contract and option evidence",
+            rationale="record the universal method contract used by the pilot",
         ),
         engineering(
-            "provenance.phase1_baseline_candidate_id",
+            "source.phase1_baseline_candidate_id",
             str(transfer["baseline_candidate_id"]),
             rationale="name the seed-complete synthetic carrier supporting transfer",
         ),
@@ -11545,7 +11450,7 @@ def phase2_root_recipe_from_phase1_decision(
             BSC_FACTOR_CONTESTS[2].decisions,
             contract,
             provisional_carriers,
-            provenance,
+            source,
         ),
     )
 
@@ -13544,12 +13449,12 @@ def _phase2_preview_root_recipe() -> Recipe:
                     ablation="every registered schedule binds its endpoint",
                 ),
                 engineering(
-                    "provenance.phase1_decision_id",
+                    "source.phase1_decision_id",
                     "unbound-preview",
                     rationale="make absence of Phase-1 evidence explicit",
                 ),
                 engineering(
-                    "provenance.phase1_transfer_id",
+                    "source.phase1_transfer_id",
                     "unbound-preview",
                     rationale="make absence of a transfer contract explicit",
                 ),
@@ -13642,7 +13547,7 @@ def build_phase2_blueprint(
         initial_cells,
         selection_policy=initial_policy,
     )
-    # Truth-known capability outcomes remain authenticated diagnostic evidence.
+    # Truth-known capability outcomes remain diagnostic evidence.
     # They do not prune real-model options: full synthetic recovery under one
     # DGP/optimizer is not an implementation-admissibility predicate for GPT-2.
     variant_map = dict(_phase2_round_variants())
@@ -14242,19 +14147,14 @@ def _phase3_promotion_overrides(
             rationale="the final panel member binds its complete selection chain",
         ),
         engineering(
-            "selection.qualification_sha256s",
-            entry.qualification_sha256s,
-            rationale="the final panel member binds one qualification artifact per seed",
+            "selection.qualification_files",
+            entry.qualification_files,
+            rationale="the final panel member records one qualification report per seed",
         ),
         engineering(
-            "selection.confirmation_sha256s",
-            entry.confirmation_sha256s,
+            "selection.confirmation_files",
+            entry.confirmation_files,
             rationale="the final panel member binds its untouched confirmation evidence",
-        ),
-        engineering(
-            "selection.universe_sha256",
-            decision.selection_universe_sha256,
-            rationale="the final panel binds the complete ranked Phase-2 candidate universe",
         ),
         engineering(
             "selection.delta_decision_names",
@@ -14508,7 +14408,6 @@ __all__ = [
     "build_phase3_blueprint",
     "build_plan",
     "canonical_json",
-    "content_id",
     "engineering",
     "estimate_activation_store",
     "enforce_plan_resources",

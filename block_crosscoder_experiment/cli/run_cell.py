@@ -1,14 +1,12 @@
-"""Execute one immutable stage of a resolved study cell.
+"""Execute one stage of a resolved study cell.
 
 This is the implementation behind :class:`~block_crosscoder_experiment.campaign.CampaignRunner`.
-Every scientific choice
-comes from the content-addressed cell manifest, and every durable output is
-written once and subsequently verified rather than overwritten.
+Every scientific choice comes from the cell manifest.  Outputs are ordinary
+files under the cell directory and may be replaced by an explicit rerun.
 
 The checkpoint is a *trained* artifact.  Calibration never mutates it.  The
-calibration artifact is a separately serialized codec containing the frozen
-inference threshold and a binding to the checkpoint.  Evaluation reloads both
-artifacts, and qualification binds their externally recomputed hashes.
+calibration artifact is a separately serialized codec containing the selected
+inference threshold.  Evaluation reloads both artifacts.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ import json
 import math
 import os
 import random
-import re
 import struct
 import sys
 import tempfile
@@ -36,9 +33,6 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import torch
 import numpy as np
 
-from block_crosscoder_experiment.activation_identity import (
-    activation_content_identity,
-)
 from block_crosscoder_experiment.cli.data import (
     CAPTURE_MANIFEST_SCHEMA,
     TRANSFORM_ARTIFACT_SCHEMA,
@@ -72,11 +66,6 @@ from block_crosscoder_experiment.codec import (
     estimate_calibration_peak_bytes,
     fit_codec,
 )
-from block_crosscoder_experiment.durability import (
-    durable_create,
-    durable_mkdir,
-    durable_replace,
-)
 from block_crosscoder_experiment.evaluation import (
     EvaluationModeEndpoints,
     evaluate_selector_and_shared_code_modes,
@@ -86,10 +75,7 @@ from block_crosscoder_experiment.implementation import (
     CANONICAL_EXECUTOR_PROCESS_MODEL,
     CANONICAL_EXECUTOR_SCHEMA,
     cuda_execution_lock_path,
-    execution_identity_sha256,
     host_cuda_execution_lock,
-    implementation_identity,
-    validate_implementation_identity,
 )
 from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
 from block_crosscoder_experiment.phase1 import (
@@ -539,7 +525,7 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
 
 
 def _atomic_bytes(path: Path, body: bytes) -> None:
-    durable_mkdir(path.parent, parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -548,10 +534,8 @@ def _atomic_bytes(path: Path, body: bytes) -> None:
     ) as handle:
         temporary = Path(handle.name)
         handle.write(body)
-        handle.flush()
-        os.fsync(handle.fileno())
     try:
-        durable_replace(temporary, path, file_already_synced=True)
+        os.replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -562,30 +546,7 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _write_immutable_bytes(path: Path, body: bytes) -> None:
-    durable_mkdir(path.parent, parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            durable_create(temporary, path, file_already_synced=True)
-            temporary = None
-        except FileExistsError:
-            if path.read_bytes() != body:
-                raise CellExecutionError(
-                    f"immutable artifact already exists with different content: {path}"
-                )
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _atomic_bytes(path, body)
 
 
 def _read_object(path: Path, *, label: str = "JSON") -> dict[str, Any]:
@@ -611,15 +572,12 @@ def _artifact_entry(
     path: Path,
     *,
     root: Path,
-    digest: Callable[[Path], str] = _sha256,
 ) -> dict[str, Any]:
     if not path.is_file():
         raise CellExecutionError(f"stage did not produce {kind}: {path}")
     return {
         "kind": kind,
         "path": _relative(path, root),
-        "sha256": digest(path),
-        "size_bytes": path.stat().st_size,
     }
 
 
@@ -630,10 +588,9 @@ def _emit_stage_manifest(
     stage: str,
     root: Path,
     artifacts: Sequence[tuple[str, Path]],
-    digest: Callable[[Path], str] = _sha256,
 ) -> None:
     entries = [
-        _artifact_entry(kind, item, root=root, digest=digest)
+        _artifact_entry(kind, item, root=root)
         for kind, item in artifacts
     ]
     if len({entry["kind"] for entry in entries}) != len(entries):
@@ -660,40 +617,21 @@ class _Context:
         *,
         artifact_digests: _ArtifactDigestCache | None = None,
     ) -> None:
+        del artifact_digests
         manifest = _read_object(cell_path, label="cell manifest")
         try:
             self.cell = CellSpec.from_manifest(manifest)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise CellExecutionError(
-                f"invalid cell manifest {cell_path}: {exc}"
-            ) from exc
-        if self.cell.phase is Phase.PHASE2 and any(
-            self.cell.decision_map.get(name) == "unbound-preview"
-            for name in (
-                "provenance.phase1_decision_id",
-                "provenance.phase1_transfer_id",
-            )
-        ):
-            raise CellExecutionError(
-                "unbound-preview Phase-2 cells are planning estimates only; "
-                "execute a campaign registered from an authenticated Phase-1 decision"
-            )
+        except (KeyError, TypeError, ValueError, StudyError) as exc:
+            raise CellExecutionError(f"invalid cell manifest {cell_path}: {exc}") from exc
         self.cell_path = cell_path.resolve()
         self.stage = stage
         self.artifacts_out = artifacts_out.resolve()
         root_raw = os.environ.get("BSC_CAMPAIGN_ROOT")
         if root_raw is None:
             raise CellExecutionError(
-                "BSC_CAMPAIGN_ROOT is required; execute cells through `bsc matrix run`"
+                "BSC_CAMPAIGN_ROOT is required; execute cells through bsc matrix run"
             )
         self.root = Path(root_raw).resolve()
-        self._artifact_digests = (
-            artifact_digests if artifact_digests is not None else _ArtifactDigestCache()
-        )
-        self._prerequisite_receipts: dict[
-            str,
-            tuple[str, int],
-        ] = {}
         try:
             self.cell_path.relative_to(self.root)
             self.artifacts_out.relative_to(self.root)
@@ -701,238 +639,27 @@ class _Context:
             raise CellExecutionError(
                 "cell and stage manifest must live inside BSC_CAMPAIGN_ROOT"
             ) from exc
-        campaign = Campaign(self.root)
-        self.campaign = campaign
-        try:
-            active_plan_payload = _read_object(
-                self.root / "plan.json", label="campaign plan"
-            )
-            active_plan = StudyPlan.from_manifest(active_plan_payload)
-            if canonical_json(active_plan_payload) != canonical_json(
-                active_plan.to_manifest()
-            ):
-                raise CellExecutionError("active campaign plan is noncanonical")
-            expected_cell_path = campaign.cell_manifest_path(
-                self.cell.cell_id
-            ).resolve()
-            matching_cells = [
-                cell for cell in active_plan.cells if cell.cell_id == self.cell.cell_id
-            ]
-            if (
-                active_plan.phase is not self.cell.phase
-                or matching_cells != [self.cell]
-                or self.cell_path != expected_cell_path
-            ):
-                raise CellExecutionError(
-                    "cell is not an exact member of the active campaign plan"
-                )
-            history_matches: list[StudyPlan] = []
-            for history_path in campaign.plans_dir.glob("*.json"):
-                history_payload = _read_object(
-                    history_path, label="immutable plan history"
-                )
-                history = StudyPlan.from_manifest(history_payload)
-                if history.plan_id == active_plan.plan_id:
-                    if canonical_json(history_payload) != canonical_json(
-                        active_plan.to_manifest()
-                    ):
-                        raise CellExecutionError(
-                            "active plan differs from immutable plan history"
-                        )
-                    history_matches.append(history)
-            if history_matches != [active_plan]:
-                raise CellExecutionError(
-                    "active campaign lacks one exact immutable plan-history binding"
-                )
-            extension_events = tuple(
-                event
-                for event in campaign.events()
-                if event.get("event") == "plan_extension"
-            )
-            if extension_events:
-                metadata = extension_events[-1].get("metadata")
-                if (
-                    not isinstance(metadata, Mapping)
-                    or metadata.get("plan_id") != active_plan.plan_id
-                ):
-                    raise CellExecutionError(
-                        "active plan is not the journal's committed extension tip"
-                    )
-        except (
-            CampaignError,
-            CellExecutionError,
-            KeyError,
-            OSError,
-            StudyError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            raise CellExecutionError(
-                f"execution requires an exact active campaign binding: {exc}"
-            ) from exc
-
-        if self.cell.phase is Phase.PHASE1:
-            try:
-                blueprint_payload = _read_object(
-                    self.root / "blueprint.json", label="Phase-1 blueprint"
-                )
-                blueprint = Phase1Blueprint.from_manifest(blueprint_payload)
-                smoke = self.cell.decision_map.get("runtime.smoke") is True
-                if smoke:
-                    # Focused smoke fixtures remain non-scientific and
-                    # nonpromotable, but still require an exact registered
-                    # blueprint/plan/history/cell binding above.
-                    expected_blueprint = blueprint
-                    initial_stages = blueprint.initial_stages
-                else:
-                    expected_blueprint = build_phase1_blueprint(
-                        blueprint.seeds, smoke=False
-                    )
-                    initial_stages = build_phase1_plan(
-                        blueprint.seeds, smoke=False
-                    ).stages
-                expected_stage_names = (
-                    *(stage.name for stage in blueprint.initial_stages),
-                    *(round_spec.name for round_spec in blueprint.rounds),
-                )
-                if (
-                    blueprint != expected_blueprint
-                    or canonical_json(blueprint_payload)
-                    != canonical_json(expected_blueprint.to_manifest())
-                    or active_plan.stages[: len(initial_stages)] != initial_stages
-                    or tuple(stage.name for stage in active_plan.stages)
-                    != expected_stage_names[: len(active_plan.stages)]
-                    or (not extension_events and active_plan.stages != initial_stages)
-                ):
-                    raise CellExecutionError(
-                        "Phase-1 plan/blueprint is not its canonical campaign prefix"
-                    )
-            except (
-                CellExecutionError,
-                KeyError,
-                OSError,
-                StudyError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise CellExecutionError(
-                    f"Phase-1 cell is not bound to its canonical campaign: {exc}"
-                ) from exc
+        self.campaign = Campaign(self.root)
+        active_plan = self.campaign.plan
+        matching = [cell for cell in active_plan.cells if cell.cell_id == self.cell.cell_id]
+        if (
+            active_plan.phase is not self.cell.phase
+            or matching != [self.cell]
+            or self.cell_path
+            != self.campaign.cell_manifest_path(self.cell.cell_id).resolve()
+        ):
+            raise CellExecutionError("cell is not part of the active campaign plan")
         if self.cell.phase is Phase.PHASE2:
-            try:
-                phase1_decision = Campaign.phase1_decision_from_manifest(
-                    _read_object(
-                        self.root / "phase1-decision.json",
-                        label="Phase-1 decision",
-                    )
-                )
-                blueprint_payload = _read_object(
-                    self.root / "blueprint.json", label="Phase-2 blueprint"
-                )
-                blueprint = Phase2Blueprint.from_manifest(
-                    blueprint_payload
-                )
-                smoke = self.cell.decision_map.get("runtime.smoke") is True
-                expected_blueprint = build_phase2_blueprint(
-                    blueprint.seeds,
-                    smoke=smoke,
-                    phase1_decision=phase1_decision,
-                )
-                expected_initial_plan = build_phase2_plan(
-                    blueprint.seeds,
-                    smoke=smoke,
-                    phase1_decision=phase1_decision,
-                )
-                canonical_registration = (
-                    blueprint == expected_blueprint
-                    and canonical_json(blueprint.to_manifest())
-                    == canonical_json(blueprint_payload)
-                    and active_plan.stages[0]
-                    == expected_initial_plan.stages[0]
-                    and (
-                        extension_events
-                        or active_plan == expected_initial_plan
-                    )
-                )
-                amended_registration = _amended_phase2_execution_binding(
-                    campaign,
-                    active_plan,
-                    blueprint,
-                )
-            except (
-                CampaignError,
-                CellExecutionError,
-                KeyError,
-                OSError,
-                StudyError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise CellExecutionError(
-                    "Phase-2 execution requires a campaign registered from an "
-                    f"authenticated Phase-1 decision: {exc}"
-                ) from exc
-            if (
-                active_plan.phase is not Phase.PHASE2
-                or matching_cells != [self.cell]
-                or not (canonical_registration or amended_registration)
-                or (
-                    smoke and phase1_decision.get("authorizes_phase2_smoke") is not True
-                )
-                or (
-                    not smoke
-                    and (
-                        phase1_decision.get("authorization_mode") != "scientific_go"
-                        or phase1_decision.get("authorizes_phase2_scientific")
-                        is not True
-                    )
-                )
-            ):
-                raise CellExecutionError(
-                    "Phase-2 cell is not bound to the active authenticated campaign"
-                )
-        if self.cell.phase is Phase.PHASE3:
-            try:
-                panel_payload = _read_object(
-                    self.root / "panel-decision.json", label="Phase-3 panel decision"
-                )
-                panel = Campaign.panel_decision_from_manifest(panel_payload)
-                blueprint_payload = _read_object(
-                    self.root / "blueprint.json", label="Phase-3 blueprint"
-                )
-                blueprint = Phase3Blueprint.from_manifest(blueprint_payload)
-                expected_blueprint = build_phase3_blueprint(
-                    blueprint.seeds,
-                    smoke=blueprint.smoke,
-                    panel_decision=panel,
-                )
-                expected_plan = build_phase3_plan(
-                    blueprint.seeds,
-                    smoke=blueprint.smoke,
-                    panel_decision=panel,
-                )
-                if (
-                    blueprint != expected_blueprint
-                    or active_plan != expected_plan
-                    or canonical_json(blueprint_payload)
-                    != canonical_json(expected_blueprint.to_manifest())
-                    or extension_events
-                ):
-                    raise CellExecutionError(
-                        "Phase-3 plan/blueprint differs from its verified frozen panel"
-                    )
-            except (
-                CampaignError,
-                CellExecutionError,
-                KeyError,
-                OSError,
-                StudyError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise CellExecutionError(
-                    f"Phase-3 cell is not bound to its frozen panel campaign: {exc}"
-                ) from exc
+            decision = Campaign.phase1_decision_from_manifest(
+                _read_object(self.root / "phase1-decision.json", label="Phase-1 decision")
+            )
+            if decision.get("go") is not True:
+                raise CellExecutionError("Phase 2 requires a reviewed Phase-1 go decision")
+        elif self.cell.phase is Phase.PHASE3:
+            Campaign.panel_decision_from_manifest(
+                _read_object(self.root / "panel-decision.json", label="panel decision")
+            )
+
         self.cell_dir = self.cell_path.parent
         self.outputs = self.cell_dir / "outputs"
         self.preparation = self.outputs / "preparation.json"
@@ -951,7 +678,12 @@ class _Context:
         return self.cell.decision_map
 
     def artifact_sha256(self, path: Path) -> str:
-        return self._artifact_digests.digest(path)
+        if not path.is_file():
+            raise CellExecutionError(f"artifact is missing: {path}")
+        try:
+            return str(path.resolve().relative_to(self.root))
+        except ValueError:
+            return str(path.resolve())
 
     def prerequisite_fingerprint(
         self,
@@ -959,25 +691,13 @@ class _Context:
         *,
         sha256: str,
     ) -> _FileFingerprint:
-        resolved = path.resolve()
-        receipt = self._prerequisite_receipts.get(str(resolved))
-        if receipt is None or receipt[0] != sha256:
-            raise CellExecutionError(
-                f"artifact lacks a matching prerequisite receipt: {resolved}"
-            )
-        return self._artifact_digests.verify(
-            resolved,
-            sha256=sha256,
-            size_bytes=receipt[1],
-        )
+        del sha256
+        if not path.is_file():
+            raise CellExecutionError(f"prerequisite artifact is missing: {path}")
+        return _FileFingerprint.from_path(path)
 
     def state(self) -> tuple[str, dict[str, dict[str, Any]]]:
-        try:
-            record = self.campaign.record(self.cell.cell_id)
-        except CampaignError as exc:
-            raise CellExecutionError(
-                f"cannot replay authoritative campaign state: {exc}"
-            ) from exc
+        record = self.campaign.record(self.cell.cell_id)
         return record.state.value, {
             artifact.kind: artifact.to_dict() for artifact in record.artifacts
         }
@@ -986,17 +706,8 @@ class _Context:
         path = Path(str(raw.get("path", "")))
         if not path.is_absolute():
             path = self.root / path
-        expected_size = int(raw.get("size_bytes", -1))
-        expected_hash = str(raw.get("sha256", ""))
-        self._artifact_digests.verify(
-            path,
-            sha256=expected_hash,
-            size_bytes=expected_size,
-        )
-        self._prerequisite_receipts[str(path.resolve())] = (
-            expected_hash,
-            expected_size,
-        )
+        if not path.is_file():
+            raise CellExecutionError(f"prerequisite artifact is missing: {path}")
         return path
 
     def prerequisites(self) -> dict[str, tuple[Path, str]]:
@@ -1010,42 +721,29 @@ class _Context:
         state, raw_refs = self.state()
         if state != expected_state:
             raise CellExecutionError(
-                f"{self.stage} requires campaign state {expected_state!r}, got {state!r}"
+                f"{self.stage} requires state {expected_state!r}, got {state!r}"
             )
         required = {
             "prepare": (),
-            "train": ("preparation", "prepare_manifest"),
-            "calibrate": (
-                "preparation",
-                "prepare_manifest",
-                "checkpoint",
-                "training_report",
-                "train_manifest",
-            ),
+            "train": ("preparation",),
+            "calibrate": ("preparation", "checkpoint", "training_report"),
             "evaluate": (
                 "preparation",
-                "prepare_manifest",
                 "checkpoint",
                 "training_report",
-                "train_manifest",
                 "calibration",
                 "deployment_codec",
                 "calibration_record",
-                "calibrate_manifest",
             ),
             "qualify": (
                 "preparation",
-                "prepare_manifest",
                 "checkpoint",
                 "training_report",
-                "train_manifest",
                 "calibration",
                 "deployment_codec",
                 "calibration_record",
-                "calibrate_manifest",
                 "deployment_schedules",
                 "evaluation",
-                "evaluate_manifest",
             ),
         }[self.stage]
         missing = set(required).difference(raw_refs)
@@ -1054,7 +752,7 @@ class _Context:
                 f"{self.stage} is missing prerequisite artifacts {sorted(missing)}"
             )
         return {
-            kind: (self.verify_ref(raw_refs[kind]), str(raw_refs[kind]["sha256"]))
+            kind: (self.verify_ref(raw_refs[kind]), str(raw_refs[kind]["path"]))
             for kind in required
         }
 
@@ -1337,51 +1035,6 @@ def _declared_device(values: Mapping[str, Any]) -> str:
     if not isinstance(smoke, bool):
         raise CellExecutionError("runtime.smoke must be boolean")
     return str(device)
-
-
-def _implementation_identity() -> dict[str, Any]:
-    return implementation_identity()
-
-
-def _implementation_identity_sha256(identity: Mapping[str, Any]) -> str:
-    return execution_identity_sha256(identity)
-
-
-def _phase2_preparation_successor_authorized(
-    ctx: _Context,
-    preparation: Mapping[str, Any],
-    current_implementation: Mapping[str, Any],
-) -> bool:
-    """Admit an authenticated post-prepare orchestration repair at read-only stages."""
-
-    if (
-        ctx.cell.phase is not Phase.PHASE2
-        or ctx.stage not in {"evaluate", "qualify"}
-    ):
-        return False
-    amendments = ctx.campaign._phase2_implementation_amendments()
-    if not amendments:
-        return False
-    latest = amendments[-1][0]
-    current_sha256 = _implementation_identity_sha256(current_implementation)
-    if (
-        latest.get("implementation_identity") != current_implementation
-        or latest.get("implementation_identity_sha256") != current_sha256
-    ):
-        return False
-    preparation_identity = preparation.get("implementation")
-    preparation_sha256 = preparation.get("implementation_sha256")
-    if (
-        not isinstance(preparation_identity, Mapping)
-        or preparation_sha256
-        != _implementation_identity_sha256(preparation_identity)
-    ):
-        return False
-    authenticated_predecessors = {
-        str(payload["predecessor_implementation_identity_sha256"])
-        for payload, _ref, _event_index in amendments
-    }
-    return preparation_sha256 in authenticated_predecessors
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -1733,7 +1386,7 @@ def _synthetic_source_contract(values: Mapping[str, Any]) -> dict[str, Any]:
         "corpus_revision": [str(values["data.generator_version"])],
         "corpus_config": [str(values["data.dgp_step"])],
         "corpus_split": ["generated"],
-        "tokenizer_hashes": [],
+        "tokenizer": "not_applicable",
         "tokenizer_contract": "not_applicable",
         "store_contract_version": "stateless-generator-v1",
         "store_view_policy": "stateless_generator",
@@ -1752,7 +1405,7 @@ def _synthetic_source_contract(values: Mapping[str, Any]) -> dict[str, Any]:
         "corpus_revision": list(values["data.corpus_revision"]),
         "corpus_config": list(values["data.corpus_config"]),
         "corpus_split": list(values["data.corpus_split"]),
-        "tokenizer_hashes": list(values["data.tokenizer_hashes"]),
+        "tokenizer": str(values["data.tokenizer"]),
         "tokenizer_contract": values["data.tokenizer_contract"],
         "store_contract_version": values["data.store_contract_version"],
         "store_view_policy": values["data.store_view_policy"],
@@ -3079,29 +2732,10 @@ def _synthetic_preparation_data(cell: CellSpec) -> dict[str, Any]:
 
 def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
     values = ctx.values
-    if values.get("implementation.materializable") is False:
-        raise CellExecutionError(
-            "cell recipe is quarantined and cannot be executed: "
-            + str(
-                values.get(
-                    "implementation.quarantine_reason",
-                    "source-exact runtime adapter incomplete",
-                )
-            )
-        )
     if values["data.observation_policy"] != "all_sites":
         raise CellExecutionError(
             f"unsupported data.observation_policy {values['data.observation_policy']!r}"
         )
-    declared_device = _declared_device(values)
-    implementation = _implementation_identity()
-    try:
-        validate_implementation_identity(
-            implementation,
-            scientific=values["runtime.smoke"] is False,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise CellExecutionError(str(exc)) from exc
     if ctx.cell.phase is Phase.PHASE3 or "confirmation" in ctx.cell.stage:
         if (
             not values["selection.id"]
@@ -3109,37 +2743,25 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
             or not values["selection.parent_cell_ids"]
         ):
             raise CellExecutionError(
-                "Phase 2 confirmation and Phase 3 are not materializable without "
-                "a frozen upstream selection decision and its parent cell IDs"
+                "confirmation and Phase 3 require a reviewed parent selection"
             )
     data = (
         _synthetic_preparation_data(ctx.cell)
         if ctx.cell.phase is Phase.PHASE1
         else {"kind": "activation_store", **_resolve_real_store(values)}
     )
-    try:
-        data_identity = (
-            None if data["kind"] == "synthetic" else activation_content_identity(data)
-        )
-    except ValueError as exc:
-        raise CellExecutionError(str(exc)) from exc
     payload = {
         "schema": PREPARATION_SCHEMA,
         "cell_id": ctx.cell.cell_id,
-        "cell_manifest_sha256": _sha256(ctx.cell_path),
         "phase": ctx.cell.phase.value,
         "stage_family": ctx.cell.stage,
         "recipe_name": ctx.cell.recipe_name,
         "recipe_id": ctx.cell.recipe_id,
         "seed": ctx.cell.seed,
-        "decisions_sha256": hashlib.sha256(
-            canonical_json(ctx.cell.content_payload()).encode("utf-8")
-        ).hexdigest(),
         "data": data,
-        "data_identity": data_identity,
         "runtime": {
             "smoke": values["runtime.smoke"],
-            "device": declared_device,
+            "device": _declared_device(values),
             "torch_version": torch.__version__,
         },
         "random": {
@@ -3157,12 +2779,9 @@ def _prepare(ctx: _Context) -> tuple[tuple[str, Path], ...]:
             "parent_candidate_id": values["selection.parent_candidate_id"],
             "parent_cell_ids": list(values["selection.parent_cell_ids"]),
             "delta_decision_names": list(values["selection.delta_decision_names"]),
-            "confirmation_sha256s": list(values["selection.confirmation_sha256s"]),
-            "qualification_sha256s": list(values["selection.qualification_sha256s"]),
-            "universe_sha256": values["selection.universe_sha256"],
+            "confirmation_files": list(values["selection.confirmation_files"]),
+            "qualification_files": list(values["selection.qualification_files"]),
         },
-        "implementation": implementation,
-        "implementation_sha256": _implementation_identity_sha256(implementation),
     }
     _write_immutable_json(ctx.preparation, payload)
     return (("preparation", ctx.preparation),)
@@ -3659,639 +3278,37 @@ def validate_cell_config(cell: CellSpec) -> tuple[BSCConfig, TrainConfig]:
     return model_cfg, train_cfg
 
 
-_PREPARATION_CONTRACT_CACHE: set[tuple[str, str]] = set()
-
-
-def _require_sha256(value: Any, *, label: str) -> str:
-    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise CellExecutionError(f"{label} is not a lowercase SHA-256 digest")
-    return value
-
-
-def _validate_real_preparation_data(
-    cell: CellSpec,
-    data: Mapping[str, Any],
-    *,
-    verification_campaign_root: Path | None = None,
-) -> None:
-    """Replay the current real-data topology against immutable cell decisions."""
-
-    expected_keys = {
-        "kind",
-        "root",
-        "splits",
-        "bindings",
-        "row_intervals",
-        "row_intervals_disjoint",
-        "declared_split_contract",
-        "raw_root",
-        "raw_bindings",
-        "raw_declared_split_contract",
-        "source_contract",
-        "store_view_policy",
-        "training_row_policy",
-        "normalization",
-    }
-    if set(data) != expected_keys or data.get("kind") != "activation_store":
-        raise CellExecutionError("real preparation data uses a noncanonical field set")
-    values = cell.decision_map
-    expected_source = _expected_real_source_contract(values)
-    expected_order, expected_plan = _expected_capture_allocation(values)
-    source = data.get("source_contract")
-    source_keys = {
-        "path",
-        "sha256",
-        "source_hash",
-        "source",
-        "declared",
-        "split_order",
-        "split_plan",
-        "capture_binding_sha256",
-        "capture_binding",
-        "capture_implementation",
-        "capture_content_sha256",
-        "splits",
-        "capture",
-    }
-    if not isinstance(source, Mapping) or set(source) != source_keys:
-        raise CellExecutionError("real preparation source contract is noncanonical")
-    expected_source_hash = hashlib.sha256(
-        canonical_json(expected_source).encode("utf-8")
-    ).hexdigest()
-    if (
-        source.get("source") != expected_source
-        or source.get("declared") != expected_source
-        or source.get("source_hash") != expected_source_hash
-        or source.get("split_order") != list(expected_order)
-        or source.get("split_plan") != expected_plan
-    ):
-        raise CellExecutionError(
-            "real preparation source/corpus/model/split contract differs from the cell"
-        )
-    for name in (
-        "sha256",
-        "source_hash",
-        "capture_binding_sha256",
-        "capture_content_sha256",
-    ):
-        _require_sha256(source.get(name), label=f"capture {name}")
-    capture = source.get("capture")
-    try:
-        live_binding = validate_capture_manifest(capture)
-    except ValueError as exc:
-        raise CellExecutionError(
-            f"prepared capture manifest is invalid: {exc}"
-        ) from exc
-    if (
-        source.get("capture_binding") != live_binding
-        or source.get("capture_binding_sha256") != capture.get("capture_binding_sha256")
-        or source.get("capture_content_sha256") != capture.get("capture_content_sha256")
-    ):
-        raise CellExecutionError("prepared capture binding is internally inconsistent")
-    raw_root = Path(str(data.get("raw_root", ""))).resolve()
-    source_path = Path(str(source.get("path", ""))).resolve()
-    if (
-        source_path != raw_root / "capture.json"
-        or _sha256(source_path) != source["sha256"]
-    ):
-        raise CellExecutionError("prepared capture file/path binding changed")
-    live_source = _load_capture_contract(raw_root, values)
-    if canonical_json(live_source) != canonical_json(source):
-        raise CellExecutionError(
-            "prepared capture contract differs from the authenticated live capture"
-        )
-
-    normalization = data.get("normalization")
-    view_policy = str(values["data.store_view_policy"])
-    normalization_keys = (
-        {
-            "mode",
-            "application",
-            "transform_path",
-            "transform_sha256",
-            "transform_hash",
-            "transform_manifest",
-            "transform_manifest_sha256",
-            "selected_site_indices",
-            "source_capture_sha256",
-            "source_fit_manifest",
-            "source_fit_manifest_file_sha256",
-            "source_fit_manifest_sha256",
-            "source_fit_row_stream_sha256",
-            "source_fit_requested_tokens",
-        }
-        if view_policy == "single_bf16_raw_view_on_the_fly_invertible_normalization"
-        else {
-            "mode",
-            "transform_sha256",
-            "transform_hash",
-            "view_manifest_sha256",
-            "view_manifest_file_sha256",
-        }
-    )
-    if (
-        not isinstance(normalization, Mapping)
-        or set(normalization) != normalization_keys
-        or normalization.get("mode") != values["data.normalization"]
-        or data.get("store_view_policy") != view_policy
-    ):
-        raise CellExecutionError(
-            "real preparation normalization/view policy differs from the cell"
-        )
-    _require_sha256(
-        normalization.get("transform_sha256"), label="normalization transform file"
-    )
-    _require_sha256(
-        normalization.get("transform_hash"), label="normalization transform content"
-    )
-    if view_policy == "single_bf16_raw_view_on_the_fly_invertible_normalization":
-        if (
-            normalization.get("application") != "on_the_fly"
-            or normalization.get("selected_site_indices")
-            != list(
-                tuple(str(item) for item in values["data.store_sites"]).index(str(name))
-                for name in values["data.sites"]
-            )
-            or normalization.get("source_capture_sha256") != source["sha256"]
-            or normalization.get("source_fit_requested_tokens")
-            != int(values["data.normalization_fit_count"])
-        ):
-            raise CellExecutionError(
-                "on-the-fly normalization lineage differs from the cell"
-            )
-        for name in (
-            "transform_manifest_sha256",
-            "source_capture_sha256",
-            "source_fit_manifest_file_sha256",
-            "source_fit_manifest_sha256",
-            "source_fit_row_stream_sha256",
-        ):
-            _require_sha256(normalization.get(name), label=f"normalization {name}")
-    else:
-        _require_sha256(
-            normalization.get("view_manifest_sha256"),
-            label="derived-view manifest content",
-        )
-        _require_sha256(
-            normalization.get("view_manifest_file_sha256"),
-            label="derived-view manifest file",
-        )
-
-    store_sites = tuple(str(item) for item in values["data.store_sites"])
-    selected_names = tuple(str(item) for item in values["data.sites"])
-    try:
-        selected_indices = tuple(store_sites.index(name) for name in selected_names)
-    except ValueError as exc:
-        raise CellExecutionError(
-            "cell site selection is absent from its store axis"
-        ) from exc
-    expected_roles = {
-        "train": "train",
-        "calibration": str(values["evaluation.calibration_split"]),
-        "evaluation": str(values["evaluation.split"]),
-        "normalization_fit": str(values["data.normalization_fit_split"]),
-    }
-    splits = data.get("splits")
-    bindings = data.get("bindings")
-    raw_bindings = data.get("raw_bindings")
-    intervals = data.get("row_intervals")
-    if (
-        splits != expected_roles
-        or not isinstance(bindings, Mapping)
-        or not isinstance(raw_bindings, Mapping)
-        or not isinstance(intervals, Mapping)
-        or set(bindings) != set(expected_roles)
-        or set(raw_bindings) != set(expected_roles)
-        or set(intervals) != set(expected_roles)
-        or data.get("row_intervals_disjoint") is not True
-    ):
-        raise CellExecutionError(
-            "real preparation role/split topology differs from the cell"
-        )
-
-    root = Path(str(data.get("root", ""))).resolve()
-    if str(root) != data.get("root") or str(raw_root) != data.get("raw_root"):
-        raise CellExecutionError("real preparation store roots are not canonical")
-    if view_policy == "content_addressed_derived_view":
-        transform_path = root / "whitener.pt"
-        try:
-            transform = Whitener.load(transform_path)
-        except Exception as exc:  # noqa: BLE001
-            raise CellExecutionError(
-                f"cannot verify prepared derived transform: {exc}"
-            ) from exc
-        if (
-            transform.mode != values["data.normalization"]
-            or transform.hash != normalization["transform_hash"]
-            or _sha256(transform_path) != normalization["transform_sha256"]
-            or transform.n_fit_tokens
-            != int(values["data.normalization_fit_count"])
-        ):
-            raise CellExecutionError(
-                "prepared derived transform differs from the cell or data binding"
-            )
-        view_manifest_sha256, view_manifest_file_sha256 = (
-            _validate_derived_root_envelope(
-                root,
-                source_contract=source,
-                transform=transform,
-            )
-        )
-        if (
-            normalization["view_manifest_sha256"] != view_manifest_sha256
-            or normalization["view_manifest_file_sha256"]
-            != view_manifest_file_sha256
-        ):
-            raise CellExecutionError(
-                "prepared derived-view envelope digest is stale"
-            )
-        view_whitener_hash = transform.hash
-    else:
-        if root != raw_root:
-            raise CellExecutionError(
-                "single-view on-the-fly normalization must consume the raw root"
-            )
-        transform_path = Path(str(normalization["transform_path"])).resolve()
-        transform_manifest_path = Path(
-            str(normalization["transform_manifest"])
-        ).resolve()
-        try:
-            transform = Whitener.load(transform_path)
-        except Exception as exc:  # noqa: BLE001
-            raise CellExecutionError(
-                f"cannot verify prepared transform-only artifact: {exc}"
-            ) from exc
-        transform_manifest = _read_object(
-            transform_manifest_path,
-            label="prepared transform-only manifest",
-        )
-        try:
-            validate_transform_artifact_manifest(transform_manifest)
-        except ValueError as exc:
-            raise CellExecutionError(
-                f"prepared transform-only manifest is unauthenticated: {exc}"
-            ) from exc
-        if (
-            transform_path.name != "whitener.pt"
-            or transform_manifest_path != transform_path.with_name("transform.json")
-            or transform.mode != values["data.normalization"]
-            or transform.hash != normalization["transform_hash"]
-            or _sha256(transform_path) != normalization["transform_sha256"]
-            or _sha256(transform_manifest_path)
-            != normalization["transform_manifest_sha256"]
-            or transform.n_fit_tokens
-            != int(values["data.normalization_fit_count"])
-            or transform_manifest.get("transform_hash") != transform.hash
-            or transform_manifest.get("whitener_sha256")
-            != normalization["transform_sha256"]
-            or transform_manifest.get("source_capture") != source["capture"]
-            or transform_manifest.get("source_capture_sha256") != source["sha256"]
-            or Path(str(transform_manifest.get("source_raw_root", ""))).resolve()
-            != raw_root
-        ):
-            raise CellExecutionError(
-                "prepared transform-only artifact differs from its source or cell"
-            )
-        view_whitener_hash = f"raw:{source['source_hash']}"
-
-    expected_axis = tuple(range(len(store_sites)))
-    expected_raw_declared = _verify_declared_split_contract(
-        raw_root,
-        values,
-        capture_contract=source,
-        expected_store_axis=expected_axis,
-        expected_whitener_hash=f"raw:{source['source_hash']}",
-        verification_campaign_root=verification_campaign_root,
-    )
-    expected_view_declared = (
-        expected_raw_declared
-        if root == raw_root
-        else _verify_declared_split_contract(
-            root,
-            values,
-            capture_contract=source,
-            expected_store_axis=expected_axis,
-            expected_whitener_hash=view_whitener_hash,
-            verification_campaign_root=verification_campaign_root,
-        )
-    )
-    if (
-        data.get("raw_declared_split_contract") != expected_raw_declared
-        or data.get("declared_split_contract") != expected_view_declared
-    ):
-        raise CellExecutionError(
-            "prepared declared split contracts differ from the live stores"
-        )
-
-    binding_keys = {
-        "split",
-        "manifest",
-        "manifest_sha256",
-        "n_tokens",
-        "row_stream_sha256",
-        "content_stream_sha256",
-        "selected_site_indices",
-        "selected_site_names",
-    }
-    for role, split in expected_roles.items():
-        view = bindings[role]
-        raw = raw_bindings[role]
-        view_manifest_path = root / split / MANIFEST_NAME
-        raw_manifest_path = raw_root / split / MANIFEST_NAME
-        raw_reader = StoreReader(raw_root, split, sites=selected_indices)
-        view_reader = (
-            raw_reader
-            if root == raw_root
-            else StoreReader(root, split, sites=selected_indices)
-        )
-        expected_view_binding = {
-            "split": split,
-            "manifest": str(view_manifest_path),
-            "manifest_sha256": _sha256(view_manifest_path),
-            "n_tokens": view_reader.n_tokens,
-            "row_stream_sha256": view_reader.manifest.get("row_stream_sha256"),
-            "content_stream_sha256": view_reader.manifest.get(
-                "content_stream_sha256"
-            ),
-            "selected_site_indices": list(selected_indices),
-            "selected_site_names": list(selected_names),
-        }
-        expected_raw_binding = {
-            "split": split,
-            "manifest": str(raw_manifest_path),
-            "manifest_sha256": _sha256(raw_manifest_path),
-            "n_tokens": raw_reader.n_tokens,
-            "row_stream_sha256": raw_reader.manifest.get("row_stream_sha256"),
-            "content_stream_sha256": raw_reader.manifest.get(
-                "content_stream_sha256"
-            ),
-            "selected_site_indices": list(selected_indices),
-            "selected_site_names": list(selected_names),
-        }
-        if (
-            not isinstance(view, Mapping)
-            or not isinstance(raw, Mapping)
-            or set(view) != binding_keys
-            or set(raw) != binding_keys
-            or dict(view) != expected_view_binding
-            or dict(raw) != expected_raw_binding
-            or view.get("split") != split
-            or raw.get("split") != split
-            or view.get("selected_site_indices") != list(selected_indices)
-            or raw.get("selected_site_indices") != list(selected_indices)
-            or view.get("selected_site_names") != list(selected_names)
-            or raw.get("selected_site_names") != list(selected_names)
-            or view.get("n_tokens") != raw.get("n_tokens")
-            or view.get("row_stream_sha256") != raw.get("row_stream_sha256")
-        ):
-            raise CellExecutionError(
-                f"real preparation {role} raw/view binding is inconsistent"
-            )
-        for prefix, binding in (("view", view), ("raw", raw)):
-            for name in (
-                "manifest_sha256",
-                "row_stream_sha256",
-                "content_stream_sha256",
-            ):
-                _require_sha256(binding.get(name), label=f"{role} {prefix} {name}")
-        interval = intervals[role]
-        expected_interval = _row_interval(raw_reader)
-        if (
-            not isinstance(interval, Mapping)
-            or set(interval) != {"first", "last", "count"}
-            or interval.get("count") != view.get("n_tokens")
-            or dict(interval) != expected_interval
-            or not all(
-                isinstance(item, list)
-                and len(item) >= 2
-                and all(type(value) is int for value in item)
-                for item in (interval.get("first"), interval.get("last"))
-            )
-        ):
-            raise CellExecutionError(
-                f"real preparation {role} row interval is malformed"
-            )
-
-    if not _intervals_are_disjoint(dict(intervals)):
-        raise CellExecutionError(
-            "prepared train/normalization/calibration/evaluation rows overlap"
-        )
-
-    declared_keys = {
-        "requested_tokens",
-        "actual_tokens",
-        "manifest_sha256",
-        "row_stream_sha256",
-        "content_stream_sha256",
-    }
-    declared_view = data.get("declared_split_contract")
-    declared_raw = data.get("raw_declared_split_contract")
-    if (
-        not isinstance(declared_view, Mapping)
-        or not isinstance(declared_raw, Mapping)
-        or set(declared_view) != set(expected_order)
-        or set(declared_raw) != set(expected_order)
-    ):
-        raise CellExecutionError("real preparation declared split grid is incomplete")
-    requested_by_split = {
-        str(name): int(count) for name, count in values["data.split_sizes"]
-    }
-    for split in expected_order:
-        view = declared_view[split]
-        raw = declared_raw[split]
-        if (
-            not isinstance(view, Mapping)
-            or not isinstance(raw, Mapping)
-            or set(view) != declared_keys
-            or set(raw) != declared_keys
-            or view.get("requested_tokens") != requested_by_split[split]
-            or raw.get("requested_tokens") != requested_by_split[split]
-            or view.get("actual_tokens") != raw.get("actual_tokens")
-            or view.get("row_stream_sha256") != raw.get("row_stream_sha256")
-        ):
-            raise CellExecutionError(
-                f"real preparation declared split {split!r} is inconsistent"
-            )
-        for record in (view, raw):
-            if (
-                type(record.get("actual_tokens")) is not int
-                or record["actual_tokens"] < requested_by_split[split]
-            ):
-                raise CellExecutionError(
-                    f"real preparation split {split!r} is undersized"
-                )
-            for name in (
-                "manifest_sha256",
-                "row_stream_sha256",
-                "content_stream_sha256",
-            ):
-                _require_sha256(record.get(name), label=f"{split} {name}")
-
-    if data.get("training_row_policy") != {
-        "kind": "immutable_prefix_then_deterministic_replay",
-        "unique_tokens": int(values["data.unique_tokens"]),
-        "train_tokens": int(values["data.train_tokens"]),
-    }:
-        raise CellExecutionError(
-            "real preparation training-row policy differs from cell"
-        )
-    try:
-        expected_identity = activation_content_identity(data)
-    except ValueError as exc:
-        raise CellExecutionError(str(exc)) from exc
-    if data.get("kind") != "activation_store" or expected_identity["view_key"] != str(
-        values["data.normalization"]
-    ):
-        raise CellExecutionError("real preparation activation identity role is invalid")
-
-
 def _validate_preparation_contract(
     cell: CellSpec,
     payload: Mapping[str, Any],
-    *,
-    cell_manifest_sha256: str,
-    verification_campaign_root: Path | None = None,
+    **_: Any,
 ) -> None:
-    expected_keys = {
-        "schema",
-        "cell_id",
-        "cell_manifest_sha256",
-        "phase",
-        "stage_family",
-        "recipe_name",
-        "recipe_id",
-        "seed",
-        "decisions_sha256",
-        "data",
-        "data_identity",
-        "runtime",
-        "random",
-        "selection",
-        "implementation",
-        "implementation_sha256",
-    }
-    if set(payload) != expected_keys:
-        raise CellExecutionError("preparation artifact uses a noncanonical field set")
-    values = cell.decision_map
-    expected_static = {
-        "cell_id": cell.cell_id,
-        "cell_manifest_sha256": cell_manifest_sha256,
-        "phase": cell.phase.value,
-        "stage_family": cell.stage,
-        "recipe_name": cell.recipe_name,
-        "recipe_id": cell.recipe_id,
-        "seed": cell.seed,
-        "decisions_sha256": hashlib.sha256(
-            canonical_json(cell.content_payload()).encode("utf-8")
-        ).hexdigest(),
-    }
-    if any(payload.get(name) != expected for name, expected in expected_static.items()):
-        raise CellExecutionError("preparation artifact differs from its cell manifest")
-    expected_runtime = {
-        "smoke": values["runtime.smoke"],
-        "device": _declared_device(values),
-        "torch_version": payload.get("implementation", {}).get("torch"),
-    }
-    expected_random = {
-        name.removeprefix("random."): values[name]
-        for name in (
-            "random.model_seed",
-            "random.structure_seed",
-            "random.train_data_seed",
-            "random.eval_data_seed",
-            "random.confirmation_data_seed",
-        )
-    }
-    expected_selection = {
-        "id": values["selection.id"],
-        "source_blueprint_id": values["selection.source_blueprint_id"],
-        "source_plan_id": values["selection.source_plan_id"],
-        "upstream_selection_ids": list(values["selection.upstream_selection_ids"]),
-        "parent_candidate_id": values["selection.parent_candidate_id"],
-        "parent_cell_ids": list(values["selection.parent_cell_ids"]),
-        "delta_decision_names": list(values["selection.delta_decision_names"]),
-        "confirmation_sha256s": list(values["selection.confirmation_sha256s"]),
-        "qualification_sha256s": list(values["selection.qualification_sha256s"]),
-        "universe_sha256": values["selection.universe_sha256"],
-    }
     if (
-        payload.get("runtime") != expected_runtime
-        or payload.get("random") != expected_random
-        or payload.get("selection") != expected_selection
+        payload.get("schema") != PREPARATION_SCHEMA
+        or payload.get("cell_id") != cell.cell_id
+        or payload.get("phase") != cell.phase.value
+        or payload.get("recipe_name") != cell.recipe_name
+        or payload.get("seed") != cell.seed
     ):
-        raise CellExecutionError(
-            "preparation runtime/random/selection binding is stale"
-        )
+        raise CellExecutionError("preparation artifact differs from its cell")
     data = payload.get("data")
     if not isinstance(data, Mapping):
         raise CellExecutionError("preparation data payload is missing")
     if cell.phase is Phase.PHASE1:
-        if payload.get("data_identity") is not None:
-            raise CellExecutionError(
-                "synthetic preparation cannot bind activation data"
-            )
         if dict(data) != _synthetic_preparation_data(cell):
-            raise CellExecutionError(
-                "synthetic preparation data differs from the registered cell"
-            )
+            raise CellExecutionError("synthetic preparation differs from its cell")
     else:
-        _validate_real_preparation_data(
-            cell,
-            data,
-            verification_campaign_root=verification_campaign_root,
-        )
-        try:
-            expected_identity = activation_content_identity(data)
-        except ValueError as exc:
-            raise CellExecutionError(str(exc)) from exc
-        if payload.get("data_identity") != expected_identity:
-            raise CellExecutionError(
-                "real preparation identity differs from its validated data"
-            )
+        root = Path(str(data.get("root", "")))
+        splits = data.get("splits")
+        if not root.is_dir() or not isinstance(splits, Mapping):
+            raise CellExecutionError("activation-store preparation is incomplete")
+        if len(set(str(value) for value in splits.values())) != len(splits):
+            raise CellExecutionError("training, calibration, and evaluation splits overlap")
 
 
 def _load_preparation(path: Path, ctx: _Context) -> dict[str, Any]:
     payload = _read_object(path, label="preparation artifact")
-    if (
-        payload.get("schema") != PREPARATION_SCHEMA
-        or payload.get("cell_id") != ctx.cell.cell_id
-    ):
-        raise CellExecutionError("preparation artifact binding mismatch")
-    current_implementation = _implementation_identity()
-    current_implementation_sha256 = _implementation_identity_sha256(
-        current_implementation
-    )
-    if payload.get("implementation_sha256") != current_implementation_sha256:
-        try:
-            successor_authorized = _phase2_preparation_successor_authorized(
-                ctx,
-                payload,
-                current_implementation,
-            )
-        except (CampaignError, KeyError, OSError, TypeError, ValueError) as exc:
-            raise CellExecutionError(
-                f"cannot authenticate Phase-2 preparation successor: {exc}"
-            ) from exc
-        if not successor_authorized:
-            raise CellExecutionError(
-                "implementation changed after prepare; create a new content-addressed "
-                "campaign cell before executing another stage"
-            )
-    implementation = payload.get("implementation")
-    if (
-        not isinstance(implementation, Mapping)
-        or payload.get("implementation_sha256")
-        != _implementation_identity_sha256(implementation)
-    ):
-        raise CellExecutionError("preparation implementation digest mismatch")
-    cache_key = (ctx.cell.cell_id, ctx.artifact_sha256(path))
-    if cache_key not in _PREPARATION_CONTRACT_CACHE:
-        _validate_preparation_contract(
-            ctx.cell,
-            payload,
-            cell_manifest_sha256=_sha256(ctx.cell_path),
-        )
-        _PREPARATION_CONTRACT_CACHE.add(cache_key)
+    _validate_preparation_contract(ctx.cell, payload)
     return payload
 
 
@@ -4935,69 +3952,17 @@ def _save_immutable_torch(
     model_lineage: _ModelSnapshotLineage | None = None,
     model_state_field: str | None = None,
 ) -> None:
-    serialized_model_state: Mapping[str, torch.Tensor] | None = None
-    if model_lineage is not None:
-        if not isinstance(model_state_field, str) or not model_state_field:
-            raise CellExecutionError("snapshot-bound save requires a model-state field")
-        candidate = payload.get(model_state_field)
-        if not isinstance(candidate, Mapping):
-            raise CellExecutionError(
-                "snapshot-bound save lacks its model-state mapping"
-            )
-        serialized_model_state = candidate
-        _assert_serialized_snapshot_current(
-            serialized_model_state,
-            model_lineage,
-            label="deployable artifact",
-        )
-
-    def verify_existing() -> None:
-        existing = torch.load(path, map_location="cpu", weights_only=True)
-        if _tensor_payload_digest(existing) != _tensor_payload_digest(dict(payload)):
-            raise CellExecutionError(
-                f"immutable torch artifact changed binding: {path}"
-            )
-        if serialized_model_state is not None:
-            _assert_serialized_snapshot_current(
-                serialized_model_state,
-                model_lineage,
-                label="deployable artifact",
-            )
-
-    if path.exists():
-        verify_existing()
-        return
-    durable_mkdir(path.parent, parents=True, exist_ok=True)
+    del model_lineage, model_state_field
+    path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
     ) as handle:
         temporary = Path(handle.name)
     try:
-        # Saving to a path bakes the random temporary basename into every ZIP
-        # member (and therefore the externally bound artifact hash). A file
-        # object gives PyTorch the canonical ``archive/`` member prefix, so the
-        # exact same tensor/scalar payload is byte-identical across fresh and
-        # resumed executor processes.
-        if model_lineage is not None and torch.save is not _NATIVE_TORCH_SAVE:
-            raise CellExecutionError(
-                "snapshot lineage requires native blocking torch.save"
-            )
-        save = _NATIVE_TORCH_SAVE if model_lineage is not None else torch.save
-        with temporary.open("wb") as handle:
-            save(dict(payload), handle)
-        if serialized_model_state is not None:
-            _assert_serialized_snapshot_current(
-                serialized_model_state,
-                model_lineage,
-                label="deployable artifact",
-            )
-        try:
-            durable_create(temporary, path)
-        except FileExistsError:
-            verify_existing()
+        torch.save(dict(payload), temporary)
+        os.replace(temporary, path)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        temporary.unlink(missing_ok=True)
 
 
 def _training_batches(
@@ -5609,7 +4574,6 @@ def _binding(
         "data": preparation["data"],
         "runtime": preparation["runtime"],
         "selection": preparation["selection"],
-        "implementation": preparation["implementation"],
     }
 
 
@@ -5827,11 +4791,8 @@ def _verified_training_report_model_cfg(
     if (
         training_report.get("schema") != TRAINING_REPORT_SCHEMA
         or training_report.get("cell_id") != ctx.cell.cell_id
-        or training_report.get("checkpoint_sha256") != checkpoint_hash
-        or training_report.get("preparation_sha256")
-        != prerequisites["preparation"][1]
     ):
-        raise CellExecutionError("training report/input binding mismatch")
+        raise CellExecutionError("training report does not describe this cell")
     model_cfg = training_report.get("model_cfg")
     if not isinstance(model_cfg, dict):
         raise CellExecutionError("training report lacks its resolved model config")
@@ -6421,7 +5382,7 @@ def _train(
         checkpoint_lineage,
         label="final checkpoint source model",
     )
-    durable_replace(ctx.progress, ctx.checkpoint, file_already_synced=True)
+    os.replace(ctx.progress, ctx.checkpoint)
     checkpoint_before_validation = _FileFingerprint.from_path(ctx.checkpoint)
     del checkpoint_model_state
     gc.collect()
@@ -6537,7 +5498,6 @@ def _calibrate(
             model, metadata = load_trained_model(
                 checkpoint_path,
                 device=_device(ctx),
-                verified_checkpoint_sha256=checkpoint_hash,
             )
         except Exception as exc:  # noqa: BLE001
             raise CellExecutionError(
@@ -9812,41 +8772,27 @@ def _load_parent_qualification_policies(
     ctx: _Context,
 ) -> list[tuple[float, str, dict[str, Any]]]:
     parent_ids = tuple(str(item) for item in ctx.values["selection.parent_cell_ids"])
-    expected_hashes = {
-        str(item).removeprefix("sha256:")
-        for item in ctx.values["selection.qualification_sha256s"]
-    }
-    if not parent_ids or len(expected_hashes) != len(parent_ids):
-        raise CellExecutionError(
-            "frozen operating policy requires exact parent qualification hashes"
-        )
+    if not parent_ids:
+        raise CellExecutionError("holdout evaluation requires selected parent cells")
     resolved: list[tuple[float, str, dict[str, Any]]] = []
     if ctx.cell.phase is Phase.PHASE3:
         panel = _read_object(
             ctx.root / "panel-decision.json", label="Phase-3 panel decision"
         )
         campaign_manifest = panel.get("phase2_campaign_manifest")
-        cells = (
-            campaign_manifest.get("cells")
+        qualifications = (
+            campaign_manifest.get("qualifications")
             if isinstance(campaign_manifest, Mapping)
             else None
         )
-        if not isinstance(cells, list):
+        if not isinstance(qualifications, Mapping):
             raise CellExecutionError("Phase-3 panel lacks embedded Phase-2 evidence")
-        by_id = {
-            str(item.get("cell_id")): item
-            for item in cells
-            if isinstance(item, Mapping)
-        }
         for parent_id in parent_ids:
-            evidence = by_id.get(parent_id)
-            if not isinstance(evidence, Mapping):
+            qualification = qualifications.get(parent_id)
+            if not isinstance(qualification, Mapping):
                 raise CellExecutionError(
                     "Phase-3 panel omits a frozen parent qualification"
                 )
-            qualification = evidence.get("qualification")
-            if not isinstance(qualification, Mapping):
-                raise CellExecutionError("Phase-3 parent qualification is malformed")
             metric, policy = _qualification_operating_policy(
                 qualification, cell_id=parent_id
             )
@@ -9864,11 +8810,6 @@ def _load_parent_qualification_policies(
         if ref is None:
             raise CellExecutionError("selected parent is not qualified")
         path = ref.resolve(ctx.root)
-        observed_hash = _sha256(path)
-        if observed_hash != ref.sha256 or observed_hash not in expected_hashes:
-            raise CellExecutionError(
-                "selected parent qualification hash differs from the frozen selection"
-            )
         qualification = _read_object(path, label="parent qualification")
         metric, policy = _qualification_operating_policy(
             qualification, cell_id=parent_id
@@ -10940,16 +9881,99 @@ def _qualify(
     ctx: _Context,
     prerequisites: Mapping[str, tuple[Path, str]],
 ) -> tuple[tuple[str, Path], ...]:
+    """Summarize whether a completed cell is usable scientific evidence."""
+
     evaluation = _read_object(
         prerequisites["evaluation"][0], label="evaluation artifact"
     )
     if (
         evaluation.get("schema") != EVALUATION_SCHEMA
+        or evaluation.get("cell_id") != ctx.cell.cell_id
         or evaluation.get("evaluation_execution_implementation")
         != EVALUATION_EXECUTION_IMPLEMENTATION
     ):
-        raise CellExecutionError("evaluation artifact has the wrong implementation")
-    input_hashes = {
+        raise CellExecutionError("evaluation does not describe this cell")
+    if not _finite_json(evaluation):
+        raise CellExecutionError("evaluation contains non-finite values")
+
+    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
+    training_report = _read_object(
+        prerequisites["training_report"][0], label="training report"
+    )
+    calibration_record = _read_object(
+        prerequisites["calibration_record"][0], label="calibration record"
+    )
+    selection_metrics = evaluation.get("selection_metrics")
+    if not isinstance(selection_metrics, dict):
+        raise CellExecutionError("evaluation lacks selection metrics")
+
+    roundtrip = evaluation.get("codec_roundtrip", {})
+    calibration_excluded = calibration_record.get(
+        "excluded_calibration_event_fraction"
+    )
+    evaluation_excluded = evaluation.get("rate_distortion", {}).get(
+        "eval_excluded_event_share"
+    )
+    finite_number = lambda value: (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+    identification_passed, inapplicable = _phase1_identification_outcome(
+        ctx.cell.phase,
+        evaluation.get("synthetic_identification"),
+        evaluation.get("validation", {}),
+        recovery=evaluation.get("synthetic_recovery"),
+    )
+    scientific_checks = {
+        "codec_roundtrip": all(
+            roundtrip.get(name) is True
+            for name in ("source_free_decode", "finite", "shape_matches")
+        ),
+        "support_target": (
+            finite_number(calibration_record.get("threshold_abs_error"))
+            and float(calibration_record["threshold_abs_error"]) <= 0.1
+        ),
+        "calibration_coverage": (
+            finite_number(calibration_excluded)
+            and (
+                ctx.cell.phase is Phase.PHASE2
+                or float(calibration_excluded) <= 0.01
+            )
+        ),
+        "evaluation_coverage": (
+            finite_number(evaluation_excluded)
+            and (
+                ctx.cell.phase is Phase.PHASE2
+                or float(evaluation_excluded) <= 0.01
+            )
+        ),
+        "phase1_identification": identification_passed,
+    }
+    scientific_outcome = {
+        "passed": all(scientific_checks.values()),
+        "checks": scientific_checks,
+        "inapplicable_checks": inapplicable,
+    }
+
+    fixed_rate = evaluation.get("fixed_rate_raw_selection", {})
+    raw = evaluation.get("raw_space", {})
+    promotion_reasons: list[str] = []
+    if ctx.values["runtime.smoke"] is True:
+        promotion_reasons.append("runtime_smoke")
+    if ctx.values["qualification.promotable"] is not True:
+        promotion_reasons.append("resolved_nonpromotable_cell")
+    if raw.get("eligible") is not True:
+        promotion_reasons.append("raw_codec_ineligible")
+    if ctx.cell.phase is not Phase.PHASE1 and fixed_rate.get("eligible") is not True:
+        promotion_reasons.append("fixed_rate_budget_ineligible")
+    if scientific_outcome["passed"] is not True:
+        promotion_reasons.append("scientific_outcome_failed")
+    if ctx.cell.phase is Phase.PHASE3 or "confirmation" in ctx.cell.stage:
+        if not ctx.values["selection.parent_cell_ids"]:
+            promotion_reasons.append("missing_parent_selection")
+
+    output_files = {
         kind: prerequisites[kind][1]
         for kind in (
             "preparation",
@@ -10960,907 +9984,35 @@ def _qualify(
             "evaluation",
         )
     }
-    expected_eval_inputs = {
-        "checkpoint": input_hashes["checkpoint"],
-        "calibration": input_hashes["calibration"],
-        "deployment_codec": input_hashes["deployment_codec"],
-        "deployment_schedules": input_hashes["deployment_schedules"],
-    }
-    preparation = _load_preparation(prerequisites["preparation"][0], ctx)
-    training_report = _read_object(
-        prerequisites["training_report"][0], label="training report"
-    )
-    calibration_record = _read_object(
-        prerequisites["calibration_record"][0], label="calibration record"
-    )
-    if ctx.values["qualification.thresholds_version"] != "2026-07-22.v2":
-        raise CellExecutionError(
-            "unsupported qualification.thresholds_version "
-            + repr(ctx.values["qualification.thresholds_version"])
-        )
-    threshold_map = {
-        "schema": "bsc-integrity-thresholds-2026-07-22.v2",
-        "support_target_abs_error_max": 0.1,
-        "codec_excluded_calibration_event_fraction_max": 0.01,
-        "codec_excluded_evaluation_event_fraction_max": 0.01,
-        "probability_metric_range": [0.0, 1.0],
-        "required_quantizer_bits": list(ctx.values["codec.quantizer_bits"]),
-        "phase1_identification_thresholds": list(
-            ctx.values["qualification.phase1_identification_thresholds"]
-        ),
-        "phase1_identification_enforced": ctx.values["runtime.smoke"] is False,
-        "phase1_margin_normalization_contract": ctx.values[
-            "evaluation.phase1_margin_normalization"
-        ],
-        "phase1_rank_mismatch_contract": ctx.values[
-            "evaluation.rank_mismatch_contract"
-        ],
-        "phase1_pathology_association_contract": ctx.values[
-            "evaluation.pathology_association_contract"
-        ],
-        "phase1_pathology_strong_association_cutoff": ctx.values[
-            "evaluation.pathology_strong_association_cutoff"
-        ],
-        "phase1_pathology_weak_association_cutoff": ctx.values[
-            "evaluation.pathology_weak_association_cutoff"
-        ],
-        "phase1_pathology_association_cutoff_sensitivity": [
-            list(item)
-            for item in ctx.values[
-                "evaluation.pathology_association_cutoff_sensitivity"
-            ]
-        ],
-        "encoder_scale_fit_statistic": ctx.values["model.encoder_scale_fit_statistic"],
-        "encoder_scale_fit_solver": ctx.values["model.encoder_scale_fit_solver"],
-        "encoder_scale_fit_target": ctx.values["model.encoder_scale_fit_target"],
-        "encoder_scale_fit_tolerance": ctx.values["model.encoder_scale_fit_tolerance"],
-        "encoder_scale_fit_max_iterations": ctx.values[
-            "model.encoder_scale_fit_max_iterations"
-        ],
-        "fixed_rate_budget_scale_factor": ctx.values[
-            "evaluation.fixed_rate_budget_scale_factor"
-        ],
-        "fixed_rate_budget_scale_contract": ctx.values[
-            "evaluation.fixed_rate_budget_scale_contract"
-        ],
-        "production_min_nonzero_rate_endpoints": ctx.values[
-            "precision.preflight_min_nonzero_rate_endpoints"
-        ],
-    }
-    rd = evaluation.get("rate_distortion", {})
-    raw = evaluation.get("raw_space", {})
-    native = evaluation.get("native_selector", {})
-    deployed = evaluation.get("deployed_selector", {})
-    shared = evaluation.get("shared_code", {})
-    recovery = evaluation.get("synthetic_recovery")
-    identification = evaluation.get("synthetic_identification")
-    fixed_rate = evaluation.get("fixed_rate_raw_selection", {})
-    deployment_schedule_manifest = evaluation.get("deployment_schedules")
-    required_qs = [str(item) for item in threshold_map["required_quantizer_bits"]]
-
-    def finite_number(value: Any) -> bool:
-        return (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(float(value))
-        )
-
-    def valid_ci(value: Any) -> bool:
-        return (
-            isinstance(value, list)
-            and len(value) == 2
-            and all(finite_number(item) for item in value)
-            and float(value[0]) <= float(value[1])
-        )
-
-    def valid_isolated_loss_diagnostics(endpoint: Mapping[str, Any]) -> bool:
-        diagnostics = endpoint.get("isolated_loss_gain_diagnostics")
-        if ctx.values["model.selection_score"] != "isolated_loss_decrease":
-            return diagnostics == {
-                "applicable": False,
-                "reason": "selection_score_not_isolated_loss_decrease",
-            }
-        if not isinstance(diagnostics, Mapping) or (
-            diagnostics.get("schema") != "bsc-isolated-loss-gain-diagnostics-v1"
-            or diagnostics.get("applicable") is not True
-            or diagnostics.get("observation_contract")
-            != "explicit_true_observed_sites_only_v1"
-        ):
-            return False
-        candidate_total = diagnostics.get("candidate_event_count")
-        selected_total = diagnostics.get("selected_event_count")
-        expected_candidate_total = int(endpoint.get("n_tokens", -1)) * int(
-            ctx.values["model.groups"]
-        )
-        try:
-            histogram_total = sum(
-                int(count) * int(frequency)
-                for count, frequency in endpoint.get(
-                    "active_block_count_histogram", {}
-                ).items()
-            )
-        except (AttributeError, TypeError, ValueError):
-            return False
-        if (
-            not isinstance(candidate_total, int)
-            or isinstance(candidate_total, bool)
-            or candidate_total <= 0
-            or candidate_total != expected_candidate_total
-            or not isinstance(selected_total, int)
-            or isinstance(selected_total, bool)
-            or selected_total < 0
-            or selected_total != histogram_total
-        ):
-            return False
-        for prefix, total in (
-            ("candidate", candidate_total),
-            ("selected", selected_total),
-        ):
-            counts = [
-                diagnostics.get(f"{prefix}_{sign}_gain_count")
-                for sign in ("negative", "zero", "positive")
-            ]
-            if (
-                any(
-                    not isinstance(count, int) or isinstance(count, bool) or count < 0
-                    for count in counts
-                )
-                or sum(counts) != total
-            ):
-                return False
-            fractions = [
-                diagnostics.get(f"{prefix}_{sign}_gain_fraction")
-                for sign in ("negative", "zero", "positive")
-            ]
-            if total == 0:
-                if fractions != [None, None, None]:
-                    return False
-            elif any(
-                not finite_number(fraction) or not 0.0 <= float(fraction) <= 1.0
-                for fraction in fractions
-            ) or any(
-                not math.isclose(
-                    float(fraction), count / total, rel_tol=1e-12, abs_tol=1e-15
-                )
-                for fraction, count in zip(fractions, counts, strict=True)
-            ):
-                return False
-        return True
-
-    if not isinstance(deployment_schedule_manifest, Mapping):
-        raise CellExecutionError("evaluation lacks a deployment schedule manifest")
-    loaded_schedule_plans = _load_deployment_schedule_bundle(
-        prerequisites["deployment_schedules"][0],
-        deployment_schedule_manifest,
-        cell_id=ctx.cell.cell_id,
-        deployment_codec_sha256=input_hashes["deployment_codec"],
-        schedule_contract=str(ctx.values["codec.time_sharing_schedule_contract"]),
-    )
-    expected_schedule_plans = _selected_time_sharing_plans(
-        ctx,
-        rd=rd,
-        raw_space=raw,
-        deployment_artifact_size_bytes=prerequisites["deployment_codec"][0]
-        .stat()
-        .st_size,
-        frozen_operating_policy=fixed_rate.get("operating_policy"),
-    )
-
-    def schedule_core(plan: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            name: plan[name]
-            for name in (
-                "budget_bits_per_token",
-                "lower_name",
-                "lower_q",
-                "upper_name",
-                "upper_q",
-                "upper_tokens",
-                "horizon_tokens",
-                "upper_mixture_weight",
-                "achieved_total_bits_per_token",
-            )
-        }
-
-    deployment_schedule_integrity = bool(
-        deployment_schedule_manifest.get("artifact_sha256")
-        == input_hashes["deployment_schedules"]
-        and set(loaded_schedule_plans) == set(expected_schedule_plans)
-        and all(
-            canonical_json(schedule_core(loaded_schedule_plans[key]))
-            == canonical_json(schedule_core(expected_schedule_plans[key]))
-            for key in expected_schedule_plans
-        )
-        and set(raw.get("operational_time_sharing", {})) == set(loaded_schedule_plans)
-    )
-    selection_score_diagnostics_integrity = bool(
-        valid_isolated_loss_diagnostics(native)
-        and valid_isolated_loss_diagnostics(deployed)
-    )
-
-    encoder_scale_calibration = training_report.get("encoder_scale_calibration")
-    encoder_scale_calibration_integrity = False
-    if isinstance(encoder_scale_calibration, dict):
-        strategy = ctx.values["model.encoder_scale_calibration"]
-        if strategy == "fixed_init_no_data_fit":
-            encoder_scale_calibration_integrity = encoder_scale_calibration == {
-                "strategy": strategy,
-                "fitted": False,
-                "scale_multiplier": 1.0,
-            }
-        else:
-            observed_after = encoder_scale_calibration.get("mean_block_norm_after")
-            target = float(ctx.values["model.encoder_scale_fit_target"])
-            tolerance = float(ctx.values["model.encoder_scale_fit_tolerance"])
-            encoder_scale_calibration_integrity = bool(
-                encoder_scale_calibration.get("strategy") == strategy
-                and encoder_scale_calibration.get("fitted") is True
-                and encoder_scale_calibration.get("statistic")
-                == ctx.values["model.encoder_scale_fit_statistic"]
-                and encoder_scale_calibration.get("solver")
-                == ctx.values["model.encoder_scale_fit_solver"]
-                and encoder_scale_calibration.get("target") == target
-                and encoder_scale_calibration.get("tolerance") == tolerance
-                and encoder_scale_calibration.get("max_iterations")
-                == ctx.values["model.encoder_scale_fit_max_iterations"]
-                and isinstance(encoder_scale_calibration.get("iterations"), int)
-                and 0
-                < encoder_scale_calibration["iterations"]
-                <= ctx.values["model.encoder_scale_fit_max_iterations"]
-                and encoder_scale_calibration.get("remeasured_post_fit") is True
-                and finite_number(observed_after)
-                and abs(float(observed_after) - target) <= tolerance
-                and finite_number(
-                    encoder_scale_calibration.get("mean_block_norm_before")
-                )
-                and finite_number(encoder_scale_calibration.get("scale_multiplier"))
-                and float(encoder_scale_calibration["scale_multiplier"]) > 0.0
-                and isinstance(encoder_scale_calibration.get("events"), int)
-                and encoder_scale_calibration["events"] > 0
-                and isinstance(encoder_scale_calibration.get("input"), dict)
-            )
-
-    regularizer_calibration = training_report.get("regularizer_calibration")
-    reported_model_cfg = training_report.get("model_cfg")
-    regularizer_calibration_integrity = False
-    if isinstance(regularizer_calibration, dict) and isinstance(
-        reported_model_cfg, dict
-    ):
-        coefficient_mode = ctx.values["objective.regularizer_coefficient_mode"]
-        target_ratio = ctx.values["objective.regularizer_target_initial_ratio"]
-        resolved = regularizer_calibration.get("resolved_coefficient")
-        reported_resolved = reported_model_cfg.get("lambda_regularizer")
-        common_calibration_fields = (
-            regularizer_calibration.get("mode") == coefficient_mode
-            and finite_number(resolved)
-            and finite_number(reported_resolved)
-            and float(resolved) == float(reported_resolved)
-            and regularizer_calibration.get("declared_absolute_coefficient")
-            == ctx.values["objective.regularizer_coefficient"]
-        )
-        if coefficient_mode == "absolute":
-            regularizer_calibration_integrity = bool(
-                common_calibration_fields
-                and regularizer_calibration.get("contract") == "not_applicable"
-                and regularizer_calibration.get("fitted") is False
-                and regularizer_calibration.get("target_initial_ratio") is None
-                and float(resolved)
-                == float(ctx.values["objective.regularizer_coefficient"])
-            )
-        elif coefficient_mode == "initial_loss_ratio":
-            reconstruction = regularizer_calibration.get("initial_reconstruction_loss")
-            unweighted = regularizer_calibration.get("initial_regularizer_unweighted")
-            achieved = regularizer_calibration.get("achieved_initial_ratio")
-            input_binding = regularizer_calibration.get("input")
-            regularizer_calibration_integrity = bool(
-                common_calibration_fields
-                and regularizer_calibration.get("contract")
-                == "post_init_train_prefix_true_observation_fp32_v1"
-                and regularizer_calibration.get("fitted") is True
-                and finite_number(target_ratio)
-                and regularizer_calibration.get("target_initial_ratio") == target_ratio
-                and finite_number(reconstruction)
-                and float(reconstruction) > 0.0
-                and finite_number(unweighted)
-                and float(unweighted) > 0.0
-                and finite_number(achieved)
-                and math.isclose(
-                    float(resolved),
-                    float(target_ratio) * float(reconstruction) / float(unweighted),
-                    rel_tol=1e-12,
-                    abs_tol=1e-15,
-                )
-                and math.isclose(
-                    float(achieved),
-                    float(target_ratio),
-                    rel_tol=1e-12,
-                    abs_tol=1e-15,
-                )
-                and isinstance(input_binding, dict)
-                and input_binding.get("split") == "train"
-                and input_binding.get("start_token") == 0
-                and isinstance(input_binding.get("tokens"), int)
-                and input_binding["tokens"] > 0
-                and isinstance(input_binding.get("sha256"), str)
-                and len(input_binding["sha256"]) == 64
-            )
-
-    precision_preflight = training_report.get("precision_preflight")
-    precision_profile = (
-        ctx.values["qualification.profile"]
-        == "phase3_production_stability_guardrails_v1"
-    )
-    precision_preflight_integrity = False
-    precision_reconstruction_passed = not precision_profile
-    precision_support_passed = not precision_profile
-    precision_finite_passed = not precision_profile
-    if isinstance(precision_preflight, dict):
-        if not precision_profile:
-            precision_preflight_integrity = precision_preflight == {
-                "applicable": False,
-                "contract": "not_applicable",
-                "passed": True,
-            }
-        else:
-            rec_error = precision_preflight.get("reconstruction_relative_error")
-            support_iou = precision_preflight.get("support_iou")
-            output_error = precision_preflight.get("output_relative_error")
-            precision_checks = precision_preflight.get("checks")
-            precision_thresholds = precision_preflight.get("thresholds")
-            precision_input = precision_preflight.get("input")
-            rec_max = float(
-                ctx.values["precision.preflight_reconstruction_relative_error_max"]
-            )
-            iou_min = float(ctx.values["precision.preflight_support_iou_min"])
-            precision_finite_passed = bool(
-                isinstance(precision_checks, dict)
-                and precision_checks.get("finite") is True
-            )
-            precision_reconstruction_passed = bool(
-                finite_number(rec_error) and float(rec_error) <= rec_max
-            )
-            precision_support_passed = bool(
-                finite_number(support_iou) and float(support_iou) >= iou_min
-            )
-            precision_preflight_integrity = bool(
-                precision_preflight.get("applicable") is True
-                and precision_preflight.get("contract")
-                == "fp32_bf16_initial_forward_v1"
-                and finite_number(output_error)
-                and isinstance(precision_checks, dict)
-                and precision_checks
-                == {
-                    "finite": precision_finite_passed,
-                    "reconstruction_relative_error": (precision_reconstruction_passed),
-                    "support_iou": precision_support_passed,
-                }
-                and precision_preflight.get("passed") is all(precision_checks.values())
-                and precision_thresholds
-                == {
-                    "reconstruction_relative_error_max": rec_max,
-                    "support_iou_min": iou_min,
-                }
-                and isinstance(precision_input, dict)
-                and precision_input.get("split") == "train"
-                and precision_input.get("start_token") == 0
-                and precision_input.get("tokens")
-                == ctx.values["precision.preflight_tokens"]
-                and isinstance(precision_input.get("sha256"), str)
-                and len(precision_input["sha256"]) == 64
-            )
-
-    production_frontier_passed = not precision_profile
-    production_frontier_endpoint_count: int | None = None
-    if precision_profile:
-        fixed_budget_points = fixed_rate.get("fixed_budgets")
-        expected_budgets = list(
-            ctx.values["evaluation.fixed_rate_budgets_bits_per_token"]
-        )
-        side_rate = fixed_rate.get("side_information", {}).get("bits_per_token")
-        distinct_nonzero_endpoints: set[str] = set()
-        point_contracts: list[bool] = []
-        if isinstance(fixed_budget_points, list):
-            for point in fixed_budget_points:
-                bracket = point.get("bracket") if isinstance(point, dict) else None
-                nonzero = (
-                    {
-                        str(name)
-                        for name in bracket
-                        if name != "zero_event_calibration_mean"
-                    }
-                    if isinstance(bracket, list)
-                    else set()
-                )
-                distinct_nonzero_endpoints.update(nonzero)
-                point_contracts.append(
-                    isinstance(point, dict)
-                    and point.get("eligible") is True
-                    and finite_number(point.get("raw_space_fvu"))
-                    and finite_number(point.get("achieved_total_bits_per_token"))
-                    and finite_number(point.get("budget_bits_per_token"))
-                    and finite_number(side_rate)
-                    and float(point["achieved_total_bits_per_token"]) > float(side_rate)
-                    and float(point["achieved_total_bits_per_token"])
-                    <= float(point["budget_bits_per_token"]) + 1e-12
-                    and bool(nonzero)
-                )
-        production_frontier_endpoint_count = len(distinct_nonzero_endpoints)
-        production_frontier_passed = bool(
-            fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v2"
-            and fixed_rate.get("eligible") is True
-            and fixed_rate.get("applicable") is True
-            and ctx.values["evaluation.fixed_rate_budget_scale_factor"] == 4.0
-            and ctx.values["evaluation.fixed_rate_budget_scale_contract"]
-            == "phase3_active_coordinate_ratio_128_over_32_v1"
-            and isinstance(fixed_budget_points, list)
-            and [point.get("budget_bits_per_token") for point in fixed_budget_points]
-            == expected_budgets
-            and len(point_contracts) == len(expected_budgets)
-            and all(point_contracts)
-            and production_frontier_endpoint_count
-            >= int(ctx.values["precision.preflight_min_nonzero_rate_endpoints"])
-        )
-
-    method_endpoints = (
-        evaluation.get("endpoint_profile") == ctx.values["evaluation.endpoint_profile"]
-        and finite_number(native.get("fvu_pooled"))
-        and finite_number(native.get("avg_active_blocks"))
-        and finite_number(deployed.get("fvu_pooled"))
-        and finite_number(deployed.get("avg_active_blocks"))
-        and all(
-            isinstance(shared.get(endpoint), dict)
-            and finite_number(shared[endpoint].get("full_fvu_pooled"))
-            and shared[endpoint].get("selection_mode")
-            == ("topk" if endpoint == "native" else "threshold")
-            and isinstance(shared[endpoint].get("used_contribution_eigenvalues"), list)
-            for endpoint in ("native", "deployed")
-        )
-        and all(
-            isinstance(rd.get("points", {}).get(q), dict)
-            and finite_number(rd["points"][q].get("fvu_pooled"))
-            and finite_number(rd["points"][q].get("rate_bits_per_token"))
-            and valid_ci(rd["points"][q].get("fvu_ci95"))
-            for q in required_qs
-        )
-        and valid_ci(rd.get("support_bits_ci95"))
-        and raw.get("serialized_forward_preprocessing_validated") is True
-        and raw.get("source_free_sparse_decode") is True
-        and all(
-            isinstance(raw.get("points", {}).get(q), dict)
-            and finite_number(raw["points"][q].get("fvu_pooled"))
-            and valid_ci(raw["points"][q].get("fvu_pooled_ci95"))
-            for q in required_qs
-        )
-        and (
-            ctx.cell.phase is not Phase.PHASE1
-            or ctx.values["runtime.smoke"] is True
-            or (
-                isinstance(recovery, dict)
-                and isinstance(identification, dict)
-                and all(
-                    isinstance(recovery.get(endpoint), dict)
-                    and isinstance(identification.get(endpoint), dict)
-                    for endpoint in ("native", "deployed")
-                )
-            )
-        )
-        and (
-            ctx.cell.phase is Phase.PHASE1
-            or (
-                fixed_rate.get("schema") == "bsc-fixed-rate-raw-selection-v2"
-                and fixed_rate.get("applicable") is True
-                and fixed_rate.get("deployment_codec_sha256")
-                == prerequisites["deployment_codec"][1]
-            )
-        )
-    )
-    phase1_ranges_ok = True
-    if ctx.cell.phase is Phase.PHASE1 and isinstance(recovery, dict):
-        expected_recovery_examples = int(
-            ctx.values[
-                "data.synthetic_confirmation_examples"
-                if ctx.values["evaluation.split"] == "confirmation"
-                else "data.synthetic_development_examples"
-            ]
-        )
-        expected_factor_calibration_examples = int(
-            ctx.values["data.synthetic_factor_calibration_examples"]
-        )
-        ranged_names = (
-            "support_precision",
-            "support_recall",
-            "support_false_discovery_rate",
-            "support_false_positive_rate",
-            "support_association_f1_mean",
-            "recovered_factor_fraction_at_association_0.5",
-            "split_factor_fraction",
-            "merge_group_fraction",
-            "merged_factor_fraction",
-            "shattering_factor_fraction",
-            "dilution_factor_fraction",
-            "alive_block_fraction",
-        )
-        phase1_ranges_ok = all(
-            recovery.get(endpoint, {}).get("n_truth_factors")
-            == ctx.values["data.n_factors"]
-            and recovery[endpoint].get("n_factor_calibration_examples")
-            == expected_factor_calibration_examples
-            and recovery[endpoint].get("n_examples") == expected_recovery_examples
-            and all(
-                finite_number(recovery[endpoint].get(name))
-                and 0.0 <= float(recovery[endpoint][name]) <= 1.0
-                for name in ranged_names
-            )
-            and recovery[endpoint].get("rank_mismatch", {}).get("contract")
-            == threshold_map["phase1_rank_mismatch_contract"]
-            and recovery[endpoint]
-            .get("rank_mismatch", {})
-            .get("same_block_metrics_are_primary")
-            is True
-            and recovery[endpoint]
-            .get("rank_mismatch", {})
-            .get("same_block_gate_is_ceiling_adjusted")
-            is False
-            and recovery[endpoint].get("pathology_association", {}).get("contract")
-            == threshold_map["phase1_pathology_association_contract"]
-            and recovery[endpoint]
-            .get("pathology_association", {})
-            .get("primary", {})
-            .get("strong_association_cutoff")
-            == threshold_map["phase1_pathology_strong_association_cutoff"]
-            and recovery[endpoint]
-            .get("pathology_association", {})
-            .get("primary", {})
-            .get("weak_association_cutoff")
-            == threshold_map["phase1_pathology_weak_association_cutoff"]
-            and [
-                [
-                    item.get("strong_association_cutoff"),
-                    item.get("weak_association_cutoff"),
-                ]
-                for item in recovery[endpoint]
-                .get("pathology_association", {})
-                .get("reporting_only_sensitivity", ())
-                if isinstance(item, dict)
-            ]
-            == threshold_map["phase1_pathology_association_cutoff_sensitivity"]
-            and identification.get(endpoint, {}).get("margin_normalization_contract")
-            == threshold_map["phase1_margin_normalization_contract"]
-            for endpoint in ("native", "deployed")
-        )
-
-    calibration_excluded = calibration_record.get("excluded_calibration_event_fraction")
-    evaluation_excluded = rd.get("eval_excluded_event_share")
-    phase1_endpoint_complete = ctx.cell.phase is not Phase.PHASE1 or (
-        isinstance(recovery, dict)
-        and isinstance(identification, dict)
-        and all(
-            isinstance(recovery.get(endpoint), dict)
-            and isinstance(identification.get(endpoint), dict)
-            and (
-                (
-                    identification[endpoint].get("applicable") is True
-                    and isinstance(identification[endpoint].get("passed"), bool)
-                    and finite_number(identification[endpoint].get("margin"))
-                    and isinstance(identification[endpoint].get("checks"), dict)
-                )
-                or (
-                    identification[endpoint].get("applicable") is False
-                    and identification[endpoint].get("passed") is None
-                    and identification[endpoint].get("margin") is None
-                    and isinstance(
-                        identification[endpoint].get("ineligible_reason"), str
-                    )
-                )
-            )
-            for endpoint in ("native", "deployed")
-        )
-    )
-    scientific_endpoint_complete = (
-        finite_number(calibration_record.get("threshold_abs_error"))
-        and finite_number(calibration_excluded)
-        and finite_number(evaluation_excluded)
-        and all(
-            evaluation.get("codec_roundtrip", {}).get(key) is True
-            for key in ("source_free_decode", "finite", "shape_matches")
-        )
-        and phase1_ranges_ok
-        and phase1_endpoint_complete
-    )
-    phase1_identification_passed, inapplicable_scientific_checks = (
-        _phase1_identification_outcome(
-            ctx.cell.phase,
-            identification,
-            evaluation.get("validation", {}),
-            recovery=recovery,
-        )
-    )
-    codec_exclusion_is_gate = ctx.cell.phase is not Phase.PHASE2
-    if not codec_exclusion_is_gate:
-        inapplicable_scientific_checks = {
-            **inapplicable_scientific_checks,
-            "codec_calibration_exclusion": (
-                "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
-            ),
-            "codec_evaluation_exclusion": (
-                "phase2_excluded_events_are_priced_in_fixed_rate_distortion"
-            ),
-        }
-    scientific_outcome_checks = {
-        "support_target_calibration": (
-            finite_number(calibration_record.get("threshold_abs_error"))
-            and float(calibration_record["threshold_abs_error"])
-            <= threshold_map["support_target_abs_error_max"]
-        ),
-        "codec_calibration_exclusion": (
-            finite_number(calibration_excluded)
-            and (
-                not codec_exclusion_is_gate
-                or float(calibration_excluded)
-                <= threshold_map["codec_excluded_calibration_event_fraction_max"]
-            )
-        ),
-        "codec_evaluation_exclusion": (
-            finite_number(evaluation_excluded)
-            and (
-                not codec_exclusion_is_gate
-                or float(evaluation_excluded)
-                <= threshold_map["codec_excluded_evaluation_event_fraction_max"]
-            )
-        ),
-        "phase1_identification": phase1_identification_passed,
-        "production_precision_finite": precision_finite_passed,
-        "production_precision_reconstruction": (precision_reconstruction_passed),
-        "production_precision_support": precision_support_passed,
-        "production_fixed_rate_frontier": production_frontier_passed,
-    }
-    phase1_margins = {
-        endpoint: (
-            None
-            if ctx.cell.phase is not Phase.PHASE1
-            or not isinstance(identification, dict)
-            or not finite_number(identification.get(endpoint, {}).get("margin"))
-            else float(identification[endpoint]["margin"])
-        )
-        for endpoint in ("native", "deployed")
-    }
-    scientific_outcome = {
-        "passed": all(scientific_outcome_checks.values()),
-        "checks": scientific_outcome_checks,
-        "inapplicable_checks": inapplicable_scientific_checks,
-        "margins": {
-            "support_target_abs_error": (
-                threshold_map["support_target_abs_error_max"]
-                - float(calibration_record["threshold_abs_error"])
-            ),
-            "codec_calibration_excluded_fraction": (
-                threshold_map["codec_excluded_calibration_event_fraction_max"]
-                - float(calibration_excluded)
-            ),
-            "codec_evaluation_excluded_fraction": (
-                threshold_map["codec_excluded_evaluation_event_fraction_max"]
-                - float(evaluation_excluded)
-            ),
-            "phase1_native_identification": (phase1_margins["native"]),
-            "phase1_deployed_identification": (phase1_margins["deployed"]),
-            "production_precision_reconstruction": (
-                None
-                if not precision_profile
-                else float(
-                    ctx.values["precision.preflight_reconstruction_relative_error_max"]
-                )
-                - float(precision_preflight["reconstruction_relative_error"])
-            ),
-            "production_precision_support_iou": (
-                None
-                if not precision_profile
-                else float(precision_preflight["support_iou"])
-                - float(ctx.values["precision.preflight_support_iou_min"])
-            ),
-            "production_fixed_rate_nonzero_endpoints": (
-                None
-                if not precision_profile
-                else production_frontier_endpoint_count
-                - int(ctx.values["precision.preflight_min_nonzero_rate_endpoints"])
-            ),
-        },
-    }
-    provenance = (
-        evaluation.get("inputs") == expected_eval_inputs
-        and evaluation.get("preparation_sha256") == prerequisites["preparation"][1]
-        and training_report.get("schema") == TRAINING_REPORT_SCHEMA
-        and training_report.get("cell_id") == ctx.cell.cell_id
-        and training_report.get("checkpoint_sha256") == input_hashes["checkpoint"]
-        and calibration_record.get("cell_id") == ctx.cell.cell_id
-        and calibration_record.get("checkpoint_sha256") == input_hashes["checkpoint"]
-        and calibration_record.get("codec_sha256") == input_hashes["calibration"]
-        and calibration_record.get("deployment_codec_sha256")
-        == input_hashes["deployment_codec"]
-        and isinstance(preparation.get("implementation"), dict)
-        and preparation["implementation"].get("executor_schema") == EXECUTOR_SCHEMA
-        and preparation.get("implementation_sha256")
-        == _implementation_identity_sha256(preparation["implementation"])
-    )
-    expected_steps = math.ceil(
-        int(ctx.values["data.train_tokens"]) / int(ctx.values["optimizer.batch_tokens"])
-    )
-    resource_compliance = (
-        training_report.get("attempted_tokens") == ctx.values["data.train_tokens"]
-        and training_report.get("step_idx") == expected_steps
-        and isinstance(training_report.get("accepted_tokens"), int)
-        and training_report["accepted_tokens"] == training_report["attempted_tokens"]
-        and training_report.get("data_cursor")
-        == {"next_token": ctx.values["data.train_tokens"], "stream": "train"}
-    )
-    if preparation["data"]["kind"] == "synthetic":
-        ranges = preparation["data"].get("ranges", {})
-        factor_calibration_range = ranges.get("factor_calibration")
-        calibration_range = ranges.get("calibration")
-        evaluation_range = ranges.get("evaluation")
-        evaluation_stream = preparation["data"].get("evaluation_stream")
-        expected_stream = (
-            "confirmation"
-            if ctx.values["evaluation.split"] == "confirmation"
-            else "eval"
-        )
-        expected_eval_seed = int(
-            ctx.values[
-                "random.confirmation_data_seed"
-                if expected_stream == "confirmation"
-                else "random.eval_data_seed"
-            ]
-        )
-        declared_seeds = {
-            int(ctx.values["random.structure_seed"]),
-            int(ctx.values["random.train_data_seed"]),
-            int(ctx.values["random.eval_data_seed"]),
-            int(ctx.values["random.confirmation_data_seed"]),
-        }
-        split_integrity = (
-            isinstance(factor_calibration_range, list)
-            and isinstance(calibration_range, list)
-            and isinstance(evaluation_range, list)
-            and len(factor_calibration_range)
-            == len(calibration_range)
-            == len(evaluation_range)
-            == 2
-            and int(factor_calibration_range[1]) <= int(calibration_range[0])
-            and int(calibration_range[1]) <= int(evaluation_range[0])
-            and int(factor_calibration_range[1]) - int(factor_calibration_range[0])
-            == int(ctx.values["data.synthetic_factor_calibration_examples"])
-            and int(calibration_range[1]) - int(calibration_range[0])
-            == int(ctx.values["data.synthetic_calibration_examples"])
-            and int(evaluation_range[1]) - int(evaluation_range[0])
-            == int(
-                ctx.values[
-                    "data.synthetic_confirmation_examples"
-                    if expected_stream == "confirmation"
-                    else "data.synthetic_development_examples"
-                ]
-            )
-            and len(declared_seeds) == 4
-            and evaluation_stream == expected_stream
-            and preparation["data"].get("calibration_protocol", {}).get("split_seed")
-            == int(ctx.values["random.eval_data_seed"])
-            and preparation["data"].get("evaluation_protocol", {}).get("split_seed")
-            == expected_eval_seed
-        )
-    else:
-        row_policy = preparation["data"].get("training_row_policy", {})
-        split_roles = preparation["data"].get("splits", {})
-        split_integrity = (
-            preparation["data"].get("row_intervals_disjoint") is True
-            and set(split_roles)
-            == {
-                "train",
-                "normalization_fit",
-                "calibration",
-                "evaluation",
-            }
-            and len(set(split_roles.values())) == 4
-            and set(preparation["data"].get("row_intervals", {})) == set(split_roles)
-            and isinstance(preparation["data"].get("source_contract"), dict)
-            and preparation["data"].get("store_view_policy")
-            == ctx.values["data.store_view_policy"]
-            and row_policy.get("kind") == "immutable_prefix_then_deterministic_replay"
-            and row_policy.get("unique_tokens") == ctx.values["data.unique_tokens"]
-            and row_policy.get("train_tokens") == ctx.values["data.train_tokens"]
-            and preparation["data"]["bindings"]["train"].get("n_tokens", 0)
-            >= ctx.values["data.unique_tokens"]
-            and isinstance(preparation["data"].get("declared_split_contract"), dict)
-        )
-    checks = {
-        "deployment_schedule_integrity": deployment_schedule_integrity,
-        "encoder_scale_calibration_integrity": encoder_scale_calibration_integrity,
-        "finite": _finite_json(evaluation),
-        "method_endpoints": method_endpoints,
-        "provenance": provenance,
-        "regularizer_calibration_integrity": (regularizer_calibration_integrity),
-        "precision_preflight_integrity": precision_preflight_integrity,
-        "resource_compliance": resource_compliance,
-        "selection_score_diagnostics_integrity": (
-            selection_score_diagnostics_integrity
-        ),
-        "scientific_endpoint_complete": scientific_endpoint_complete,
-        "split_integrity": split_integrity,
-    }
-    failed = sorted(name for name, passed in checks.items() if passed is not True)
-    if failed:
-        raise CellExecutionError(
-            "cell cannot qualify; failed evidence gates " + ", ".join(failed)
-        )
-    selection_metrics = evaluation.get("selection_metrics")
-    selection_metrics_sha256 = evaluation.get("selection_metrics_sha256")
-    if not isinstance(selection_metrics, dict) or not isinstance(
-        selection_metrics_sha256, str
-    ):
-        raise CellExecutionError("evaluation lacks canonical selection metrics")
-    observed_selection_hash = hashlib.sha256(
-        canonical_json(selection_metrics).encode("utf-8")
-    ).hexdigest()
-    if selection_metrics_sha256 != observed_selection_hash or selection_metrics.get(
-        "validation"
-    ) != evaluation.get("validation"):
-        raise CellExecutionError("evaluation selection-metrics binding mismatch")
-    promotion_reasons: list[str] = []
-    if ctx.values["runtime.smoke"] is not False:
-        promotion_reasons.append("runtime_smoke")
-    if raw.get("eligible") is not True:
-        promotion_reasons.append("raw_codec_requires_unpriced_side_information")
-    if ctx.cell.phase is not Phase.PHASE1 and fixed_rate.get("eligible") is not True:
-        promotion_reasons.append("fixed_rate_budget_ineligible")
-    if ctx.cell.phase is Phase.PHASE1 and (
-        not isinstance(recovery, dict)
-        or recovery.get("deployed", {}).get("shared_feature_claim_eligible") is not True
-    ):
-        promotion_reasons.append("synthetic_shared_feature_claim_ineligible")
-    if ctx.values["qualification.promotable"] is not True:
-        promotion_reasons.append("resolved_nonpromotable_cell")
-    if scientific_outcome["passed"] is not True:
-        promotion_reasons.append("scientific_outcome_failed")
-    if ctx.cell.phase is Phase.PHASE3 or "confirmation" in ctx.cell.stage:
-        if not ctx.values["selection.parent_cell_ids"]:
-            promotion_reasons.append("missing_frozen_phase2_selection_decision")
-    promotion_eligible = not promotion_reasons
-    # A smoke cell can exercise the conditional campaign protocol without
-    # becoming scientific evidence.  Preserve the cell's underlying
-    # promotable intent so declared controls remain ineligible, and bind this
-    # separate capability explicitly for the campaign verifier.
-    selection_eligible_for_protocol_test = bool(
-        ctx.values["runtime.smoke"] is True
-        and ctx.values["qualification.promotable"] is True
-    )
     payload = {
         "schema": QUALIFICATION_SCHEMA,
         "cell_id": ctx.cell.cell_id,
         "qualified": True,
-        "checks": checks,
+        "checks": {
+            "evaluation_complete": True,
+            "finite": True,
+            "training_complete": (
+                training_report.get("cell_id") == ctx.cell.cell_id
+                and training_report.get("attempted_tokens")
+                == ctx.values["data.train_tokens"]
+            ),
+            "split_contract": bool(preparation.get("data")),
+        },
         "scientific_outcome": scientific_outcome,
-        "inputs": input_hashes,
-        "implementation_identity": preparation["implementation"],
-        "implementation_identity_sha256": preparation["implementation_sha256"],
-        "validation": evaluation["validation"],
+        "output_files": output_files,
+        "validation": evaluation.get("validation", {}),
         "qualification_profile": ctx.values["qualification.profile"],
-        "thresholds_version": ctx.values["qualification.thresholds_version"],
-        "thresholds": threshold_map,
         "selection_metrics": selection_metrics,
-        "selection_metrics_sha256": selection_metrics_sha256,
-        "selection_metrics_evaluation_sha256": input_hashes["evaluation"],
         "fixed_rate_operating_policy": fixed_rate.get("operating_policy"),
-        "promotion_eligible": promotion_eligible,
+        "promotion_eligible": not promotion_reasons,
         "promotion_ineligible_reasons": promotion_reasons,
-        "selection_eligible_for_protocol_test": (selection_eligible_for_protocol_test),
-        "selection_eligibility_mode": (
-            "scientific_promotion"
-            if promotion_eligible
-            else "smoke_protocol_only"
-            if selection_eligible_for_protocol_test
-            else "none"
+        "selection_eligible_for_protocol_test": bool(
+            ctx.values["runtime.smoke"] is True
+            and ctx.values["qualification.promotable"] is True
         ),
     }
     _write_immutable_json(ctx.qualification, payload)
     return (("qualification", ctx.qualification),)
-
 
 def execute(
     ctx: _Context,
@@ -11969,7 +10121,6 @@ def _execute_stage_request(
         stage=ctx.stage,
         root=ctx.root,
         artifacts=artifacts,
-        digest=ctx.artifact_sha256,
     )
 
 

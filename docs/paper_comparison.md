@@ -113,7 +113,7 @@ budget. The Mistral SASA setting uses block 8, 500M tokens, context 512,
 The paper does not disclose numeric `lambda_dim`, so the live paper bridge does
 not transfer an invented absolute coefficient across dimensions or reduction
 conventions. After all declared initialization and encoder-scale fitting, it
-measures the unweighted map penalty and reconstruction loss on the hash-bound
+measures the unweighted map penalty and reconstruction loss on the declared
 first training batch in fp32 and resolves the coefficient to target an initial
 penalty/reconstruction ratio. The independent SASA ladder is
 `0/.01/.03/.10`, centered at `.03`; the zero arm retains the map objective.
@@ -200,12 +200,11 @@ cells**: six initial learnability cells and nine confirmation cells.
 
 ### 4.1 Transfer to Phase 2
 
-The frozen `bsc-phase1-transfer-v3` payload separates the universal method
-contract, the signed-coordinate/decoded-energy provisional carrier, and all
-diagnostic capability panels; it also binds claim-scope narrowing, selection
-IDs, source plan/blueprint IDs, evidence hashes, and its own content ID. It
-contains no synthetic numeric winner for architecture, width, rank, masking,
-score, selector, optimizer, or scale, and capability failures do not filter the pilot.
+The Phase-1 decision separates the universal method contract, the
+signed-coordinate/decoded-energy provisional carrier, and the diagnostic
+capability panels. It contains no synthetic numeric winner for architecture,
+width, rank, masking, score, selector, optimizer, or scale, and capability
+failures do not filter the pilot.
 The signed coordinate ontology is universal, while the literal activation
 operator and score are explicitly reopened; group soft thresholding remains a
 signed-coordinate Phase-2 method.
@@ -272,10 +271,10 @@ achieved packet rate.
 Every development stage retains one candidate using mean raw FVU at the frozen
 256, 384, and 512 total-bit/token budgets. Operational packet bits and exact
 serialized codec bytes amortized over 100M tokens are included. Adjacent
-lower-envelope mixtures use the content-bound
+lower-envelope mixtures use the declared
 `balanced_global_token_counter_u64_v1` schedule, requiring no per-token side
 bits. Each selected operating point is serialized as an exact 32-byte record
-in the immutable `deployment_schedules` bundle, reloaded through the consumer
+in the `deployment_schedules` bundle, reloaded through the consumer
 path, and amortized with the deployable codec. Mixture distortion is measured
 by executing those bytes on paired raw rows, not by averaging the aggregate
 endpoint FVUs. The score comes only from the
@@ -299,8 +298,8 @@ selected mask is Bernoulli zero.
 The nonselectable confirmation round does not tune a gauge. Panel freeze uses
 the scalar-RMS rerun and requires every seed to re-pass qualification while
 remaining within `0.02` fixed-rate score of its exact development parent. This
-is a novel project reproducibility rule, content-bound in the confirmation
-cells with a `.01/.02/.05` marginal sensitivity report; it is not attributed
+is a novel project reproducibility rule with a `.01/.02/.05` marginal
+sensitivity report; it is not attributed
 to a paper.
 
 BSC selected-parent/revisit policies and comparator-family policies use the
@@ -313,11 +312,11 @@ not part of the source architecture.
 
 The winner-changing practical-effect and noninferiority thresholds are novel
 preregistered project policies, not values from any paper. Each applicable
-policy content-binds the complete sensitivity grid: minimum effect
+policy reports the complete sensitivity grid: minimum effect
 `0/.001/.002/.005`; noninferiority `.005/.01/.02`; and confirmation score
 degradation `.01/.02/.05`.
 Each selection artifact reports marginal counterfactual pass sets from the
-authenticated measurements without retuning the center policy.
+measured results without retuning the center policy.
 
 Six independent comparator-family chains branch from their own anchor
 selection. Width/activity are calibrated for block families; Group Lasso
@@ -329,13 +328,13 @@ learning-rate ladder `3e-5/1e-4/2e-4/3e-4` as applicable. One top-two nomination
 policy ranks the complete union of qualified
 4M family-round candidates, deduplicates resolved non-replicate execution
 signatures before outcome ranking while preserving every stage/candidate alias
-and metric spread, and binds one universe hash. The earliest declared source
+and metric spread. The earliest declared source
 round is the representative, preventing best-of-repeats bias. Comparator-family policies report but do not gate on BSC sharing
 admission, so a deliberately non-sharing baseline cannot disappear before the
 comparison. Each chain ends with a fresh 16M-token revisit of that overall
 winner and strongest distinct resolved runner-up,
 followed by a one-winner family selection. This probes local path/order sensitivity but does not
-claim a global optimum. Phase 3 consumes those content-addressed family
+claim a global optimum. Phase 3 consumes those reviewed family
 selections, never the root anchors. At seeds 0 and 1 the blueprint derives
 a pre-elision ceiling of **176 main-chain cells** and **202 control-family cells**,
 **378 total**, computed from the manifest. The main chain has 18 anchors and
@@ -522,7 +521,7 @@ Pattern-specific threshold calibration and a fixed effective-rank codec remain
 contingent on reproducible missingness-rate drift and decoder-Gram anisotropy,
 respectively, with every new basis/rank byte priced.
 
-## 9. Adversarial non-paper design-space triage
+## 9. Non-paper design-space triage
 
 No item below is source-exact for a same-model signed block crosscoder. An
 `adapted` label means the nearest paper supplies a mechanism, while the block,
@@ -559,7 +558,7 @@ hyperparameter space:
   identification under study; any diagnostic must use calibration-only fits,
   an identity control, and fully priced dense maps.
 
-The audit also rejects several superficially cheap axes. A learned scalar site
+The design also rejects several superficially cheap axes. A learned scalar site
 weight is non-identifiable with the free untied site encoders; rare-token or
 high-norm oversampling changes the target distribution without truth labels;
 and causal/downstream losses change the estimand from activation
