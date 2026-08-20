@@ -50,8 +50,8 @@ def _sparse_decode_forward(
                 )
             else:
                 weight_offsets = (
-                    (group * block_dim + coordinate) * output_width + output_offsets
-                )
+                    group * block_dim + coordinate
+                ) * output_width + output_offsets
             decoder = tl.load(
                 weight + weight_offsets,
                 mask=output_offsets < output_width,
@@ -102,8 +102,8 @@ def _sparse_decode_backward_code(
             )
         else:
             weight_offsets = (
-                (group * block_dim + coordinate) * output_width + output_offsets
-            )
+                group * block_dim + coordinate
+            ) * output_width + output_offsets
         decoder = tl.load(
             weight + weight_offsets,
             mask=output_offsets < output_width,
@@ -158,8 +158,8 @@ def _sparse_decode_backward_weight(
         )
     else:
         weight_offsets = (
-            (group * block_dim + coordinate) * output_width + output_offsets
-        )
+            group * block_dim + coordinate
+        ) * output_width + output_offsets
     tl.store(
         grad_weight + weight_offsets,
         accumulator,

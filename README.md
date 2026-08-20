@@ -81,12 +81,16 @@ than a separate promotion hurdle.
   transitions
 - `block_crosscoder_experiment/cli/` — the `bsc` command
 - `docs/design.md` — complete scientific contract
-- `docs/paper_comparison.md` — bridges to the source papers
-- `docs/findings.md` — evidence-bound reporting surface
+- `docs/methods.md` — source bridges and executable conditional matrix
+- `docs/findings.md` — evidence-bound scientific report
+- `docs/replication.md` — one-command CUDA replication contract
+- `references/` — bibliography, literature synthesis, and curated source notes
+- `figures/` — publication figures and their compact metric inputs
+- `data/summary/` — machine-readable campaign headlines
 
 Generated checkpoints, stores, evaluations, and logs are local artifacts.
-Compact result tables live in `data/summary/`; publication figures live in
-`docs/figures/`.
+Downloaded paper copies live under ignored `references/sources/` and
+`references/pdfs/`; they are research inputs rather than repository content.
 
 ## Quick start
 
@@ -111,7 +115,7 @@ reviewer's request: LR `6e-4`, batch 512, no warmup, final-fifth decay, and
 the weight-1 frequency-dead auxiliary. This exact 16M extrapolation was not
 previously run or confirmed; the artifact and result say so directly.
 
-See [`docs/reviewer_setup.md`](docs/reviewer_setup.md) for the hardware and
+See [`docs/replication.md`](docs/replication.md) for the hardware and
 storage expectation, resume behavior, exact formula, and artifact-loading
 example.
 

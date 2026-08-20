@@ -1,6 +1,5 @@
-# Load-bearing papers for this experiment. Markdown copies live beside this
-# file, gitignored — (re)fetch them with:
-#   python -m transformer_experiments.references
+# Load-bearing papers for this experiment. Generated Markdown copies are
+# gitignored under sources/. See README.md for the refresh-and-file command.
 references:
   - arxiv: "2404.16014"
     note: Gated SAEs separate support selection from magnitude estimation; shrinkage control baseline.

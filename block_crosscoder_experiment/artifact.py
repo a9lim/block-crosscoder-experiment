@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from .codec import Codec, EncodedBatch, decode_batch, encode_batch
-from .model import BSCConfig, BlockCrosscoder
+from .model import BlockCrosscoder, BSCConfig
 
 ARTIFACT_SCHEMA = "bsc-winning-formula-artifact-v1"
 DEFAULT_ARTIFACT_NAME = "bsc-16m.pt"
@@ -91,7 +91,7 @@ def load_artifact(
 
 __all__ = [
     "ARTIFACT_SCHEMA",
-    "BSCArtifact",
     "DEFAULT_ARTIFACT_NAME",
+    "BSCArtifact",
     "load_artifact",
 ]

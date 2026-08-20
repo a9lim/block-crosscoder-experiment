@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import fcntl
 import hashlib
 import itertools
@@ -15,15 +14,16 @@ import shutil
 import socket
 import stat
 import tempfile
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any
 
 import torch
 
-from block_crosscoder_experiment.implementation import host_cuda_execution_lock
 from block_crosscoder_experiment.durability import durable_mkdir
-
+from block_crosscoder_experiment.implementation import host_cuda_execution_lock
 from block_crosscoder_experiment.store import (
     NORMALIZATION_MODES,
     STORE_FORMAT_VERSION,
@@ -167,7 +167,7 @@ class SourceSpec:
     hook: str
 
     @classmethod
-    def parse(cls, text: str) -> "SourceSpec":
+    def parse(cls, text: str) -> SourceSpec:
         # MODEL|REVISION|HOOK; an empty revision resolves the current HF ref to
         # an immutable commit before capture.
         parts = text.split("|", 2)
@@ -559,7 +559,7 @@ def expected_capture_source_contract(values: Mapping[str, Any]) -> dict[str, Any
     base: dict[str, Any] = {
         "sources": [
             {"model": model, "revision": revision, "hook": hook}
-            for model, revision, hook in zip(models, revisions, hooks)
+            for model, revision, hook in zip(models, revisions, hooks, strict=True)
         ],
         "corpus": singleton("data.corpus"),
         "corpus_config": singleton("data.corpus_config"),
@@ -1817,7 +1817,7 @@ def _derive_views_unlocked(
                 for x, row_ids in reader.sequential_batches_with_ids(batch_size):
                     writer.add(transform.apply(x), row_ids)
                 manifest = writer.close()
-            except BaseException as producer_error:  # noqa: BLE001
+            except BaseException as producer_error:
                 try:
                     writer.abort()
                 except BaseException as drain_error:  # noqa: BLE001
@@ -2950,7 +2950,7 @@ def _capture_unlocked(
                     writer.add(x, row_ids)
                 remaining -= count
             manifest = writer.close()
-        except BaseException as producer_error:  # noqa: BLE001
+        except BaseException as producer_error:
             try:
                 writer.abort()
             except BaseException as drain_error:  # noqa: BLE001
@@ -3012,13 +3012,15 @@ def capture(
     failure_injector: Callable[[str, int], None] | None = None,
 ) -> dict[str, object]:
     _preflight_capture_arguments(args)
-    with _producer_lock(args.out, operation="capture"):
-        with host_cuda_execution_lock(
+    with (
+        _producer_lock(args.out, operation="capture"),
+        host_cuda_execution_lock(
             args.device,
             operation="activation-capture",
             owner_id=str(args.out.resolve()),
-        ):
-            return _capture_unlocked(args, failure_injector=failure_injector)
+        ),
+    ):
+        return _capture_unlocked(args, failure_injector=failure_injector)
 
 
 def main(argv: Iterable[str] | None = None) -> None:

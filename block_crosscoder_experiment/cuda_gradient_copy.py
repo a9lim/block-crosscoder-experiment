@@ -51,9 +51,7 @@ def _copy_bf16_gradient_and_flag(
     values = tl.load(source + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(destination + offsets, values, mask=mask)
 
-    unsafe_values = mask & (
-        (values != values) | (tl.abs(values) >= safe_l2_limit)
-    )
+    unsafe_values = mask & ((values != values) | (tl.abs(values) >= safe_l2_limit))
     block_unsafe = tl.max(unsafe_values.to(tl.int32), axis=0)
     if tl.program_id(0) == 0:
         rec_value = tl.load(rec)

@@ -404,7 +404,7 @@ blocks 3/5/7. The seam closes enough to meet the declared ring read only at
 block 9. Meanwhile, the variance captured by the first two dimensions rises
 from 39.2% to 43.4%.
 
-![Raw GPT-2 month geometry across layers](figures/phase2/month_raw_residual_layers_2d.png)
+![Raw GPT-2 month geometry across layers](../figures/phase2/month_raw_residual_layers_2d.png)
 
 **Learned BSC geometry.** The highest-response block is active in 100% of the
 probe rows under the trained BatchTopK selector in both seeds, but the
@@ -424,13 +424,13 @@ The 3D views show that these are not artifacts of independently chosen 2D
 rotations: the BSC panels share one width-four projection basis within each
 seed.
 
-![Per-layer BSC month geometry in 2D](figures/phase2/month_bsc_layers_2d.png)
+![Per-layer BSC month geometry in 2D](../figures/phase2/month_bsc_layers_2d.png)
 
-![Per-layer BSC month geometry in 3D](figures/phase2/month_bsc_layers_3d.png)
+![Per-layer BSC month geometry in 3D](../figures/phase2/month_bsc_layers_3d.png)
 
-![Joint BSC month geometry](figures/phase2/month_bsc_joint_2d.png)
+![Joint BSC month geometry](../figures/phase2/month_bsc_joint_2d.png)
 
-![Top month-responsive BSC feature blocks](figures/phase2/month_bsc_feature_gallery_2d.png)
+![Top month-responsive BSC feature blocks](../figures/phase2/month_bsc_feature_gallery_2d.png)
 
 **Interpretation.** The positive result is calendar topology rather than a
 perfect Euclidean circle. Raw GPT-2 residuals show a clean layer-dependent
@@ -442,7 +442,7 @@ manifold structure without making a seed-stable, canonical-circle claim.
 
 The complete 2D/3D coordinates, top-block rankings, selection frequencies, and
 metric definitions are retained in
-[`month_geometry_metrics.json`](figures/phase2/month_geometry_metrics.json).
+[`month_geometry_metrics.json`](../figures/phase2/month_geometry_metrics.json).
 
 ## Comparator-family development
 

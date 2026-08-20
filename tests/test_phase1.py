@@ -7,8 +7,8 @@ import pytest
 import torch
 
 from block_crosscoder_experiment.phase1 import (
-    FelSyntheticConfig,
     LADDER_STEPS,
+    FelSyntheticConfig,
     LadderSyntheticConfig,
     make_fel_dataset,
     make_ladder_dataset,
@@ -513,18 +513,14 @@ def test_ladder_orthogonal_truth_is_exact_and_marks_multisite_claims(n_sites: in
             torch.eye(24),
             atol=2e-5,
         )
-    expected = torch.full_like(
-        dataset.realized_pair_principal_angles_degrees, 90.0
-    )
+    expected = torch.full_like(dataset.realized_pair_principal_angles_degrees, 90.0)
     assert torch.allclose(
         dataset.realized_pair_principal_angles_degrees,
         expected,
         atol=2e-5,
     )
     assert dataset.ground_truth["target_pair_principal_angle_degrees"] == 90.0
-    assert bool(dataset.ground_truth["shared_feature_claim_eligible"]) is (
-        n_sites > 1
-    )
+    assert bool(dataset.ground_truth["shared_feature_claim_eligible"]) is (n_sites > 1)
 
 
 def test_ladder_one_factor_contract_has_empty_pair_diagnostics():

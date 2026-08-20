@@ -9,8 +9,9 @@ import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
@@ -104,9 +105,7 @@ def _capture(raw: Path, *, device: str, resume: bool) -> None:
         "capture",
     ]
     for hook in HOOKS:
-        command.extend(
-            ("--source", f"{GPT2_MODEL}|{GPT2_MODEL_REVISION}|{hook}")
-        )
+        command.extend(("--source", f"{GPT2_MODEL}|{GPT2_MODEL_REVISION}|{hook}"))
     command.extend(
         (
             "--corpus",
@@ -287,12 +286,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "runtime": runtime,
         "training": training,
-        "evaluation": _read_json(
-            artifacts["evaluation"].resolve(campaign.root)
-        ),
-        "qualification": _read_json(
-            artifacts["qualification"].resolve(campaign.root)
-        ),
+        "evaluation": _read_json(artifacts["evaluation"].resolve(campaign.root)),
+        "qualification": _read_json(artifacts["qualification"].resolve(campaign.root)),
     }
     _write_json(result_path, result)
     if not args.keep_work:

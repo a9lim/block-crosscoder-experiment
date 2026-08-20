@@ -18,6 +18,10 @@ COMMANDS: dict[str, tuple[str, str]] = {
         "block_crosscoder_experiment.cli.run_cell",
         "execute one resolved cell stage",
     ),
+    "figures": (
+        "block_crosscoder_experiment.analysis.month_geometry",
+        "render the publication month-geometry figure set",
+    ),
     "replicate": (
         "block_crosscoder_experiment.cli.replicate",
         "train the selected 16M BSC formula on CUDA",

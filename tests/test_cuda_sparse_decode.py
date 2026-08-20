@@ -9,7 +9,7 @@ pytest.importorskip("triton")
 
 from block_crosscoder_experiment.cuda_sparse_decode import cuda_sparse_topk_decode
 from block_crosscoder_experiment.gram import gram_residual
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.trainer import TrainConfig, Trainer
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -316,11 +316,11 @@ def test_sparse_unfactorized_qr_trainer_has_bounded_trajectory_drift(
         strict=True,
     ):
         parameter_delta_sq += (
-            sparse_parameter.float() - dense_parameter.float()
-        ).square().sum()
+            (sparse_parameter.float() - dense_parameter.float()).square().sum()
+        )
         parameter_scale_sq += dense_parameter.float().square().sum()
-    parameter_drift = (
-        parameter_delta_sq.sqrt() / parameter_scale_sq.sqrt().clamp_min(1e-30)
+    parameter_drift = parameter_delta_sq.sqrt() / parameter_scale_sq.sqrt().clamp_min(
+        1e-30
     )
     assert float(parameter_drift) <= 0.05
     assert float(gram_residual(sparse.master.decoder_tensor()).max()) <= 1e-4

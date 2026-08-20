@@ -1,11 +1,10 @@
 """Offline tests for the preregistered R-D codec (tranche 3)."""
 
 import copy
-from dataclasses import replace
 import gc
 import json
 import weakref
-
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -15,15 +14,15 @@ import block_crosscoder_experiment.codec as codec_module
 from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
-    _RDEvaluationInput,
-    _RDEvaluationSelection,
-    _RDEvaluationSession,
     _artifact_digest,
     _decode_trusted_packet_events_q_chunks,
     _encode_batch_all_q_events,
     _evaluate_rd_stream,
     _grouped_coordinate_quantiles,
     _packet_from_output,
+    _RDEvaluationInput,
+    _RDEvaluationSelection,
+    _RDEvaluationSession,
     _rotate_multi_q_events,
     decode_batch,
     decode_batch_all_q,
@@ -34,10 +33,10 @@ from block_crosscoder_experiment.codec import (
     fit_codec,
 )
 from block_crosscoder_experiment.model import (
-    BSCOutput,
-    BSCSelection,
     BlockCrosscoder,
     BSCConfig,
+    BSCOutput,
+    BSCSelection,
 )
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,

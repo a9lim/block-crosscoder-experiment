@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import fcntl
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 import torch
-
 
 CANONICAL_EXECUTOR_SCHEMA = "bsc-cell-executor-simple-v1"
 CANONICAL_EXECUTOR_PROCESS_MODEL = "ordinary-stage-files-v1"

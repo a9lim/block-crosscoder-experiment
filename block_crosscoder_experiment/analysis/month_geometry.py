@@ -15,19 +15,19 @@ import argparse
 import gc
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import matplotlib
 import numpy as np
 import torch
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
-
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 
 MONTHS = (
     "January",
@@ -140,7 +140,9 @@ def _circle_radial_cv(points: np.ndarray) -> float:
     return float(radii.std() / max(float(radii.mean()), np.finfo(float).eps))
 
 
-def _calendar_metrics(points: np.ndarray, *, permutations: int = 20_000) -> dict[str, float | str]:
+def _calendar_metrics(
+    points: np.ndarray, *, permutations: int = 20_000
+) -> dict[str, float | str]:
     points, _ = _shape_normalize(points)
     distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
     calendar_edges = np.array([distances[i, (i + 1) % 12] for i in range(12)])
@@ -161,23 +163,26 @@ def _calendar_metrics(points: np.ndarray, *, permutations: int = 20_000) -> dict
         dtype=int,
     )
     tri = np.triu_indices(12, 1)
-    distance_correlation = float(
-        np.corrcoef(distances[tri], cyclic_steps[tri])[0, 1]
-    )
+    distance_correlation = float(np.corrcoef(distances[tri], cyclic_steps[tri])[0, 1])
     observed_length = float(calendar_edges.sum())
     rng = np.random.default_rng(20260726)
     random_lengths = np.empty(permutations, dtype=np.float64)
     for item in range(permutations):
         order = rng.permutation(12)
         random_lengths[item] = sum(
-            distances[order[index], order[(index + 1) % 12]]
-            for index in range(12)
+            distances[order[index], order[(index + 1) % 12]] for index in range(12)
         )
-    permutation_p = float((1 + np.sum(random_lengths <= observed_length)) / (permutations + 1))
-    closure_ratio = float(calendar_edges[-1] / max(float(calendar_edges[:-1].mean()), np.finfo(float).eps))
+    permutation_p = float(
+        (1 + np.sum(random_lengths <= observed_length)) / (permutations + 1)
+    )
+    closure_ratio = float(
+        calendar_edges[-1] / max(float(calendar_edges[:-1].mean()), np.finfo(float).eps)
+    )
     radial_cv = _circle_radial_cv(points)
     neighbor_recall = neighbor_hits / 24.0
-    edge_ratio = float(calendar_edges.mean() / max(float(np.mean(noncalendar)), np.finfo(float).eps))
+    edge_ratio = float(
+        calendar_edges.mean() / max(float(np.mean(noncalendar)), np.finfo(float).eps)
+    )
     if (
         neighbor_recall >= 0.625
         and permutation_p <= 0.05
@@ -202,7 +207,9 @@ def _calendar_metrics(points: np.ndarray, *, permutations: int = 20_000) -> dict
     }
 
 
-def _capture_month_activations(device: torch.device) -> tuple[torch.Tensor, dict[str, Any]]:
+def _capture_month_activations(
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, Any]]:
     from sae_lens import HookedSAETransformer
 
     model = HookedSAETransformer.from_pretrained_no_processing(
@@ -283,13 +290,13 @@ def _load_deployable(
     if normalization.get("kind") != "frozen_transform":
         raise RuntimeError("geometry analysis requires a frozen scalar-RMS transform")
     if normalization.get("mode") != "scalar_rms":
-        raise RuntimeError(
-            f"expected scalar_rms, got {normalization.get('mode')!r}"
-        )
+        raise RuntimeError(f"expected scalar_rms, got {normalization.get('mode')!r}")
     return model, normalization
 
 
-def _normalize(raw: torch.Tensor, normalization: dict[str, Any], device: torch.device) -> torch.Tensor:
+def _normalize(
+    raw: torch.Tensor, normalization: dict[str, Any], device: torch.device
+) -> torch.Tensor:
     mean = normalization["mean"].to(device=device, dtype=torch.float32)
     diagonal = torch.diagonal(
         normalization["W"].to(device=device, dtype=torch.float32),
@@ -353,18 +360,28 @@ def _seed_geometry(
         site = torch.einsum("nsd,sgbd->nsgb", x, encoder)
         joint = model.encode(x)
         selection = model.select(joint, mode="topk", x=x)
-    site_np = site.float().cpu().numpy().reshape(
-        templates,
-        months,
-        sites,
-        model.cfg.n_blocks,
-        model.cfg.block_dim,
+    site_np = (
+        site.float()
+        .cpu()
+        .numpy()
+        .reshape(
+            templates,
+            months,
+            sites,
+            model.cfg.n_blocks,
+            model.cfg.block_dim,
+        )
     )
-    joint_np = joint.float().cpu().numpy().reshape(
-        templates,
-        months,
-        model.cfg.n_blocks,
-        model.cfg.block_dim,
+    joint_np = (
+        joint.float()
+        .cpu()
+        .numpy()
+        .reshape(
+            templates,
+            months,
+            model.cfg.n_blocks,
+            model.cfg.block_dim,
+        )
     )
     selection_frequency = selection.float().mean(dim=0).cpu().numpy()
     order, top_blocks = _response_ranking(joint_np, selection_frequency)
@@ -376,7 +393,9 @@ def _seed_geometry(
     joint_centered = joint_block - joint_block.mean(axis=1, keepdims=True)
     site_centroids = site_centered.mean(axis=0).transpose(1, 0, 2)
     joint_centroids = joint_centered.mean(axis=0)
-    combined = np.concatenate((site_centroids.reshape(-1, model.cfg.block_dim), joint_centroids))
+    combined = np.concatenate(
+        (site_centroids.reshape(-1, model.cfg.block_dim), joint_centroids)
+    )
     basis, explained = _pca_basis(combined, 3)
     site_projected = np.einsum("smb,bk->smk", site_centroids, basis)
     joint_projected = joint_centroids @ basis
@@ -478,10 +497,20 @@ def _draw_cycle_2d(ax: plt.Axes, points: np.ndarray, *, annotate: bool = True) -
     colors = _month_colors()
     closed = np.vstack((points, points[:1]))
     ax.plot(closed[:, 0], closed[:, 1], color="#59636e", linewidth=1.2, alpha=0.72)
-    ax.scatter(points[:, 0], points[:, 1], c=colors, s=52, edgecolor="white", linewidth=0.7, zorder=3)
+    ax.scatter(
+        points[:, 0],
+        points[:, 1],
+        c=colors,
+        s=52,
+        edgecolor="white",
+        linewidth=0.7,
+        zorder=3,
+    )
     if annotate:
         for label, (x, y) in zip(MONTH_LABELS, points, strict=True):
-            ax.annotate(label, (x, y), xytext=(4, 4), textcoords="offset points", fontsize=8)
+            ax.annotate(
+                label, (x, y), xytext=(4, 4), textcoords="offset points", fontsize=8
+            )
     ax.axhline(0, color="#d9dde2", linewidth=0.6, zorder=0)
     ax.axvline(0, color="#d9dde2", linewidth=0.6, zorder=0)
     ax.set_aspect("equal", adjustable="datalim")
@@ -492,8 +521,24 @@ def _draw_cycle_2d(ax: plt.Axes, points: np.ndarray, *, annotate: bool = True) -
 def _draw_cycle_3d(ax: Any, points: np.ndarray) -> None:
     colors = _month_colors()
     closed = np.vstack((points, points[:1]))
-    ax.plot(closed[:, 0], closed[:, 1], closed[:, 2], color="#59636e", linewidth=1.1, alpha=0.74)
-    ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=38, depthshade=False, edgecolor="white", linewidth=0.5)
+    ax.plot(
+        closed[:, 0],
+        closed[:, 1],
+        closed[:, 2],
+        color="#59636e",
+        linewidth=1.1,
+        alpha=0.74,
+    )
+    ax.scatter(
+        points[:, 0],
+        points[:, 1],
+        points[:, 2],
+        c=colors,
+        s=38,
+        depthshade=False,
+        edgecolor="white",
+        linewidth=0.5,
+    )
     for label, point in zip(MONTH_LABELS, points, strict=True):
         ax.text(point[0], point[1], point[2], label, fontsize=7)
     ax.set_xticks([])
@@ -510,10 +555,14 @@ def _save_figure(fig: plt.Figure, path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_bsc_layers(results: Iterable[SeedGeometry], output: Path, *, dimensions: int) -> None:
+def _plot_bsc_layers(
+    results: Iterable[SeedGeometry], output: Path, *, dimensions: int
+) -> None:
     results = tuple(results)
     if dimensions == 2:
-        fig, axes = plt.subplots(len(results), 4, figsize=(15.5, 7.4), constrained_layout=True)
+        fig, axes = plt.subplots(
+            len(results), 4, figsize=(15.5, 7.4), constrained_layout=True
+        )
         axes = np.atleast_2d(axes)
         for row, result in enumerate(results):
             for layer in range(4):
@@ -556,10 +605,14 @@ def _plot_bsc_layers(results: Iterable[SeedGeometry], output: Path, *, dimension
     _save_figure(fig, output)
 
 
-def _plot_joint(results: Iterable[SeedGeometry], output: Path, *, dimensions: int) -> None:
+def _plot_joint(
+    results: Iterable[SeedGeometry], output: Path, *, dimensions: int
+) -> None:
     results = tuple(results)
     if dimensions == 2:
-        fig, axes = plt.subplots(1, len(results), figsize=(11, 5.2), constrained_layout=True)
+        fig, axes = plt.subplots(
+            1, len(results), figsize=(11, 5.2), constrained_layout=True
+        )
         axes = np.atleast_1d(axes)
         for ax, result in zip(axes, results, strict=True):
             _draw_cycle_2d(ax, result.joint_points_2d)
@@ -631,7 +684,9 @@ def _plot_raw(raw_geometry: dict[str, Any], output: Path, *, dimensions: int) ->
 
 def _plot_gallery(results: Iterable[SeedGeometry], output: Path) -> None:
     results = tuple(results)
-    fig, axes = plt.subplots(len(results), 3, figsize=(12.5, 7.3), constrained_layout=True)
+    fig, axes = plt.subplots(
+        len(results), 3, figsize=(12.5, 7.3), constrained_layout=True
+    )
     axes = np.atleast_2d(axes)
     for row, result in enumerate(results):
         for column, feature in enumerate(result.gallery):
@@ -734,7 +789,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Deployable-codec path, once per independent seed.",
     )
-    parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--output",
+        default="figures/phase2",
+        help="Output directory (default: figures/phase2).",
+    )
     parser.add_argument("--device", default="cuda")
     return parser
 

@@ -6,11 +6,11 @@ import hashlib
 import math
 import os
 import struct
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Mapping
+from typing import Any
 
 import torch
-
 
 MODEL_STATE_DIGEST_CONTRACT = "sha256_merkle_16m_v1"
 TYPED_PAYLOAD_DIGEST_CONTRACT = "sha256_typed_frames_v1"

@@ -39,7 +39,7 @@ The experiment is same-model and cross-layer. Its main source components are:
 
 No source publishes the complete signed vector-block crosscoder used here. The
 combined representation is a project hypothesis. Exact source bridges and
-adaptations are listed in [`paper_comparison.md`](paper_comparison.md).
+adaptations are listed in [`methods.md`](methods.md).
 
 Every scientific choice is labeled:
 

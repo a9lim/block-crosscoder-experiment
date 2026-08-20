@@ -86,13 +86,13 @@ def _advance_to_qualified(
             }
         )
     )
-    qualification = ArtifactRef.from_path(
-        "qualification", qualification_path, root
-    )
+    qualification = ArtifactRef.from_path("qualification", qualification_path, root)
     campaign.transition(cell_id, RunState.QUALIFIED, artifacts=(qualification,))
 
 
-def test_registration_writes_one_current_plan_and_state_per_cell(tmp_path: Path) -> None:
+def test_registration_writes_one_current_plan_and_state_per_cell(
+    tmp_path: Path,
+) -> None:
     campaign = _campaign(tmp_path)
 
     assert campaign.plan.plan_id.startswith("study:")
@@ -107,7 +107,7 @@ def test_registration_writes_one_current_plan_and_state_per_cell(tmp_path: Path)
 def test_artifacts_are_ordinary_paths_and_operator_edits_are_allowed(
     tmp_path: Path,
 ) -> None:
-    campaign = _campaign(tmp_path)
+    _campaign(tmp_path)
     path = _file(tmp_path, "notes.json", '{"choice": 1}')
     ref = ArtifactRef.from_path("notes", path, tmp_path)
 

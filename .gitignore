@@ -1,18 +1,12 @@
+# Downloaded source material is local; curated reference notes are tracked.
+references/sources/
+references/pdfs/
+
 # Generated research inputs and run products are local, reproducible artifacts.
-references/**
-!references/.gitkeep
-!references/refs.yaml
 data/**
-!data/.gitkeep
-!data/evidence/
-data/evidence/**
-!data/evidence/.gitkeep
 !data/summary/
 !data/summary/**
-figures/**
-!figures/README.md
-!figures/public/
-!figures/public/**
+figures/work/
 tmp/
 
 # Python
@@ -29,7 +23,3 @@ dist/
 .idea/
 .vscode/
 .claude/
-
-# run logs (regeneration helper output)
-logs/**
-!logs/.gitkeep

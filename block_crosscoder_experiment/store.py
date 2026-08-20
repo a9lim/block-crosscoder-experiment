@@ -29,24 +29,25 @@ import json
 import math
 import os
 import shutil
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any
 
 import torch
 
-from .serialization import TYPED_PAYLOAD_DIGEST_CONTRACT, tensor_payload_digest
 from .durability import durable_mkdir
+from .serialization import TYPED_PAYLOAD_DIGEST_CONTRACT, tensor_payload_digest
 
 __all__ = [
-    "cuda_prefetch_batches",
     "DEFAULT_RIDGE_SCALE",
     "NORMALIZATION_MODES",
-    "Whitener",
-    "WhitenerAccumulator",
     "ShardWriter",
     "StoreReader",
+    "Whitener",
+    "WhitenerAccumulator",
+    "cuda_prefetch_batches",
     "prefetch_batches",
 ]
 
@@ -264,7 +265,7 @@ class WhitenerAccumulator:
         if self.outer is not None:
             self.outer += torch.einsum("nsd,nse->sde", x64, x64)
 
-    def merge(self, other: "WhitenerAccumulator") -> "WhitenerAccumulator":
+    def merge(self, other: WhitenerAccumulator) -> WhitenerAccumulator:
         if (
             self.sum.shape != other.sum.shape
             or self.track_covariance != other.track_covariance
@@ -293,7 +294,7 @@ class WhitenerAccumulator:
         site_renorm: bool = False,
         mode: str = "whiten",
         mean_centered_norm: torch.Tensor | None = None,
-    ) -> "Whitener":
+    ) -> Whitener:
         """Fit and freeze one declared normalization transform in fp64.
 
         ``none`` stores raw activations. ``sqrt_d`` mean-centres and scales the
@@ -500,10 +501,9 @@ class Whitener:
 
         if not isinstance(self.sites, tuple) or len(self.sites) != n_sites:
             raise TypeError("whitener sites must be one tuple entry per site")
-        if (
-            any(type(site) is not int or site < 0 for site in self.sites)
-            or len(set(self.sites)) != len(self.sites)
-        ):
+        if any(type(site) is not int or site < 0 for site in self.sites) or len(
+            set(self.sites)
+        ) != len(self.sites):
             raise ValueError("whitener sites must be unique non-negative integers")
         if type(self.n_fit_tokens) is not int or self.n_fit_tokens <= 0:
             raise ValueError("whitener n_fit_tokens must be a positive integer")
@@ -516,7 +516,10 @@ class Whitener:
         if (
             not isinstance(raw_site_dims, list)
             or len(raw_site_dims) != n_sites
-            or any(type(width) is not int or width <= 0 or width > d_model for width in raw_site_dims)
+            or any(
+                type(width) is not int or width <= 0 or width > d_model
+                for width in raw_site_dims
+            )
         ):
             raise ValueError(
                 "whitener meta.site_dims must give one positive padded width per site"
@@ -630,14 +633,16 @@ class Whitener:
         _fsync_directory(path.parent)
 
     @classmethod
-    def load(cls, path: str | Path) -> "Whitener":
+    def load(cls, path: str | Path) -> Whitener:
         p = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(p, dict) or set(p) != WHITENER_PAYLOAD_KEYS:
             raise ValueError(f"whitener payload has a noncanonical field set in {path}")
         if p.get("schema") != WHITENER_ARTIFACT_SCHEMA:
             raise ValueError(f"whitener payload has the wrong schema in {path}")
         if p.get("digest_contract") != TYPED_PAYLOAD_DIGEST_CONTRACT:
-            raise ValueError(f"whitener payload has the wrong digest contract in {path}")
+            raise ValueError(
+                f"whitener payload has the wrong digest contract in {path}"
+            )
         if not isinstance(p.get("sites"), list):
             raise TypeError(f"whitener payload sites must be a list in {path}")
         w = cls(
@@ -1110,7 +1115,7 @@ class ShardWriter:
             if self._on_durable_shard is not None:
                 self._on_durable_shard(persisted)
             return persisted
-        except BaseException as exc:  # noqa: BLE001 - poison and re-raise exactly
+        except BaseException as exc:
             self._pending = None
             self._poison = exc
             raise
@@ -1176,7 +1181,7 @@ class ShardWriter:
             result = self._write_manifest(complete=True)
             self._closed = True
             return result
-        except BaseException as exc:  # noqa: BLE001 - preserve exact cause
+        except BaseException as exc:
             if self._poison is None:
                 self._poison = exc
             self._closed = True
@@ -1466,7 +1471,7 @@ def cuda_prefetch_batches(
                 consumer_stream.wait_event(current.ready)
                 map_batch(
                     current.device,
-                    lambda tensor: record_leaf(tensor, consumer_stream),
+                    lambda tensor, stream=consumer_stream: record_leaf(tensor, stream),
                 )
                 # Retain ``current.host`` across the yield. This is stricter
                 # than relying only on pinned-allocator event tracking.

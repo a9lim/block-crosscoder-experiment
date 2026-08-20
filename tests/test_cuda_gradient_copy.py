@@ -25,9 +25,7 @@ def _run_certificate(
     unsafe = torch.zeros((), dtype=torch.int32, device="cuda")
     rec_tensor = torch.tensor(rec, dtype=torch.float32, device="cuda")
     total_tensor = torch.tensor(total, dtype=torch.float32, device="cuda")
-    safe_l2_limit = math.sqrt(
-        torch.finfo(torch.float32).max / source.numel()
-    )
+    safe_l2_limit = math.sqrt(torch.finfo(torch.float32).max / source.numel())
     cuda_copy_bf16_gradient_and_flag_(
         source,
         destination,

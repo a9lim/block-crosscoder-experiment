@@ -69,16 +69,16 @@ from .runtime_limits import TRUSTED_DECODE_Q_CHUNK
 from .serialization import TYPED_PAYLOAD_DIGEST_CONTRACT, typed_payload_digest
 
 __all__ = [
-    "CodecSpec",
     "Codec",
+    "CodecSpec",
     "EncodedBatch",
-    "fit_codec",
-    "evaluate_rd",
-    "encode_batch",
-    "encode_batch_all_q",
     "decode_batch",
     "decode_batch_all_q",
+    "encode_batch",
+    "encode_batch_all_q",
     "estimate_calibration_peak_bytes",
+    "evaluate_rd",
+    "fit_codec",
 ]
 
 
@@ -947,7 +947,7 @@ class Codec:
         return payload
 
     @classmethod
-    def from_payload(cls, value: dict, *, source: str = "codec payload") -> "Codec":
+    def from_payload(cls, value: dict, *, source: str = "codec payload") -> Codec:
         """Validate and reconstruct a codec without consulting another file."""
 
         if set(value) != _CODEC_PAYLOAD_KEYS:
@@ -987,7 +987,7 @@ class Codec:
         return codec
 
     @classmethod
-    def load(cls, path: str | Path) -> "Codec":
+    def load(cls, path: str | Path) -> Codec:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(payload, dict):
             raise ValueError(f"expected codec mapping in {path}")

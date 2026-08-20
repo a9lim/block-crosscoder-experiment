@@ -8,9 +8,10 @@ across activation sites in a single model. It is not a general-purpose library.
 
 - `README.md` — experiment overview and ordinary operating workflow
 - `docs/design.md` — scientific, data, metric, and execution contract
-- `docs/paper_comparison.md` — exact bridges to source methods
-- `docs/papers/` — primary-source procedure notes
-- `docs/findings.md` — evidence-bound reporting format
+- `docs/methods.md` — exact bridges and executable conditional matrix
+- `docs/findings.md` — evidence-bound scientific report
+- `docs/replication.md` — reviewer-facing CUDA replication contract
+- `references/README.md` — bibliography, synthesis, and source-note map
 
 ## Operating model
 
@@ -82,6 +83,8 @@ decisions may open only smoke descendants.
 bsc matrix --help
 bsc data --help
 bsc cell --help
+bsc figures --help
+bsc replicate --help
 ```
 
 - `studies.py`: recipes, blueprints, selection policies, resource estimates
@@ -102,10 +105,10 @@ Do not add paper-specific scripts or a parallel analysis package.
 - Ordered hook names and site dimensions remain part of the data contract.
   Padding is structural and masked.
 - Generated stores, checkpoints, evaluations, and logs are local and ignored.
-  Commit compact evidence under `data/summary/` and figures under
-  `docs/figures/`.
+  Commit compact evidence under `data/summary/` and publication assets under
+  `figures/`; use `figures/work/` for ignored exploratory renders.
 - Maintainer machines use shared plain Python 3.12. The reviewer install in
-  `docs/reviewer_setup.md` declares every capture and CUDA dependency in one
+  `docs/replication.md` declares every capture and CUDA dependency in one
   package command; do not send reviewers through a separate CPU environment.
 - Run maintainer training and capture on `jobe` when it is available. The
   reviewer replication command may use any compatible Linux/NVIDIA device.

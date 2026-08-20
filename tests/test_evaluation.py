@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
 import math
 import weakref
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -18,9 +18,9 @@ from block_crosscoder_experiment.evaluation import (
     load_trained_model,
 )
 from block_crosscoder_experiment.model import (
-    BSCConfig,
-    BlockCrosscoder,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
+    BlockCrosscoder,
+    BSCConfig,
 )
 from block_crosscoder_experiment.runtime_limits import (
     DECODED_ENERGY_EXACT_IMPLEMENTATION,
@@ -735,9 +735,10 @@ def test_blockwise_intersection_and_derived_union_counts_match_set_oracle(
     actual_intersection = torch.zeros(2, dtype=torch.float64)
     for start in range(0, groups, 512):
         actual_intersection += (
-            full[:, :, start : start + 512]
-            & partial[:, :, start : start + 512]
-        ).sum(dim=(1, 2)).double()
+            (full[:, :, start : start + 512] & partial[:, :, start : start + 512])
+            .sum(dim=(1, 2))
+            .double()
+        )
     actual_union = (
         full.sum(dim=(1, 2)).double()
         + partial.sum(dim=(1, 2)).double()
@@ -1262,9 +1263,7 @@ def test_joint_mode_full_view_is_exact_deployable_codec_carrier(carrier: str) ->
         config = BSCConfig(
             **common,
             selection_score="isolated_loss_decrease",
-            isolated_loss_decrease_implementation=(
-                ISOLATED_LOSS_MAPPED_IMPLEMENTATION
-            ),
+            isolated_loss_decrease_implementation=(ISOLATED_LOSS_MAPPED_IMPLEMENTATION),
         )
     model = BlockCrosscoder(config)
     x = torch.randn(13, config.n_sites, config.d_model)
@@ -1281,9 +1280,7 @@ def test_joint_mode_full_view_is_exact_deployable_codec_carrier(carrier: str) ->
     )
     with torch.no_grad():
         decoder, encoder = codec_module._materialized_model_tensors(model)
-        geometry = (
-            None if decoder is None else model._frozen_score_geometry(decoder)
-        )
+        geometry = None if decoder is None else model._frozen_score_geometry(decoder)
         expected = codec_module._threshold_select(
             model,
             x,

@@ -16,29 +16,23 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 from .runtime_limits import (
     CODE_NORM_CUDA_IMPLEMENTATION,
     CODE_NORM_NATIVE_IMPLEMENTATION,
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
-    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
-    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
-    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
-    FACTORIZED_EXECUTION_NOT_APPLICABLE,
-    DECODED_ENERGY_EXACT_IMPLEMENTATION,
-    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
-    DECODED_ENERGY_STIEFEL_WORKSPACE_CREDIT_BUFFERS,
-    EVALUATION_CONCORDANCE_BLOCK_CHUNK,
-    EVALUATION_REDUCTION_TOKEN_CHUNK,
-    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
     ESTIMATOR_ACTIVATION_SHARD_TOKENS,
     ESTIMATOR_CHECKPOINT_PARAMETER_BYTES,
     ESTIMATOR_CHOLESKY_QR_SMALL_MATRIX_BUFFERS,
@@ -58,6 +52,13 @@ from .runtime_limits import (
     ESTIMATOR_SPLIT_MANIFEST_BASE_BYTES,
     ESTIMATOR_SPLIT_MANIFEST_SHARD_BYTES,
     ESTIMATOR_TRAINING_PARAMETER_RESIDENCY_BYTES,
+    EVALUATION_CONCORDANCE_BLOCK_CHUNK,
+    EVALUATION_REDUCTION_TOKEN_CHUNK,
+    EVALUATION_SPARSE_DECODE_DENSITY_DENOMINATOR,
+    FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
+    FACTORIZED_EXECUTION_NOT_APPLICABLE,
     GRAM_BLOCK_CHUNK,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
@@ -66,8 +67,8 @@ from .runtime_limits import (
     MAP_NUCLEAR_GUARDED_MATMUL_IMPLEMENTATION,
     RD_EVALUATION_TOKEN_CHUNK,
     RETRACTION_UNCHUNKED_MAX_GROUPS,
-    SMALL_MATRIX_EIGH_MAX_BATCH,
     SMALL_MATRIX_EIGENSOLVER_WORKSPACE_BYTES,
+    SMALL_MATRIX_EIGH_MAX_BATCH,
     SPARSE_DECODE_CUDA_IMPLEMENTATION,
     SPARSE_DECODE_DENSE_REFERENCE_IMPLEMENTATION,
     SPECTRUM_CUDA_GRAM_BLOCK_CHUNK,
@@ -302,7 +303,7 @@ class Phase(str, Enum):
     PHASE3 = "phase3"
 
     @classmethod
-    def parse(cls, value: str | "Phase") -> "Phase":
+    def parse(cls, value: str | Phase) -> Phase:
         if isinstance(value, cls):
             return value
         normalized = value.lower().replace("-", "").replace("_", "")
@@ -340,8 +341,7 @@ def _validate_value(value: Any, *, path: str = "value") -> None:
             _validate_value(item, path=f"{path}[{index}]")
         return
     raise StudyError(
-        f"{path} must be JSON-like data (scalar or tuple), got "
-        f"{type(value).__name__}"
+        f"{path} must be JSON-like data (scalar or tuple), got {type(value).__name__}"
     )
 
 
@@ -411,7 +411,7 @@ class Decision:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "Decision":
+    def from_dict(cls, payload: Mapping[str, Any]) -> Decision:
         def freeze(value: Any) -> DecisionValue:
             if isinstance(value, list):
                 return tuple(freeze(item) for item in value)
@@ -806,7 +806,7 @@ _EXECUTION_METADATA_PREFIXES = (
 )
 
 
-def resolved_execution_signature(cell: "CellSpec") -> str:
+def resolved_execution_signature(cell: CellSpec) -> str:
     """Serialize resolved runtime/scientific values while ignoring labels."""
 
     payload = {
@@ -817,7 +817,7 @@ def resolved_execution_signature(cell: "CellSpec") -> str:
     return canonical_json(payload)
 
 
-def resolved_candidate_execution_signature(cells: Sequence["CellSpec"]) -> str:
+def resolved_candidate_execution_signature(cells: Sequence[CellSpec]) -> str:
     """Serialize one seed-complete configuration independently of labels and seeds.
 
     Comparator calibration rounds deliberately repeat center configurations.
@@ -1608,7 +1608,7 @@ class CellSpec:
         }
 
     @classmethod
-    def from_manifest(cls, payload: Mapping[str, Any]) -> "CellSpec":
+    def from_manifest(cls, payload: Mapping[str, Any]) -> CellSpec:
         if payload.get("schema") != SCHEMA_VERSION:
             raise StudyError(
                 f"unsupported cell schema {payload.get('schema')!r}; preserve any "
@@ -2057,7 +2057,7 @@ class SelectionPolicy:
         return {"policy_id": self.policy_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "SelectionPolicy":
+    def from_dict(cls, payload: Mapping[str, Any]) -> SelectionPolicy:
         policy = cls(
             metric_path=str(payload["metric_path"]),
             map_key=payload.get("map_key"),
@@ -2243,7 +2243,7 @@ class GateCondition:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "GateCondition":
+    def from_dict(cls, payload: Mapping[str, Any]) -> GateCondition:
         return cls(
             source_stage=str(payload["source_stage"]),
             minimum_count=int(payload.get("minimum_count", 1)),
@@ -2381,7 +2381,7 @@ class StageSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "StageSpec":
+    def from_dict(cls, payload: Mapping[str, Any]) -> StageSpec:
         gate = payload.get("gate")
         policy = payload.get("selection_policy")
         return cls(
@@ -2470,7 +2470,7 @@ class StudyPlan:
         }
 
     @classmethod
-    def from_manifest(cls, payload: Mapping[str, Any]) -> "StudyPlan":
+    def from_manifest(cls, payload: Mapping[str, Any]) -> StudyPlan:
         if payload.get("schema") != SCHEMA_VERSION:
             raise StudyError(
                 f"unsupported plan schema {payload.get('schema')!r}; preserve any "
@@ -2555,7 +2555,7 @@ class FrozenSelection:
         cells: Sequence[CellSpec],
         metric_values: Sequence[float],
         qualification_files: Sequence[str],
-    ) -> "FrozenSelection":
+    ) -> FrozenSelection:
         supplied_cells = tuple(cells)
         supplied_values = tuple(float(value) for value in metric_values)
         supplied_qualifications = tuple(str(value) for value in qualification_files)
@@ -2567,7 +2567,12 @@ class FrozenSelection:
             raise StudyError("selection qualification count does not match seed cells")
         ordered_pairs = tuple(
             sorted(
-                zip(supplied_cells, supplied_values, supplied_qualifications),
+                zip(
+                    supplied_cells,
+                    supplied_values,
+                    supplied_qualifications,
+                    strict=True,
+                ),
                 key=lambda item: item[0].seed,
             )
         )
@@ -2603,7 +2608,7 @@ class FrozenSelection:
         )
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "FrozenSelection":
+    def from_dict(cls, payload: Mapping[str, Any]) -> FrozenSelection:
         selection = cls(
             source_stage=str(payload["source_stage"]),
             policy_id=str(payload["policy_id"]),
@@ -2718,8 +2723,7 @@ class FrozenPanelEntry:
                     "comparator evidence must come from the Phase-2 anchor split"
                 )
         if any(
-            not value
-            for value in (*self.qualification_files, *self.confirmation_files)
+            not value for value in (*self.qualification_files, *self.confirmation_files)
         ):
             raise StudyError("panel evidence paths must be nonempty")
 
@@ -2766,7 +2770,7 @@ class FrozenPanelEntry:
         selection_ids: Sequence[str] = (),
         qualification_files: Sequence[str],
         confirmation_files: Sequence[str] = (),
-    ) -> "FrozenPanelEntry":
+    ) -> FrozenPanelEntry:
         return cls(
             panel_slot=panel_slot,
             role=role,
@@ -2777,7 +2781,7 @@ class FrozenPanelEntry:
         )
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "FrozenPanelEntry":
+    def from_dict(cls, payload: Mapping[str, Any]) -> FrozenPanelEntry:
         entry = cls(
             panel_slot=str(payload["panel_slot"]),
             role=str(payload["role"]),
@@ -2866,7 +2870,7 @@ class FrozenPanelDecision:
         return {"panel_id": self.panel_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "FrozenPanelDecision":
+    def from_dict(cls, payload: Mapping[str, Any]) -> FrozenPanelDecision:
         expected_projection = {
             "contract": PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT,
             "estimator": ESTIMATOR_VERSION,
@@ -2932,7 +2936,7 @@ class ChildVariant:
         return {"variant_id": self.variant_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "ChildVariant":
+    def from_dict(cls, payload: Mapping[str, Any]) -> ChildVariant:
         variant = cls(
             name=str(payload["name"]),
             decisions=tuple(Decision.from_dict(item) for item in payload["decisions"]),
@@ -3124,7 +3128,7 @@ class StageBlueprint:
         return {"blueprint_id": self.blueprint_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "StageBlueprint":
+    def from_dict(cls, payload: Mapping[str, Any]) -> StageBlueprint:
         policy = payload.get("selection_policy")
         blueprint = cls(
             name=str(payload["name"]),
@@ -3226,7 +3230,7 @@ class FamilyCalibrationRound:
         return {"round_id": self.round_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "FamilyCalibrationRound":
+    def from_dict(cls, payload: Mapping[str, Any]) -> FamilyCalibrationRound:
         round_spec = cls(
             name=str(payload["name"]),
             train_tokens=int(payload["train_tokens"]),
@@ -3305,7 +3309,7 @@ class FamilyRevisitBlueprint:
         return {"revisit_id": self.revisit_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "FamilyRevisitBlueprint":
+    def from_dict(cls, payload: Mapping[str, Any]) -> FamilyRevisitBlueprint:
         revisit = cls(
             name=str(payload["name"]),
             train_tokens=int(payload["train_tokens"]),
@@ -3380,7 +3384,7 @@ class ComparatorFamilyBlueprint:
         return {"family_id": self.family_id, **self.content_payload()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "ComparatorFamilyBlueprint":
+    def from_dict(cls, payload: Mapping[str, Any]) -> ComparatorFamilyBlueprint:
         family = cls(
             name=str(payload["name"]),
             root_recipe_name=str(payload["root_recipe_name"]),
@@ -3511,7 +3515,7 @@ class Phase2Blueprint:
         }
 
     @classmethod
-    def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase2Blueprint":
+    def from_manifest(cls, payload: Mapping[str, Any]) -> Phase2Blueprint:
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError(
                 "unsupported Phase-2 blueprint schema; preserve any existing "
@@ -3563,7 +3567,9 @@ class Phase1Blueprint:
             raise StudyError("Phase-1 initial stages do not cover every blueprint seed")
         final_initial = self.initial_stages[-1]
         if final_initial.selection_policy is None:
-            raise StudyError("Phase-1 truth-contract stage must have a selection policy")
+            raise StudyError(
+                "Phase-1 truth-contract stage must have a selection policy"
+            )
         previous = final_initial.name
         previous_policy = final_initial.selection_policy.policy_id
         for index, round_spec in enumerate(self.rounds):
@@ -3612,7 +3618,7 @@ class Phase1Blueprint:
         }
 
     @classmethod
-    def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase1Blueprint":
+    def from_manifest(cls, payload: Mapping[str, Any]) -> Phase1Blueprint:
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError(
                 "unsupported Phase-1 blueprint schema; preserve any existing "
@@ -3704,7 +3710,7 @@ class Phase3PanelSlot:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "Phase3PanelSlot":
+    def from_dict(cls, payload: Mapping[str, Any]) -> Phase3PanelSlot:
         return cls(
             name=str(payload["name"]),
             role=str(payload["role"]),
@@ -3809,7 +3815,7 @@ class Phase3Blueprint:
         }
 
     @classmethod
-    def from_manifest(cls, payload: Mapping[str, Any]) -> "Phase3Blueprint":
+    def from_manifest(cls, payload: Mapping[str, Any]) -> Phase3Blueprint:
         if payload.get("schema") != BLUEPRINT_SCHEMA_VERSION:
             raise StudyError(
                 "unsupported Phase-3 blueprint schema; preserve any existing "
@@ -4050,9 +4056,7 @@ def _evaluation_workspace_bytes(
     # activations.  One traversal owns both metric spaces and the first packet
     # round trip; it does not receive a memory credit merely because the former
     # second traversal was removed.
-    retained_packet_bytes = rd_batch_tokens * 4 + rd_events * (
-        32 + 12 * block_width
-    )
+    retained_packet_bytes = rd_batch_tokens * 4 + rd_events * (32 + 12 * block_width)
     trusted_decode_bytes = (
         retained_packet_bytes
         + q_chunk * rd_events * block_width * 16
@@ -4164,9 +4168,7 @@ def _evaluation_workspace_bytes(
     # boundary and overlap with every packet/decode allocation, so price that
     # irreducible carrier additively rather than granting it the former
     # max(shared, R-D) lifetime credit.
-    threshold_consumer_carrier_bytes = batch_tokens * (
-        latents * 4 + groups * (4 + 1)
-    )
+    threshold_consumer_carrier_bytes = batch_tokens * (latents * 4 + groups * (4 + 1))
     fused_rd_bytes = (
         joint_rd_bytes + endpoint_resident_bytes + threshold_consumer_carrier_bytes
     )
@@ -5109,7 +5111,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
                         tracker_checkpoint_bytes=item[6],
                     )
                 )
-                for cell, item in zip(plan.cells, components)
+                for cell, item in zip(plan.cells, components, strict=True)
             )
             + max(
                 (
@@ -5119,7 +5121,7 @@ def estimate_plan(plan: StudyPlan) -> ResourceEstimate:
                         tracker_checkpoint_bytes=item[6],
                         activation_publication_bytes=item[8],
                     )
-                    for cell, item in zip(plan.cells, components)
+                    for cell, item in zip(plan.cells, components, strict=True)
                 ),
                 default=0,
             )
@@ -5196,6 +5198,8 @@ PHASE3_MODEL = "google/gemma-3-4b-pt"
 PHASE3_MODEL_REVISION = "cc012e0a6d0787b4adcc0fa2c4da74402494554d"
 PHASE3_CORPUS = "HuggingFaceFW/fineweb-edu"
 PHASE3_CORPUS_REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+
+
 def _paper_runtime(citation: str) -> tuple[Decision, ...]:
     return (
         exact("objective.reconstruction", "squared_l2", citation),
@@ -6947,9 +6951,12 @@ def _source_contract_defaults(
 ) -> tuple[Decision, ...]:
     values = {decision.name: decision.value for decision in decisions}
     n_sites = len(tuple(values["data.site_dims"]))
-    scientific = lambda name, value, rationale, ablation: _scientific_cell_decision(  # noqa: E731
-        recipe, name, value, rationale=rationale, ablation=ablation
-    )
+
+    def scientific(name, value, rationale, ablation) -> Decision:
+        return _scientific_cell_decision(
+            recipe, name, value, rationale=rationale, ablation=ablation
+        )
+
     if phase is Phase.PHASE1:
         sites = tuple(f"synthetic.site.{index}" for index in range(n_sites))
         normalization = str(values["data.normalization"])
@@ -8059,6 +8066,7 @@ def _resolved_cell_defaults(
             "model.encoder_scale_fit_max_iterations",
         ),
         encoder_fit,
+        strict=True,
     ):
         absent(
             name,
@@ -8496,22 +8504,23 @@ def _smoke_overrides(
     smoke_factor_count = min(8, int(values.get("data.n_factors", 8)))
     smoke_group_count = min(16, int(values["model.groups"]))
     smoke_active_count = min(2, int(values["model.active_blocks"]))
-    scientific = lambda name, value, rationale: _scientific_cell_decision(  # noqa: E731
-        recipe,
-        name,
-        value,
-        rationale=rationale,
-        ablation="run the unchanged non-smoke cell before using scientific evidence",
-    )
+
+    def scientific(name, value, rationale) -> Decision:
+        return _scientific_cell_decision(
+            recipe,
+            name,
+            value,
+            rationale=rationale,
+            ablation="run the unchanged non-smoke cell before using scientific evidence",
+        )
+
     smoke_width = (
         max(min(site_dims), smoke_factor_count * block_width)
         if values.get("data.factor_subspace_overlap") == "orthogonal"
         else 8
     )
     smoke_dims = (
-        tuple(smoke_width for _ in site_dims)
-        if phase is Phase.PHASE1
-        else site_dims
+        tuple(smoke_width for _ in site_dims) if phase is Phase.PHASE1 else site_dims
     )
     result: list[Decision] = [
         scientific(
@@ -9111,8 +9120,7 @@ def materialize_child_stage(
             variants = (parent_variant,)
     elif stage_blueprint.activation_condition == "fixed_token_topk_runner_up":
         selectors = {
-            str(parent.decision_map["model.selector"])
-            for parent in ordered_parents
+            str(parent.decision_map["model.selector"]) for parent in ordered_parents
         }
         if len(selectors) != 1:
             raise StudyError(
@@ -9125,13 +9133,9 @@ def materialize_child_stage(
                     "conditional runner-up round lacks its Appendix-D variant"
                 )
             elided_conditional_variants = (runner_up_variant,)
-            conditional_elision_reason = (
-                "appendix_runner_up_requires_fixed_token_topk"
-            )
+            conditional_elision_reason = "appendix_runner_up_requires_fixed_token_topk"
             variants = tuple(
-                variant
-                for variant in variants
-                if variant.name != runner_up_variant
+                variant for variant in variants if variant.name != runner_up_variant
             )
     for variant in variants:
         variant_cells = tuple(
@@ -11374,9 +11378,7 @@ def build_phase1_transfer(
     }
     return {
         **body,
-        "transfer_id": (
-            f"phase1-transfer:{plan.name}:{baseline_cells[0].recipe_name}"
-        ),
+        "transfer_id": (f"phase1-transfer:{plan.name}:{baseline_cells[0].recipe_name}"),
     }
 
 
@@ -11941,10 +11943,12 @@ def _comparator_family_blueprints() -> tuple[ComparatorFamilyBlueprint, ...]:
             variants: tuple[ChildVariant, ...],
             *,
             rules: tuple[str, ...] = (),
+            target_rounds: list[FamilyCalibrationRound] = rounds,
+            target_family: str = family_name,
         ) -> None:
-            rounds.append(
+            target_rounds.append(
                 FamilyCalibrationRound(
-                    name=f"family_{family_name}_{slug}",
+                    name=f"family_{target_family}_{slug}",
                     train_tokens=4_000_000,
                     variants=variants,
                     # Comparator calibration must not condition the paper/control
@@ -14149,8 +14153,7 @@ def build_phase3_blueprint(
     if tuple(sorted(seed_tuple)) != seed_tuple:
         raise StudyError("Phase-3 blueprint seeds must be sorted")
     comparator_families = {
-        family.name: family
-        for family in _comparator_family_blueprints()
+        family.name: family for family in _comparator_family_blueprints()
     }
     entries = (
         {}
@@ -14434,96 +14437,96 @@ def build_plan(
 
 __all__ = [
     "ANTHROPIC_ARCHITECTURE",
-    "BSC_FACTOR_CONTESTS",
     "BRIDGE_RECIPES",
+    "BSC_FACTOR_CONTESTS",
     "BSF_GROUP_LASSO_RELEASED_CODE",
     "BSF_RECIPES",
-    "Budget",
-    "BudgetExceeded",
     "CONTROL_RECIPES",
     "CONTROL_SCALAR_RELU",
     "CONTROL_SCALAR_SIGNED",
     "CONTROL_SOURCE_BLOCK",
     "CONTROL_SOURCE_SCALAR",
-    "CellSpec",
-    "ChildVariant",
-    "ComparatorFamilyBlueprint",
     "DECODER_WEIGHTED_BATCHTOPK_BRIDGE",
-    "Decision",
-    "DecisionDomain",
-    "GateCondition",
-    "FrozenSelection",
-    "FrozenPanelDecision",
-    "FrozenPanelEntry",
-    "FamilyCalibrationRound",
-    "FamilyRevisitBlueprint",
-    "Lineage",
     "NOVEL_RECIPES",
     "PAPER_RECIPES",
     "PHASE1_LEARNABILITY_RECIPES",
+    "PHASE1_QUALIFICATION_THRESHOLD_SENSITIVITY",
     "PHASE1_SCIENTIFIC_SEEDS",
-    "PHASE2_SCIENTIFIC_SEEDS",
+    "PHASE1_TRANSFER_SCHEMA",
     "PHASE2_CONFIRMATION_SCORE_DEGRADATION_MAX",
     "PHASE2_CONFIRMATION_SCORE_DEGRADATION_SENSITIVITY",
     "PHASE2_CONFIRMATION_THRESHOLD_BASIS",
-    "WINNING_FORMULA_STAGE",
-    "WINNING_FORMULA_TRAIN_TOKENS",
+    "PHASE2_SCIENTIFIC_SEEDS",
     "PHASE3_COMPUTE_CEILING_FLOPS",
-    "PHASE1_TRANSFER_SCHEMA",
     "PHASE3_MIN_SUSTAINED_FLOPS",
-    "PHASE3_PARAMETER_CEILING",
     "PHASE3_PANEL_SLOTS",
-    "PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT",
+    "PHASE3_PARAMETER_CEILING",
     "PHASE3_PRODUCTION_STABILITY_TOKENS",
+    "PHASE3_PROMOTION_RESOURCE_PROJECTION_CONTRACT",
     "PHASE3_PROVISIONED_STORAGE_BYTES",
     "PHASE3_RUNTIME_CEILING_SECONDS",
     "PHASE3_STORAGE_CEILING_BYTES",
     "PHASE3_TRAINING_TOKEN_CEILING",
-    "PHASE1_QUALIFICATION_THRESHOLD_SENSITIVITY",
     "QUALIFICATION_THRESHOLD_BASIS",
+    "RECIPES",
+    "RELEASE_DIAGNOSTIC_RECIPES",
+    "REQUIRED_CELL_DECISIONS",
+    "SASA_PAPER",
+    "SASA_RELEASED_CODE",
+    "SELECTION_THRESHOLD_BASIS",
+    "SELECTION_THRESHOLD_SENSITIVITY",
+    "WINNING_FORMULA_STAGE",
+    "WINNING_FORMULA_TRAIN_TOKENS",
+    "Budget",
+    "BudgetExceeded",
+    "CellSpec",
+    "ChildVariant",
+    "ComparatorFamilyBlueprint",
+    "Decision",
+    "DecisionDomain",
+    "FamilyCalibrationRound",
+    "FamilyRevisitBlueprint",
+    "FrozenPanelDecision",
+    "FrozenPanelEntry",
+    "FrozenSelection",
+    "GateCondition",
+    "Lineage",
     "Phase",
     "Phase1Blueprint",
     "Phase2Blueprint",
     "Phase3Blueprint",
     "Phase3PanelSlot",
-    "RECIPES",
-    "RELEASE_DIAGNOSTIC_RECIPES",
-    "REQUIRED_CELL_DECISIONS",
     "Recipe",
     "ResourceEstimate",
-    "SASA_PAPER",
-    "SASA_RELEASED_CODE",
-    "SELECTION_THRESHOLD_BASIS",
-    "SELECTION_THRESHOLD_SENSITIVITY",
     "SelectionPolicy",
     "StageBlueprint",
     "StageSpec",
     "StudyError",
     "StudyPlan",
     "adapted",
-    "build_phase1_plan",
     "build_phase1_blueprint",
+    "build_phase1_plan",
     "build_phase1_transfer",
-    "build_phase2_plan",
     "build_phase2_blueprint",
-    "build_phase3_plan",
+    "build_phase2_plan",
     "build_phase3_blueprint",
-    "build_winning_formula_plan",
+    "build_phase3_plan",
     "build_plan",
+    "build_winning_formula_plan",
     "canonical_json",
+    "declared_phase_budget",
+    "derive_child_cell",
+    "enforce_plan_resources",
     "engineering",
     "estimate_activation_store",
-    "enforce_plan_resources",
-    "derive_child_cell",
     "estimate_cell",
     "estimate_plan",
-    "declared_phase_budget",
     "exact",
-    "merge_decisions",
     "materialize_child_plan",
     "materialize_child_stage",
     "materialize_family_child_plan",
     "materialize_family_revisit_plan",
+    "merge_decisions",
     "novel",
     "phase2_root_recipe_from_phase1_decision",
     "project_phase3_panel_resources",

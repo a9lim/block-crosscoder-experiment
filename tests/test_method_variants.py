@@ -5,8 +5,8 @@ configuration reachability.  They are CPU-only so every matrix change is
 checked before an accelerator campaign can make an invalid recipe expensive.
 """
 
-from dataclasses import asdict
 import random
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,7 +20,7 @@ from block_crosscoder_experiment.codec import (
     fit_codec,
 )
 from block_crosscoder_experiment.gram import gram_residual
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig, bsc_loss
 from block_crosscoder_experiment.trainer import (
     TrainConfig,
     Trainer,
@@ -418,9 +418,7 @@ def test_sasa_release_unit_latent_constraints_and_decoder_nuclear_loss():
     assert torch.allclose(model.encoder_tensor().norm(dim=-1), torch.ones(1, 3, 2))
     with torch.no_grad():
         model.D.mul_(torch.linspace(0.2, 2.0, 6).view(1, 3, 2, 1))
-        model._encoder_full_tensor().mul_(
-            torch.linspace(2.0, 0.2, 6).view(1, 3, 2, 1)
-        )
+        model._encoder_full_tensor().mul_(torch.linspace(2.0, 0.2, 6).view(1, 3, 2, 1))
     model.project_decoder_()
     assert torch.allclose(model.D.norm(dim=-1), torch.ones(1, 3, 2), atol=1e-6)
     assert torch.allclose(

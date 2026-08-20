@@ -4,6 +4,7 @@ See ``docs/design.md`` for the normative three-phase architecture and protocol.
 The post-publication consumer bridge lands in saklas, not this package.
 """
 
+from .artifact import BSCArtifact, load_artifact
 from .gram import (
     block_gram,
     gram_residual,
@@ -14,7 +15,6 @@ from .gram import (
     site_frobenius_shares,
     site_singular_values,
 )
-from .artifact import BSCArtifact, load_artifact
 from .model import (
     BlockCrosscoder,
     BSCConfig,
@@ -34,8 +34,8 @@ from .trainer import DeadTracker, TrainConfig, Trainer, aux_loss, tensor_batches
 __version__ = "0.1.0"
 
 __all__ = [
-    "BSCConfig",
     "BSCArtifact",
+    "BSCConfig",
     "BSCOutput",
     "BlockCrosscoder",
     "DeadTracker",
@@ -45,19 +45,19 @@ __all__ = [
     "Phase1Dataset",
     "TrainConfig",
     "Trainer",
+    "__version__",
     "aux_loss",
     "batch_topk_mask",
-    "token_topk_mask",
-    "tensor_batches",
     "block_gram",
     "bsc_loss",
     "gram_residual",
     "init_decoder_stack",
-    "map_nuclear_penalty",
     "load_artifact",
+    "map_nuclear_penalty",
     "project_block_frobenius_",
     "retract_",
     "site_frobenius_shares",
     "site_singular_values",
-    "__version__",
+    "tensor_batches",
+    "token_topk_mask",
 ]

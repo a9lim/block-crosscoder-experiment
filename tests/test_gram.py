@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import block_crosscoder_experiment.gram as gram_module
-
 from block_crosscoder_experiment.gram import (
     block_gram,
     cholesky_qr_retract_,

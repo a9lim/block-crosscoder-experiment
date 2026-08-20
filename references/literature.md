@@ -1,7 +1,7 @@
 # Literature synthesis and scope map
 
 *Primary-source map for the 2026-07-20 design. The committed bibliography is
-`references/refs.yaml`; generated Markdown copies are local research inputs,
+[`refs.yaml`](refs.yaml); generated Markdown copies are local research inputs,
 not committed evidence.*
 
 ## 1. The closest parents

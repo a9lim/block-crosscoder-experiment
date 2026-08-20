@@ -16,14 +16,14 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 from .studies import (
     CellSpec,
@@ -38,7 +38,6 @@ from .studies import (
     StudyPlan,
     build_phase1_transfer,
 )
-
 
 CAMPAIGN_SCHEMA = "bsc-campaign-simple-v1"
 ARTIFACT_SCHEMA = "bsc-stage-artifacts-simple-v1"
@@ -104,18 +103,14 @@ STAGE_TARGETS: Mapping[str, RunState] = {
 EXPECTED_STAGE_ARTIFACTS: Mapping[str, frozenset[str]] = {
     "prepare": frozenset({"preparation"}),
     "train": frozenset({"checkpoint", "training_report"}),
-    "calibrate": frozenset(
-        {"calibration", "deployment_codec", "calibration_record"}
-    ),
+    "calibrate": frozenset({"calibration", "deployment_codec", "calibration_record"}),
     "evaluate": frozenset({"deployment_schedules", "evaluation"}),
     "qualify": frozenset({"qualification"}),
 }
 
 REQUIRED_ARTIFACTS: Mapping[RunState, frozenset[str]] = {
     RunState.PREPARED: frozenset({"preparation"}),
-    RunState.TRAINED: frozenset(
-        {"preparation", "checkpoint", "training_report"}
-    ),
+    RunState.TRAINED: frozenset({"preparation", "checkpoint", "training_report"}),
     RunState.CALIBRATED: frozenset(
         {
             "preparation",
@@ -216,7 +211,7 @@ class ArtifactRef:
             raise ArtifactError("artifact kind and path are required")
 
     @classmethod
-    def from_path(cls, kind: str, path: str | Path, root: str | Path) -> "ArtifactRef":
+    def from_path(cls, kind: str, path: str | Path, root: str | Path) -> ArtifactRef:
         root_path = Path(root)
         artifact_path = Path(path)
         if not artifact_path.is_absolute():
@@ -226,7 +221,7 @@ class ArtifactRef:
         return cls(kind, _relative_or_absolute(artifact_path, root_path))
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "ArtifactRef":
+    def from_dict(cls, payload: Mapping[str, Any]) -> ArtifactRef:
         return cls(str(payload["kind"]), str(payload["path"]))
 
     def resolve(self, root: str | Path) -> Path:
@@ -235,7 +230,7 @@ class ArtifactRef:
             path = Path(root) / path
         return path
 
-    def verify(self, root: str | Path) -> "ArtifactRef":
+    def verify(self, root: str | Path) -> ArtifactRef:
         if not self.resolve(root).is_file():
             raise ArtifactError(f"artifact does not exist: {self.resolve(root)}")
         return self
@@ -269,7 +264,7 @@ class CampaignRecord:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "CampaignRecord":
+    def from_dict(cls, payload: Mapping[str, Any]) -> CampaignRecord:
         resume = payload.get("resume_state")
         return cls(
             cell_id=str(payload["cell_id"]),
@@ -287,7 +282,7 @@ class CellLock(AbstractContextManager["CellLock"]):
         self.path = path
         self._handle = None
 
-    def __enter__(self) -> "CellLock":
+    def __enter__(self) -> CellLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open("a+")
         try:
@@ -295,7 +290,9 @@ class CellLock(AbstractContextManager["CellLock"]):
         except BlockingIOError as exc:
             self._handle.close()
             self._handle = None
-            raise CampaignLocked(f"cell is already running: {self.path.parent.name}") from exc
+            raise CampaignLocked(
+                f"cell is already running: {self.path.parent.name}"
+            ) from exc
         return self
 
     def bind_worker(self, *, pid: int, pgid: int) -> None:
@@ -389,7 +386,9 @@ class Campaign:
     def _replace_plan(self, plan: StudyPlan) -> None:
         current = self.plan
         current_stages = [stage.to_dict() for stage in current.stages]
-        incoming_prefix = [stage.to_dict() for stage in plan.stages[: len(current.stages)]]
+        incoming_prefix = [
+            stage.to_dict() for stage in plan.stages[: len(current.stages)]
+        ]
         if current.phase is not plan.phase or current_stages != incoming_prefix:
             raise CampaignError("extended plan must preserve the current stage prefix")
         self._register_cells(plan.cells[len(current.cells) :])
@@ -515,14 +514,10 @@ class Campaign:
         payload = self._qualification(record)
         return payload.get("promotion_eligible") is True
 
-    def promote(
-        self, cell_id: str, promotion: ArtifactRef
-    ) -> CampaignRecord:
+    def promote(self, cell_id: str, promotion: ArtifactRef) -> CampaignRecord:
         if not self.eligible_for_promotion(cell_id):
             raise CampaignError("cell is not eligible for promotion")
-        return self.transition(
-            cell_id, RunState.PROMOTED, artifacts=(promotion,)
-        )
+        return self.transition(cell_id, RunState.PROMOTED, artifacts=(promotion,))
 
     def _qualification(self, record: CampaignRecord) -> dict[str, Any]:
         ref = record.artifact_map.get("qualification")
@@ -543,14 +538,12 @@ class Campaign:
         for dependency in stage.depends_on:
             source = stages[dependency]
             qualified = sum(
-                records[cell.cell_id].state
-                in {RunState.QUALIFIED, RunState.PROMOTED}
+                records[cell.cell_id].state in {RunState.QUALIFIED, RunState.PROMOTED}
                 for cell in source.cells
             )
             minimum = (
                 stage.gate.minimum_count
-                if stage.gate is not None
-                and stage.gate.source_stage == dependency
+                if stage.gate is not None and stage.gate.source_stage == dependency
                 else len(source.cells)
             )
             if qualified < minimum:
@@ -568,11 +561,13 @@ class Campaign:
             if not self.stage_open(cell.stage):
                 continue
             state = self.record(cell.cell_id).state
-            if state is RunState.PLANNED:
-                result.append(cell.cell_id)
-            elif include_resume_required and state is RunState.RUNNING:
-                result.append(cell.cell_id)
-            elif include_failed and state is RunState.FAILED:
+            if (
+                state is RunState.PLANNED
+                or include_resume_required
+                and state is RunState.RUNNING
+                or include_failed
+                and state is RunState.FAILED
+            ):
                 result.append(cell.cell_id)
         return tuple(result)
 
@@ -654,8 +649,7 @@ class Campaign:
                 if candidate["candidate_id"] == parent["candidate_id"]:
                     continue
                 values = {
-                    item["seed"]: item["metric"]
-                    for item in candidate["observations"]
+                    item["seed"]: item["metric"] for item in candidate["observations"]
                 }
                 passed = set(values) == set(parent_values) and all(
                     cls._directional_improvement(
@@ -684,14 +678,11 @@ class Campaign:
             }
             selected = None
             for variant in policy.parsimony_order_variants:
-                candidate = cls._candidate_for_variant(
-                    stage_name, candidates, variant
-                )
+                candidate = cls._candidate_for_variant(stage_name, candidates, variant)
                 if candidate is None:
                     continue
                 values = {
-                    item["seed"]: item["metric"]
-                    for item in candidate["observations"]
+                    item["seed"]: item["metric"] for item in candidate["observations"]
                 }
                 if set(values) == set(reference_values) and all(
                     -cls._directional_improvement(
@@ -729,7 +720,9 @@ class Campaign:
         candidates: list[dict[str, Any]] = []
         excluded: list[dict[str, Any]] = []
         for candidate_id, pairs in sorted(by_candidate.items()):
-            cells = tuple(sorted((cell for cell, _ in pairs), key=lambda item: item.seed))
+            cells = tuple(
+                sorted((cell for cell, _ in pairs), key=lambda item: item.seed)
+            )
             record_by_id = {record.cell_id: record for _, record in pairs}
             reason = None
             if tuple(cell.seed for cell in cells) != expected_seeds:
@@ -808,9 +801,7 @@ class Campaign:
                 min(values) if policy.direction == "max" else max(values)
             )
             candidates.append(entry)
-        candidates = self._apply_policy_gates(
-            stage_name, policy, candidates, excluded
-        )
+        candidates = self._apply_policy_gates(stage_name, policy, candidates, excluded)
         return candidates, excluded
 
     @staticmethod
@@ -836,7 +827,9 @@ class Campaign:
         candidates, excluded = self._selection_population(stage_name, policy)
         if not candidates:
             raise CampaignError(f"stage {stage_name!r} has no seed-complete candidate")
-        ranked = sorted(candidates, key=lambda item: self._rank_key(item, policy.direction))
+        ranked = sorted(
+            candidates, key=lambda item: self._rank_key(item, policy.direction)
+        )
         keep = (
             policy.retain_count
             if policy.retain_count is not None
@@ -888,14 +881,14 @@ class Campaign:
     ) -> dict[str, Any]:
         blueprint = Phase2Blueprint.from_manifest(_read_json(self.blueprint_path))
         matches = [
-            family for family in blueprint.comparator_families if family.name == family_name
+            family
+            for family in blueprint.comparator_families
+            if family.name == family_name
         ]
         if len(matches) != 1:
             raise CampaignError(f"unknown comparator family {family_name!r}")
         stage = blueprint.initial_stage
-        original = next(
-            item for item in self.plan.stages if item.name == stage.name
-        )
+        original = next(item for item in self.plan.stages if item.name == stage.name)
         policy = matches[0].root_selection_policy
         if original.selection_policy == policy:
             return self.select_stage(original.name, out=out)
@@ -912,7 +905,9 @@ class Campaign:
             original.elided_conditional_variants,
         )
         plan = self.plan
-        stages = tuple(proxy if item.name == original.name else item for item in plan.stages)
+        stages = tuple(
+            proxy if item.name == original.name else item for item in plan.stages
+        )
         temporary = StudyPlan(plan.name, plan.phase, stages)
         original_plan = _read_json(self.plan_path)
         try:
@@ -1011,9 +1006,7 @@ class Campaign:
         if plan.phase is not Phase.PHASE1:
             raise CampaignError("freeze-phase1 requires a Phase-1 campaign")
         blueprint = Phase1Blueprint.from_manifest(_read_json(self.blueprint_path))
-        smoke_values = {
-            bool(cell.decision_map["runtime.smoke"]) for cell in plan.cells
-        }
+        smoke_values = {bool(cell.decision_map["runtime.smoke"]) for cell in plan.cells}
         if len(smoke_values) != 1:
             raise CampaignError("Phase-1 campaign mixes smoke and scientific cells")
         smoke = smoke_values.pop()
@@ -1041,8 +1034,13 @@ class Campaign:
         if not baseline:
             raise CampaignError("Phase-1 confirmation has no baseline carrier")
         scientific_go = all(
-            isinstance(self._qualification(records[cell.cell_id]).get("scientific_outcome"), Mapping)
-            and self._qualification(records[cell.cell_id])["scientific_outcome"].get("passed")
+            isinstance(
+                self._qualification(records[cell.cell_id]).get("scientific_outcome"),
+                Mapping,
+            )
+            and self._qualification(records[cell.cell_id])["scientific_outcome"].get(
+                "passed"
+            )
             is True
             for cell in baseline
         )
@@ -1139,18 +1137,22 @@ class Campaign:
             )
         return result
 
-    def freeze_panel(
-        self, *, out: str | Path | None = None
-    ) -> dict[str, Any]:
+    def freeze_panel(self, *, out: str | Path | None = None) -> dict[str, Any]:
         plan = self.plan
         if plan.phase is not Phase.PHASE2:
             raise CampaignError("freeze-panel requires a Phase-2 campaign")
         blueprint = Phase2Blueprint.from_manifest(_read_json(self.blueprint_path))
         candidates = self._qualified_candidate_groups()
-        panel_slots = __import__(
-            "block_crosscoder_experiment.studies",
-            fromlist=["build_phase3_blueprint"],
-        ).build_phase3_blueprint(smoke=bool(plan.cells[0].decision_map["runtime.smoke"])).panel_slots
+        panel_slots = (
+            __import__(
+                "block_crosscoder_experiment.studies",
+                fromlist=["build_phase3_blueprint"],
+            )
+            .build_phase3_blueprint(
+                smoke=bool(plan.cells[0].decision_map["runtime.smoke"])
+            )
+            .panel_slots
+        )
         entries: list[FrozenPanelEntry] = []
         used: set[str] = set()
         for slot in panel_slots:
@@ -1172,11 +1174,11 @@ class Campaign:
                     if family in item["cells"][0].stage
                     or family in item["cells"][0].recipe_name
                 ]
-            matches = [
-                item for item in matches if item["candidate_id"] not in used
-            ]
+            matches = [item for item in matches if item["candidate_id"] not in used]
             if not matches:
-                raise CampaignError(f"no qualified candidate for panel slot {slot.name!r}")
+                raise CampaignError(
+                    f"no qualified candidate for panel slot {slot.name!r}"
+                )
             chosen = max(matches, key=lambda item: item["score"])
             used.add(chosen["candidate_id"])
             cells = chosen["cells"]
@@ -1201,9 +1203,7 @@ class Campaign:
                     selection_ids=selection_ids or ("selection:reviewed",),
                     qualification_files=qualification_files,
                     confirmation_files=(
-                        qualification_files
-                        if slot.role == "selected_finalist"
-                        else ()
+                        qualification_files if slot.role == "selected_finalist" else ()
                     ),
                 )
             )
@@ -1413,9 +1413,7 @@ class CampaignRunner:
         completed = failed = skipped = 0
         for cell_id in selected:
             try:
-                result = self._run_cell(
-                    cell_id, resume=resume, stop_after=stop_after
-                )
+                result = self._run_cell(cell_id, resume=resume, stop_after=stop_after)
             except CampaignLocked:
                 skipped += 1
                 continue
@@ -1493,9 +1491,7 @@ class CampaignRunner:
         environment["BSC_CAMPAIGN_ROOT"] = str(self.campaign.root.resolve())
         source_root = str(Path(__file__).resolve().parent.parent)
         environment["PYTHONPATH"] = os.pathsep.join(
-            item
-            for item in (source_root, environment.get("PYTHONPATH", ""))
-            if item
+            item for item in (source_root, environment.get("PYTHONPATH", "")) if item
         )
         return _PersistentCellWorker(
             command=[
@@ -1615,23 +1611,23 @@ class CampaignRunner:
 
 __all__ = [
     "ARTIFACT_SCHEMA",
+    "CAMPAIGN_SCHEMA",
+    "EVALUATION_SCHEMA",
+    "EXPECTED_STAGE_ARTIFACTS",
+    "LEGAL_TRANSITIONS",
+    "PROMOTION_SCHEMA",
+    "QUALIFICATION_SCHEMA",
+    "REQUIRED_ARTIFACTS",
+    "REQUIRED_QUALIFICATION_CHECKS",
+    "SELECTION_SCHEMA",
     "ArtifactError",
     "ArtifactRef",
-    "CAMPAIGN_SCHEMA",
     "Campaign",
     "CampaignError",
     "CampaignLocked",
     "CampaignRecord",
     "CampaignRunner",
-    "EVALUATION_SCHEMA",
-    "EXPECTED_STAGE_ARTIFACTS",
     "InvalidTransition",
-    "LEGAL_TRANSITIONS",
-    "PROMOTION_SCHEMA",
-    "QUALIFICATION_SCHEMA",
-    "REQUIRED_QUALIFICATION_CHECKS",
-    "REQUIRED_ARTIFACTS",
-    "SELECTION_SCHEMA",
     "RunState",
     "RunSummary",
 ]

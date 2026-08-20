@@ -42,9 +42,9 @@ import json
 import math
 import random
 import shutil
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -66,12 +66,11 @@ from .runtime_limits import (
 )
 from .serialization import MODEL_STATE_DIGEST_CONTRACT, model_state_digest
 
-
 _NATIVE_TORCH_SAVE = torch.save
 
 __all__ = [
-    "TrainConfig",
     "DeadTracker",
+    "TrainConfig",
     "Trainer",
     "aux_loss",
     "tensor_batches",
@@ -1042,8 +1041,7 @@ def aux_loss(
         # has no guaranteed unselected runner-up set.
         if model.cfg.code_activation == "group_soft_threshold":
             raise ValueError(
-                "fel runner-up auxiliary is undefined for learned "
-                "Group-Lasso support"
+                "fel runner-up auxiliary is undefined for learned Group-Lasso support"
             )
         # Every token must supply the complete declared auxiliary width; a
         # variable or silently underfilled AuxK is a different method.
@@ -1493,10 +1491,7 @@ def _project_decoder_(
                     and model.cfg.decoder_constraint
                     in {"frobenius", "unit_frobenius", "unit_latent", "free"}
                 )
-                or (
-                    parameter is model.D
-                    and model.cfg.decoder_constraint != "gram"
-                )
+                or (parameter is model.D and model.cfg.decoder_constraint != "gram")
             )
             return count, mutated, certified
         count, mutated = project_with_state()
@@ -1929,9 +1924,7 @@ class Trainer:
                 # full gradient set between backward passes.
                 f.grad = None
             if use_fused_gradient_certificate:
-                fused_gradient_certificate = not bool(
-                    self._cuda_gradient_copy_unsafe
-                )
+                fused_gradient_certificate = not bool(self._cuda_gradient_copy_unsafe)
         parameters = [p for p in self.master.parameters() if p.grad is not None]
         gradients = [p.grad for p in parameters]
         if not gradients:
@@ -1988,6 +1981,7 @@ class Trainer:
                 for name, value in zip(
                     scalar_names,
                     torch.stack(scalar_tensors).cpu(),
+                    strict=True,
                 )
             }
             if not all(
@@ -2047,8 +2041,7 @@ class Trainer:
             parameter
             for parameter in projected_parameters
             if not any(
-                parameter is certified
-                for certified in finite_certified_parameters
+                parameter is certified for certified in finite_certified_parameters
             )
         )
         if post_projection_parameters and not _all_finite(post_projection_parameters):
@@ -2058,7 +2051,9 @@ class Trainer:
             )
         if self.fwd is not self.master:
             with torch.no_grad():
-                for m, f in zip(self.master.parameters(), self.fwd.parameters()):
+                for m, f in zip(
+                    self.master.parameters(), self.fwd.parameters(), strict=True
+                ):
                     f.copy_(m)
                 # theta is a frozen calibration buffer, not optimizer state.
                 # The forward copy is created after checkpoint loading, so a
@@ -2244,9 +2239,8 @@ class Trainer:
             serialized_model_state = model_state
         if model_state_sha256 is None:
             model_state_sha256 = model_state_digest(serialized_model_state)
-        elif (
-            len(model_state_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in model_state_sha256)
+        elif len(model_state_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in model_state_sha256
         ):
             raise RuntimeError("model-state digest is not canonical SHA-256")
         payload = {
@@ -2315,7 +2309,7 @@ class Trainer:
         *,
         device: torch.device | str = "cpu",
         expected_binding: dict | None = None,
-    ) -> "Trainer":
+    ) -> Trainer:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         model_state = payload.get("model")
         claimed_digest_contract = payload.get("model_state_digest_contract")
@@ -2476,6 +2470,8 @@ class Trainer:
                 torch.mps.set_rng_state(rng["torch_mps"].cpu())
         if trainer.fwd is not trainer.master:
             with torch.no_grad():
-                for m, f in zip(trainer.master.parameters(), trainer.fwd.parameters()):
+                for m, f in zip(
+                    trainer.master.parameters(), trainer.fwd.parameters(), strict=True
+                ):
                     f.copy_(m)
         return trainer

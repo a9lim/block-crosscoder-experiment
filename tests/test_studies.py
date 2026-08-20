@@ -100,9 +100,7 @@ def test_phase3_panel_has_one_finalist_and_six_comparators() -> None:
     assert len(blueprint.panel_slots) == 7
     assert sum(slot.role == "selected_finalist" for slot in blueprint.panel_slots) == 1
     assert {
-        slot.name
-        for slot in blueprint.panel_slots
-        if slot.role != "selected_finalist"
+        slot.name for slot in blueprint.panel_slots if slot.role != "selected_finalist"
     } == {
         "bsf_grassmannian",
         "bsf_group_lasso",

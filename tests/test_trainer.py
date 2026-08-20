@@ -14,12 +14,12 @@ import block_crosscoder_experiment.trainer as trainer_module
 from block_crosscoder_experiment.gram import gram_residual
 from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig, BSCOutput
 from block_crosscoder_experiment.runtime_limits import (
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_SYMMETRIC_POLAR_IMPLEMENTATION,
     DECODER_RETRACTION_SYMMETRIC_POLAR_REFERENCE_IMPLEMENTATION,
-    DECODED_ENERGY_EXACT_IMPLEMENTATION,
-    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     FACTORIZED_EXECUTION_DIRECT_RANK_SPACE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
@@ -379,7 +379,7 @@ def test_bf16_forward_copy_stays_in_sync(device):
     trainer = Trainer(model, train_cfg(total_steps=30, forward_dtype="bf16"))
     trainer.fit(planted_batches(device))
     # Forward copy is exactly the bf16 cast of the retracted master.
-    for m, f in zip(trainer.master.parameters(), trainer.fwd.parameters()):
+    for m, f in zip(trainer.master.parameters(), trainer.fwd.parameters(), strict=True):
         assert f.dtype == torch.bfloat16
         assert torch.equal(f, m.to(torch.bfloat16))
     # Master satisfies the constraint tightly; the post-cast residual is
@@ -1173,11 +1173,7 @@ def test_block_auxk_cutoff_ties_choose_lowest_block_indices(
             "scores",
             lambda *args, **kwargs: torch.ones(2, 4, device=device),
         )
-    dead = (
-        None
-        if variant == "fel"
-        else torch.ones(4, dtype=torch.bool, device=device)
-    )
+    dead = None if variant == "fel" else torch.ones(4, dtype=torch.bool, device=device)
     assert aux_loss(model, x, out, variant, dead, s_aux=2) is not None
     support = captured[-1].squeeze(-1) != 0
     expected = torch.tensor(
@@ -1610,7 +1606,9 @@ def test_checkpoint_resume_matches(device, tmp_path):
     ]
     assert continued_jumps == pytest.approx(resumed_jumps, rel=1e-6, abs=1e-8)
     assert resumed_trainer.history == trainer.history
-    for a, b in zip(trainer.master.parameters(), resumed_trainer.master.parameters()):
+    for a, b in zip(
+        trainer.master.parameters(), resumed_trainer.master.parameters(), strict=True
+    ):
         assert torch.allclose(a, b, atol=1e-5)
 
 
@@ -1819,14 +1817,20 @@ def test_site_bmm_polar_fast_shape_bounds_reference_training_trajectory(
     assert actual.master.D is not None and reference.master.D is not None
     assert float(gram_residual(actual.master.D).max()) <= 1e-4
     assert float(gram_residual(reference.master.D).max()) <= 1e-4
-    assert _nested_relative_l2(
-        actual.master.state_dict(),
-        reference.master.state_dict(),
-    ) <= 3e-3
-    assert _nested_relative_l2(
-        actual.opt.state_dict()["state"],
-        reference.opt.state_dict()["state"],
-    ) <= 1e-5
+    assert (
+        _nested_relative_l2(
+            actual.master.state_dict(),
+            reference.master.state_dict(),
+        )
+        <= 3e-3
+    )
+    assert (
+        _nested_relative_l2(
+            actual.opt.state_dict()["state"],
+            reference.opt.state_dict()["state"],
+        )
+        <= 1e-5
+    )
 
 
 @pytest.mark.parametrize("selection", ("token_topk", "batch_topk"))
@@ -2355,10 +2359,12 @@ def test_site_mask_rng_and_factorized_parameters_resume_exactly(device, tmp_path
         row["encoder_site_keep_fraction"] for row in continued
     ]
     for actual, expected in zip(
-        resumed.master.parameters(), trainer.master.parameters()
+        resumed.master.parameters(), trainer.master.parameters(), strict=True
     ):
         assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
-    for master, forward in zip(resumed.master.parameters(), resumed.fwd.parameters()):
+    for master, forward in zip(
+        resumed.master.parameters(), resumed.fwd.parameters(), strict=True
+    ):
         assert torch.equal(forward, master.to(torch.bfloat16))
 
 
@@ -3097,8 +3103,7 @@ def test_guarded_map_nuclear_bounds_trajectory_and_resumes_exactly(tmp_path):
     reference = Trainer(BlockCrosscoder(reference_cfg).to("cuda"), training)
     reference_records, reference_supports = run(reference, batches)
     maximum_loss_drift = max(
-        abs(actual["total"] - expected["total"])
-        / max(abs(expected["total"]), 1e-30)
+        abs(actual["total"] - expected["total"]) / max(abs(expected["total"]), 1e-30)
         for actual, expected in zip(
             optimized_records,
             reference_records,
@@ -3133,14 +3138,20 @@ def test_guarded_map_nuclear_bounds_trajectory_and_resumes_exactly(tmp_path):
     assert maximum_loss_drift <= 1e-5
     assert maximum_regularizer_drift <= 2e-5
     assert intersections / max(unions, 1) >= 0.995
-    assert _nested_relative_l2(
-        optimized.master.state_dict(),
-        reference.master.state_dict(),
-    ) <= 2e-3
-    assert _nested_relative_l2(
-        optimized.opt.state_dict()["state"],
-        reference.opt.state_dict()["state"],
-    ) <= 1e-5
+    assert (
+        _nested_relative_l2(
+            optimized.master.state_dict(),
+            reference.master.state_dict(),
+        )
+        <= 2e-3
+    )
+    assert (
+        _nested_relative_l2(
+            optimized.opt.state_dict()["state"],
+            reference.opt.state_dict()["state"],
+        )
+        <= 1e-5
+    )
 
 
 def _fast_decoded_energy_cfg() -> BSCConfig:

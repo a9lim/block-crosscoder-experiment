@@ -17,10 +17,7 @@ from block_crosscoder_experiment.cli.data import (
 
 def test_transformer_lens_loader_name_preserves_model_identity() -> None:
     assert transformer_lens_model_name("openai-community/gpt2") == "gpt2"
-    assert (
-        transformer_lens_model_name("google/gemma-3-1b-pt")
-        == "google/gemma-3-1b-pt"
-    )
+    assert transformer_lens_model_name("google/gemma-3-1b-pt") == "google/gemma-3-1b-pt"
 
 
 def test_split_parser_requires_named_positive_roles() -> None:
@@ -121,7 +118,7 @@ def test_capture_pipeline_estimate_accounts_for_overlap_buffers() -> None:
         drop_positions=1,
         cuda_overlap=True,
     )
-    assert overlapped["peak_host_pipeline_bytes"] > synchronous[
-        "peak_host_pipeline_bytes"
-    ]
+    assert (
+        overlapped["peak_host_pipeline_bytes"] > synchronous["peak_host_pipeline_bytes"]
+    )
     assert overlapped["peak_cuda_capture_lookahead_bytes"] > 0

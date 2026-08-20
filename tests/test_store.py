@@ -327,9 +327,7 @@ def test_whitener_load_rejects_dtype_alias_of_same_content_hash(tmp_path, field)
             "wrong digest contract",
         ),
         (
-            lambda payload: payload.__setitem__(
-                "mean", payload["mean"].reshape(-1)
-            ),
+            lambda payload: payload.__setitem__("mean", payload["mean"].reshape(-1)),
             "mean must have nonempty shape",
         ),
         (
@@ -550,7 +548,11 @@ def test_site_subset_view_matches_sliced_full_stream(tmp_path):
     assert sub.n_tokens == full.n_tokens
 
     kw = dict(seed=5, epochs=1, buffer_tokens=256)
-    for xf, xs in zip(full.shuffled_batches(64, **kw), sub.shuffled_batches(64, **kw)):
+    for xf, xs in zip(
+        full.shuffled_batches(64, **kw),
+        sub.shuffled_batches(64, **kw),
+        strict=True,
+    ):
         assert xs.shape == (xf.shape[0], 1, D)
         assert torch.equal(xs, xf[:, 1:2])
 
@@ -614,7 +616,7 @@ def test_prefetch_preserves_order_and_reraises(tmp_path):
     plain = list(reader.shuffled_batches(64, **kw))
     fetched = list(prefetch_batches(reader.shuffled_batches(64, **kw), depth=3))
     assert len(plain) == len(fetched)
-    assert all(torch.equal(a, b) for a, b in zip(plain, fetched))
+    assert all(torch.equal(a, b) for a, b in zip(plain, fetched, strict=True))
 
     def boom():
         yield torch.zeros(2)

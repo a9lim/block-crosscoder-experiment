@@ -27,17 +27,18 @@ import copy
 import hashlib
 import json
 import math
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
 
 __all__ = [
+    "LADDER_STEPS",
     "FactorMetadata",
     "FelDataset",
     "FelSyntheticConfig",
-    "LADDER_STEPS",
     "LadderDataset",
     "LadderSyntheticConfig",
     "Phase1Batch",
@@ -962,9 +963,9 @@ class LadderSyntheticConfig:
     feature_frequency: Literal["uniform", "zipf_alpha_1"] = "uniform"
     coactivation_probability: float = 0.0
     coordinate_amplitude_law: Literal["gaussian", "student_t_df3"] = "gaussian"
-    factor_subspace_overlap: Literal[
-        "uncontrolled", "orthogonal", "paired_30deg"
-    ] = "uncontrolled"
+    factor_subspace_overlap: Literal["uncontrolled", "orthogonal", "paired_30deg"] = (
+        "uncontrolled"
+    )
     train_unique_examples: int = 100_000
     train_presentations: int = 100_000
     eval_unique_examples: int = 20_000
@@ -1149,11 +1150,7 @@ class LadderDataset(Phase1Dataset):
                 joint_frame = _orthonormal(
                     config.d_model,
                     config.n_factors * config.block_dim,
-                    seed=(
-                        config.structure_seed
-                        + 92_000_071
-                        + 10_000_019 * basis
-                    ),
+                    seed=(config.structure_seed + 92_000_071 + 10_000_019 * basis),
                 )
                 map_bases[:, basis] = (
                     joint_frame.T.reshape(

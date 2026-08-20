@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import closing, contextmanager
 import functools
 import gc
 import hashlib
@@ -26,13 +25,24 @@ import struct
 import sys
 import tempfile
 import weakref
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
-import torch
 import numpy as np
+import torch
 
+from block_crosscoder_experiment.campaign import (
+    ARTIFACT_SCHEMA,
+    EVALUATION_EXECUTION_IMPLEMENTATION,
+    EVALUATION_SCHEMA,
+    PREPARATION_SCHEMA,
+    QUALIFICATION_SCHEMA,
+    Campaign,
+    CampaignError,
+)
 from block_crosscoder_experiment.cli.data import (
     CAPTURE_MANIFEST_SCHEMA,
     TRANSFORM_ARTIFACT_SCHEMA,
@@ -44,24 +54,14 @@ from block_crosscoder_experiment.cli.data import (
     validate_derived_view_manifest,
     validate_transform_artifact_manifest,
 )
-
-from block_crosscoder_experiment.campaign import (
-    ARTIFACT_SCHEMA,
-    Campaign,
-    CampaignError,
-    EVALUATION_EXECUTION_IMPLEMENTATION,
-    EVALUATION_SCHEMA,
-    PREPARATION_SCHEMA,
-    QUALIFICATION_SCHEMA,
-)
 from block_crosscoder_experiment.codec import (
     Codec,
     CodecSpec,
+    _packet_from_events,
     _RDEvaluationBatch,
     _RDEvaluationInput,
     _RDEvaluationSelection,
     _RDEvaluationSession,
-    _packet_from_events,
     decode_batch,
     estimate_calibration_peak_bytes,
     fit_codec,
@@ -77,7 +77,7 @@ from block_crosscoder_experiment.implementation import (
     cuda_execution_lock_path,
     host_cuda_execution_lock,
 )
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder, bsc_loss
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig, bsc_loss
 from block_crosscoder_experiment.phase1 import (
     FelSyntheticConfig,
     LadderSyntheticConfig,
@@ -85,16 +85,11 @@ from block_crosscoder_experiment.phase1 import (
     make_fel_dataset,
     make_ladder_dataset,
 )
-from block_crosscoder_experiment.store import (
-    MANIFEST_NAME,
-    StoreReader,
-    Whitener,
-    cuda_prefetch_batches,
-    prefetch_batches,
-)
 from block_crosscoder_experiment.runtime_limits import (
     CODE_NORM_CUDA_IMPLEMENTATION,
     CODE_NORM_NATIVE_IMPLEMENTATION,
+    DECODED_ENERGY_EXACT_IMPLEMENTATION,
+    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     DECODER_RETRACTION_CHOLESKY_QR_IMPLEMENTATION,
     DECODER_RETRACTION_HOUSEHOLDER_QR_IMPLEMENTATION,
     DECODER_RETRACTION_NOT_APPLICABLE,
@@ -104,8 +99,6 @@ from block_crosscoder_experiment.runtime_limits import (
     FACTORIZED_EXECUTION_FACTOR_REGULARIZERS_IMPLEMENTATION,
     FACTORIZED_EXECUTION_MATERIALIZED_REFERENCE_IMPLEMENTATION,
     FACTORIZED_EXECUTION_NOT_APPLICABLE,
-    DECODED_ENERGY_EXACT_IMPLEMENTATION,
-    DECODED_ENERGY_STIEFEL_CODE_NORM_IMPLEMENTATION,
     ISOLATED_LOSS_EXACT_IMPLEMENTATION,
     ISOLATED_LOSS_MAPPED_IMPLEMENTATION,
     MAP_NUCLEAR_EINSUM_REFERENCE_IMPLEMENTATION,
@@ -120,25 +113,26 @@ from block_crosscoder_experiment.runtime_limits import (
 from block_crosscoder_experiment.serialization import (
     MODEL_STATE_DIGEST_CONTRACT,
     model_state_digest,
+)
+from block_crosscoder_experiment.serialization import (
     tensor_payload_digest as _tensor_payload_digest,
 )
+from block_crosscoder_experiment.store import (
+    MANIFEST_NAME,
+    StoreReader,
+    Whitener,
+    cuda_prefetch_batches,
+    prefetch_batches,
+)
 from block_crosscoder_experiment.studies import (
-    CellSpec,
-    Phase,
-    Phase1Blueprint,
-    Phase2Blueprint,
-    Phase3Blueprint,
     PHASE2_INELIGIBLE_SELECTION_SCORE,
     PHASE2_SELECTION_METRIC_KEY,
     WINNING_FORMULA_STAGE,
+    CellSpec,
+    Phase,
+    Phase2Blueprint,
     StudyError,
     StudyPlan,
-    build_phase1_blueprint,
-    build_phase1_plan,
-    build_phase2_blueprint,
-    build_phase2_plan,
-    build_phase3_blueprint,
-    build_phase3_plan,
     canonical_json,
 )
 from block_crosscoder_experiment.trainer import (
@@ -147,7 +141,6 @@ from block_crosscoder_experiment.trainer import (
     validate_optimizer_state_config,
     validate_run_binding,
 )
-
 
 _NATIVE_TORCH_SAVE = torch.save
 TRAINING_REPORT_SCHEMA = "bsc-training-report-v1"
@@ -212,9 +205,7 @@ def _amended_phase2_execution_binding(
         )
         history = StudyPlan.from_manifest(history_payload)
         if history.plan_id == amendment["source_plan_id_at_adoption"]:
-            if canonical_json(history_payload) != canonical_json(
-                history.to_manifest()
-            ):
+            if canonical_json(history_payload) != canonical_json(history.to_manifest()):
                 return False
             adoption_matches.append(history)
     if len(adoption_matches) != 1:
@@ -223,8 +214,7 @@ def _amended_phase2_execution_binding(
     if (
         adoption_plan.phase is not Phase.PHASE2
         or len(adoption_plan.stages) > len(active_plan.stages)
-        or active_plan.stages[: len(adoption_plan.stages)]
-        != adoption_plan.stages
+        or active_plan.stages[: len(adoption_plan.stages)] != adoption_plan.stages
     ):
         return False
 
@@ -270,7 +260,7 @@ class _FileFingerprint:
     ctime_ns: int
 
     @classmethod
-    def from_path(cls, path: Path) -> "_FileFingerprint":
+    def from_path(cls, path: Path) -> _FileFingerprint:
         stat = path.stat()
         return cls(
             stat.st_dev,
@@ -336,6 +326,7 @@ def _verify_store_reader_once(
     verification_campaign_root: Path | None = None,
 ) -> None:
     manifest = root / split / MANIFEST_NAME
+
     def stat_record(path: Path) -> dict[str, int | str]:
         status = path.stat()
         return {
@@ -371,9 +362,7 @@ def _verify_store_reader_once(
         size = path.stat().st_size
         length = min(size, _VERIFICATION_PROBE_BYTES)
         offset_span = size - length
-        offset_seed = hashlib.sha256(
-            f"{manifest_sha256}:{path.name}".encode("utf-8")
-        ).digest()
+        offset_seed = hashlib.sha256(f"{manifest_sha256}:{path.name}".encode()).digest()
         offset = (
             int.from_bytes(offset_seed[:8], "big") % (offset_span + 1)
             if offset_span
@@ -485,9 +474,7 @@ def _verify_store_reader_once(
             receipt = None
         if (
             isinstance(receipt, dict)
-            and {
-                name: receipt.get(name) for name in expected_receipt_core
-            }
+            and {name: receipt.get(name) for name in expected_receipt_core}
             == expected_receipt_core
             and isinstance(receipt.get("content_probes"), list)
         ):
@@ -590,10 +577,7 @@ def _emit_stage_manifest(
     root: Path,
     artifacts: Sequence[tuple[str, Path]],
 ) -> None:
-    entries = [
-        _artifact_entry(kind, item, root=root)
-        for kind, item in artifacts
-    ]
+    entries = [_artifact_entry(kind, item, root=root) for kind, item in artifacts]
     if len({entry["kind"] for entry in entries}) != len(entries):
         raise CellExecutionError("a stage cannot emit the same artifact kind twice")
     _atomic_bytes(
@@ -623,7 +607,9 @@ class _Context:
         try:
             self.cell = CellSpec.from_manifest(manifest)
         except (KeyError, TypeError, ValueError, StudyError) as exc:
-            raise CellExecutionError(f"invalid cell manifest {cell_path}: {exc}") from exc
+            raise CellExecutionError(
+                f"invalid cell manifest {cell_path}: {exc}"
+            ) from exc
         self.cell_path = cell_path.resolve()
         self.stage = stage
         self.artifacts_out = artifacts_out.resolve()
@@ -642,7 +628,9 @@ class _Context:
             ) from exc
         self.campaign = Campaign(self.root)
         active_plan = self.campaign.plan
-        matching = [cell for cell in active_plan.cells if cell.cell_id == self.cell.cell_id]
+        matching = [
+            cell for cell in active_plan.cells if cell.cell_id == self.cell.cell_id
+        ]
         if (
             active_plan.phase is not self.cell.phase
             or matching != [self.cell]
@@ -650,15 +638,16 @@ class _Context:
             != self.campaign.cell_manifest_path(self.cell.cell_id).resolve()
         ):
             raise CellExecutionError("cell is not part of the active campaign plan")
-        if (
-            self.cell.phase is Phase.PHASE2
-            and self.cell.stage != WINNING_FORMULA_STAGE
-        ):
+        if self.cell.phase is Phase.PHASE2 and self.cell.stage != WINNING_FORMULA_STAGE:
             decision = Campaign.phase1_decision_from_manifest(
-                _read_object(self.root / "phase1-decision.json", label="Phase-1 decision")
+                _read_object(
+                    self.root / "phase1-decision.json", label="Phase-1 decision"
+                )
             )
             if decision.get("go") is not True:
-                raise CellExecutionError("Phase 2 requires a reviewed Phase-1 go decision")
+                raise CellExecutionError(
+                    "Phase 2 requires a reviewed Phase-1 go decision"
+                )
             if (
                 decision.get("smoke") is True
                 and self.cell.decision_map["runtime.smoke"] is not True
@@ -1641,7 +1630,7 @@ def _intervals_are_disjoint(intervals: Mapping[str, Mapping[str, Any]]) -> bool:
     # Token-disjoint is insufficient: adjacent positions from one language-
     # model context leak almost the whole receptive field across a split.
     # Scientific splits therefore require whole-sequence separation.
-    return all(left[1][0] < right[0][0] for left, right in zip(ordered, ordered[1:]))
+    return all(left[1][0] < right[0][0] for left, right in itertools.pairwise(ordered))
 
 
 def _resolved_capture_contract(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -1795,9 +1784,7 @@ def _load_capture_contract(raw_root: Path, values: Mapping[str, Any]) -> dict[st
             "allocation": dict(allocation),
             "manifest_file_sha256": _sha256(manifest_path),
             "manifest_sha256": reader.manifest.get("manifest_sha256"),
-            "content_stream_sha256": reader.manifest.get(
-                "content_stream_sha256"
-            ),
+            "content_stream_sha256": reader.manifest.get("content_stream_sha256"),
             "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
             "n_tokens": reader.n_tokens,
             "sites": list(reader.sites),
@@ -1874,18 +1861,12 @@ def _validate_derived_root_envelope(
         expected_record = {
             "allocation": dict(capture["split_plan"][split]),
             "manifest_sha256": reader.manifest.get("manifest_sha256"),
-            "content_stream_sha256": reader.manifest.get(
-                "content_stream_sha256"
-            ),
+            "content_stream_sha256": reader.manifest.get("content_stream_sha256"),
             "row_stream_sha256": reader.manifest.get("row_stream_sha256"),
             "n_tokens": reader.n_tokens,
-            "source_manifest_file_sha256": source_record[
-                "manifest_file_sha256"
-            ],
+            "source_manifest_file_sha256": source_record["manifest_file_sha256"],
             "source_manifest_sha256": source_record["manifest_sha256"],
-            "source_content_stream_sha256": source_record[
-                "content_stream_sha256"
-            ],
+            "source_content_stream_sha256": source_record["content_stream_sha256"],
             "source_row_stream_sha256": source_record["row_stream_sha256"],
         }
         if validated["splits"].get(split) != expected_record:
@@ -2392,7 +2373,7 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
             )
         try:
             transform = Whitener.load(transform_path)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CellExecutionError(
                 f"cannot verify frozen transform {transform_path}: {exc}"
             ) from exc
@@ -2521,12 +2502,10 @@ def _resolve_real_store(values: Mapping[str, Any]) -> dict[str, Any]:
     source_contract = _load_capture_contract(raw_root, values)
     source_hash = source_contract["source_hash"]
     assert transform is not None
-    view_manifest_sha256, view_manifest_file_sha256 = (
-        _validate_derived_root_envelope(
-            root,
-            source_contract=source_contract,
-            transform=transform,
-        )
+    view_manifest_sha256, view_manifest_file_sha256 = _validate_derived_root_envelope(
+        root,
+        source_contract=source_contract,
+        transform=transform,
     )
     expected_store_axis = tuple(range(len(store_site_names)))
     raw_declared_split_contract = _verify_declared_split_contract(
@@ -3314,7 +3293,9 @@ def _validate_preparation_contract(
         if not root.is_dir() or not isinstance(splits, Mapping):
             raise CellExecutionError("activation-store preparation is incomplete")
         if len(set(str(value) for value in splits.values())) != len(splits):
-            raise CellExecutionError("training, calibration, and evaluation splits overlap")
+            raise CellExecutionError(
+                "training, calibration, and evaluation splits overlap"
+            )
 
 
 def _load_preparation(path: Path, ctx: _Context) -> dict[str, Any]:
@@ -3387,9 +3368,7 @@ def _store_reader(
         split,
         expected_row_identity={
             "sequence_start": int(allocation["sequence_start"]),
-            "sequence_stop_exclusive": int(
-                allocation["sequence_stop_exclusive"]
-            ),
+            "sequence_stop_exclusive": int(allocation["sequence_stop_exclusive"]),
             "tokens_per_sequence": int(allocation["tokens_per_sequence"]),
             "position_start": int(source_contract["source"]["drop_positions"]),
         },
@@ -3438,7 +3417,7 @@ def _prepared_transform(preparation: Mapping[str, Any]) -> Whitener | None:
         raise CellExecutionError("Phase-3 normalization-fit binding mismatch")
     try:
         transform = Whitener.load(path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise CellExecutionError(
             f"cannot load frozen Phase-3 transform: {exc}"
         ) from exc
@@ -3474,7 +3453,7 @@ def _apply_prepared_transform(
     cache = getattr(transform, "_application_cache", None)
     if cache is None:
         cache = {}
-        setattr(transform, "_application_cache", cache)
+        transform._application_cache = cache
     device_key = (x.device.type, x.device.index)
     key = (selected, device_key)
     bound = cache.get(key)
@@ -3697,7 +3676,7 @@ def _load_deployable_codec(
 
     try:
         value = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise CellExecutionError(f"cannot load deployable codec: {exc}") from exc
     if not isinstance(value, dict):
         raise CellExecutionError("deployable codec is not a mapping")
@@ -3923,7 +3902,7 @@ def _load_deployable_codec(
             )
         ):
             raise ValueError("deployable codec has an invalid rate contract")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise CellExecutionError(
             f"cannot reconstruct consumer from deployable codec: {exc}"
         ) from exc
@@ -4597,7 +4576,7 @@ def _validate_final_checkpoint(
 ) -> dict[str, Any]:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:  # noqa: BLE001 - convert corrupt torch files cleanly
+    except Exception as exc:
         raise CellExecutionError(
             f"cannot load immutable checkpoint {path}: {exc}"
         ) from exc
@@ -5280,7 +5259,7 @@ def _train(
             trainer = Trainer.load_checkpoint(
                 ctx.progress, device=device, expected_binding=binding
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CellExecutionError(
                 f"cannot resume partial checkpoint: {exc}"
             ) from exc
@@ -5510,7 +5489,7 @@ def _calibrate(
                 checkpoint_path,
                 device=_device(ctx),
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CellExecutionError(
                 f"cannot load checkpoint for calibration: {exc}"
             ) from exc
@@ -5651,7 +5630,7 @@ def _calibrate(
     if ctx.calibration.exists():
         try:
             existing = Codec.load(ctx.calibration)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CellExecutionError(f"existing calibration is corrupt: {exc}") from exc
         expected_binding = {
             key: codec.meta[key]
@@ -9878,8 +9857,7 @@ def _evaluate(
     invalid_json_path = _first_nonfinite_json_path(payload)
     if invalid_json_path is not None:
         raise CellExecutionError(
-            "evaluation contains a non-finite or non-JSON value at "
-            f"{invalid_json_path}"
+            f"evaluation contains a non-finite or non-JSON value at {invalid_json_path}"
         )
     _write_immutable_json(ctx.evaluation, payload)
     return (
@@ -9919,17 +9897,18 @@ def _qualify(
         raise CellExecutionError("evaluation lacks selection metrics")
 
     roundtrip = evaluation.get("codec_roundtrip", {})
-    calibration_excluded = calibration_record.get(
-        "excluded_calibration_event_fraction"
-    )
+    calibration_excluded = calibration_record.get("excluded_calibration_event_fraction")
     evaluation_excluded = evaluation.get("rate_distortion", {}).get(
         "eval_excluded_event_share"
     )
-    finite_number = lambda value: (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
+
+    def finite_number(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
     identification_passed, inapplicable = _phase1_identification_outcome(
         ctx.cell.phase,
         evaluation.get("synthetic_identification"),
@@ -9947,17 +9926,11 @@ def _qualify(
         ),
         "calibration_coverage": (
             finite_number(calibration_excluded)
-            and (
-                ctx.cell.phase is Phase.PHASE2
-                or float(calibration_excluded) <= 0.01
-            )
+            and (ctx.cell.phase is Phase.PHASE2 or float(calibration_excluded) <= 0.01)
         ),
         "evaluation_coverage": (
             finite_number(evaluation_excluded)
-            and (
-                ctx.cell.phase is Phase.PHASE2
-                or float(evaluation_excluded) <= 0.01
-            )
+            and (ctx.cell.phase is Phase.PHASE2 or float(evaluation_excluded) <= 0.01)
         ),
         "phase1_identification": identification_passed,
     }
@@ -10024,6 +9997,7 @@ def _qualify(
     }
     _write_immutable_json(ctx.qualification, payload)
     return (("qualification", ctx.qualification),)
+
 
 def execute(
     ctx: _Context,

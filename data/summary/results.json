@@ -49,7 +49,7 @@
   ],
   "sources": [
     "docs/findings.md",
-    "docs/figures/phase2/month_geometry_metrics.json",
+    "figures/phase2/month_geometry_metrics.json",
     "docs/design.md"
   ]
 }

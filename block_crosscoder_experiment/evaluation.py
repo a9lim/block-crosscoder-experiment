@@ -9,13 +9,14 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable, NamedTuple
+from typing import NamedTuple
 
 import torch
 
-from .model import BSCConfig, BlockCrosscoder
+from .model import BlockCrosscoder, BSCConfig
 from .runtime_limits import (
     EVALUATION_CONCORDANCE_BLOCK_CHUNK,
     EVALUATION_REDUCTION_TOKEN_CHUNK,
@@ -25,9 +26,9 @@ from .runtime_limits import (
 from .trainer import validate_run_binding
 
 __all__ = [
+    "EvaluationModeEndpoints",
     "centered_fvu",
     "checkpoint_sha256",
-    "EvaluationModeEndpoints",
     "evaluate_selector_and_shared_code_modes",
     "evaluate_shared_code",
     "evaluate_shared_code_modes",
@@ -873,6 +874,7 @@ def _evaluate_code_modes(
             empty: bool,
             frozen_encoder_sites,
             full_outputs_for_batch: dict[str, _EvaluationViewOutput],
+            batch: torch.Tensor = x,
         ) -> dict[str, _EvaluationViewOutput]:
             """Run one mode-independent partial encoding and both selectors."""
             if source_missing or empty:
@@ -880,7 +882,7 @@ def _evaluate_code_modes(
                 if null_outputs is not None:
                     return null_outputs
                 if zero_x is None:
-                    zero_x = torch.zeros_like(x)
+                    zero_x = torch.zeros_like(batch)
                 null_observed = torch.zeros_like(view_observed)
                 fallback = cfg.source_site if cfg.encoder_fusion == "source" else 0
                 null_observed[:, fallback] = True
@@ -893,7 +895,7 @@ def _evaluate_code_modes(
             if cfg.encoder_fusion == "source" or S == 1:
                 return full_outputs_for_batch
             return outputs_for_view(
-                x,
+                batch,
                 observed=view_observed,
                 validate_observed=False,
                 encoder_sites=frozen_encoder_sites,

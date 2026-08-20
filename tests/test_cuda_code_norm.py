@@ -7,7 +7,7 @@ pytest.importorskip("triton")
 
 import block_crosscoder_experiment.cuda_code_norm as cuda_code_norm_module
 from block_crosscoder_experiment.cuda_code_norm import cuda_code_norm4
-from block_crosscoder_experiment.model import BSCConfig, BlockCrosscoder
+from block_crosscoder_experiment.model import BlockCrosscoder, BSCConfig
 from block_crosscoder_experiment.runtime_limits import (
     CODE_NORM_NATIVE_IMPLEMENTATION,
     CUDA_CODE_NORM_LARGE_OUTPUTS,
@@ -161,15 +161,12 @@ def test_model_code_norm_falls_back_outside_complete_cuda_carrier(monkeypatch, c
 
 
 def test_cuda_code_norm4_refuses_invalid_direct_calls():
-    with pytest.raises(TypeError, match="BF16 CUDA"):
-        with torch.no_grad():
-            cuda_code_norm4(torch.ones(4, 4, device="cuda"))
+    with pytest.raises(TypeError, match="BF16 CUDA"), torch.no_grad():
+        cuda_code_norm4(torch.ones(4, 4, device="cuda"))
     with pytest.raises(ValueError, match="contiguous final dimension four"):
         with torch.no_grad():
             cuda_code_norm4(
-                torch.ones(4, 5, 4, dtype=torch.bfloat16, device="cuda").transpose(
-                    0, 1
-                )
+                torch.ones(4, 5, 4, dtype=torch.bfloat16, device="cuda").transpose(0, 1)
             )
     with pytest.raises(RuntimeError, match="no-grad only"):
         cuda_code_norm4(torch.ones(4, 4, dtype=torch.bfloat16, device="cuda"))

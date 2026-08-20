@@ -7,22 +7,22 @@ The operator may edit or replace them before continuing.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import json
 import os
 import shutil
 import signal
 import sys
+from collections.abc import Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Sequence
 
-from block_crosscoder_experiment.cli.data import DEFAULT_FREE_SPACE_FLOOR_FRAC
 from block_crosscoder_experiment.campaign import (
     Campaign,
     CampaignError,
     CampaignRunner,
     RunSummary,
 )
+from block_crosscoder_experiment.cli.data import DEFAULT_FREE_SPACE_FLOOR_FRAC
 from block_crosscoder_experiment.store import NORMALIZATION_MODES, StoreReader
 from block_crosscoder_experiment.studies import (
     Budget,
@@ -31,7 +31,6 @@ from block_crosscoder_experiment.studies import (
     Phase,
     Phase1Blueprint,
     Phase2Blueprint,
-    StudyPlan,
     StudyError,
     build_phase1_blueprint,
     build_phase1_plan,
@@ -39,9 +38,9 @@ from block_crosscoder_experiment.studies import (
     build_phase2_plan,
     build_phase3_blueprint,
     build_phase3_plan,
+    enforce_plan_resources,
     estimate_activation_store,
     estimate_plan,
-    enforce_plan_resources,
     materialize_child_plan,
     materialize_family_child_plan,
     materialize_family_revisit_plan,
@@ -175,6 +174,7 @@ def _existing_input_storage(
         "existing_input_bytes": sum(path.stat().st_size for path in counted),
         "inputs": records,
     }
+
 
 def _estimated_plan_input_storage_bytes(plan) -> int:
     """Return the exact activation-store portion of ``estimate_plan(plan)``."""
@@ -425,6 +425,7 @@ def _resolve_phase2_view_dispatch(
                     "different row counts or geometry"
                 )
     return dispatched
+
 
 def _run_with_optional_view_dispatch(
     campaign: Campaign,
