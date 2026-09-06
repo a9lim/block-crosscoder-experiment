@@ -1,5 +1,15 @@
 # AGENTS.md
 
+> **Deprecated — no longer compatible with or supported on Jobe (2026-09-06).**
+> This experiment is intentionally orphaned from the maintained workspace runtime
+> (PyTorch 2.14 / CUDA 13.2). Its code and research artifacts remain available,
+> but its dependencies, installation instructions, CUDA gates, and runbooks are
+> historical and are not maintained or qualified for that runtime. Do not install
+> or run it in Jobe's shared environment, or constrain that environment to keep
+> it working. This notice supersedes all active-status and Jobe execution
+> guidance below and in the linked documentation. Only `delta-feedback-experiment`
+> and `recurrent-lens-experiment` remain in the supported experiment scope.
+
 This repository runs a staged scientific experiment on **block-sparse
 crosscoders**: one sparse block support with signed vector coordinates shared
 across activation sites in a single model. It is not a general-purpose library.
