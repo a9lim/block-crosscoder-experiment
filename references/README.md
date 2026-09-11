@@ -12,7 +12,7 @@ generated research inputs.
 - `pdfs/` contains local PDF fallbacks for sources without usable HTML and is
   ignored.
 
-From the parent `transformer-experiments` workspace, refresh the generated
+Using the shared `transformer-experiments` package, refresh the generated
 Markdown copies and put them in the ignored source cache with:
 
 ```bash
